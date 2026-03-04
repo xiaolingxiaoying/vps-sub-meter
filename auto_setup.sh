@@ -1,0 +1,473 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ==============================================================================
+# VPS 流量统计与订阅管理 自动配置脚本
+# 用法:
+#   bash <(curl -fsSL https://raw.githubusercontent.com/<user>/<repo>/main/auto_setup.sh)
+# ==============================================================================
+
+# 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
+if [ ! -t 0 ]; then
+    exec < /dev/tty
+fi
+
+# 1. 检查 root 权限
+if [ "$(id -u)" != "0" ]; then
+    echo "错误: 请使用 root 权限运行此脚本 (例如: sudo bash <(curl -fsSL URL))"
+    exit 1
+fi
+
+# 2. 检查系统兼容性
+if ! command -v apt &>/dev/null; then
+    echo "错误: 此脚本仅支持 Debian/Ubuntu 系统 (需要 apt 包管理器)"
+    exit 1
+fi
+
+echo "=================================================="
+echo "      VPS 流量统计与订阅管理 - 自动配置向导       "
+echo "=================================================="
+echo "(如果已运行过此脚本，再次运行将覆盖旧配置)"
+echo ""
+
+# 3. 交互式收集配置信息
+read -rp "请输入绑定的域名 (例如: sub.example.com): " DOMAIN
+if [ -z "$DOMAIN" ]; then
+    echo "错误: 域名不能为空"
+    exit 1
+fi
+
+read -rp "请输入访问用户名 (用于 BasicAuth): " CADDY_USER
+if [ -z "$CADDY_USER" ]; then
+    echo "错误: 用户名不能为空"
+    exit 1
+fi
+
+while true; do
+    read -rs -p "请输入访问密码 (用于 BasicAuth，避免使用 @:/ 等特殊字符): " CADDY_PASS
+    echo
+    if [ -z "$CADDY_PASS" ]; then
+        echo "错误: 密码不能为空，请重新输入"
+        continue
+    fi
+    # 检查密码中是否含 URL 不安全字符
+    if [[ "$CADDY_PASS" =~ [@:/] ]]; then
+        echo "警告: 密码中包含 @ : / 字符，这会导致一键导入链接无法正常使用。"
+        read -rp "是否仍使用此密码? (y/N): " confirm
+        if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            break
+        fi
+    else
+        break
+    fi
+done
+
+read -rp "请输入每月流量上限 (GiB，默认 200): " TRAFFIC_LIMIT_GIB
+TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-200}
+read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
+TZ_NAME=${TZ_NAME:-America/Los_Angeles}
+
+# 自动获取默认网卡
+DEFAULT_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+read -rp "请确认出口网卡名称 [默认: $DEFAULT_IFACE]: " IFACE
+IFACE=${IFACE:-$DEFAULT_IFACE}
+
+# 验证网卡存在
+if [ ! -d "/sys/class/net/$IFACE" ]; then
+    echo "错误: 网卡 $IFACE 不存在"
+    exit 1
+fi
+
+# 生成随机 Token
+TOKEN="$(openssl rand -hex 24)"
+echo
+echo "=> 已为您生成安全访问 Token: $TOKEN"
+echo "=================================================="
+
+# ===================== 开始安装 =====================
+
+echo "[1/8] 安装基础依赖 (vnstat, python3, curl, openssl)..."
+apt-get update -qq
+apt-get install -y -qq vnstat python3 curl jq openssl debian-keyring debian-archive-keyring apt-transport-https
+
+echo "[2/8] 安装 Caddy (通过官方 APT 仓库)..."
+# 使用 Caddy 官方 APT 仓库，确保稳定可靠
+if ! command -v caddy &>/dev/null; then
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+    curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+    apt-get update -qq
+    apt-get install -y -qq caddy
+else
+    echo "=> Caddy 已安装，跳过 (当前版本: $(caddy version))"
+fi
+
+systemctl enable --now vnstat
+systemctl enable --now caddy
+
+echo "[3/8] 配置 vnStat 监控网卡与时区..."
+# 只在 Interface 行存在时替换，否则追加
+if grep -q '^Interface ' /etc/vnstat.conf 2>/dev/null; then
+    sed -i "s/^Interface .*/Interface \"$IFACE\"/" /etc/vnstat.conf
+else
+    echo "Interface \"$IFACE\"" >> /etc/vnstat.conf
+fi
+mkdir -p /etc/systemd/system/vnstat.service.d
+cat > /etc/systemd/system/vnstat.service.d/override.conf <<EOF
+[Service]
+Environment=TZ=$TZ_NAME
+EOF
+systemctl daemon-reload
+systemctl restart vnstat
+
+echo "[4/8] 创建隔离的服务用户和目录..."
+id subsrv &>/dev/null || useradd -r -s /usr/sbin/nologin subsrv
+mkdir -p /var/lib/subsrv
+chown subsrv:subsrv /var/lib/subsrv
+chmod 750 /var/lib/subsrv
+
+# 初始化订阅配置副本
+if [ -f /etc/s-box/clash_meta_client.yaml ]; then
+    cp -f /etc/s-box/clash_meta_client.yaml /var/lib/subsrv/client.yaml
+else
+    echo "# 暂无订阅内容，等待 yonggekkk 脚本生成" > /var/lib/subsrv/client.yaml
+    echo "=> 警告: /etc/s-box/clash_meta_client.yaml 不存在，已创建默认空配置"
+fi
+chown subsrv:subsrv /var/lib/subsrv/client.yaml
+chmod 640 /var/lib/subsrv/client.yaml
+
+# 初始化流量状态文件
+touch /var/lib/subsrv/tx_state.json
+chown subsrv:subsrv /var/lib/subsrv/tx_state.json
+chmod 640 /var/lib/subsrv/tx_state.json
+
+echo "[5/8] 配置配置文件定时同步 (每 5 分钟)..."
+cat > /usr/local/bin/refresh_sub_copy.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+SRC="/etc/s-box/clash_meta_client.yaml"
+DST="/var/lib/subsrv/client.yaml"
+TMP="/var/lib/subsrv/client.yaml.tmp"
+[ -f "$SRC" ] || exit 0
+cp -f "$SRC" "$TMP"
+chown subsrv:subsrv "$TMP"
+chmod 640 "$TMP"
+mv -f "$TMP" "$DST"
+SH
+chmod +x /usr/local/bin/refresh_sub_copy.sh
+
+cat > /etc/systemd/system/refresh-sub-copy.service <<'UNIT'
+[Unit]
+Description=Refresh served subscription copy
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/refresh_sub_copy.sh
+UNIT
+
+cat > /etc/systemd/system/refresh-sub-copy.timer <<'UNIT'
+[Unit]
+Description=Run refresh-sub-copy every 5 minutes
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
+echo "[6/8] 配置流量基线重置机制..."
+# 使用 printf 代替嵌套 heredoc，避免 heredoc 标记冲突
+cat > /usr/local/bin/reset_tx_baseline.sh <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+IFACE="\${1:-$IFACE}"
+STATE="/var/lib/subsrv/tx_state.json"
+TZNAME="$TZ_NAME"
+
+now_ym="\$(TZ=\$TZNAME date +%Y-%m)"
+tx="\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)"
+
+tmp="\$(mktemp)"
+printf '{"ym":"%s","base_tx":%s}\n' "\$now_ym" "\$tx" > "\$tmp"
+install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+rm -f "\$tmp"
+echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE ym=\$now_ym base_tx=\$tx wrote=\$STATE"
+SH
+chmod +x /usr/local/bin/reset_tx_baseline.sh
+/usr/local/bin/reset_tx_baseline.sh "$IFACE"
+
+# 设置系统时区以确保 systemd timer 在正确时间触发
+echo "=> 设置系统时区为 $TZ_NAME (确保 Timer 在正确时间触发)..."
+timedatectl set-timezone "$TZ_NAME" 2>/dev/null || {
+    ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
+    echo "$TZ_NAME" > /etc/timezone
+}
+
+cat > /etc/systemd/system/reset-tx-baseline.service <<UNIT
+[Unit]
+Description=Reset monthly tx baseline
+[Service]
+Type=oneshot
+Environment=TZ=$TZ_NAME
+ExecStart=/usr/local/bin/reset_tx_baseline.sh $IFACE
+UNIT
+
+cat > /etc/systemd/system/reset-tx-baseline.timer <<'UNIT'
+[Unit]
+Description=Run reset-tx-baseline at 00:00 on day 1 each month
+[Timer]
+OnCalendar=*-*-01 00:00:00
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
+echo "[7/8] 编写并启动动态订阅服务端 (Python)..."
+cat > /usr/local/bin/sub_server.py <<'PY'
+#!/usr/bin/env python3
+import json, os
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from urllib.parse import urlparse
+from datetime import datetime, timezone
+
+try:
+    from zoneinfo import ZoneInfo
+except Exception:
+    ZoneInfo = None
+
+def log(msg):
+    ts = datetime.now(timezone.utc).isoformat()
+    print(f"[sub_server] {ts} {msg}", flush=True)
+
+IFACE      = os.environ.get("SUB_IFACE",      "ens4")
+TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
+YAML_PATH  = os.environ.get("SUB_YAML_PATH",   "/var/lib/subsrv/client.yaml")
+LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "200"))
+TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
+STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
+
+TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
+
+def pt_now():
+    if ZoneInfo:
+        return datetime.now(ZoneInfo(TZ_NAME))
+    return datetime.now(timezone.utc)
+
+def current_ym_pt():
+    now = pt_now()
+    return f"{now.year:04d}-{now.month:02d}"
+
+def next_reset_epoch_pt():
+    now = pt_now()
+    y, m = now.year, now.month
+    if m == 12:
+        y2, m2 = y + 1, 1
+    else:
+        y2, m2 = y, m + 1
+    if ZoneInfo:
+        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=ZoneInfo(TZ_NAME))
+    else:
+        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=timezone.utc)
+    return int(dt.timestamp())
+
+def read_tx_bytes_sysfs():
+    p = f"/sys/class/net/{IFACE}/statistics/tx_bytes"
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception as e:
+        log(f"WARN: cannot read {p}: {e}")
+        return 0
+
+def load_state():
+    try:
+        with open(STATE_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+def save_state(ym, base_tx):
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"ym": ym, "base_tx": int(base_tx)}, f, separators=(",", ":"))
+    os.replace(tmp, STATE_PATH)
+
+def month_used_tx_bytes_realtime():
+    ym = current_ym_pt()
+    cur = read_tx_bytes_sysfs()
+    st = load_state()
+    st_ym = st.get("ym")
+    base = st.get("base_tx")
+
+    if st_ym != ym or base is None:
+        save_state(ym, cur)
+        log(f"state reset: ym={ym} base_tx={cur} (reason: missing or month changed)")
+        return 0, cur, cur
+
+    used = cur - int(base)
+    if used < 0:
+        save_state(ym, cur)
+        log(f"state reset: ym={ym} base_tx={cur} (reason: counter wrapped)")
+        return 0, cur, cur
+
+    return int(used), int(base), int(cur)
+
+class Handler(BaseHTTPRequestHandler):
+    def do_HEAD(self):
+        self._head_only = True
+        return self.do_GET()
+
+    def do_GET(self):
+        self._head_only = getattr(self, "_head_only", False)
+        path = urlparse(self.path).path
+        log(f"{'HEAD' if self._head_only else 'GET'} {path} from {self.client_address[0]}")
+
+        if path != TOKEN_PATH:
+            self.send_response(404)
+            self.end_headers()
+            return
+
+        try:
+            used_tx, base_tx, cur_tx = month_used_tx_bytes_realtime()
+        except Exception as e:
+            log(f"ERROR reading tx_bytes: {e}")
+            used_tx, base_tx, cur_tx = 0, 0, 0
+
+        expire = next_reset_epoch_pt()
+        remain = max(TOTAL_BYTES - used_tx, 0)
+
+        try:
+            with open(YAML_PATH, "rb") as f:
+                body = f.read()
+            log(f"read yaml ok: {YAML_PATH} bytes={len(body)}")
+        except Exception as e:
+            log(f"ERROR read yaml: {e}")
+            body = b"# subscription source missing\n"
+
+        header_val = f"upload=0; download={used_tx}; total={TOTAL_BYTES}; expire={expire}"
+        log(f"userinfo: used_tx={used_tx} remain={remain} ym={current_ym_pt()} base_tx={base_tx} cur_tx={cur_tx}")
+
+        self.send_response(200)
+        self.send_header("Content-Type", "text/yaml; charset=utf-8")
+        self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
+        self.send_header("Pragma", "no-cache")
+        self.send_header("Expires", "0")
+        self.send_header("subscription-userinfo", header_val)
+        self.end_headers()
+
+        if not self._head_only:
+            self.wfile.write(body)
+
+    def log_message(self, fmt, *args):
+        return
+
+def main():
+    host = os.environ.get("SUB_LISTEN", "127.0.0.1")
+    port = int(os.environ.get("SUB_PORT", "2080"))
+    log(f"start listen={host}:{port} iface={IFACE} tz={TZ_NAME} token_path={TOKEN_PATH} state={STATE_PATH}")
+    HTTPServer((host, port), Handler).serve_forever()
+
+if __name__ == "__main__":
+    main()
+PY
+chmod +x /usr/local/bin/sub_server.py
+
+cat > /etc/systemd/system/sub-server.service <<UNIT
+[Unit]
+Description=Dynamic subscription server with subscription-userinfo
+After=network-online.target vnstat.service
+Wants=network-online.target
+
+[Service]
+User=subsrv
+Group=subsrv
+Environment=SUB_IFACE=$IFACE
+Environment=SUB_TOKEN_PATH=/sub/$TOKEN.yaml
+Environment=SUB_YAML_PATH=/var/lib/subsrv/client.yaml
+Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
+Environment=SUB_TZ=$TZ_NAME
+Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
+Environment=SUB_LISTEN=127.0.0.1
+Environment=SUB_PORT=2080
+ExecStart=/usr/local/bin/sub_server.py
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now refresh-sub-copy.timer
+systemctl enable --now reset-tx-baseline.timer
+systemctl enable --now sub-server
+
+echo "[8/8] 配置 Caddy (反向代理与鉴权)..."
+# 清理 caddy hash-password 输出中可能的多余空白
+PASSWORD_HASH=$(caddy hash-password --plaintext "$CADDY_PASS" 2>/dev/null | tr -d '[:space:]')
+if [ -z "$PASSWORD_HASH" ]; then
+    echo "错误: caddy hash-password 生成失败，请检查 Caddy 是否正确安装"
+    exit 1
+fi
+
+# 备份旧配置
+cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/null || true
+
+cat > /etc/caddy/Caddyfile <<EOF
+$DOMAIN {
+	@sub path /sub/$TOKEN.yaml
+
+	basic_auth @sub {
+		$CADDY_USER $PASSWORD_HASH
+	}
+
+	reverse_proxy @sub 127.0.0.1:2080
+
+	respond "not found" 404
+}
+EOF
+
+caddy fmt --overwrite /etc/caddy/Caddyfile
+
+# 先验证配置是否合法，再重载
+if caddy validate --config /etc/caddy/Caddyfile 2>/dev/null; then
+    systemctl reload caddy
+    echo "=> Caddy 配置验证通过并已重载"
+else
+    echo "错误: Caddyfile 验证失败，请手动检查 /etc/caddy/Caddyfile"
+    echo "Caddy 仍在使用旧配置运行"
+    exit 1
+fi
+
+# URL 编码函数 (用于输出带认证的链接)
+urlencode() {
+    python3 -c "import urllib.parse; print(urllib.parse.quote('$1', safe=''))"
+}
+
+ENCODED_USER=$(urlencode "$CADDY_USER")
+ENCODED_PASS=$(urlencode "$CADDY_PASS")
+
+echo ""
+echo "=================================================="
+echo "                   部署完成!                      "
+echo "=================================================="
+echo ""
+echo "请在 Clash / Stash 客户端中使用以下信息导入订阅："
+echo ""
+echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.yaml"
+echo "  认证方式: Basic Auth"
+echo "  用户名:   $CADDY_USER"
+echo "  密码:     <你刚刚输入的密码>"
+echo ""
+echo "或者使用一键带认证链接直接导入："
+echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+echo ""
+echo "=================================================="
+echo ""
+echo "常用排查命令："
+echo "  journalctl -u sub-server -n 80 --no-pager"
+echo "  journalctl -u caddy -n 80 --no-pager"
+echo "  systemctl list-timers --all | grep -E 'refresh|reset'"
+echo ""
+echo "测试命令:"
+echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | grep -i subscription-userinfo"
+echo ""
