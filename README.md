@@ -4,5 +4,5 @@ bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb
 ```
 再使用
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps_proxy_auto_setup/main/auto_setup.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
 ```
