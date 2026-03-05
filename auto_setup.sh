@@ -16,6 +16,9 @@ set -euo pipefail
 #   - 每 5 分钟同步上游订阅配置
 # ==============================================================================
 
+# 配置文件路径
+CONFIG_FILE="/etc/sub-srv/config.conf"
+
 # 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
 if [ ! -t 0 ]; then
     exec < /dev/tty
@@ -33,71 +36,345 @@ if ! command -v apt &>/dev/null; then
     exit 1
 fi
 
+# ===================== 输入验证函数 =====================
+
+# 验证域名格式 (支持 IDN 和常见域名)
+validate_domain() {
+    local domain="$1"
+    # 基本格式检查：至少有一个点，不包含非法字符
+    if [[ ! "$domain" =~ ^[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9-]*[a-zA-Z0-9])?)*$ ]]; then
+        return 1
+    fi
+    # 长度检查
+    if [ ${#domain} -gt 253 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 验证用户名 (BasicAuth 用户名限制)
+validate_username() {
+    local username="$1"
+    # BasicAuth 用户名不能包含冒号，且不应包含空格和特殊字符
+    if [[ "$username" =~ [:[:space:]] ]]; then
+        return 1
+    fi
+    if [ ${#username} -gt 64 ]; then
+        return 1
+    fi
+    return 0
+}
+
+# 验证流量上限 (必须是有效数字)
+validate_traffic_limit() {
+    local limit="$1"
+    if [ -z "$limit" ]; then
+        return 0  # 空值表示无限，允许
+    fi
+    # 必须是非负整数或浮点数
+    if [[ ! "$limit" =~ ^[0-9]+\.?[0-9]*$ ]]; then
+        return 1
+    fi
+    return 0
+}
+
+# 检查端口是否被占用
+check_port_available() {
+    local port="$1"
+    # 使用更精确的正则表达式避免误匹配 (例如 2080 匹配到 12080)
+    if ss -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]" || \
+       netstat -tuln 2>/dev/null | grep -qE "[:.]${port}[[:space:]]"; then
+        return 1
+    fi
+    return 0
+}
+
+# 保存配置到文件
+save_config() {
+    local config_dir
+    config_dir=$(dirname "$CONFIG_FILE")
+    mkdir -p "$config_dir"
+    chmod 700 "$config_dir"
+
+    cat > "$CONFIG_FILE" <<EOF
+# VPS 订阅服务配置文件
+# 生成时间: $(date -Iseconds)
+
+DOMAIN="${DOMAIN}"
+CADDY_USER="${CADDY_USER}"
+CADDY_PASS_HASH="${PASSWORD_HASH}"
+TRAFFIC_LIMIT_GIB="${TRAFFIC_LIMIT_GIB}"
+TZ_NAME="${TZ_NAME}"
+IFACE="${IFACE}"
+TOKEN="${TOKEN}"
+BACKEND_PORT="${BACKEND_PORT:-2080}"
+EOF
+    chmod 600 "$CONFIG_FILE"
+    echo "=> 配置已保存到 $CONFIG_FILE"
+}
+
+# 加载已有配置
+load_config() {
+    if [ -f "$CONFIG_FILE" ]; then
+        echo "检测到已有配置文件: $CONFIG_FILE"
+        read -rp "是否加载已有配置? [Y/n]: " load_choice
+        load_choice=${load_choice:-Y}
+        if [[ "$load_choice" =~ ^[Yy] ]]; then
+            # shellcheck source=/dev/null
+            if ! source "$CONFIG_FILE" 2>/dev/null; then
+                echo "警告: 配置文件损坏，将使用默认配置"
+                return 1
+            fi
+            echo "=> 已加载配置: 域名=$DOMAIN, 用户=$CADDY_USER, 网卡=$IFACE"
+            return 0
+        fi
+    fi
+    return 1
+}
+
 echo "=================================================="
 echo "      VPS 流量统计与订阅管理 - 自动配置向导       "
 echo "=================================================="
-echo "(如果已运行过此脚本，再次运行将覆盖旧配置)"
+
+# 尝试加载已有配置
+if load_config; then
+    echo "(已加载配置，如需修改请直接输入新值，留空保持原值)"
+else
+    echo "(如果已运行过此脚本，再次运行将覆盖旧配置)"
+fi
 echo ""
 
 # 3. 交互式收集配置信息
-read -rp "请输入绑定的域名 (例如: sub.example.com): " DOMAIN
-if [ -z "$DOMAIN" ]; then
-    echo "错误: 域名不能为空"
-    exit 1
-fi
+# 域名输入与验证
+while true; do
+    if [ -n "${DOMAIN:-}" ]; then
+        read -rp "请输入绑定的域名 [当前: $DOMAIN]: " input_domain
+        if [ -z "$input_domain" ]; then
+            break  # 保持原值
+        fi
+        DOMAIN="$input_domain"
+    else
+        read -rp "请输入绑定的域名 (例如: sub.example.com): " DOMAIN
+    fi
 
-read -rp "请输入访问用户名 (用于 BasicAuth): " CADDY_USER
-if [ -z "$CADDY_USER" ]; then
-    echo "错误: 用户名不能为空"
-    exit 1
-fi
+    if [ -z "$DOMAIN" ]; then
+        echo "错误: 域名不能为空"
+        continue
+    fi
+
+    if ! validate_domain "$DOMAIN"; then
+        echo "错误: 域名格式无效 '$DOMAIN'"
+        echo "       请使用类似 sub.example.com 的格式"
+        DOMAIN=""
+        continue
+    fi
+    break
+done
+
+# 用户名输入与验证
+while true; do
+    if [ -n "${CADDY_USER:-}" ]; then
+        read -rp "请输入访问用户名 (用于 BasicAuth) [当前: $CADDY_USER]: " input_user
+        if [ -z "$input_user" ]; then
+            break  # 保持原值
+        fi
+        CADDY_USER="$input_user"
+    else
+        read -rp "请输入访问用户名 (用于 BasicAuth): " CADDY_USER
+    fi
+
+    if [ -z "$CADDY_USER" ]; then
+        echo "错误: 用户名不能为空"
+        continue
+    fi
+
+    if ! validate_username "$CADDY_USER"; then
+        echo "错误: 用户名包含非法字符 (不能包含冒号或空格)"
+        echo "       请使用字母、数字、下划线或短横线"
+        CADDY_USER=""
+        continue
+    fi
+    break
+done
 
 # URL 编码函数 (安全传递任意字符到 python3，使用 stdin 避免引号/特殊字符问题)
 urlencode() {
     printf '%s' "$1" | python3 -c "import sys, urllib.parse; print(urllib.parse.quote(sys.stdin.buffer.read().decode(), safe=''), end='')"
 }
 
-while true; do
-    read -rs -p "请输入访问密码 (用于 BasicAuth，支持特殊字符): " CADDY_PASS
-    echo
-    if [ -z "$CADDY_PASS" ]; then
-        echo "错误: 密码不能为空，请重新输入"
-        continue
+# 密码输入与验证
+NEED_NEW_PASSWORD=true
+if [ -n "${CADDY_PASS_HASH:-}" ]; then
+    echo "检测到已保存的密码 (哈希值: ${CADDY_PASS_HASH:0:20}...)"
+    read -rp "是否使用已保存的密码? [Y/n]: " use_saved
+    use_saved=${use_saved:-Y}
+    if [[ "$use_saved" =~ ^[Yy] ]]; then
+        NEED_NEW_PASSWORD=false
+        PASSWORD_HASH="$CADDY_PASS_HASH"
+        # 生成临时密码用于显示 (实际不会用于认证，因为已有哈希)
+        CADDY_PASS="<已保存的密码>"
+        echo "=> 将使用已保存的密码"
     fi
-    # 检查密码中是否含 URL 不安全字符，提示但不阻止
-    if [[ "$CADDY_PASS" =~ [@:/] ]]; then
-        echo "提示: 密码中包含特殊字符，一键导入链接将自动进行 URL 编码处理。"
+fi
+
+if [ "$NEED_NEW_PASSWORD" = true ]; then
+    while true; do
+        read -rs -p "请输入访问密码 (用于 BasicAuth，支持特殊字符): " CADDY_PASS
+        echo
+        if [ -z "$CADDY_PASS" ]; then
+            echo "错误: 密码不能为空，请重新输入"
+            continue
+        fi
+        # 检查密码中是否含 URL 不安全字符，提示但不阻止
+        if [[ "$CADDY_PASS" =~ [@:/] ]]; then
+            echo "提示: 密码中包含特殊字符，一键导入链接将自动进行 URL 编码处理。"
+        fi
+        break
+    done
+fi
+
+# 流量上限输入与验证
+while true; do
+    if [ -n "${TRAFFIC_LIMIT_GIB:-}" ]; then
+        read -rp "请输入每月流量上限 (GiB，0 或留空表示无限) [当前: $TRAFFIC_LIMIT_GIB]: " input_limit
+        if [ -z "$input_limit" ]; then
+            break  # 保持原值
+        fi
+        TRAFFIC_LIMIT_GIB="$input_limit"
+    else
+        read -rp "请输入每月流量上限 (GiB，0 或留空表示无限，默认 0): " TRAFFIC_LIMIT_GIB
+    fi
+
+    TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-0}
+
+    if ! validate_traffic_limit "$TRAFFIC_LIMIT_GIB"; then
+        echo "错误: 流量上限必须是有效的数字"
+        TRAFFIC_LIMIT_GIB=""
+        continue
     fi
     break
 done
 
-read -rp "请输入每月流量上限 (GiB，0 或留空表示无限，默认 0): " TRAFFIC_LIMIT_GIB
-TRAFFIC_LIMIT_GIB=${TRAFFIC_LIMIT_GIB:-0}
-read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
-TZ_NAME=${TZ_NAME:-America/Los_Angeles}
+# 时区输入与验证
+while true; do
+    if [ -n "${TZ_NAME:-}" ]; then
+        read -rp "请输入计费时区 [当前: $TZ_NAME]: " input_tz
+        if [ -z "$input_tz" ]; then
+            break  # 保持原值
+        fi
+        TZ_NAME="$input_tz"
+    else
+        read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
+    fi
 
-# 验证时区合法性
-if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
-    echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
-    exit 1
-fi
+    TZ_NAME=${TZ_NAME:-America/Los_Angeles}
+
+    # 验证时区合法性
+    if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
+        echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
+        echo "       可用时区列表: ls /usr/share/zoneinfo/"
+        TZ_NAME=""
+        continue
+    fi
+    break
+done
 
 # 自动获取默认网卡
-DEFAULT_IFACE=$(ip route get 1.1.1.1 | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
-read -rp "请确认出口网卡名称 [默认: $DEFAULT_IFACE]: " IFACE
-IFACE=${IFACE:-$DEFAULT_IFACE}
-
-# 验证网卡存在
-if [ ! -d "/sys/class/net/$IFACE" ]; then
-    echo "错误: 网卡 $IFACE 不存在"
-    exit 1
+DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
+if [ -z "$DEFAULT_IFACE" ]; then
+    # 备选方案：获取第一个非 lo 网卡
+    DEFAULT_IFACE=$(ip link show | grep -v "lo:" | awk -F: '/^[0-9]+:/{gsub(/ /, "", $2); print $2; exit}')
 fi
 
-# 生成随机 Token
-TOKEN="$(openssl rand -hex 24)"
+# 网卡输入与验证
+while true; do
+    if [ -n "${IFACE:-}" ]; then
+        read -rp "请确认出口网卡名称 [当前: $IFACE]: " input_iface
+        if [ -z "$input_iface" ]; then
+            break  # 保持原值
+        fi
+        IFACE="$input_iface"
+    else
+        if [ -n "$DEFAULT_IFACE" ]; then
+            read -rp "请确认出口网卡名称 [默认: $DEFAULT_IFACE]: " IFACE
+            IFACE=${IFACE:-$DEFAULT_IFACE}
+        else
+            read -rp "请输入出口网卡名称 (例如: eth0, ens4): " IFACE
+        fi
+    fi
+
+    if [ -z "$IFACE" ]; then
+        echo "错误: 网卡名称不能为空"
+        IFACE=""
+        continue
+    fi
+
+    # 验证网卡存在
+    if [ ! -d "/sys/class/net/$IFACE" ]; then
+        echo "错误: 网卡 $IFACE 不存在"
+        echo "       可用网卡列表: $(ls /sys/class/net/ | tr '\n' ' ')"
+        IFACE=""
+        continue
+    fi
+    break
+done
+
+# 后端端口输入与验证 (默认 2080)
+BACKEND_PORT="${BACKEND_PORT:-2080}"
+while true; do
+    read -rp "请输入后端服务端口 [默认: $BACKEND_PORT]: " input_port
+    if [ -z "$input_port" ]; then
+        break
+    fi
+
+    # 验证端口号
+    if [[ ! "$input_port" =~ ^[0-9]+$ ]] || [ "$input_port" -lt 1 ] || [ "$input_port" -gt 65535 ]; then
+        echo "错误: 端口号必须是 1-65535 之间的整数"
+        continue
+    fi
+
+    BACKEND_PORT="$input_port"
+    break
+done
+
+# 检查端口是否被占用
+if ! check_port_available "$BACKEND_PORT"; then
+    echo "警告: 端口 $BACKEND_PORT 已被占用"
+    read -rp "是否继续使用此端口? [y/N]: " continue_port
+    if [[ ! "$continue_port" =~ ^[Yy] ]]; then
+        echo "已取消安装"
+        exit 1
+    fi
+fi
+
+# 生成随机 Token (如果未从配置文件加载)
+if [ -z "${TOKEN:-}" ]; then
+    TOKEN="$(openssl rand -hex 24)"
+fi
 echo
-echo "=> 已为您生成安全访问 Token: $TOKEN"
+echo "=> 安全访问 Token: $TOKEN"
 echo "=================================================="
+
+# ===================== 配置摘要与确认 =====================
+echo ""
+echo "========== 配置摘要 =========="
+echo "域名:       $DOMAIN"
+echo "用户名:     $CADDY_USER"
+echo "密码:       $([ "$CADDY_PASS" = "<已保存的密码>" ] && echo "<已保存>" || echo "${CADDY_PASS:0:3}***")"
+echo "流量上限:   $TRAFFIC_LIMIT_GIB GiB"
+echo "时区:       $TZ_NAME"
+echo "网卡:       $IFACE"
+echo "后端端口:   $BACKEND_PORT"
+echo "Token:      ${TOKEN:0:12}...${TOKEN: -12}"
+echo "=============================="
+echo ""
+read -rp "确认开始安装? [Y/n]: " confirm
+confirm=${confirm:-Y}
+if [[ ! "$confirm" =~ ^[Yy] ]]; then
+    echo "已取消安装"
+    exit 0
+fi
+echo ""
 
 # ===================== 开始安装 =====================
 
@@ -120,8 +397,14 @@ else
     echo "=> Caddy 已安装，跳过 (当前版本: $(caddy version))"
 fi
 
+# 启动基础服务
+echo "=> 启动 vnstat 和 Caddy 服务..."
 systemctl enable --now vnstat
 systemctl enable --now caddy
+
+# 保存配置到文件
+echo "=> 保存配置到 $CONFIG_FILE ..."
+save_config
 
 echo "[3/8] 配置 vnStat 监控网卡与时区..."
 # 只在 Interface 行存在时替换，否则追加
@@ -454,7 +737,7 @@ Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
 Environment=SUB_TZ=$TZ_NAME
 Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
 Environment=SUB_LISTEN=127.0.0.1
-Environment=SUB_PORT=2080
+Environment=SUB_PORT=$BACKEND_PORT
 ExecStart=/usr/local/bin/sub_server.py
 Restart=always
 RestartSec=2
@@ -471,11 +754,18 @@ systemctl enable sub-server
 systemctl restart sub-server
 
 echo "[8/8] 配置 Caddy (反向代理与鉴权)..."
-# 生成密码哈希 (清理输出中可能的多余空白)
-PASSWORD_HASH=$(caddy hash-password --plaintext "$CADDY_PASS" 2>/dev/null | tr -d '[:space:]')
-if [ -z "$PASSWORD_HASH" ]; then
-    echo "错误: caddy hash-password 生成失败，请检查 Caddy 是否正确安装"
-    exit 1
+# 生成密码哈希 (如果是新密码)
+if [ "$NEED_NEW_PASSWORD" = true ]; then
+    PASSWORD_HASH=$(caddy hash-password --plaintext "$CADDY_PASS" 2>/dev/null | tr -d '[:space:]')
+    if [ -z "$PASSWORD_HASH" ]; then
+        echo "错误: caddy hash-password 生成失败，请检查 Caddy 是否正确安装"
+        exit 1
+    fi
+    # 更新配置文件中的密码哈希
+    echo "=> 更新配置文件中的密码哈希..."
+    save_config
+else
+    echo "=> 使用已保存的密码哈希: ${PASSWORD_HASH:0:20}..."
 fi
 
 # 备份旧配置
@@ -510,7 +800,7 @@ $DOMAIN {
 
 	# 1) token 参数优先：不需要 BasicAuth
 	handle @sub_with_token {
-		reverse_proxy 127.0.0.1:2080
+		reverse_proxy 127.0.0.1:$BACKEND_PORT
 	}
 
 	# 2) 精确路径匹配：需要 BasicAuth
@@ -518,7 +808,7 @@ $DOMAIN {
 		basic_auth {
 			$CADDY_USER $PASSWORD_HASH
 		}
-		reverse_proxy 127.0.0.1:2080
+		reverse_proxy 127.0.0.1:$BACKEND_PORT
 	}
 
 	# 3) 其他路径全部 404
@@ -550,13 +840,13 @@ echo ""
 echo "=> 正在验证本地服务..."
 
 # 验证 Python 后端是否响应
-if curl -sf -o /dev/null "http://127.0.0.1:2080/sub/$TOKEN.yaml"; then
+if curl -sf -o /dev/null "http://127.0.0.1:$BACKEND_PORT/sub/$TOKEN.yaml"; then
     echo "   [OK] Python 订阅服务正常响应 (Clash Meta YAML)"
 else
     echo "   [WARN] Python 订阅服务未响应 (YAML)，请检查: journalctl -u sub-server -n 40"
 fi
 
-if curl -sf -o /dev/null "http://127.0.0.1:2080/sub/$TOKEN.json"; then
+if curl -sf -o /dev/null "http://127.0.0.1:$BACKEND_PORT/sub/$TOKEN.json"; then
     echo "   [OK] Python 订阅服务正常响应 (sing-box JSON)"
 else
     echo "   [WARN] Python 订阅服务未响应 (JSON)，请检查: journalctl -u sub-server -n 40"
@@ -573,8 +863,18 @@ else
 fi
 
 # ===================== 输出部署信息 =====================
-ENCODED_USER=$(urlencode "$CADDY_USER")
-ENCODED_PASS=$(urlencode "$CADDY_PASS")
+# 只有新密码才编码显示，已保存的密码不显示明文
+if [ "$NEED_NEW_PASSWORD" = true ]; then
+    ENCODED_USER=$(urlencode "$CADDY_USER")
+    ENCODED_PASS=$(urlencode "$CADDY_PASS")
+    SHOW_PASSWORD="$CADDY_PASS"
+    SHOW_ONE_CLICK=true
+else
+    ENCODED_USER=$(urlencode "$CADDY_USER")
+    ENCODED_PASS="<已保存的密码>"
+    SHOW_PASSWORD="<已保存的密码，如需查看请重新配置>"
+    SHOW_ONE_CLICK=false
+fi
 
 echo ""
 echo "=================================================="
@@ -588,10 +888,16 @@ echo ""
 echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.yaml"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
-echo "  密码:     $CADDY_PASS"
+echo "  密码:     $SHOW_PASSWORD"
 echo ""
-echo "  一键导入链接 (已自动 URL 编码):"
-echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+if [ "$SHOW_ONE_CLICK" = true ]; then
+    echo "  一键导入链接 (已自动 URL 编码):"
+    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+else
+    echo "  一键导入链接:"
+    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.yaml"
+    echo "  (请手动替换 <用户名> 和 <密码>)"
+fi
 echo ""
 echo "--- 方式二: Token 免密访问 (CMFA / 不支持 BasicAuth 的客户端) ---"
 echo ""
@@ -604,10 +910,16 @@ echo ""
 echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.json"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
-echo "  密码:     $CADDY_PASS"
+echo "  密码:     $SHOW_PASSWORD"
 echo ""
-echo "  一键导入链接 (已自动 URL 编码):"
-echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+if [ "$SHOW_ONE_CLICK" = true ]; then
+    echo "  一键导入链接 (已自动 URL 编码):"
+    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+else
+    echo "  一键导入链接:"
+    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.json"
+    echo "  (请手动替换 <用户名> 和 <密码>)"
+fi
 echo ""
 echo "--- 方式二: Token 免密访问 (SFA / SFI / SFM 等 sing-box 客户端) ---"
 echo ""
@@ -624,13 +936,21 @@ echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
-echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+if [ "$SHOW_ONE_CLICK" = true ]; then
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+else
+    echo "  curl -sD - -u '<用户名>:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+fi
 echo ""
 echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
-echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+if [ "$SHOW_ONE_CLICK" = true ]; then
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+else
+    echo "  curl -sD - -u '<用户名>:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+fi
 echo ""
 echo "测试命令 (sing-box JSON - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
