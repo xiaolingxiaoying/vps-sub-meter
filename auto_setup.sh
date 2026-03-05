@@ -211,13 +211,14 @@ if [ -n "${CADDY_PASS_HASH:-}" ]; then
     if [[ "$use_saved" =~ ^[Yy] ]]; then
         NEED_NEW_PASSWORD=false
         PASSWORD_HASH="$CADDY_PASS_HASH"
-        # 生成临时密码用于显示 (实际不会用于认证，因为已有哈希)
-        CADDY_PASS="<已保存的密码>"
+        # 为了显示一键链接，需要设置一个标记
+        SAVED_PASSWORD_MODE=true
         echo "=> 将使用已保存的密码"
     fi
 fi
 
 if [ "$NEED_NEW_PASSWORD" = true ]; then
+    SAVED_PASSWORD_MODE=false
     while true; do
         read -rs -p "请输入访问密码 (用于 BasicAuth，支持特殊字符): " CADDY_PASS
         echo
