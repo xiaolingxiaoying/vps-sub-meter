@@ -881,10 +881,10 @@ if [ "$NEED_NEW_PASSWORD" = true ]; then
     SHOW_PASSWORD="$CADDY_PASS"
     SHOW_ONE_CLICK=true
 else
-    ENCODED_USER=""
-    ENCODED_PASS=""
+    ENCODED_USER=$(urlencode "$CADDY_USER")
+    ENCODED_PASS="<密码>"
     SHOW_PASSWORD="<已保存的密码，如需查看请重新配置>"
-    SHOW_ONE_CLICK=false
+    SHOW_ONE_CLICK=true
 fi
 
 echo ""
@@ -902,7 +902,11 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    echo "  一键导入链接 (已自动 URL 编码):"
+    if [ "$NEED_NEW_PASSWORD" = true ]; then
+        echo "  一键导入链接 (已自动 URL 编码):"
+    else
+        echo "  一键导入链接 (请手动替换 <密码>):"
+    fi
     echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
 else
     echo "  一键导入链接:"
@@ -924,7 +928,11 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    echo "  一键导入链接 (已自动 URL 编码):"
+    if [ "$NEED_NEW_PASSWORD" = true ]; then
+        echo "  一键导入链接 (已自动 URL 编码):"
+    else
+        echo "  一键导入链接 (请手动替换 <密码>):"
+    fi
     echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
 else
     echo "  一键导入链接:"
@@ -947,20 +955,20 @@ echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
-if [ "$SHOW_ONE_CLICK" = true ]; then
+if [ "$NEED_NEW_PASSWORD" = true ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 else
-    echo "  curl -sD - -u '<用户名>:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 fi
 echo ""
 echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
-if [ "$SHOW_ONE_CLICK" = true ]; then
+if [ "$NEED_NEW_PASSWORD" = true ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 else
-    echo "  curl -sD - -u '<用户名>:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 fi
 echo ""
 echo "测试命令 (sing-box JSON - Token 免密):"
