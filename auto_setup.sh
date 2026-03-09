@@ -648,7 +648,32 @@ rm -f "\$tmp"
 echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE ym=\$now_ym base_tx=\$tx wrote=\$STATE"
 SH
 chmod +x /usr/local/bin/reset_tx_baseline.sh
-/usr/local/bin/reset_tx_baseline.sh "$IFACE"
+
+# 仅在首次部署或月份变更时初始化基线，避免重新部署时清零已累计流量
+STATE_FILE="/var/lib/subsrv/tx_state.json"
+CURRENT_YM=$(TZ=$TZ_NAME date +%Y-%m)
+NEED_RESET=true
+
+if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    SAVED_YM=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get('ym', ''))
+except:
+    print('')
+" "$STATE_FILE")
+    if [ "$SAVED_YM" = "$CURRENT_YM" ]; then
+        NEED_RESET=false
+        echo "=> 检测到本月已有流量基线 (ym=$SAVED_YM)，跳过重置以保留已累计流量"
+    else
+        echo "=> 月份已变更 ($SAVED_YM -> $CURRENT_YM)，重置流量基线"
+    fi
+fi
+
+if [ "$NEED_RESET" = true ]; then
+    /usr/local/bin/reset_tx_baseline.sh "$IFACE"
+fi
 
 # 设置系统时区以确保 systemd timer 在正确时间触发
 echo "=> 设置系统时区为 $TZ_NAME (确保 Timer 在正确时间触发)..."
