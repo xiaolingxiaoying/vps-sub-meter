@@ -105,10 +105,6 @@ save_config() {
         "${PASSWORD_HASH:-}" \
         "${TRAFFIC_LIMIT_GIB}" \
         "${TZ_NAME}" \
-        "${RESET_MODE:-natural_month}" \
-        "${RESET_ANCHOR_DATE:-}" \
-        "${RESET_HOUR:-0}" \
-        "${RESET_MINUTE:-0}" \
         "${IFACE}" \
         "${TOKEN}" \
         "${BACKEND_PORT:-2080}" \
@@ -122,13 +118,9 @@ caddy_user = sys.argv[3]
 pass_hash  = sys.argv[4]
 limit_gib  = sys.argv[5]
 tz_name    = sys.argv[6]
-reset_mode = sys.argv[7]
-reset_anchor_date = sys.argv[8]
-reset_hour = sys.argv[9]
-reset_minute = sys.argv[10]
-iface      = sys.argv[11]
-token      = sys.argv[12]
-backend_port = sys.argv[13]
+iface      = sys.argv[7]
+token      = sys.argv[8]
+backend_port = sys.argv[9]
 
 lines = [
     "# VPS 订阅服务配置文件",
@@ -139,10 +131,6 @@ lines = [
     f"CADDY_PASS_HASH={pass_hash!r}",
     f"TRAFFIC_LIMIT_GIB={limit_gib!r}",
     f"TZ_NAME={tz_name!r}",
-    f"RESET_MODE={reset_mode!r}",
-    f"RESET_ANCHOR_DATE={reset_anchor_date!r}",
-    f"RESET_HOUR={reset_hour!r}",
-    f"RESET_MINUTE={reset_minute!r}",
     f"IFACE={iface!r}",
     f"TOKEN={token!r}",
     f"BACKEND_PORT={backend_port!r}",
@@ -204,13 +192,8 @@ PYEOF
             # 将配置文件中的字段映射到脚本使用的变量名
             CADDY_PASS_HASH="${CADDY_PASS_HASH:-}"
             PASSWORD_HASH="${CADDY_PASS_HASH:-}"
-            TZ_NAME="${TZ_NAME:-America/Los_Angeles}"
-            RESET_MODE="${RESET_MODE:-natural_month}"
-            RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
-            RESET_HOUR="${RESET_HOUR:-0}"
-            RESET_MINUTE="${RESET_MINUTE:-0}"
 
-            echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 时区=${TZ_NAME:-未设置}, 网卡=${IFACE:-未设置}"
+            echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 网卡=${IFACE:-未设置}"
             return 0
         fi
     fi
@@ -300,20 +283,9 @@ if [ -n "${CADDY_PASS_HASH:-}" ]; then
         if [[ "$use_saved" =~ ^[Yy] ]]; then
             NEED_NEW_PASSWORD=false
             PASSWORD_HASH="$CADDY_PASS_HASH"
-            echo "=> 将使用已保存的密码哈希进行 BasicAuth 认证"
-            echo ""
-            echo "提示: 如需在部署完成后生成含密码的一键导入链接和二维码，"
-            echo "      请输入您的密码明文 (仅用于生成链接，不会额外存储)。"
-            read -rs -p "请输入密码明文 (留空则跳过，链接/二维码中将显示占位符): " CADDY_PASS
-            echo
-            if [ -n "$CADDY_PASS" ]; then
-                SAVED_PASSWORD_MODE=false
-                echo "=> 已记录密码，部署完成后将生成完整的一键导入链接和二维码"
-            else
-                CADDY_PASS="<已保存的密码>"
-                SAVED_PASSWORD_MODE=true
-                echo "=> 已跳过，一键导入链接和二维码中将显示占位符 <密码>"
-            fi
+            CADDY_PASS="<已保存的密码>"
+            SAVED_PASSWORD_MODE=true
+            echo "=> 将使用已保存的密码"
         fi
     else
         echo "警告: 已保存的密码哈希格式无效 (可能由旧版脚本的 bug 导致损坏)"
@@ -360,150 +332,29 @@ while true; do
     break
 done
 
-# 时区选择与验证
-TZ_NAME="${TZ_NAME:-America/Los_Angeles}"
+# 时区输入与验证
 while true; do
-    echo "请选择流量刷新/重置时区:"
-    echo "  1) America/Los_Angeles (默认)"
-    echo "  2) Asia/Shanghai"
-    echo "  3) 自定义输入"
-
     if [ -n "${TZ_NAME:-}" ]; then
-        read -rp "请输入选项 [当前: $TZ_NAME，回车保持当前]: " tz_choice
-        if [ -z "$tz_choice" ]; then
-            tz_choice=0
+        read -rp "请输入计费时区 [当前: $TZ_NAME]: " input_tz
+        if [ -z "$input_tz" ]; then
+            break  # 保持原值
         fi
+        TZ_NAME="$input_tz"
     else
-        read -rp "请输入选项 [默认: 1]: " tz_choice
-        tz_choice=${tz_choice:-1}
+        read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
     fi
 
-    case "$tz_choice" in
-        0)
-            ;;
-        1)
-            TZ_NAME="America/Los_Angeles"
-            ;;
-        2)
-            TZ_NAME="Asia/Shanghai"
-            ;;
-        3)
-            read -rp "请输入自定义时区 (例如: America/Los_Angeles): " custom_tz
-            if [ -z "$custom_tz" ]; then
-                echo "错误: 自定义时区不能为空"
-                continue
-            fi
-            TZ_NAME="$custom_tz"
-            ;;
-        *)
-            echo "错误: 无效选项，请输入 1/2/3"
-            continue
-            ;;
-    esac
+    TZ_NAME=${TZ_NAME:-America/Los_Angeles}
 
+    # 验证时区合法性
     if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
         echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
         echo "       可用时区列表: ls /usr/share/zoneinfo/"
+        TZ_NAME=""
         continue
     fi
     break
 done
-
-# 选择刷新规则 (按所选时区解释)
-RESET_MODE="${RESET_MODE:-natural_month}"
-RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
-RESET_HOUR="${RESET_HOUR:-0}"
-RESET_MINUTE="${RESET_MINUTE:-0}"
-
-while true; do
-    echo "请选择流量到期/刷新规则 (时区: $TZ_NAME):"
-    echo "  1) 自然月: 每月 1 日 00:00 (默认)"
-    echo "  2) 指定首个重置年月日和时间，之后每月同日同时间"
-    if [ "$RESET_MODE" = "anchored_monthly" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
-        reset_mode_default=2
-    else
-        reset_mode_default=1
-    fi
-    if [ "$RESET_MODE" = "anchored_monthly" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
-        printf -v current_reset_desc "每月 %s 日 %02d:%02d (首个重置: %s %02d:%02d)" \
-            "$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)" "$RESET_HOUR" "$RESET_MINUTE" "$RESET_ANCHOR_DATE" "$RESET_HOUR" "$RESET_MINUTE"
-    else
-        current_reset_desc="每月 1 日 00:00"
-    fi
-    read -rp "请输入选项 [当前: $current_reset_desc，默认: $reset_mode_default]: " reset_mode_choice
-    reset_mode_choice=${reset_mode_choice:-$reset_mode_default}
-
-    if [ "$reset_mode_choice" = "1" ]; then
-        RESET_MODE="natural_month"
-        RESET_ANCHOR_DATE=""
-        RESET_HOUR=0
-        RESET_MINUTE=0
-        break
-    elif [ "$reset_mode_choice" = "2" ]; then
-        while true; do
-            if [ -n "$RESET_ANCHOR_DATE" ]; then
-                read -rp "请输入首个重置日期 (YYYY-MM-DD) [当前: $RESET_ANCHOR_DATE]: " input_anchor_date
-                input_anchor_date=${input_anchor_date:-$RESET_ANCHOR_DATE}
-            else
-                read -rp "请输入首个重置日期 (YYYY-MM-DD): " input_anchor_date
-            fi
-
-            if [ -n "${RESET_HOUR:-}" ] && [ -n "${RESET_MINUTE:-}" ]; then
-                read -rp "请输入重置时间小时 (0-23) [当前: $RESET_HOUR]: " input_reset_hour
-                read -rp "请输入重置时间分钟 (0-59) [当前: $RESET_MINUTE]: " input_reset_minute
-                input_reset_hour=${input_reset_hour:-$RESET_HOUR}
-                input_reset_minute=${input_reset_minute:-$RESET_MINUTE}
-            else
-                read -rp "请输入重置时间小时 (0-23，默认 0): " input_reset_hour
-                read -rp "请输入重置时间分钟 (0-59，默认 0): " input_reset_minute
-                input_reset_hour=${input_reset_hour:-0}
-                input_reset_minute=${input_reset_minute:-0}
-            fi
-
-            if ! TZ="$TZ_NAME" date -d "$input_anchor_date" +%F >/dev/null 2>&1; then
-                echo "错误: 日期格式无效，请输入 YYYY-MM-DD"
-                continue
-            fi
-
-            if [[ ! "$input_reset_hour" =~ ^[0-9]+$ ]] || [ "$input_reset_hour" -lt 0 ] || [ "$input_reset_hour" -gt 23 ]; then
-                echo "错误: 小时必须是 0-23 的整数"
-                continue
-            fi
-
-            if [[ ! "$input_reset_minute" =~ ^[0-9]+$ ]] || [ "$input_reset_minute" -lt 0 ] || [ "$input_reset_minute" -gt 59 ]; then
-                echo "错误: 分钟必须是 0-59 的整数"
-                continue
-            fi
-
-            RESET_MODE="anchored_monthly"
-            RESET_ANCHOR_DATE=$(TZ="$TZ_NAME" date -d "$input_anchor_date" +%F)
-            RESET_HOUR="$input_reset_hour"
-            RESET_MINUTE="$input_reset_minute"
-            break
-        done
-        break
-    else
-        echo "错误: 无效选项，请输入 1 或 2"
-    fi
-done
-
-if [ "$RESET_MODE" = "anchored_monthly" ]; then
-    RESET_DAY=$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)
-    RESET_DAY=$((10#$RESET_DAY))
-else
-    RESET_MODE="natural_month"
-    RESET_DAY=1
-    RESET_HOUR=0
-    RESET_MINUTE=0
-    RESET_ANCHOR_DATE=""
-fi
-
-printf -v RESET_TIME_HHMM "%02d:%02d" "$RESET_HOUR" "$RESET_MINUTE"
-if [ "$RESET_MODE" = "anchored_monthly" ]; then
-    RESET_DESC="每月 ${RESET_DAY} 日 ${RESET_TIME_HHMM} (首个重置: ${RESET_ANCHOR_DATE} ${RESET_TIME_HHMM}，短月自动按月末)"
-else
-    RESET_DESC="每月 1 日 00:00 (自然月默认)"
-fi
 
 # 自动获取默认网卡
 DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -579,10 +430,6 @@ if ! check_port_available "$BACKEND_PORT"; then
     fi
 fi
 
-if [ "$RESET_MODE" != "anchored_monthly" ]; then
-    RESET_ANCHOR_DATE=""
-fi
-
 # 生成随机 Token (如果未从配置文件加载)
 if [ -z "${TOKEN:-}" ]; then
     TOKEN="$(openssl rand -hex 24 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 48)"
@@ -599,7 +446,6 @@ echo "用户名:     $CADDY_USER"
 echo "密码:       $([ "$CADDY_PASS" = "<已保存的密码>" ] && echo "<已保存>" || echo "${CADDY_PASS:0:3}***")"
 echo "流量上限:   $TRAFFIC_LIMIT_GIB GiB"
 echo "时区:       $TZ_NAME"
-echo "刷新规则:   $RESET_DESC"
 echo "网卡:       $IFACE"
 echo "后端端口:   $BACKEND_PORT"
 echo "Token:      ${TOKEN:0:12}...${TOKEN: -12}"
@@ -688,19 +534,6 @@ fi
 chown subsrv:subsrv /var/lib/subsrv/client.json
 chmod 640 /var/lib/subsrv/client.json
 
-# 初始化订阅配置副本 — Shadowrocket (TXT)
-if [ -f /etc/s-box/jhdy.txt ]; then
-    cp -f /etc/s-box/jhdy.txt /var/lib/subsrv/client.txt
-elif [ -f /etc/s-box/jh_sub.txt ]; then
-    cp -f /etc/s-box/jh_sub.txt /var/lib/subsrv/client.txt
-    echo "=> 提示: jhdy.txt 不存在，已使用 jh_sub.txt 代替"
-else
-    echo "# 暂无订阅内容，等待 yonggekkk 脚本生成" > /var/lib/subsrv/client.txt
-    echo "=> 警告: /etc/s-box/jhdy.txt 和 jh_sub.txt 均不存在，已创建默认空配置"
-fi
-chown subsrv:subsrv /var/lib/subsrv/client.txt
-chmod 640 /var/lib/subsrv/client.txt
-
 # 初始化流量状态文件
 touch /var/lib/subsrv/tx_state.json
 chown subsrv:subsrv /var/lib/subsrv/tx_state.json
@@ -732,24 +565,6 @@ if [ -f "$SRC_JSON" ]; then
     chmod 640 "$TMP_JSON"
     mv -f "$TMP_JSON" "$DST_JSON"
 fi
-
-# 同步 Shadowrocket 配置 (TXT)
-SRC_TXT="/etc/s-box/jhdy.txt"
-SRC_TXT_FALLBACK="/etc/s-box/jh_sub.txt"
-DST_TXT="/var/lib/subsrv/client.txt"
-if [ -f "$SRC_TXT" ]; then
-    TMP_TXT="/var/lib/subsrv/client.txt.tmp"
-    cp -f "$SRC_TXT" "$TMP_TXT"
-    chown subsrv:subsrv "$TMP_TXT"
-    chmod 640 "$TMP_TXT"
-    mv -f "$TMP_TXT" "$DST_TXT"
-elif [ -f "$SRC_TXT_FALLBACK" ]; then
-    TMP_TXT="/var/lib/subsrv/client.txt.tmp"
-    cp -f "$SRC_TXT_FALLBACK" "$TMP_TXT"
-    chown subsrv:subsrv "$TMP_TXT"
-    chmod 640 "$TMP_TXT"
-    mv -f "$TMP_TXT" "$DST_TXT"
-fi
 SH
 chmod +x /usr/local/bin/refresh_sub_copy.sh
 
@@ -780,131 +595,18 @@ set -euo pipefail
 IFACE="\${1:-$IFACE}"
 STATE="/var/lib/subsrv/tx_state.json"
 TZNAME="$TZ_NAME"
-RESET_MODE="$RESET_MODE"
-RESET_ANCHOR_DATE="$RESET_ANCHOR_DATE"
-RESET_DAY="$RESET_DAY"
-RESET_HOUR="$RESET_HOUR"
-RESET_MINUTE="$RESET_MINUTE"
 
-calc_cycle_key() {
-    local now_ts y m d hh mm
-    now_ts="\$(TZ=\$TZNAME date +%s)"
-    y="\$(TZ=\$TZNAME date +%Y)"
-    m="\$(TZ=\$TZNAME date +%m)"
-
-    if [ "\$RESET_MODE" = "natural_month" ]; then
-        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" 1 0 0
-        return
-    fi
-
-    d="\$RESET_DAY"
-    hh="\$RESET_HOUR"
-    mm="\$RESET_MINUTE"
-
-    if [ -n "\$RESET_ANCHOR_DATE" ]; then
-        local anchor_ts
-        anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$hh:\$mm:00" +%s 2>/dev/null || echo 0)"
-        if [ "\$now_ts" -lt "\$anchor_ts" ]; then
-            printf "pre-anchor:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$hh))" "\$((10#\$mm))"
-            return
-        fi
-    fi
-
-    local this_last this_d this_cycle this_ts
-    this_last="\$(TZ=\$TZNAME date -d "\$((10#\$y))-\$((10#\$m))-01 +1 month -1 day" +%d)"
-    this_d="\$d"
-    if [ "\$this_d" -gt "\$this_last" ]; then
-        this_d="\$this_last"
-    fi
-    printf -v this_cycle "%04d-%02d-%02d %02d:%02d:00" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-    this_ts="\$(TZ=\$TZNAME date -d "\$this_cycle" +%s)"
-
-    if [ "\$now_ts" -ge "\$this_ts" ]; then
-        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-        return
-    fi
-
-    local prev_y prev_m prev_last prev_d
-    prev_y="\$((10#\$y))"
-    prev_m="\$((10#\$m - 1))"
-    if [ "\$prev_m" -eq 0 ]; then
-        prev_m=12
-        prev_y="\$((prev_y - 1))"
-    fi
-    prev_last="\$(TZ=\$TZNAME date -d "\$prev_y-\$prev_m-01 +1 month -1 day" +%d)"
-    prev_d="\$d"
-    if [ "\$prev_d" -gt "\$prev_last" ]; then
-        prev_d="\$prev_last"
-    fi
-    printf "%04d-%02d-%02dT%02d:%02d" "\$prev_y" "\$prev_m" "\$((10#\$prev_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-}
-
-cycle_key="\$(calc_cycle_key)"
+now_ym="\$(TZ=\$TZNAME date +%Y-%m)"
 tx="\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)"
 
-if [[ "\$cycle_key" == pre-anchor:* ]]; then
-    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE next_anchor=\${cycle_key#pre-anchor:} not reached, skip"
-    exit 0
-fi
-
-saved_cycle_key=""
-if [ -f "\$STATE" ] && [ -s "\$STATE" ]; then
-    saved_cycle_key="\$(python3 - "\$STATE" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as f:
-        st = json.load(f)
-    ck = st.get('cycle_key')
-    if ck:
-        print(ck)
-    else:
-        ym = st.get('ym', '')
-        if ym:
-            print(f"{ym}-01T00:00")
-except Exception:
-    pass
-PYEOF
-    )"
-fi
-
-if [ "\$saved_cycle_key" = "\$cycle_key" ]; then
-    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key already up-to-date, skip"
-    exit 0
-fi
-
 tmp="\$(mktemp)"
-printf '{"cycle_key":"%s","base_tx":%s}\n' "\$cycle_key" "\$tx" > "\$tmp"
+printf '{"ym":"%s","base_tx":%s}\n' "\$now_ym" "\$tx" > "\$tmp"
 install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
 rm -f "\$tmp"
-echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_tx=\$tx wrote=\$STATE"
+echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE ym=\$now_ym base_tx=\$tx wrote=\$STATE"
 SH
 chmod +x /usr/local/bin/reset_tx_baseline.sh
-
-# 仅在首次部署时初始化基线，避免重新部署时清零已累计流量
-STATE_FILE="/var/lib/subsrv/tx_state.json"
-NEED_RESET=true
-
-if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-    HAS_BASELINE=$(python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        st = json.load(f)
-    print('yes' if ('base_tx' in st and ('cycle_key' in st or 'ym' in st)) else 'no')
-except:
-    print('no')
-" "$STATE_FILE")
-    if [ "$HAS_BASELINE" = "yes" ]; then
-        NEED_RESET=false
-        echo "=> 检测到已有流量基线，跳过初始化以保留已累计流量"
-    else
-        echo "=> 检测到状态文件损坏或缺少基线信息，将重新初始化"
-    fi
-fi
-
-if [ "$NEED_RESET" = true ]; then
-    /usr/local/bin/reset_tx_baseline.sh "$IFACE"
-fi
+/usr/local/bin/reset_tx_baseline.sh "$IFACE"
 
 # 设置系统时区以确保 systemd timer 在正确时间触发
 echo "=> 设置系统时区为 $TZ_NAME (确保 Timer 在正确时间触发)..."
@@ -922,11 +624,11 @@ Environment=TZ=$TZ_NAME
 ExecStart=/usr/local/bin/reset_tx_baseline.sh $IFACE
 UNIT
 
-cat > /etc/systemd/system/reset-tx-baseline.timer <<UNIT
+cat > /etc/systemd/system/reset-tx-baseline.timer <<'UNIT'
 [Unit]
-Description=Run reset-tx-baseline every minute (guarded by cycle key)
+Description=Run reset-tx-baseline at 00:00 on day 1 each month
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnCalendar=*-*-01 00:00:00
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -939,7 +641,6 @@ import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
-from calendar import monthrange
 
 try:
     from zoneinfo import ZoneInfo
@@ -955,16 +656,9 @@ YAML_TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
 JSON_TOKEN_PATH = os.environ.get("SUB_JSON_TOKEN_PATH", "/sub/token.json")
 YAML_PATH  = os.environ.get("SUB_YAML_PATH",   "/var/lib/subsrv/client.yaml")
 JSON_PATH  = os.environ.get("SUB_JSON_PATH",   "/var/lib/subsrv/client.json")
-TXT_TOKEN_PATH = os.environ.get("SUB_TXT_TOKEN_PATH", "/sub/token.txt")
-TXT_PATH   = os.environ.get("SUB_TXT_PATH",   "/var/lib/subsrv/client.txt")
 LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "0"))
 TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
 STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
-RESET_MODE = os.environ.get("SUB_RESET_MODE", "natural_month")
-RESET_ANCHOR_DATE = os.environ.get("SUB_RESET_ANCHOR_DATE", "")
-RESET_DAY = int(os.environ.get("SUB_RESET_DAY", "1"))
-RESET_HOUR = int(os.environ.get("SUB_RESET_HOUR", "0"))
-RESET_MINUTE = int(os.environ.get("SUB_RESET_MINUTE", "0"))
 
 # 0 表示无限流量，用 1 TiB 作为显示值 (客户端会显示几乎用不完的额度)
 if LIMIT_GIB <= 0:
@@ -976,7 +670,6 @@ else:
 ROUTE_MAP = {
     YAML_TOKEN_PATH: (YAML_PATH, "text/yaml; charset=utf-8"),
     JSON_TOKEN_PATH: (JSON_PATH, "application/json; charset=utf-8"),
-    TXT_TOKEN_PATH: (TXT_PATH, "text/plain; charset=utf-8"),
 }
 
 def pt_now():
@@ -984,69 +677,22 @@ def pt_now():
         return datetime.now(ZoneInfo(TZ_NAME))
     return datetime.now(timezone.utc)
 
-def shift_month(year, month, delta):
-    total = year * 12 + (month - 1) + delta
-    y = total // 12
-    m = total % 12 + 1
-    return y, m
-
-def cycle_start_for(year, month):
-    if RESET_MODE == "natural_month":
-        d = 1
-        hh = 0
-        mm = 0
-    else:
-        last = monthrange(year, month)[1]
-        d = min(max(RESET_DAY, 1), last)
-        hh = min(max(RESET_HOUR, 0), 23)
-        mm = min(max(RESET_MINUTE, 0), 59)
-
-    if ZoneInfo:
-        return datetime(year, month, d, hh, mm, 0, tzinfo=ZoneInfo(TZ_NAME))
-    return datetime(year, month, d, hh, mm, 0, tzinfo=timezone.utc)
-
-def anchor_dt():
-    if RESET_MODE != "anchored_monthly" or not RESET_ANCHOR_DATE:
-        return None
-    try:
-        y, m, d = map(int, RESET_ANCHOR_DATE.split("-"))
-    except Exception:
-        return None
-
-    hh = min(max(RESET_HOUR, 0), 23)
-    mm = min(max(RESET_MINUTE, 0), 59)
-    if ZoneInfo:
-        return datetime(y, m, d, hh, mm, 0, tzinfo=ZoneInfo(TZ_NAME))
-    return datetime(y, m, d, hh, mm, 0, tzinfo=timezone.utc)
-
-def current_cycle_start(now=None):
-    now = now or pt_now()
-    adt = anchor_dt()
-    if adt and now < adt:
-        return adt
-
-    this_cycle = cycle_start_for(now.year, now.month)
-    if now >= this_cycle:
-        return this_cycle
-    py, pm = shift_month(now.year, now.month, -1)
-    return cycle_start_for(py, pm)
-
-def cycle_key_from_dt(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M")
+def current_ym_pt():
+    now = pt_now()
+    return f"{now.year:04d}-{now.month:02d}"
 
 def next_reset_epoch_pt():
     now = pt_now()
-    adt = anchor_dt()
-    if adt and now < adt:
-        return int(adt.timestamp())
-
-    this_cycle = cycle_start_for(now.year, now.month)
-    if now < this_cycle:
-        next_cycle = this_cycle
+    y, m = now.year, now.month
+    if m == 12:
+        y2, m2 = y + 1, 1
     else:
-        ny, nm = shift_month(now.year, now.month, 1)
-        next_cycle = cycle_start_for(ny, nm)
-    return int(next_cycle.timestamp())
+        y2, m2 = y, m + 1
+    if ZoneInfo:
+        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=ZoneInfo(TZ_NAME))
+    else:
+        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=timezone.utc)
+    return int(dt.timestamp())
 
 def read_tx_bytes_sysfs():
     p = f"/sys/class/net/{IFACE}/statistics/tx_bytes"
@@ -1064,38 +710,28 @@ def load_state():
     except Exception:
         return {}
 
-def save_state(cycle_key, base_tx):
+def save_state(ym, base_tx):
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"cycle_key": cycle_key, "base_tx": int(base_tx)}, f, separators=(",", ":"))
+        json.dump({"ym": ym, "base_tx": int(base_tx)}, f, separators=(",", ":"))
     os.replace(tmp, STATE_PATH)
 
-def get_state_cycle_key(st):
-    ck = st.get("cycle_key")
-    if isinstance(ck, str) and ck:
-        return ck
-    ym = st.get("ym")
-    if isinstance(ym, str) and len(ym) == 7:
-        return f"{ym}-01T00:00"
-    return None
-
 def month_used_tx_bytes_realtime():
-    cycle_start = current_cycle_start()
-    cycle_key = cycle_key_from_dt(cycle_start)
+    ym = current_ym_pt()
     cur = read_tx_bytes_sysfs()
     st = load_state()
-    st_cycle_key = get_state_cycle_key(st)
+    st_ym = st.get("ym")
     base = st.get("base_tx")
 
-    if st_cycle_key != cycle_key or base is None:
-        save_state(cycle_key, cur)
-        log(f"state reset: cycle_key={cycle_key} base_tx={cur} (reason: missing or cycle changed)")
+    if st_ym != ym or base is None:
+        save_state(ym, cur)
+        log(f"state reset: ym={ym} base_tx={cur} (reason: missing or month changed)")
         return 0, cur, cur
 
     used = cur - int(base)
     if used < 0:
-        save_state(cycle_key, cur)
-        log(f"state reset: cycle_key={cycle_key} base_tx={cur} (reason: counter wrapped)")
+        save_state(ym, cur)
+        log(f"state reset: ym={ym} base_tx={cur} (reason: counter wrapped)")
         return 0, cur, cur
 
     return int(used), int(base), int(cur)
@@ -1140,7 +776,7 @@ class Handler(BaseHTTPRequestHandler):
                 body = b"# subscription source missing\n"
 
         header_val = f"upload=0; download={used_tx}; total={TOTAL_BYTES}; expire={expire}"
-        log(f"userinfo: used_tx={used_tx} remain={remain} cycle={cycle_key_from_dt(current_cycle_start())} base_tx={base_tx} cur_tx={cur_tx}")
+        log(f"userinfo: used_tx={used_tx} remain={remain} ym={current_ym_pt()} base_tx={base_tx} cur_tx={cur_tx}")
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -1162,7 +798,6 @@ def main():
     log(f"start listen={host}:{port} iface={IFACE} tz={TZ_NAME}")
     log(f"  yaml: {YAML_TOKEN_PATH} -> {YAML_PATH}")
     log(f"  json: {JSON_TOKEN_PATH} -> {JSON_PATH}")
-    log(f"  txt:  {TXT_TOKEN_PATH} -> {TXT_PATH}")
     log(f"  state={STATE_PATH}")
     HTTPServer((host, port), Handler).serve_forever()
 
@@ -1183,18 +818,11 @@ Group=subsrv
 Environment=SUB_IFACE=$IFACE
 Environment=SUB_TOKEN_PATH=/sub/$TOKEN.yaml
 Environment=SUB_JSON_TOKEN_PATH=/sub/$TOKEN.json
-Environment=SUB_TXT_TOKEN_PATH=/sub/$TOKEN.txt
 Environment=SUB_YAML_PATH=/var/lib/subsrv/client.yaml
 Environment=SUB_JSON_PATH=/var/lib/subsrv/client.json
-Environment=SUB_TXT_PATH=/var/lib/subsrv/client.txt
 Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
 Environment=SUB_TZ=$TZ_NAME
 Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
-Environment=SUB_RESET_MODE=$RESET_MODE
-Environment=SUB_RESET_ANCHOR_DATE=$RESET_ANCHOR_DATE
-Environment=SUB_RESET_DAY=$RESET_DAY
-Environment=SUB_RESET_HOUR=$RESET_HOUR
-Environment=SUB_RESET_MINUTE=$RESET_MINUTE
 Environment=SUB_LISTEN=127.0.0.1
 Environment=SUB_PORT=$BACKEND_PORT
 ExecStart=/usr/local/bin/sub_server.py
@@ -1249,14 +877,14 @@ cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/
 # 解决方案：先用占位符写模板，再用 printf %s 原样替换密码哈希
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
-	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON + Shadowrocket TXT)
+	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON)
 	@sub_path {
-		path /sub/$TOKEN.yaml /sub/$TOKEN.json /sub/$TOKEN.txt
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json
 	}
 
-	# token 参数免密访问 (给 CMFA / SFA / Shadowrocket 等不支持 BasicAuth 的客户端)
+	# token 参数免密访问 (给 CMFA / SFA 等不支持 BasicAuth 的客户端)
 	@sub_with_token {
-		path /sub/$TOKEN.yaml /sub/$TOKEN.json /sub/$TOKEN.txt
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json
 		query token=$TOKEN
 	}
 
@@ -1322,12 +950,6 @@ else
     echo "   [WARN] Python 订阅服务未响应 (JSON)，请检查: journalctl -u sub-server -n 40"
 fi
 
-if curl -sf -o /dev/null "http://127.0.0.1:$BACKEND_PORT/sub/$TOKEN.txt"; then
-    echo "   [OK] Python 订阅服务正常响应 (Shadowrocket TXT)"
-else
-    echo "   [WARN] Python 订阅服务未响应 (TXT)，请检查: journalctl -u sub-server -n 40"
-fi
-
 # 验证 Caddy 是否正常转发，并等待证书申请完成
 echo "=> 正在等待 Caddy 申请 SSL 证书并验证 HTTPS 访问..."
 echo "   (这可能需要 5-15 秒，请耐心等待。如果云服务商安全组未放行 80 和 443 端口，将会超时)"
@@ -1370,8 +992,8 @@ else
 fi
 
 # ===================== 输出部署信息 =====================
-# 有明文密码时 (新密码 或 已保存但用户输入了明文) 编码显示，否则显示占位符
-if [ "$SAVED_PASSWORD_MODE" = false ]; then
+# 只有新密码才编码显示，已保存的密码不显示明文
+if [ "$NEED_NEW_PASSWORD" = true ]; then
     ENCODED_USER=$(urlencode "$CADDY_USER")
     ENCODED_PASS=$(urlencode "$CADDY_PASS")
     SHOW_PASSWORD="$CADDY_PASS"
@@ -1417,7 +1039,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$SAVED_PASSWORD_MODE" = false ]; then
+    if [ "$NEED_NEW_PASSWORD" = true ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1449,7 +1071,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$SAVED_PASSWORD_MODE" = false ]; then
+    if [ "$NEED_NEW_PASSWORD" = true ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1471,38 +1093,6 @@ echo ""
 echo "  扫码导入 (Token 免密):"
 print_qr "https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
-echo "========== Shadowrocket (TXT) 订阅 =========="
-echo ""
-echo "--- 方式一: BasicAuth 认证访问 ---"
-echo ""
-echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.txt"
-echo "  认证方式: Basic Auth"
-echo "  用户名:   $CADDY_USER"
-echo "  密码:     $SHOW_PASSWORD"
-echo ""
-if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$SAVED_PASSWORD_MODE" = false ]; then
-        echo "  一键导入链接 (已自动 URL 编码):"
-    else
-        echo "  一键导入链接 (请手动替换 <密码>):"
-    fi
-    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
-    echo ""
-    echo "  扫码导入 (BasicAuth):"
-    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
-else
-    echo "  一键导入链接:"
-    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.txt"
-    echo "  (请手动替换 <用户名> 和 <密码>)"
-fi
-echo ""
-echo "--- 方式二: Token 免密访问 (推荐 Shadowrocket 使用) ---"
-echo ""
-echo "  https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
-echo ""
-echo "  扫码导入 (Token 免密):"
-print_qr "https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
-echo ""
 echo "=================================================="
 echo ""
 echo "服务状态:"
@@ -1514,7 +1104,7 @@ echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
-if [ "$SAVED_PASSWORD_MODE" = false ]; then
+if [ "$NEED_NEW_PASSWORD" = true ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
@@ -1524,7 +1114,7 @@ echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
-if [ "$SAVED_PASSWORD_MODE" = false ]; then
+if [ "$NEED_NEW_PASSWORD" = true ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
@@ -1532,14 +1122,4 @@ fi
 echo ""
 echo "测试命令 (sing-box JSON - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
-echo ""
-echo "测试命令 (Shadowrocket TXT - BasicAuth):"
-if [ "$SAVED_PASSWORD_MODE" = false ]; then
-    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
-else
-    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
-fi
-echo ""
-echo "测试命令 (Shadowrocket TXT - Token 免密):"
-echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
