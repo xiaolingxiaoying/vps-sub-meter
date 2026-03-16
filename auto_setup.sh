@@ -112,6 +112,7 @@ save_config() {
         "${IFACE}" \
         "${TOKEN}" \
         "${BACKEND_PORT:-2080}" \
+        "${USED_TRAFFIC_GIB:-0}" \
         <<'PYEOF'
 import sys, os
 from datetime import datetime
@@ -129,6 +130,7 @@ reset_minute = sys.argv[10]
 iface      = sys.argv[11]
 token      = sys.argv[12]
 backend_port = sys.argv[13]
+used_gib   = sys.argv[14]
 
 lines = [
     "# VPS 订阅服务配置文件",
@@ -138,6 +140,7 @@ lines = [
     f"CADDY_USER={caddy_user!r}",
     f"CADDY_PASS_HASH={pass_hash!r}",
     f"TRAFFIC_LIMIT_GIB={limit_gib!r}",
+    f"USED_TRAFFIC_GIB={used_gib!r}",
     f"TZ_NAME={tz_name!r}",
     f"RESET_MODE={reset_mode!r}",
     f"RESET_ANCHOR_DATE={reset_anchor_date!r}",
@@ -209,6 +212,7 @@ PYEOF
             RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
             RESET_HOUR="${RESET_HOUR:-0}"
             RESET_MINUTE="${RESET_MINUTE:-0}"
+            USED_TRAFFIC_GIB="${USED_TRAFFIC_GIB:-}"
 
             echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 时区=${TZ_NAME:-未设置}, 网卡=${IFACE:-未设置}"
             return 0
@@ -355,6 +359,87 @@ while true; do
     if ! validate_traffic_limit "$TRAFFIC_LIMIT_GIB"; then
         echo "错误: 流量上限必须是有效的数字"
         TRAFFIC_LIMIT_GIB=""
+        continue
+    fi
+    break
+done
+
+# 已使用流量设置 (用于在重新部署或初始化时设定起始已用量)
+# 尝试从现有状态文件读取当前已用流量，供用户参考
+CURRENT_USED_GIB=""
+STATE_FILE_TMP="/var/lib/subsrv/tx_state.json"
+if [ -f "$STATE_FILE_TMP" ] && [ -s "$STATE_FILE_TMP" ]; then
+    CURRENT_USED_GIB=$(python3 - "$STATE_FILE_TMP" "${IFACE:-}" <<'PYEOF'
+import json, sys, os
+
+state_path = sys.argv[1]
+iface = sys.argv[2] if len(sys.argv) > 2 else ""
+
+try:
+    with open(state_path, encoding="utf-8") as f:
+        st = json.load(f)
+    base_tx = st.get("base_tx")
+    if base_tx is None:
+        sys.exit(0)
+    # 尝试读取当前 tx_bytes
+    cur_tx = None
+    if iface:
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
+                cur_tx = int(f.read().strip())
+        except Exception:
+            pass
+    if cur_tx is not None:
+        used = max(0, cur_tx - int(base_tx))
+        used_gib = used / (1024 ** 3)
+        print(f"{used_gib:.3f}")
+    else:
+        # 无法读取当前值，显示 0
+        print("0.000")
+except Exception:
+    pass
+PYEOF
+    ) 2>/dev/null || CURRENT_USED_GIB=""
+fi
+
+while true; do
+    if [ -n "${USED_TRAFFIC_GIB:-}" ]; then
+        # 同时显示配置文件中保存的值和实际测量值（如果有）
+        if [ -n "$CURRENT_USED_GIB" ]; then
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [当前实测: ${CURRENT_USED_GIB} GiB，配置保存值: ${USED_TRAFFIC_GIB}，留空使用实测值]: " input_used
+        else
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [配置保存值: ${USED_TRAFFIC_GIB}，留空保持原值]: " input_used
+        fi
+        if [ -z "$input_used" ]; then
+            # 留空：如果有实测值优先用实测值，否则保持配置文件中的值
+            if [ -n "$CURRENT_USED_GIB" ]; then
+                USED_TRAFFIC_GIB="$CURRENT_USED_GIB"
+                echo "=> 使用实测已用流量: ${USED_TRAFFIC_GIB} GiB"
+            fi
+            break
+        fi
+        USED_TRAFFIC_GIB="$input_used"
+    else
+        if [ -n "$CURRENT_USED_GIB" ]; then
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [当前实测: ${CURRENT_USED_GIB} GiB，留空使用实测值]: " input_used
+        else
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始，默认 0): " input_used
+        fi
+        if [ -z "$input_used" ]; then
+            if [ -n "$CURRENT_USED_GIB" ]; then
+                USED_TRAFFIC_GIB="$CURRENT_USED_GIB"
+                echo "=> 使用实测已用流量: ${USED_TRAFFIC_GIB} GiB"
+            else
+                USED_TRAFFIC_GIB="0"
+            fi
+            break
+        fi
+        USED_TRAFFIC_GIB="$input_used"
+    fi
+
+    if ! validate_traffic_limit "$USED_TRAFFIC_GIB"; then
+        echo "错误: 已使用流量必须是有效的非负数字"
+        USED_TRAFFIC_GIB=""
         continue
     fi
     break
@@ -598,6 +683,7 @@ echo "域名:       $DOMAIN"
 echo "用户名:     $CADDY_USER"
 echo "密码:       $([ "$CADDY_PASS" = "<已保存的密码>" ] && echo "<已保存>" || echo "${CADDY_PASS:0:3}***")"
 echo "流量上限:   $TRAFFIC_LIMIT_GIB GiB"
+echo "已使用流量: ${USED_TRAFFIC_GIB:-0} GiB"
 echo "时区:       $TZ_NAME"
 echo "刷新规则:   $RESET_DESC"
 echo "网卡:       $IFACE"
@@ -880,7 +966,7 @@ echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_
 SH
 chmod +x /usr/local/bin/reset_tx_baseline.sh
 
-# 仅在首次部署时初始化基线，避免重新部署时清零已累计流量
+# 流量基线初始化：根据用户设置的"已使用流量"写入 tx_state.json
 STATE_FILE="/var/lib/subsrv/tx_state.json"
 NEED_RESET=true
 
@@ -902,7 +988,81 @@ except:
     fi
 fi
 
-if [ "$NEED_RESET" = true ]; then
+# 如果用户指定了已使用流量 (USED_TRAFFIC_GIB > 0)，
+# 则无论是否首次部署，均根据该值重新计算基线并写入状态文件
+_USED_GIB="${USED_TRAFFIC_GIB:-0}"
+if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "$_USED_GIB" 2>/dev/null; then
+    echo "=> 根据已使用流量 ${_USED_GIB} GiB 重新计算流量基线..."
+    python3 - "$STATE_FILE" "$_USED_GIB" "$IFACE" "$RESET_MODE" "${RESET_ANCHOR_DATE:-}" "$RESET_DAY" "$RESET_HOUR" "$RESET_MINUTE" "$TZ_NAME" <<'PYEOF'
+import sys, os, json
+from datetime import datetime, timezone
+from calendar import monthrange
+
+state_path        = sys.argv[1]
+used_gib          = float(sys.argv[2])
+iface             = sys.argv[3]
+reset_mode        = sys.argv[4]
+reset_anchor_date = sys.argv[5]
+reset_day         = int(sys.argv[6])
+reset_hour        = int(sys.argv[7])
+reset_minute      = int(sys.argv[8])
+tz_name           = sys.argv[9]
+used_bytes        = int(used_gib * 1024 ** 3)
+
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name)
+except Exception:
+    tz = timezone.utc
+
+def shift_month(year, month, delta):
+    total = year * 12 + (month - 1) + delta
+    y = total // 12
+    m = total % 12 + 1
+    return y, m
+
+def cycle_start_for(year, month):
+    if reset_mode == "natural_month":
+        d, hh, mm = 1, 0, 0
+    else:
+        last = monthrange(year, month)[1]
+        d  = min(max(reset_day, 1), last)
+        hh = min(max(reset_hour, 0), 23)
+        mm = min(max(reset_minute, 0), 59)
+    return datetime(year, month, d, hh, mm, 0, tzinfo=tz)
+
+now = datetime.now(tz)
+this_cycle = cycle_start_for(now.year, now.month)
+if now >= this_cycle:
+    cycle_start = this_cycle
+else:
+    py, pm = shift_month(now.year, now.month, -1)
+    cycle_start = cycle_start_for(py, pm)
+
+cycle_key = cycle_start.strftime("%Y-%m-%dT%H:%M")
+
+# 读取当前网卡 tx_bytes
+cur_tx = 0
+try:
+    with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
+        cur_tx = int(f.read().strip())
+except Exception as e:
+    print(f"[baseline] WARN: cannot read tx_bytes for {iface}: {e}", flush=True)
+
+# base_tx = cur_tx - used_bytes，不能为负
+new_base = max(0, cur_tx - used_bytes)
+
+tmp = state_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump({"cycle_key": cycle_key, "base_tx": new_base}, f, separators=(",", ":"))
+os.system(f"install -o subsrv -g subsrv -m 640 {tmp!r} {state_path!r}")
+try:
+    os.unlink(tmp)
+except Exception:
+    pass
+print(f"[baseline] set: iface={iface} cur_tx={cur_tx} used_bytes={used_bytes} new_base={new_base} cycle_key={cycle_key}", flush=True)
+PYEOF
+elif [ "$NEED_RESET" = true ]; then
     /usr/local/bin/reset_tx_baseline.sh "$IFACE"
 fi
 
