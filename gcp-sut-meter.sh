@@ -283,9 +283,20 @@ if [ -n "${CADDY_PASS_HASH:-}" ]; then
         if [[ "$use_saved" =~ ^[Yy] ]]; then
             NEED_NEW_PASSWORD=false
             PASSWORD_HASH="$CADDY_PASS_HASH"
-            CADDY_PASS="<已保存的密码>"
-            SAVED_PASSWORD_MODE=true
-            echo "=> 将使用已保存的密码"
+            echo "=> 将使用已保存的密码哈希进行 BasicAuth 认证"
+            echo ""
+            echo "提示: 如需在部署完成后生成含密码的一键导入链接和二维码，"
+            echo "      请输入您的密码明文 (仅用于生成链接，不会额外存储)。"
+            read -rs -p "请输入密码明文 (留空则跳过，链接/二维码中将显示占位符): " CADDY_PASS
+            echo
+            if [ -n "$CADDY_PASS" ]; then
+                SAVED_PASSWORD_MODE=false
+                echo "=> 已记录密码，部署完成后将生成完整的一键导入链接和二维码"
+            else
+                CADDY_PASS="<已保存的密码>"
+                SAVED_PASSWORD_MODE=true
+                echo "=> 已跳过，一键导入链接和二维码中将显示占位符 <密码>"
+            fi
         fi
     else
         echo "警告: 已保存的密码哈希格式无效 (可能由旧版脚本的 bug 导致损坏)"
@@ -534,6 +545,19 @@ fi
 chown subsrv:subsrv /var/lib/subsrv/client.json
 chmod 640 /var/lib/subsrv/client.json
 
+# 初始化订阅配置副本 — Shadowrocket (TXT)
+if [ -f /etc/s-box/jhdy.txt ]; then
+    cp -f /etc/s-box/jhdy.txt /var/lib/subsrv/client.txt
+elif [ -f /etc/s-box/jh_sub.txt ]; then
+    cp -f /etc/s-box/jh_sub.txt /var/lib/subsrv/client.txt
+    echo "=> 提示: jhdy.txt 不存在，已使用 jh_sub.txt 代替"
+else
+    echo "# 暂无订阅内容，等待 yonggekkk 脚本生成" > /var/lib/subsrv/client.txt
+    echo "=> 警告: /etc/s-box/jhdy.txt 和 jh_sub.txt 均不存在，已创建默认空配置"
+fi
+chown subsrv:subsrv /var/lib/subsrv/client.txt
+chmod 640 /var/lib/subsrv/client.txt
+
 # 初始化流量状态文件
 touch /var/lib/subsrv/tx_state.json
 chown subsrv:subsrv /var/lib/subsrv/tx_state.json
@@ -564,6 +588,24 @@ if [ -f "$SRC_JSON" ]; then
     chown subsrv:subsrv "$TMP_JSON"
     chmod 640 "$TMP_JSON"
     mv -f "$TMP_JSON" "$DST_JSON"
+fi
+
+# 同步 Shadowrocket 配置 (TXT)
+SRC_TXT="/etc/s-box/jhdy.txt"
+SRC_TXT_FALLBACK="/etc/s-box/jh_sub.txt"
+DST_TXT="/var/lib/subsrv/client.txt"
+if [ -f "$SRC_TXT" ]; then
+    TMP_TXT="/var/lib/subsrv/client.txt.tmp"
+    cp -f "$SRC_TXT" "$TMP_TXT"
+    chown subsrv:subsrv "$TMP_TXT"
+    chmod 640 "$TMP_TXT"
+    mv -f "$TMP_TXT" "$DST_TXT"
+elif [ -f "$SRC_TXT_FALLBACK" ]; then
+    TMP_TXT="/var/lib/subsrv/client.txt.tmp"
+    cp -f "$SRC_TXT_FALLBACK" "$TMP_TXT"
+    chown subsrv:subsrv "$TMP_TXT"
+    chmod 640 "$TMP_TXT"
+    mv -f "$TMP_TXT" "$DST_TXT"
 fi
 SH
 chmod +x /usr/local/bin/refresh_sub_copy.sh
@@ -606,7 +648,32 @@ rm -f "\$tmp"
 echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE ym=\$now_ym base_tx=\$tx wrote=\$STATE"
 SH
 chmod +x /usr/local/bin/reset_tx_baseline.sh
-/usr/local/bin/reset_tx_baseline.sh "$IFACE"
+
+# 仅在首次部署或月份变更时初始化基线，避免重新部署时清零已累计流量
+STATE_FILE="/var/lib/subsrv/tx_state.json"
+CURRENT_YM=$(TZ=$TZ_NAME date +%Y-%m)
+NEED_RESET=true
+
+if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    SAVED_YM=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        print(json.load(f).get('ym', ''))
+except:
+    print('')
+" "$STATE_FILE")
+    if [ "$SAVED_YM" = "$CURRENT_YM" ]; then
+        NEED_RESET=false
+        echo "=> 检测到本月已有流量基线 (ym=$SAVED_YM)，跳过重置以保留已累计流量"
+    else
+        echo "=> 月份已变更 ($SAVED_YM -> $CURRENT_YM)，重置流量基线"
+    fi
+fi
+
+if [ "$NEED_RESET" = true ]; then
+    /usr/local/bin/reset_tx_baseline.sh "$IFACE"
+fi
 
 # 设置系统时区以确保 systemd timer 在正确时间触发
 echo "=> 设置系统时区为 $TZ_NAME (确保 Timer 在正确时间触发)..."
@@ -656,6 +723,8 @@ YAML_TOKEN_PATH = os.environ.get("SUB_TOKEN_PATH",  "/sub/token.yaml")
 JSON_TOKEN_PATH = os.environ.get("SUB_JSON_TOKEN_PATH", "/sub/token.json")
 YAML_PATH  = os.environ.get("SUB_YAML_PATH",   "/var/lib/subsrv/client.yaml")
 JSON_PATH  = os.environ.get("SUB_JSON_PATH",   "/var/lib/subsrv/client.json")
+TXT_TOKEN_PATH = os.environ.get("SUB_TXT_TOKEN_PATH", "/sub/token.txt")
+TXT_PATH   = os.environ.get("SUB_TXT_PATH",   "/var/lib/subsrv/client.txt")
 LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "0"))
 TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
 STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
@@ -670,6 +739,7 @@ else:
 ROUTE_MAP = {
     YAML_TOKEN_PATH: (YAML_PATH, "text/yaml; charset=utf-8"),
     JSON_TOKEN_PATH: (JSON_PATH, "application/json; charset=utf-8"),
+    TXT_TOKEN_PATH: (TXT_PATH, "text/plain; charset=utf-8"),
 }
 
 def pt_now():
@@ -798,6 +868,7 @@ def main():
     log(f"start listen={host}:{port} iface={IFACE} tz={TZ_NAME}")
     log(f"  yaml: {YAML_TOKEN_PATH} -> {YAML_PATH}")
     log(f"  json: {JSON_TOKEN_PATH} -> {JSON_PATH}")
+    log(f"  txt:  {TXT_TOKEN_PATH} -> {TXT_PATH}")
     log(f"  state={STATE_PATH}")
     HTTPServer((host, port), Handler).serve_forever()
 
@@ -818,8 +889,10 @@ Group=subsrv
 Environment=SUB_IFACE=$IFACE
 Environment=SUB_TOKEN_PATH=/sub/$TOKEN.yaml
 Environment=SUB_JSON_TOKEN_PATH=/sub/$TOKEN.json
+Environment=SUB_TXT_TOKEN_PATH=/sub/$TOKEN.txt
 Environment=SUB_YAML_PATH=/var/lib/subsrv/client.yaml
 Environment=SUB_JSON_PATH=/var/lib/subsrv/client.json
+Environment=SUB_TXT_PATH=/var/lib/subsrv/client.txt
 Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
 Environment=SUB_TZ=$TZ_NAME
 Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
@@ -877,14 +950,14 @@ cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/
 # 解决方案：先用占位符写模板，再用 printf %s 原样替换密码哈希
 cat > /etc/caddy/Caddyfile <<EOF
 $DOMAIN {
-	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON)
+	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON + Shadowrocket TXT)
 	@sub_path {
-		path /sub/$TOKEN.yaml /sub/$TOKEN.json
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json /sub/$TOKEN.txt
 	}
 
-	# token 参数免密访问 (给 CMFA / SFA 等不支持 BasicAuth 的客户端)
+	# token 参数免密访问 (给 CMFA / SFA / Shadowrocket 等不支持 BasicAuth 的客户端)
 	@sub_with_token {
-		path /sub/$TOKEN.yaml /sub/$TOKEN.json
+		path /sub/$TOKEN.yaml /sub/$TOKEN.json /sub/$TOKEN.txt
 		query token=$TOKEN
 	}
 
@@ -950,6 +1023,12 @@ else
     echo "   [WARN] Python 订阅服务未响应 (JSON)，请检查: journalctl -u sub-server -n 40"
 fi
 
+if curl -sf -o /dev/null "http://127.0.0.1:$BACKEND_PORT/sub/$TOKEN.txt"; then
+    echo "   [OK] Python 订阅服务正常响应 (Shadowrocket TXT)"
+else
+    echo "   [WARN] Python 订阅服务未响应 (TXT)，请检查: journalctl -u sub-server -n 40"
+fi
+
 # 验证 Caddy 是否正常转发，并等待证书申请完成
 echo "=> 正在等待 Caddy 申请 SSL 证书并验证 HTTPS 访问..."
 echo "   (这可能需要 5-15 秒，请耐心等待。如果云服务商安全组未放行 80 和 443 端口，将会超时)"
@@ -992,8 +1071,8 @@ else
 fi
 
 # ===================== 输出部署信息 =====================
-# 只有新密码才编码显示，已保存的密码不显示明文
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+# 有明文密码时 (新密码 或 已保存但用户输入了明文) 编码显示，否则显示占位符
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     ENCODED_USER=$(urlencode "$CADDY_USER")
     ENCODED_PASS=$(urlencode "$CADDY_PASS")
     SHOW_PASSWORD="$CADDY_PASS"
@@ -1039,7 +1118,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$NEED_NEW_PASSWORD" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1071,7 +1150,7 @@ echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
 echo ""
 if [ "$SHOW_ONE_CLICK" = true ]; then
-    if [ "$NEED_NEW_PASSWORD" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
         echo "  一键导入链接 (已自动 URL 编码):"
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
@@ -1093,6 +1172,38 @@ echo ""
 echo "  扫码导入 (Token 免密):"
 print_qr "https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
+echo "========== Shadowrocket (TXT) 订阅 =========="
+echo ""
+echo "--- 方式一: BasicAuth 认证访问 ---"
+echo ""
+echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.txt"
+echo "  认证方式: Basic Auth"
+echo "  用户名:   $CADDY_USER"
+echo "  密码:     $SHOW_PASSWORD"
+echo ""
+if [ "$SHOW_ONE_CLICK" = true ]; then
+    if [ "$SAVED_PASSWORD_MODE" = false ]; then
+        echo "  一键导入链接 (已自动 URL 编码):"
+    else
+        echo "  一键导入链接 (请手动替换 <密码>):"
+    fi
+    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
+    echo ""
+    echo "  扫码导入 (BasicAuth):"
+    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
+else
+    echo "  一键导入链接:"
+    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.txt"
+    echo "  (请手动替换 <用户名> 和 <密码>)"
+fi
+echo ""
+echo "--- 方式二: Token 免密访问 (推荐 Shadowrocket 使用) ---"
+echo ""
+echo "  https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
+echo ""
+echo "  扫码导入 (Token 免密):"
+print_qr "https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
+echo ""
 echo "=================================================="
 echo ""
 echo "服务状态:"
@@ -1104,7 +1215,7 @@ echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
@@ -1114,7 +1225,7 @@ echo "测试命令 (Clash Meta YAML - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
-if [ "$NEED_NEW_PASSWORD" = true ]; then
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
     echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 else
     echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
@@ -1122,4 +1233,14 @@ fi
 echo ""
 echo "测试命令 (sing-box JSON - Token 免密):"
 echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
+echo ""
+echo "测试命令 (Shadowrocket TXT - BasicAuth):"
+if [ "$SAVED_PASSWORD_MODE" = false ]; then
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
+else
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
+fi
+echo ""
+echo "测试命令 (Shadowrocket TXT - Token 免密):"
+echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
