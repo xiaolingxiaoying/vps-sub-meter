@@ -956,6 +956,28 @@ PYEOF
 fi
 
 if [ "\$saved_cycle_key" = "\$cycle_key" ]; then
+    # cycle_key 匹配，检查计数器是否回绕（重启后 tx_bytes 归零）
+    saved_base="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        st = json.load(f)
+    b = st.get('base_tx')
+    if b is not None:
+        print(int(b))
+except Exception:
+    pass
+PYEOF
+    )"
+    if [ -n "\$saved_base" ] && [ "\$tx" -lt "\$saved_base" ]; then
+        # 计数器回绕：cur_tx < base_tx，重置基线
+        tmp="\$(mktemp)"
+        printf '{"cycle_key":"%s","base_tx":%s}\n' "\$cycle_key" "\$tx" > "\$tmp"
+        install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+        rm -f "\$tmp"
+        echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_tx=\$tx wrote=\$STATE (reason: counter wrapped, old_base=\$saved_base)"
+        exit 0
+    fi
     echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key already up-to-date, skip"
     exit 0
 fi
@@ -1063,11 +1085,18 @@ ret = subprocess.run(
     capture_output=True
 )
 if ret.returncode != 0:
-    # install 失败时退回到直接移动（root 写入），并修正权限
+    # install 失败时退回到直接移动（root 写入），并修正属主和权限
     import shutil
     shutil.move(tmp, state_path)
+    try:
+        import pwd, grp
+        uid = pwd.getpwnam("subsrv").pw_uid
+        gid = grp.getgrnam("subsrv").gr_gid
+        os.chown(state_path, uid, gid)
+    except Exception:
+        pass
     os.chmod(state_path, 0o640)
-    print(f"[baseline] WARN: install failed ({ret.stderr.decode().strip()}), wrote as root", flush=True)
+    print(f"[baseline] WARN: install failed ({ret.stderr.decode().strip()}), wrote as root fallback", flush=True)
 else:
     try:
         os.unlink(tmp)
@@ -1233,12 +1262,6 @@ def load_state():
     except Exception:
         return {}
 
-def save_state(cycle_key, base_tx):
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"cycle_key": cycle_key, "base_tx": int(base_tx)}, f, separators=(",", ":"))
-    os.replace(tmp, STATE_PATH)
-
 def get_state_cycle_key(st):
     ck = st.get("cycle_key")
     if isinstance(ck, str) and ck:
@@ -1249,42 +1272,25 @@ def get_state_cycle_key(st):
     return None
 
 def month_used_tx_bytes_realtime():
-    now = pt_now()
-    adt = anchor_dt()
-    pre_anchor = bool(adt and now < adt)
-
-    cycle_start = current_cycle_start(now)
-    cycle_key = cycle_key_from_dt(cycle_start)
+    """只读计算本周期已用流量，不写入状态文件。
+    状态文件的创建/更新由 reset_tx_baseline.sh (定时任务) 和部署脚本独占。
+    """
     cur = read_tx_bytes_sysfs()
     st = load_state()
     st_cycle_key = get_state_cycle_key(st)
     base = st.get("base_tx")
 
-    if pre_anchor:
-        if st_cycle_key is None or base is None:
-            pre_key = f"pre-anchor:{RESET_ANCHOR_DATE}T{RESET_HOUR:02d}:{RESET_MINUTE:02d}"
-            save_state(pre_key, cur)
-            log(f"state init: cycle_key={pre_key} base_tx={cur} (reason: pre-anchor without state)")
-            return 0, cur, cur
-
-        used = cur - int(base)
-        if used < 0:
-            save_state(st_cycle_key, cur)
-            log(f"state reset: cycle_key={st_cycle_key} base_tx={cur} (reason: counter wrapped in pre-anchor)")
-            return 0, cur, cur
-
-        return int(used), int(base), int(cur)
-
-    if st_cycle_key != cycle_key or base is None:
-        save_state(cycle_key, cur)
-        log(f"state reset: cycle_key={cycle_key} base_tx={cur} (reason: missing or cycle changed)")
+    # 状态文件缺失或损坏：等待 reset_tx_baseline.sh 初始化
+    if st_cycle_key is None or base is None:
+        log(f"state not ready: st_cycle_key={st_cycle_key} base={base} (waiting for reset_tx_baseline.sh)")
         return 0, cur, cur
 
     used = cur - int(base)
+
+    # 计数器回绕（重启后 cur_tx < base_tx）：返回 0，等待定时任务修正
     if used < 0:
-        save_state(cycle_key, cur)
-        log(f"state reset: cycle_key={cycle_key} base_tx={cur} (reason: counter wrapped)")
-        return 0, cur, cur
+        log(f"counter wrapped: cur={cur} base={base} used={used} (waiting for reset_tx_baseline.sh)")
+        return 0, int(base), cur
 
     return int(used), int(base), int(cur)
 
@@ -1395,10 +1401,9 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now refresh-sub-copy.timer
-# 注意：此处不用 --now 立即触发，因为基线已由安装脚本写入
-# 若用 --now 会异步触发 reset_tx_baseline.sh，与已写入的基线产生竞争
-systemctl enable reset-tx-baseline.timer
-systemctl start reset-tx-baseline.timer
+# sub_server.py 已改为只读模式，不再写入 tx_state.json
+# 即使 Persistent=true 导致 reset_tx_baseline.sh 立即触发也无害（cycle_key 匹配会跳过）
+systemctl enable --now reset-tx-baseline.timer
 # 使用 restart 而非 start，确保覆盖部署时环境变量生效
 systemctl enable sub-server
 systemctl restart sub-server
