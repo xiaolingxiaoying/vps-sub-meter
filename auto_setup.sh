@@ -1021,10 +1021,6 @@ def anchor_dt():
 
 def current_cycle_start(now=None):
     now = now or pt_now()
-    adt = anchor_dt()
-    if adt and now < adt:
-        return adt
-
     this_cycle = cycle_start_for(now.year, now.month)
     if now >= this_cycle:
         return this_cycle
@@ -1080,12 +1076,31 @@ def get_state_cycle_key(st):
     return None
 
 def month_used_tx_bytes_realtime():
-    cycle_start = current_cycle_start()
+    now = pt_now()
+    adt = anchor_dt()
+    pre_anchor = bool(adt and now < adt)
+
+    cycle_start = current_cycle_start(now)
     cycle_key = cycle_key_from_dt(cycle_start)
     cur = read_tx_bytes_sysfs()
     st = load_state()
     st_cycle_key = get_state_cycle_key(st)
     base = st.get("base_tx")
+
+    if pre_anchor:
+        if st_cycle_key is None or base is None:
+            pre_key = f"pre-anchor:{RESET_ANCHOR_DATE}T{RESET_HOUR:02d}:{RESET_MINUTE:02d}"
+            save_state(pre_key, cur)
+            log(f"state init: cycle_key={pre_key} base_tx={cur} (reason: pre-anchor without state)")
+            return 0, cur, cur
+
+        used = cur - int(base)
+        if used < 0:
+            save_state(st_cycle_key, cur)
+            log(f"state reset: cycle_key={st_cycle_key} base_tx={cur} (reason: counter wrapped in pre-anchor)")
+            return 0, cur, cur
+
+        return int(used), int(base), int(cur)
 
     if st_cycle_key != cycle_key or base is None:
         save_state(cycle_key, cur)
