@@ -787,8 +787,10 @@ fi
 chown subsrv:subsrv /var/lib/subsrv/client.txt
 chmod 640 /var/lib/subsrv/client.txt
 
-# 初始化流量状态文件
-touch /var/lib/subsrv/tx_state.json
+# 初始化流量状态文件（仅在不存在时创建空文件，保留已有内容）
+if [ ! -f /var/lib/subsrv/tx_state.json ]; then
+    touch /var/lib/subsrv/tx_state.json
+fi
 chown subsrv:subsrv /var/lib/subsrv/tx_state.json
 chmod 640 /var/lib/subsrv/tx_state.json
 
@@ -1055,11 +1057,22 @@ new_base = max(0, cur_tx - used_bytes)
 tmp = state_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
     json.dump({"cycle_key": cycle_key, "base_tx": new_base}, f, separators=(",", ":"))
-os.system(f"install -o subsrv -g subsrv -m 640 {tmp!r} {state_path!r}")
-try:
-    os.unlink(tmp)
-except Exception:
-    pass
+import subprocess
+ret = subprocess.run(
+    ["install", "-o", "subsrv", "-g", "subsrv", "-m", "640", tmp, state_path],
+    capture_output=True
+)
+if ret.returncode != 0:
+    # install 失败时退回到直接移动（root 写入），并修正权限
+    import shutil
+    shutil.move(tmp, state_path)
+    os.chmod(state_path, 0o640)
+    print(f"[baseline] WARN: install failed ({ret.stderr.decode().strip()}), wrote as root", flush=True)
+else:
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
 print(f"[baseline] set: iface={iface} cur_tx={cur_tx} used_bytes={used_bytes} new_base={new_base} cycle_key={cycle_key}", flush=True)
 PYEOF
 elif [ "$NEED_RESET" = true ]; then
@@ -1382,7 +1395,10 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now refresh-sub-copy.timer
-systemctl enable --now reset-tx-baseline.timer
+# 注意：此处不用 --now 立即触发，因为基线已由安装脚本写入
+# 若用 --now 会异步触发 reset_tx_baseline.sh，与已写入的基线产生竞争
+systemctl enable reset-tx-baseline.timer
+systemctl start reset-tx-baseline.timer
 # 使用 restart 而非 start，确保覆盖部署时环境变量生效
 systemctl enable sub-server
 systemctl restart sub-server
