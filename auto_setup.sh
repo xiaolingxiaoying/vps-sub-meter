@@ -1073,8 +1073,11 @@ try:
 except Exception as e:
     print(f"[baseline] WARN: cannot read tx_bytes for {iface}: {e}", flush=True)
 
-# base_tx = cur_tx - used_bytes，不能为负
-new_base = max(0, cur_tx - used_bytes)
+# base_tx = cur_tx - used_bytes
+# 允许负值：当用户设置的已用流量超过当前计数器（例如 VPS 重启后计数器归零，
+# 但本周期实际已用流量很大），base_tx 为负数可正确表达偏移量。
+# used = cur_tx - base_tx = cur_tx - (cur_tx - used_bytes) = used_bytes ✓
+new_base = cur_tx - used_bytes
 
 tmp = state_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
