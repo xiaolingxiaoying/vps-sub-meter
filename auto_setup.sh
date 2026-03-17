@@ -1171,9 +1171,9 @@ RESET_DAY = int(os.environ.get("SUB_RESET_DAY", "1"))
 RESET_HOUR = int(os.environ.get("SUB_RESET_HOUR", "0"))
 RESET_MINUTE = int(os.environ.get("SUB_RESET_MINUTE", "0"))
 
-# 0 表示无限流量，用 1 TiB 作为显示值 (客户端会显示几乎用不完的额度)
+# 0 表示无限流量，用 999 TiB 作为显示值 (客户端会显示几乎用不完的额度)
 if LIMIT_GIB <= 0:
-    TOTAL_BYTES = int(1024 * 1024 * 1024 * 1024)  # 1 TiB
+    TOTAL_BYTES = int(999 * 1024 * 1024 * 1024 * 1024)  # 999 TiB
 else:
     TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
 
