@@ -14,3 +14,8 @@ gcp
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/gcp_sub_meter.sh)
 ```
+
+aws
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/aws_sub_meter.sh)
+```
