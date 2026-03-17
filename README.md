@@ -17,5 +17,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-met
 
 aws
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/aws_sub_meter.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/aws-sub-meter.sh)
 ```
