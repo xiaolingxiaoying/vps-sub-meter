@@ -801,6 +801,8 @@ if [ -f /etc/s-box/sing_box_client.json ]; then
 def keep_legacy_dns_server:
     {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
     | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
 def sb11_dns_server:
     (if (.type // "") == "" then .
      elif .type == "local" then . + {address: "local"}
@@ -819,8 +821,11 @@ def sb11_dns_server:
     | keep_legacy_dns_server;
 ([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
 | del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
 | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
 | if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
 | if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
 ' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
@@ -887,6 +892,8 @@ if [ -f "$SRC_JSON" ]; then
 def keep_legacy_dns_server:
     {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
     | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
 def sb11_dns_server:
     (if (.type // "") == "" then .
      elif .type == "local" then . + {address: "local"}
@@ -905,8 +912,11 @@ def sb11_dns_server:
     | keep_legacy_dns_server;
 ([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
 | del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
 | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
 | if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
 | if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
 ' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
