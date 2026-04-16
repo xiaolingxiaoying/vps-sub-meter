@@ -797,7 +797,32 @@ if [ -f /etc/s-box/sing_box_client.json ]; then
     cp -f /etc/s-box/sing_box_client.json "$TMP_JSON"
     if command -v jq >/dev/null 2>&1; then
         TMP_JSON_FIXED="${TMP_JSON}.fixed"
-        if jq 'del(.dns.independent_cache, .dns.store_rdrc) | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end' \
+        if jq '
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| del(.dns.independent_cache, .dns.store_rdrc)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
             mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
         else
@@ -858,7 +883,32 @@ if [ -f "$SRC_JSON" ]; then
     cp -f "$SRC_JSON" "$TMP_JSON"
     if command -v jq >/dev/null 2>&1; then
         TMP_JSON_FIXED="${TMP_JSON}.fixed"
-        if jq 'del(.dns.independent_cache, .dns.store_rdrc) | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end' \
+        if jq '
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| del(.dns.independent_cache, .dns.store_rdrc)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
             mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
         else
