@@ -803,8 +803,8 @@ def keep_legacy_dns_server:
     | with_entries(select(.value != null));
 def keep_legacy_dial_fields:
     del(.domain_resolver);
-def contains_tag($tags; $tag):
-    any($tags[]?; . == $tag);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
 def sb11_dns_server:
     (if (.type // "") == "" then .
      elif .type == "local" then . + {address: "local"}
@@ -822,22 +822,22 @@ def sb11_dns_server:
     | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
     | keep_legacy_dns_server;
 ([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
-| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $removed_outbound_tags
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
 | del(.dns.independent_cache, .dns.store_rdrc)
 | del(.route.default_domain_resolver)
 | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
 | if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
 | if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
     if ((.type // "") == "selector" or (.type // "") == "urltest") then
-        .outbounds |= map(select(contains_tag($removed_outbound_tags; .) | not))
-        | if (.default // null) != null and contains_tag($removed_outbound_tags; .default) then del(.default) else . end
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
     else .
     end
 ) else . end
 | if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
 | if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
-| if (.route.rules | type) == "array" then .route.rules |= map(select(((.outbound // null) != null and contains_tag($removed_outbound_tags; .outbound)) | not)) else . end
-| if (.route.final // null) != null and contains_tag($removed_outbound_tags; .route.final) then del(.route.final) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
 | if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
 ' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
@@ -906,8 +906,8 @@ def keep_legacy_dns_server:
     | with_entries(select(.value != null));
 def keep_legacy_dial_fields:
     del(.domain_resolver);
-def contains_tag($tags; $tag):
-    any($tags[]?; . == $tag);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
 def sb11_dns_server:
     (if (.type // "") == "" then .
      elif .type == "local" then . + {address: "local"}
@@ -925,22 +925,22 @@ def sb11_dns_server:
     | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
     | keep_legacy_dns_server;
 ([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
-| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $removed_outbound_tags
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
 | del(.dns.independent_cache, .dns.store_rdrc)
 | del(.route.default_domain_resolver)
 | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
 | if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
 | if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
     if ((.type // "") == "selector" or (.type // "") == "urltest") then
-        .outbounds |= map(select(contains_tag($removed_outbound_tags; .) | not))
-        | if (.default // null) != null and contains_tag($removed_outbound_tags; .default) then del(.default) else . end
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
     else .
     end
 ) else . end
 | if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
 | if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
-| if (.route.rules | type) == "array" then .route.rules |= map(select(((.outbound // null) != null and contains_tag($removed_outbound_tags; .outbound)) | not)) else . end
-| if (.route.final // null) != null and contains_tag($removed_outbound_tags; .route.final) then del(.route.final) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
 | if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
 ' \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
