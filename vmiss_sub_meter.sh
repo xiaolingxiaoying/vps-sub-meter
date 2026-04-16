@@ -793,7 +793,19 @@ chmod 640 /var/lib/subsrv/client.yaml
 
 # 初始化订阅配置副本 — sing-box (JSON)
 if [ -f /etc/s-box/sing_box_client.json ]; then
-    cp -f /etc/s-box/sing_box_client.json /var/lib/subsrv/client.json
+    TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    cp -f /etc/s-box/sing_box_client.json "$TMP_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        if jq 'del(.dns.independent_cache, .dns.store_rdrc) | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end' \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留复制后的原始副本"
+        fi
+    fi
+    mv -f "$TMP_JSON" /var/lib/subsrv/client.json
 else
     echo '{"log":{"level":"warn"},"dns":{},"inbounds":[],"outbounds":[]}' > /var/lib/subsrv/client.json
     echo "=> 警告: /etc/s-box/sing_box_client.json 不存在，已创建默认空配置"
@@ -842,10 +854,25 @@ SRC_JSON="/etc/s-box/sing_box_client.json"
 DST_JSON="/var/lib/subsrv/client.json"
 if [ -f "$SRC_JSON" ]; then
     TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    JSON_SYNC_READY=1
     cp -f "$SRC_JSON" "$TMP_JSON"
-    chown subsrv:subsrv "$TMP_JSON"
-    chmod 640 "$TMP_JSON"
-    mv -f "$TMP_JSON" "$DST_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        if jq 'del(.dns.independent_cache, .dns.store_rdrc) | if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end' \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            rm -f "$TMP_JSON"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留现有副本"
+            JSON_SYNC_READY=0
+        fi
+    fi
+    if [ "$JSON_SYNC_READY" -eq 1 ]; then
+        chown subsrv:subsrv "$TMP_JSON"
+        chmod 640 "$TMP_JSON"
+        mv -f "$TMP_JSON" "$DST_JSON"
+    fi
 fi
 
 # 同步 Shadowrocket 配置 (TXT)
