@@ -19,6 +19,12 @@ set -euo pipefail
 # 配置文件路径
 CONFIG_FILE="/etc/sub-srv/config.conf"
 
+# 是否自动把 Caddy 证书同步给 sing-box-yg
+SYNC_SINGBOX_CERT="${SYNC_SINGBOX_CERT:-true}"
+SINGBOX_CERT_DIR="${SINGBOX_CERT_DIR:-/root/ygkkkca}"
+SINGBOX_SERVICE="${SINGBOX_SERVICE:-sing-box}"
+SINGBOX_CERT_SYNC_READY=false
+
 # 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
 if [ ! -t 0 ]; then
     exec < /dev/tty
@@ -198,6 +204,174 @@ PYEOF
         fi
     fi
     return 1
+}
+
+# 配置 Caddy -> sing-box-yg 证书自动同步
+install_singbox_cert_sync() {
+    if [ "$SYNC_SINGBOX_CERT" != "true" ]; then
+        echo "=> 已跳过 Caddy -> sing-box 证书同步配置"
+        return 0
+    fi
+
+    if ! systemctl cat "${SINGBOX_SERVICE}.service" >/dev/null 2>&1; then
+        echo "=> 未检测到 ${SINGBOX_SERVICE}.service，跳过 sing-box 证书同步"
+        return 0
+    fi
+
+    if [ ! -d "$SINGBOX_CERT_DIR" ]; then
+        echo "=> 未检测到 sing-box-yg 证书目录 $SINGBOX_CERT_DIR，跳过证书同步"
+        return 0
+    fi
+
+    echo "=> 配置 Caddy 证书自动同步到 sing-box..."
+
+    install -d -m 755 /etc/default
+    {
+        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'SINGBOX_CERT_DIR=%q\n' "$SINGBOX_CERT_DIR"
+        printf 'SINGBOX_SERVICE=%q\n' "$SINGBOX_SERVICE"
+    } > /etc/default/sync-caddy-cert-to-singbox
+    chmod 600 /etc/default/sync-caddy-cert-to-singbox
+
+    cat > /usr/local/bin/sync-caddy-cert-to-singbox.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/default/sync-caddy-cert-to-singbox"
+CADDY_CERT_ROOT="/var/lib/caddy/.local/share/caddy/certificates"
+
+log() {
+    echo "[sync-caddy-cert-to-singbox] $(date -Is) $*"
+}
+
+if [ ! -r "$CONFIG_FILE" ]; then
+    log "WARN: config file not found: $CONFIG_FILE"
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+if [ -z "${DOMAIN:-}" ]; then
+    log "ERROR: DOMAIN is empty"
+    exit 1
+fi
+
+if [ ! -d "$CADDY_CERT_ROOT" ]; then
+    log "WARN: Caddy certificate root not found: $CADDY_CERT_ROOT"
+    exit 0
+fi
+
+CADDY_CERT="$(
+    find "$CADDY_CERT_ROOT" -type f -name "${DOMAIN}.crt" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr \
+        | sed -n '1s/^[^ ]* //p'
+)"
+
+if [ -z "$CADDY_CERT" ] || [ ! -f "$CADDY_CERT" ]; then
+    log "WARN: Caddy certificate not found for domain: $DOMAIN"
+    exit 0
+fi
+
+CADDY_KEY="${CADDY_CERT%.crt}.key"
+if [ ! -f "$CADDY_KEY" ]; then
+    log "WARN: Caddy private key not found: $CADDY_KEY"
+    exit 0
+fi
+
+if ! openssl x509 -checkend 0 -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
+    log "WARN: Caddy certificate is expired, skip sync"
+    exit 0
+fi
+
+if ! openssl x509 -checkhost "$DOMAIN" -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
+    log "WARN: Caddy certificate does not match domain: $DOMAIN"
+    exit 0
+fi
+
+if ! CERT_PUBKEY="$(
+    openssl x509 -pubkey -noout -in "$CADDY_CERT" \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+)"; then
+    log "WARN: failed to read public key from Caddy certificate"
+    exit 0
+fi
+
+if ! KEY_PUBKEY="$(
+    openssl pkey -pubout -in "$CADDY_KEY" 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+)"; then
+    log "WARN: failed to read Caddy private key"
+    exit 0
+fi
+
+if [ -z "$CERT_PUBKEY" ] || [ "$CERT_PUBKEY" != "$KEY_PUBKEY" ]; then
+    log "WARN: Caddy certificate and private key do not match"
+    exit 0
+fi
+
+install -d -m 700 "$SINGBOX_CERT_DIR"
+SING_CERT="${SINGBOX_CERT_DIR}/cert.crt"
+SING_KEY="${SINGBOX_CERT_DIR}/private.key"
+
+if [ -f "$SING_CERT" ] && [ -f "$SING_KEY" ] \
+    && cmp -s "$CADDY_CERT" "$SING_CERT" \
+    && cmp -s "$CADDY_KEY" "$SING_KEY"; then
+    log "certificate unchanged, no restart needed"
+    exit 0
+fi
+
+TMP_CERT="$(mktemp "${SINGBOX_CERT_DIR}/.cert.crt.XXXXXX")"
+TMP_KEY="$(mktemp "${SINGBOX_CERT_DIR}/.private.key.XXXXXX")"
+cleanup() {
+    rm -f "$TMP_CERT" "$TMP_KEY"
+}
+trap cleanup EXIT
+
+install -m 644 "$CADDY_CERT" "$TMP_CERT"
+install -m 600 "$CADDY_KEY" "$TMP_KEY"
+mv -f "$TMP_KEY" "$SING_KEY"
+mv -f "$TMP_CERT" "$SING_CERT"
+
+log "certificate changed, restarting ${SINGBOX_SERVICE}"
+systemctl restart "${SINGBOX_SERVICE}.service"
+openssl x509 -in "$SING_CERT" -noout -subject -issuer -dates
+SH
+    chmod 755 /usr/local/bin/sync-caddy-cert-to-singbox.sh
+
+    cat > /etc/systemd/system/sync-caddy-cert-to-singbox.service <<'UNIT'
+[Unit]
+Description=Sync Caddy certificate to sing-box
+After=caddy.service
+Wants=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sync-caddy-cert-to-singbox.sh
+UNIT
+
+    cat > /etc/systemd/system/sync-caddy-cert-to-singbox.timer <<'UNIT'
+[Unit]
+Description=Run Caddy certificate sync for sing-box daily
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now sync-caddy-cert-to-singbox.timer
+    SINGBOX_CERT_SYNC_READY=true
+    echo "=> 已创建证书同步定时任务: sync-caddy-cert-to-singbox.timer"
 }
 
 echo "=================================================="
@@ -997,6 +1171,7 @@ if caddy validate --config /etc/caddy/Caddyfile; then
     # reload 有时不能正确切换到新域名的 TLS 证书申请
     systemctl restart caddy
     echo "=> Caddy 配置验证通过并已重启"
+    install_singbox_cert_sync
 else
     echo "错误: Caddyfile 验证失败，请手动检查 /etc/caddy/Caddyfile"
     echo "Caddy 仍在使用旧配置运行"
@@ -1047,6 +1222,13 @@ done
 
 if [ "$caddy_success" = true ]; then
     echo "   [OK] Caddy HTTPS 转发正常 (SSL 证书申请成功)"
+    if [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
+        if systemctl start sync-caddy-cert-to-singbox.service; then
+            echo "   [OK] Caddy 证书已同步到 sing-box"
+        else
+            echo "   [WARN] sing-box 证书同步失败，请检查: journalctl -u sync-caddy-cert-to-singbox.service -n 50"
+        fi
+    fi
 else
     echo ""
     echo -e "\033[31m#########################################################################\033[0m"
@@ -1208,11 +1390,18 @@ echo "=================================================="
 echo ""
 echo "服务状态:"
 echo "  systemctl status sub-server caddy"
-echo "  systemctl list-timers --all | grep -E 'refresh|reset'"
+echo "  systemctl list-timers --all | grep -E 'refresh|reset|sync-caddy-cert'"
 echo ""
 echo "常用排查命令:"
 echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
+if [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
+    echo ""
+    echo "证书同步状态检查:"
+    echo "  systemctl status sync-caddy-cert-to-singbox.timer --no-pager"
+    echo "  journalctl -u sync-caddy-cert-to-singbox.service -n 50 --no-pager"
+    echo "  openssl x509 -in '${SINGBOX_CERT_DIR}/cert.crt' -noout -subject -issuer -dates"
+fi
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
 if [ "$SAVED_PASSWORD_MODE" = false ]; then
