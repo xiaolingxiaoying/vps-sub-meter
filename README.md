@@ -26,4 +26,5 @@ bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-met
 - 支持多种流量重置模式：自然月、指定日期循环、固定到期日
 - 支持 RX + TX 双向流量统计
 - 支持 BasicAuth + Token 免密两种访问方式
+- Caddy 续签后会在 15 分钟内校验并同步证书到 sing-box；只有证书变化时才重启 sing-box，避免证书过期或不同步导致代理 TLS 超时
 - 旧入口 URL（auto_setup.sh / gcp_sub_meter.sh / aws-sub-meter.sh / vmiss_sub_meter.sh）仍然可用

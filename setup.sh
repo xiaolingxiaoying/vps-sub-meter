@@ -14,7 +14,7 @@ set -euo pipefail
 #   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
 #   - 多种流量重置模式: 自然月 / 指定日期循环 / 固定到期日
 #   - 每 5 分钟同步上游订阅配置
-#   - Caddy 证书自动同步到 sing-box
+#   - Caddy 证书自动同步到 sing-box（每 15 分钟检查；仅在证书变化时重启）
 # ==============================================================================
 
 # 配置文件路径
@@ -267,8 +267,8 @@ log() {
 }
 
 if [ ! -r "$CONFIG_FILE" ]; then
-    log "WARN: config file not found: $CONFIG_FILE"
-    exit 0
+    log "ERROR: config file not found: $CONFIG_FILE"
+    exit 1
 fi
 
 # shellcheck disable=SC1090
@@ -280,8 +280,8 @@ if [ -z "${DOMAIN:-}" ]; then
 fi
 
 if [ ! -d "$CADDY_CERT_ROOT" ]; then
-    log "WARN: Caddy certificate root not found: $CADDY_CERT_ROOT"
-    exit 0
+    log "ERROR: Caddy certificate root not found: $CADDY_CERT_ROOT"
+    exit 1
 fi
 
 CADDY_CERT="$(
@@ -291,24 +291,24 @@ CADDY_CERT="$(
 )"
 
 if [ -z "$CADDY_CERT" ] || [ ! -f "$CADDY_CERT" ]; then
-    log "WARN: Caddy certificate not found for domain: $DOMAIN"
-    exit 0
+    log "ERROR: Caddy certificate not found for domain: $DOMAIN"
+    exit 1
 fi
 
 CADDY_KEY="${CADDY_CERT%.crt}.key"
 if [ ! -f "$CADDY_KEY" ]; then
-    log "WARN: Caddy private key not found: $CADDY_KEY"
-    exit 0
+    log "ERROR: Caddy private key not found: $CADDY_KEY"
+    exit 1
 fi
 
 if ! openssl x509 -checkend 0 -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
-    log "WARN: Caddy certificate is expired, skip sync"
-    exit 0
+    log "ERROR: Caddy certificate is expired"
+    exit 1
 fi
 
 if ! openssl x509 -checkhost "$DOMAIN" -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
-    log "WARN: Caddy certificate does not match domain: $DOMAIN"
-    exit 0
+    log "ERROR: Caddy certificate does not match domain: $DOMAIN"
+    exit 1
 fi
 
 if ! CERT_PUBKEY="$(
@@ -317,8 +317,8 @@ if ! CERT_PUBKEY="$(
         | sha256sum \
         | awk '{print $1}'
 )"; then
-    log "WARN: failed to read public key from Caddy certificate"
-    exit 0
+    log "ERROR: failed to read public key from Caddy certificate"
+    exit 1
 fi
 
 if ! KEY_PUBKEY="$(
@@ -327,22 +327,26 @@ if ! KEY_PUBKEY="$(
         | sha256sum \
         | awk '{print $1}'
 )"; then
-    log "WARN: failed to read Caddy private key"
-    exit 0
+    log "ERROR: failed to read Caddy private key"
+    exit 1
 fi
 
 if [ -z "$CERT_PUBKEY" ] || [ "$CERT_PUBKEY" != "$KEY_PUBKEY" ]; then
-    log "WARN: Caddy certificate and private key do not match"
-    exit 0
+    log "ERROR: Caddy certificate and private key do not match"
+    exit 1
 fi
 
 install -d -m 700 "$SINGBOX_CERT_DIR"
 SING_CERT="${SINGBOX_CERT_DIR}/cert.crt"
 SING_KEY="${SINGBOX_CERT_DIR}/private.key"
+LOADED_FINGERPRINT_FILE="${SINGBOX_CERT_DIR}/.singbox-cert-fingerprint"
+SOURCE_FINGERPRINT="$(sha256sum "$CADDY_CERT" "$CADDY_KEY" | sha256sum | awk '{print $1}')"
+LOADED_FINGERPRINT="$(cat "$LOADED_FINGERPRINT_FILE" 2>/dev/null || true)"
 
 if [ -f "$SING_CERT" ] && [ -f "$SING_KEY" ] \
     && cmp -s "$CADDY_CERT" "$SING_CERT" \
-    && cmp -s "$CADDY_KEY" "$SING_KEY"; then
+    && cmp -s "$CADDY_KEY" "$SING_KEY" \
+    && [ "$SOURCE_FINGERPRINT" = "$LOADED_FINGERPRINT" ]; then
     log "certificate unchanged, no restart needed"
     exit 0
 fi
@@ -359,8 +363,13 @@ install -m 600 "$CADDY_KEY" "$TMP_KEY"
 mv -f "$TMP_KEY" "$SING_KEY"
 mv -f "$TMP_CERT" "$SING_CERT"
 
-log "certificate changed, restarting ${SINGBOX_SERVICE}"
+log "certificate is new or not confirmed as loaded, restarting ${SINGBOX_SERVICE}"
 systemctl restart "${SINGBOX_SERVICE}.service"
+TMP_FINGERPRINT="$(mktemp "${SINGBOX_CERT_DIR}/.singbox-cert-fingerprint.XXXXXX")"
+printf '%s\n' "$SOURCE_FINGERPRINT" > "$TMP_FINGERPRINT"
+chmod 600 "$TMP_FINGERPRINT"
+mv -f "$TMP_FINGERPRINT" "$LOADED_FINGERPRINT_FILE"
+log "certificate loaded successfully by ${SINGBOX_SERVICE}"
 openssl x509 -in "$SING_CERT" -noout -subject -issuer -dates
 SH
     chmod 755 /usr/local/bin/sync-caddy-cert-to-singbox.sh
@@ -378,12 +387,12 @@ UNIT
 
     cat > /etc/systemd/system/sync-caddy-cert-to-singbox.timer <<'UNIT'
 [Unit]
-Description=Run Caddy certificate sync for sing-box daily
+Description=Run Caddy certificate sync for sing-box every 15 minutes
 
 [Timer]
 OnBootSec=2min
-OnCalendar=*-*-* 03:30:00
-RandomizedDelaySec=20min
+OnUnitActiveSec=15min
+AccuracySec=1min
 Persistent=true
 
 [Install]
