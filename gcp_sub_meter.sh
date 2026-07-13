@@ -2,18 +2,19 @@
 set -euo pipefail
 
 # ==============================================================================
-# VPS 流量统计与订阅管理 自动配置脚本
+# VPS 流量统计与订阅管理 自动配置脚本 (统一安装器)
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/setup.sh)
 #
 # 功能:
-#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
-#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON)
-#   - 同时支持 Clash Meta (YAML) 和 sing-box (JSON) 订阅格式
+#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量 (RX + TX 双向)
+#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON + TXT)
+#   - 同时支持 Clash Meta (YAML)、sing-box (JSON)、Shadowrocket (TXT) 订阅格式
 #   - Caddy 反向代理提供 HTTPS + Basic Auth 鉴权
 #   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
-#   - 每月自动重置流量基线
+#   - 多种流量重置模式: 自然月 / 指定日期循环 / 固定到期日
 #   - 每 5 分钟同步上游订阅配置
+#   - Caddy 证书自动同步到 sing-box
 # ==============================================================================
 
 # 配置文件路径
@@ -111,9 +112,14 @@ save_config() {
         "${PASSWORD_HASH:-}" \
         "${TRAFFIC_LIMIT_GIB}" \
         "${TZ_NAME}" \
+        "${RESET_MODE:-natural_month}" \
+        "${RESET_ANCHOR_DATE:-}" \
+        "${RESET_HOUR:-0}" \
+        "${RESET_MINUTE:-0}" \
         "${IFACE}" \
         "${TOKEN}" \
         "${BACKEND_PORT:-2080}" \
+        "${USED_TRAFFIC_GIB:-0}" \
         <<'PYEOF'
 import sys, os
 from datetime import datetime
@@ -124,9 +130,14 @@ caddy_user = sys.argv[3]
 pass_hash  = sys.argv[4]
 limit_gib  = sys.argv[5]
 tz_name    = sys.argv[6]
-iface      = sys.argv[7]
-token      = sys.argv[8]
-backend_port = sys.argv[9]
+reset_mode = sys.argv[7]
+reset_anchor_date = sys.argv[8]
+reset_hour = sys.argv[9]
+reset_minute = sys.argv[10]
+iface      = sys.argv[11]
+token      = sys.argv[12]
+backend_port = sys.argv[13]
+used_gib   = sys.argv[14]
 
 lines = [
     "# VPS 订阅服务配置文件",
@@ -136,7 +147,12 @@ lines = [
     f"CADDY_USER={caddy_user!r}",
     f"CADDY_PASS_HASH={pass_hash!r}",
     f"TRAFFIC_LIMIT_GIB={limit_gib!r}",
+    f"USED_TRAFFIC_GIB={used_gib!r}",
     f"TZ_NAME={tz_name!r}",
+    f"RESET_MODE={reset_mode!r}",
+    f"RESET_ANCHOR_DATE={reset_anchor_date!r}",
+    f"RESET_HOUR={reset_hour!r}",
+    f"RESET_MINUTE={reset_minute!r}",
     f"IFACE={iface!r}",
     f"TOKEN={token!r}",
     f"BACKEND_PORT={backend_port!r}",
@@ -198,8 +214,14 @@ PYEOF
             # 将配置文件中的字段映射到脚本使用的变量名
             CADDY_PASS_HASH="${CADDY_PASS_HASH:-}"
             PASSWORD_HASH="${CADDY_PASS_HASH:-}"
+            TZ_NAME="${TZ_NAME:-America/Los_Angeles}"
+            RESET_MODE="${RESET_MODE:-natural_month}"
+            RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
+            RESET_HOUR="${RESET_HOUR:-0}"
+            RESET_MINUTE="${RESET_MINUTE:-0}"
+            USED_TRAFFIC_GIB="${USED_TRAFFIC_GIB:-}"
 
-            echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 网卡=${IFACE:-未设置}"
+            echo "=> 已加载配置: 域名=${DOMAIN:-未设置}, 用户=${CADDY_USER:-未设置}, 时区=${TZ_NAME:-未设置}, 网卡=${IFACE:-未设置}"
             return 0
         fi
     fi
@@ -517,29 +539,258 @@ while true; do
     break
 done
 
-# 时区输入与验证
+# 已使用流量设置 (用于在重新部署或初始化时设定起始已用量)
+# 尝试从现有状态文件读取当前已用流量，供用户参考
+CURRENT_USED_GIB=""
+STATE_FILE_TMP="/var/lib/subsrv/tx_state.json"
+if [ -f "$STATE_FILE_TMP" ] && [ -s "$STATE_FILE_TMP" ]; then
+    CURRENT_USED_GIB=$(python3 - "$STATE_FILE_TMP" "${IFACE:-}" <<'PYEOF'
+import json, sys, os
+
+state_path = sys.argv[1]
+iface = sys.argv[2] if len(sys.argv) > 2 else ""
+
+try:
+    with open(state_path, encoding="utf-8") as f:
+        st = json.load(f)
+    base_rx = st.get("base_rx")
+    base_tx = st.get("base_tx")
+    if base_rx is None or base_tx is None:
+        sys.exit(0)
+    # 尝试读取当前 rx/tx bytes
+    cur_rx = None
+    cur_tx = None
+    if iface:
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
+                cur_rx = int(f.read().strip())
+        except Exception:
+            pass
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
+                cur_tx = int(f.read().strip())
+        except Exception:
+            pass
+    if cur_rx is not None and cur_tx is not None:
+        used_rx = max(0, cur_rx - int(base_rx))
+        used_tx = max(0, cur_tx - int(base_tx))
+        used = used_rx + used_tx
+        used_gib = used / (1024 ** 3)
+        print(f"{used_gib:.3f}")
+    else:
+        # 无法读取当前值，显示 0
+        print("0.000")
+except Exception:
+    pass
+PYEOF
+    ) 2>/dev/null || CURRENT_USED_GIB=""
+fi
+
 while true; do
-    if [ -n "${TZ_NAME:-}" ]; then
-        read -rp "请输入计费时区 [当前: $TZ_NAME]: " input_tz
-        if [ -z "$input_tz" ]; then
-            break  # 保持原值
+    if [ -n "${USED_TRAFFIC_GIB:-}" ]; then
+        # 同时显示配置文件中保存的值和实际测量值（如果有）
+        if [ -n "$CURRENT_USED_GIB" ]; then
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [当前实测: ${CURRENT_USED_GIB} GiB，配置保存值: ${USED_TRAFFIC_GIB}，留空使用实测值]: " input_used
+        else
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [配置保存值: ${USED_TRAFFIC_GIB}，留空保持原值]: " input_used
         fi
-        TZ_NAME="$input_tz"
+        if [ -z "$input_used" ]; then
+            # 留空：如果有实测值优先用实测值，否则保持配置文件中的值
+            if [ -n "$CURRENT_USED_GIB" ]; then
+                USED_TRAFFIC_GIB="$CURRENT_USED_GIB"
+                echo "=> 使用实测已用流量: ${USED_TRAFFIC_GIB} GiB"
+            fi
+            break
+        fi
+        USED_TRAFFIC_GIB="$input_used"
     else
-        read -rp "请输入计费时区 (默认 America/Los_Angeles): " TZ_NAME
+        if [ -n "$CURRENT_USED_GIB" ]; then
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始) [当前实测: ${CURRENT_USED_GIB} GiB，留空使用实测值]: " input_used
+        else
+            read -rp "请输入本周期已使用的流量 (GiB，0 表示从零开始，默认 0): " input_used
+        fi
+        if [ -z "$input_used" ]; then
+            if [ -n "$CURRENT_USED_GIB" ]; then
+                USED_TRAFFIC_GIB="$CURRENT_USED_GIB"
+                echo "=> 使用实测已用流量: ${USED_TRAFFIC_GIB} GiB"
+            else
+                USED_TRAFFIC_GIB="0"
+            fi
+            break
+        fi
+        USED_TRAFFIC_GIB="$input_used"
     fi
 
-    TZ_NAME=${TZ_NAME:-America/Los_Angeles}
-
-    # 验证时区合法性
-    if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
-        echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
-        echo "       可用时区列表: ls /usr/share/zoneinfo/"
-        TZ_NAME=""
+    if ! validate_traffic_limit "$USED_TRAFFIC_GIB"; then
+        echo "错误: 已使用流量必须是有效的非负数字"
+        USED_TRAFFIC_GIB=""
         continue
     fi
     break
 done
+
+# 时区选择与验证
+TZ_NAME="${TZ_NAME:-America/Los_Angeles}"
+while true; do
+    echo "请选择流量刷新/重置时区:"
+    echo "  1) America/Los_Angeles (默认)"
+    echo "  2) Asia/Shanghai"
+    echo "  3) 自定义输入"
+
+    if [ -n "${TZ_NAME:-}" ]; then
+        read -rp "请输入选项 [当前: $TZ_NAME，回车保持当前]: " tz_choice
+        if [ -z "$tz_choice" ]; then
+            tz_choice=0
+        fi
+    else
+        read -rp "请输入选项 [默认: 1]: " tz_choice
+        tz_choice=${tz_choice:-1}
+    fi
+
+    case "$tz_choice" in
+        0)
+            ;;
+        1)
+            TZ_NAME="America/Los_Angeles"
+            ;;
+        2)
+            TZ_NAME="Asia/Shanghai"
+            ;;
+        3)
+            read -rp "请输入自定义时区 (例如: America/Los_Angeles): " custom_tz
+            if [ -z "$custom_tz" ]; then
+                echo "错误: 自定义时区不能为空"
+                continue
+            fi
+            TZ_NAME="$custom_tz"
+            ;;
+        *)
+            echo "错误: 无效选项，请输入 1/2/3"
+            continue
+            ;;
+    esac
+
+    if [ ! -f "/usr/share/zoneinfo/$TZ_NAME" ]; then
+        echo "错误: 无效的时区 '$TZ_NAME'，请使用类似 America/Los_Angeles 的格式"
+        echo "       可用时区列表: ls /usr/share/zoneinfo/"
+        continue
+    fi
+    break
+done
+
+# 选择刷新规则 (按所选时区解释)
+RESET_MODE="${RESET_MODE:-natural_month}"
+RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
+RESET_HOUR="${RESET_HOUR:-0}"
+RESET_MINUTE="${RESET_MINUTE:-0}"
+
+while true; do
+    echo "请选择流量到期/刷新规则 (时区: $TZ_NAME):"
+    echo "  1) 自然月: 每月 1 日 00:00 (默认)"
+    echo "  2) 指定首个重置年月日和时间，之后每月同日同时间"
+    echo "  3) 指定固定到期日 (不循环，到达后直接停机失效)"
+    if [ "$RESET_MODE" = "anchored_monthly" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
+        reset_mode_default=2
+    elif [ "$RESET_MODE" = "fixed_expire" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
+        reset_mode_default=3
+    else
+        reset_mode_default=1
+    fi
+    if [ "$RESET_MODE" = "anchored_monthly" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
+        printf -v current_reset_desc "每月 %s 日 %02d:%02d (首个重置: %s %02d:%02d)" \
+            "$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)" "$RESET_HOUR" "$RESET_MINUTE" "$RESET_ANCHOR_DATE" "$RESET_HOUR" "$RESET_MINUTE"
+    elif [ "$RESET_MODE" = "fixed_expire" ] && [ -n "$RESET_ANCHOR_DATE" ]; then
+        printf -v current_reset_desc "固定到期日: %s %02d:%02d (到达后停机)" \
+            "$RESET_ANCHOR_DATE" "$RESET_HOUR" "$RESET_MINUTE"
+    else
+        current_reset_desc="每月 1 日 00:00"
+    fi
+    read -rp "请输入选项 [当前: $current_reset_desc，默认: $reset_mode_default]: " reset_mode_choice
+    reset_mode_choice=${reset_mode_choice:-$reset_mode_default}
+
+    if [ "$reset_mode_choice" = "1" ]; then
+        RESET_MODE="natural_month"
+        RESET_ANCHOR_DATE=""
+        RESET_HOUR=0
+        RESET_MINUTE=0
+        break
+    elif [ "$reset_mode_choice" = "2" ] || [ "$reset_mode_choice" = "3" ]; then
+        if [ "$reset_mode_choice" = "3" ]; then
+            RESET_MODE="fixed_expire"
+        else
+            RESET_MODE="anchored_monthly"
+        fi
+        while true; do
+            if [ "$RESET_MODE" = "fixed_expire" ]; then
+                prompt_date="固定到期日期"
+            else
+                prompt_date="首个重置日期"
+            fi
+            if [ -n "$RESET_ANCHOR_DATE" ]; then
+                read -rp "请输入$prompt_date (YYYY-MM-DD) [当前: $RESET_ANCHOR_DATE]: " input_anchor_date
+                input_anchor_date=${input_anchor_date:-$RESET_ANCHOR_DATE}
+            else
+                read -rp "请输入$prompt_date (YYYY-MM-DD): " input_anchor_date
+            fi
+
+            if [ -n "${RESET_HOUR:-}" ] && [ -n "${RESET_MINUTE:-}" ]; then
+                read -rp "请输入重置时间小时 (0-23) [当前: $RESET_HOUR]: " input_reset_hour
+                read -rp "请输入重置时间分钟 (0-59) [当前: $RESET_MINUTE]: " input_reset_minute
+                input_reset_hour=${input_reset_hour:-$RESET_HOUR}
+                input_reset_minute=${input_reset_minute:-$RESET_MINUTE}
+            else
+                read -rp "请输入重置时间小时 (0-23，默认 0): " input_reset_hour
+                read -rp "请输入重置时间分钟 (0-59，默认 0): " input_reset_minute
+                input_reset_hour=${input_reset_hour:-0}
+                input_reset_minute=${input_reset_minute:-0}
+            fi
+
+            if ! TZ="$TZ_NAME" date -d "$input_anchor_date" +%F >/dev/null 2>&1; then
+                echo "错误: 日期格式无效，请输入 YYYY-MM-DD"
+                continue
+            fi
+
+            if [[ ! "$input_reset_hour" =~ ^[0-9]+$ ]] || [ "$input_reset_hour" -lt 0 ] || [ "$input_reset_hour" -gt 23 ]; then
+                echo "错误: 小时必须是 0-23 的整数"
+                continue
+            fi
+
+            if [[ ! "$input_reset_minute" =~ ^[0-9]+$ ]] || [ "$input_reset_minute" -lt 0 ] || [ "$input_reset_minute" -gt 59 ]; then
+                echo "错误: 分钟必须是 0-59 的整数"
+                continue
+            fi
+
+            RESET_MODE="anchored_monthly"
+            RESET_ANCHOR_DATE=$(TZ="$TZ_NAME" date -d "$input_anchor_date" +%F)
+            RESET_HOUR="$input_reset_hour"
+            RESET_MINUTE="$input_reset_minute"
+            break
+        done
+        break
+    else
+        echo "错误: 无效选项，请输入 1、2 或 3"
+    fi
+done
+
+if [ "$RESET_MODE" = "anchored_monthly" ]; then
+    RESET_DAY=$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)
+    RESET_DAY=$((10#$RESET_DAY))
+else
+    RESET_MODE="natural_month"
+    RESET_DAY=1
+    RESET_HOUR=0
+    RESET_MINUTE=0
+    RESET_ANCHOR_DATE=""
+fi
+
+printf -v RESET_TIME_HHMM "%02d:%02d" "$RESET_HOUR" "$RESET_MINUTE"
+if [ "$RESET_MODE" = "anchored_monthly" ]; then
+    RESET_DESC="每月 ${RESET_DAY} 日 ${RESET_TIME_HHMM} (首个重置: ${RESET_ANCHOR_DATE} ${RESET_TIME_HHMM}，短月自动按月末)"
+elif [ "$RESET_MODE" = "fixed_expire" ]; then
+    RESET_DESC="固定到期日: ${RESET_ANCHOR_DATE} ${RESET_TIME_HHMM} (到达后直接停机失效)"
+else
+    RESET_DESC="每月 1 日 00:00 (自然月默认)"
+fi
 
 # 自动获取默认网卡
 DEFAULT_IFACE=$(ip route get 1.1.1.1 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')
@@ -615,6 +866,10 @@ if ! check_port_available "$BACKEND_PORT"; then
     fi
 fi
 
+if [ "$RESET_MODE" != "anchored_monthly" ] && [ "$RESET_MODE" != "fixed_expire" ]; then
+    RESET_ANCHOR_DATE=""
+fi
+
 # 生成随机 Token (如果未从配置文件加载)
 if [ -z "${TOKEN:-}" ]; then
     TOKEN="$(openssl rand -hex 24 2>/dev/null || tr -dc 'a-f0-9' < /dev/urandom | head -c 48)"
@@ -630,7 +885,9 @@ echo "域名:       $DOMAIN"
 echo "用户名:     $CADDY_USER"
 echo "密码:       $([ "$CADDY_PASS" = "<已保存的密码>" ] && echo "<已保存>" || echo "${CADDY_PASS:0:3}***")"
 echo "流量上限:   $TRAFFIC_LIMIT_GIB GiB"
+echo "已使用流量: ${USED_TRAFFIC_GIB:-0} GiB"
 echo "时区:       $TZ_NAME"
+echo "刷新规则:   $RESET_DESC"
 echo "网卡:       $IFACE"
 echo "后端端口:   $BACKEND_PORT"
 echo "Token:      ${TOKEN:0:12}...${TOKEN: -12}"
@@ -711,7 +968,62 @@ chmod 640 /var/lib/subsrv/client.yaml
 
 # 初始化订阅配置副本 — sing-box (JSON)
 if [ -f /etc/s-box/sing_box_client.json ]; then
-    cp -f /etc/s-box/sing_box_client.json /var/lib/subsrv/client.json
+    TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    cp -f /etc/s-box/sing_box_client.json "$TMP_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        read -r -d '' _SB11_JQ_FILTER <<'JQEOF' || true
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
+| del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
+    if ((.type // "") == "selector" or (.type // "") == "urltest") then
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
+    else .
+    end
+) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+JQEOF
+        if jq "$_SB11_JQ_FILTER" \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留复制后的原始副本"
+        fi
+    fi
+    mv -f "$TMP_JSON" /var/lib/subsrv/client.json
 else
     echo '{"log":{"level":"warn"},"dns":{},"inbounds":[],"outbounds":[]}' > /var/lib/subsrv/client.json
     echo "=> 警告: /etc/s-box/sing_box_client.json 不存在，已创建默认空配置"
@@ -732,8 +1044,10 @@ fi
 chown subsrv:subsrv /var/lib/subsrv/client.txt
 chmod 640 /var/lib/subsrv/client.txt
 
-# 初始化流量状态文件
-touch /var/lib/subsrv/tx_state.json
+# 初始化流量状态文件（仅在不存在时创建空文件，保留已有内容）
+if [ ! -f /var/lib/subsrv/tx_state.json ]; then
+    touch /var/lib/subsrv/tx_state.json
+fi
 chown subsrv:subsrv /var/lib/subsrv/tx_state.json
 chmod 640 /var/lib/subsrv/tx_state.json
 
@@ -758,10 +1072,68 @@ SRC_JSON="/etc/s-box/sing_box_client.json"
 DST_JSON="/var/lib/subsrv/client.json"
 if [ -f "$SRC_JSON" ]; then
     TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    JSON_SYNC_READY=1
     cp -f "$SRC_JSON" "$TMP_JSON"
-    chown subsrv:subsrv "$TMP_JSON"
-    chmod 640 "$TMP_JSON"
-    mv -f "$TMP_JSON" "$DST_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        # 此 jq 过滤逻辑与 setup.sh [4/8] 中的 _SB11_JQ_FILTER 保持一致
+        if jq '
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
+| del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
+    if ((.type // "") == "selector" or (.type // "") == "urltest") then
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
+    else .
+    end
+) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+' \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            rm -f "$TMP_JSON"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留现有副本"
+            JSON_SYNC_READY=0
+        fi
+    fi
+    if [ "$JSON_SYNC_READY" -eq 1 ]; then
+        chown subsrv:subsrv "$TMP_JSON"
+        chmod 640 "$TMP_JSON"
+        mv -f "$TMP_JSON" "$DST_JSON"
+    fi
 fi
 
 # 同步 Shadowrocket 配置 (TXT)
@@ -811,41 +1183,306 @@ set -euo pipefail
 IFACE="\${1:-$IFACE}"
 STATE="/var/lib/subsrv/tx_state.json"
 TZNAME="$TZ_NAME"
+RESET_MODE="$RESET_MODE"
+RESET_ANCHOR_DATE="$RESET_ANCHOR_DATE"
+RESET_DAY="$RESET_DAY"
+RESET_HOUR="$RESET_HOUR"
+RESET_MINUTE="$RESET_MINUTE"
 
-now_ym="\$(TZ=\$TZNAME date +%Y-%m)"
+calc_cycle_key() {
+    local now_ts y m d hh mm
+    now_ts="\$(TZ=\$TZNAME date +%s)"
+    y="\$(TZ=\$TZNAME date +%Y)"
+    m="\$(TZ=\$TZNAME date +%m)"
+
+    if [ "\$RESET_MODE" = "natural_month" ]; then
+        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" 1 0 0
+        return
+    fi
+
+    if [ "\$RESET_MODE" = "fixed_expire" ]; then
+        printf "fixed:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$RESET_HOUR))" "\$((10#\$RESET_MINUTE))"
+        return
+    fi
+
+    d="\$RESET_DAY"
+    hh="\$RESET_HOUR"
+    mm="\$RESET_MINUTE"
+
+    if [ -n "\$RESET_ANCHOR_DATE" ]; then
+        local anchor_ts
+        anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$hh:\$mm:00" +%s 2>/dev/null || echo 0)"
+        if [ "\$now_ts" -lt "\$anchor_ts" ]; then
+            printf "pre-anchor:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$hh))" "\$((10#\$mm))"
+            return
+        fi
+    fi
+
+    local this_last this_d this_cycle this_ts
+    this_last="\$(TZ=\$TZNAME date -d "\$((10#\$y))-\$((10#\$m))-01 +1 month -1 day" +%d)"
+    this_d="\$d"
+    if [ "\$this_d" -gt "\$this_last" ]; then
+        this_d="\$this_last"
+    fi
+    printf -v this_cycle "%04d-%02d-%02d %02d:%02d:00" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
+    this_ts="\$(TZ=\$TZNAME date -d "\$this_cycle" +%s)"
+
+    if [ "\$now_ts" -ge "\$this_ts" ]; then
+        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
+        return
+    fi
+
+    local prev_y prev_m prev_last prev_d
+    prev_y="\$((10#\$y))"
+    prev_m="\$((10#\$m - 1))"
+    if [ "\$prev_m" -eq 0 ]; then
+        prev_m=12
+        prev_y="\$((prev_y - 1))"
+    fi
+    prev_last="\$(TZ=\$TZNAME date -d "\$prev_y-\$prev_m-01 +1 month -1 day" +%d)"
+    prev_d="\$d"
+    if [ "\$prev_d" -gt "\$prev_last" ]; then
+        prev_d="\$prev_last"
+    fi
+    printf "%04d-%02d-%02dT%02d:%02d" "\$prev_y" "\$prev_m" "\$((10#\$prev_d))" "\$((10#\$hh))" "\$((10#\$mm))"
+}
+
+cycle_key="\$(calc_cycle_key)"
+rx="\$(cat /sys/class/net/"\$IFACE"/statistics/rx_bytes 2>/dev/null || echo 0)"
 tx="\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)"
 
-tmp="\$(mktemp)"
-printf '{"ym":"%s","base_tx":%s}\n' "\$now_ym" "\$tx" > "\$tmp"
-install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
-rm -f "\$tmp"
-echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE ym=\$now_ym base_tx=\$tx wrote=\$STATE"
-SH
-chmod +x /usr/local/bin/reset_tx_baseline.sh
-
-# 仅在首次部署或月份变更时初始化基线，避免重新部署时清零已累计流量
-STATE_FILE="/var/lib/subsrv/tx_state.json"
-CURRENT_YM=$(TZ=$TZ_NAME date +%Y-%m)
-NEED_RESET=true
-
-if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-    SAVED_YM=$(python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        print(json.load(f).get('ym', ''))
-except:
-    print('')
-" "$STATE_FILE")
-    if [ "$SAVED_YM" = "$CURRENT_YM" ]; then
-        NEED_RESET=false
-        echo "=> 检测到本月已有流量基线 (ym=$SAVED_YM)，跳过重置以保留已累计流量"
-    else
-        echo "=> 月份已变更 ($SAVED_YM -> $CURRENT_YM)，重置流量基线"
+if [[ "\$cycle_key" == fixed:* ]]; then
+    now_ts="\$(TZ=\$TZNAME date +%s)"
+    anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$RESET_HOUR:\$RESET_MINUTE:00" +%s 2>/dev/null || echo 0)"
+    if [ "\$now_ts" -ge "\$anchor_ts" ]; then
+        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Returning empty config (sub_server.py handles client-side)"
+        exit 0
     fi
 fi
 
-if [ "$NEED_RESET" = true ]; then
+if [[ "\$cycle_key" == pre-anchor:* ]]; then
+    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE next_anchor=\${cycle_key#pre-anchor:} not reached, skip"
+    exit 0
+fi
+
+saved_cycle_key=""
+if [ -f "\$STATE" ] && [ -s "\$STATE" ]; then
+    saved_cycle_key="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        st = json.load(f)
+    ck = st.get('cycle_key')
+    if ck:
+        print(ck)
+    else:
+        ym = st.get('ym', '')
+        if ym:
+            print(f"{ym}-01T00:00")
+except Exception:
+    pass
+PYEOF
+    )"
+fi
+
+if [ "\$saved_cycle_key" = "\$cycle_key" ]; then
+    # cycle_key 匹配，检查计数器是否回绕（重启后 rx/tx_bytes 归零）
+    saved_bases="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1], encoding='utf-8') as f:
+        st = json.load(f)
+    brx = st.get('base_rx')
+    btx = st.get('base_tx')
+    if brx is not None and btx is not None:
+        print(f"{int(brx)}:{int(btx)}")
+except Exception:
+    pass
+PYEOF
+    )"
+    if [ -n "\$saved_bases" ]; then
+        saved_base_rx="\${saved_bases%%:*}"
+        saved_base_tx="\${saved_bases##*:}"
+    else
+        saved_base_rx=""
+        saved_base_tx=""
+    fi
+    # 迁移旧格式 {ym, base_tx} → {cycle_key, base_rx, base_tx}
+    if [ -z "\$saved_base_rx" ] && [ -n "\$saved_cycle_key" ]; then
+        saved_old_tx="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        st = json.load(f)
+    btx = st.get('base_tx')
+    if btx is not None:
+        print(int(btx))
+except Exception:
+    pass
+PYEOF
+        )"
+        if [ -n "\$saved_old_tx" ]; then
+            tmp="\$(mktemp)"
+            printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$saved_old_tx" > "\$tmp"
+            install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+            rm -f "\$tmp"
+            echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE migrated old format: cycle_key=\$cycle_key base_rx=\$rx base_tx=\$saved_old_tx"
+            exit 0
+        fi
+    fi
+    if [ -n "\$saved_base_rx" ] && [ -n "\$saved_base_tx" ] && { [ "\$rx" -lt "\$saved_base_rx" ] || [ "\$tx" -lt "\$saved_base_tx" ]; }; then
+        # 计数器回绕：cur_rx < base_rx 或 cur_tx < base_tx，重置基线
+        tmp="\$(mktemp)"
+        printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
+        install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+        rm -f "\$tmp"
+        echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE (reason: counter wrapped, old_base_rx=\$saved_base_rx old_base_tx=\$saved_base_tx)"
+        exit 0
+    fi
+    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key already up-to-date, skip"
+    exit 0
+fi
+
+tmp="\$(mktemp)"
+printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
+install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+rm -f "\$tmp"
+echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE"
+SH
+chmod +x /usr/local/bin/reset_tx_baseline.sh
+
+# 流量基线初始化：根据用户设置的"已使用流量"写入 tx_state.json
+STATE_FILE="/var/lib/subsrv/tx_state.json"
+NEED_RESET=true
+
+if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
+    HAS_BASELINE=$(python3 -c "
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        st = json.load(f)
+    print('yes' if ('base_rx' in st and 'base_tx' in st and ('cycle_key' in st or 'ym' in st)) else 'no')
+except:
+    print('no')
+" "$STATE_FILE")
+    if [ "$HAS_BASELINE" = "yes" ]; then
+        NEED_RESET=false
+        echo "=> 检测到已有流量基线，跳过初始化以保留已累计流量"
+    else
+        echo "=> 检测到状态文件损坏或缺少基线信息，将重新初始化"
+    fi
+fi
+
+# 如果用户指定了已使用流量 (USED_TRAFFIC_GIB > 0)，
+# 则无论是否首次部署，均根据该值重新计算基线并写入状态文件
+_USED_GIB="${USED_TRAFFIC_GIB:-0}"
+if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "$_USED_GIB" 2>/dev/null; then
+    echo "=> 根据已使用流量 ${_USED_GIB} GiB 重新计算流量基线..."
+    python3 - "$STATE_FILE" "$_USED_GIB" "$IFACE" "$RESET_MODE" "${RESET_ANCHOR_DATE:-}" "$RESET_DAY" "$RESET_HOUR" "$RESET_MINUTE" "$TZ_NAME" <<'PYEOF'
+import sys, os, json
+from datetime import datetime, timezone
+from calendar import monthrange
+
+state_path        = sys.argv[1]
+used_gib          = float(sys.argv[2])
+iface             = sys.argv[3]
+reset_mode        = sys.argv[4]
+reset_anchor_date = sys.argv[5]
+reset_day         = int(sys.argv[6])
+reset_hour        = int(sys.argv[7])
+reset_minute      = int(sys.argv[8])
+tz_name           = sys.argv[9]
+used_bytes        = int(used_gib * 1024 ** 3)
+
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name)
+except Exception:
+    tz = timezone.utc
+
+def shift_month(year, month, delta):
+    total = year * 12 + (month - 1) + delta
+    y = total // 12
+    m = total % 12 + 1
+    return y, m
+
+def cycle_start_for(year, month):
+    if reset_mode == "natural_month":
+        d, hh, mm = 1, 0, 0
+    else:
+        last = monthrange(year, month)[1]
+        d  = min(max(reset_day, 1), last)
+        hh = min(max(reset_hour, 0), 23)
+        mm = min(max(reset_minute, 0), 59)
+    return datetime(year, month, d, hh, mm, 0, tzinfo=tz)
+
+now = datetime.now(tz)
+if reset_mode == "fixed_expire":
+    cycle_key = f"fixed:{reset_anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
+else:
+    this_cycle = cycle_start_for(now.year, now.month)
+    if now >= this_cycle:
+        cycle_start = this_cycle
+    else:
+        py, pm = shift_month(now.year, now.month, -1)
+        cycle_start = cycle_start_for(py, pm)
+    cycle_key = cycle_start.strftime("%Y-%m-%dT%H:%M")
+
+# 读取当前网卡 rx/tx_bytes
+cur_rx = 0
+cur_tx = 0
+try:
+    with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
+        cur_rx = int(f.read().strip())
+except Exception as e:
+    print(f"[baseline] WARN: cannot read rx_bytes for {iface}: {e}", flush=True)
+
+try:
+    with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
+        cur_tx = int(f.read().strip())
+except Exception as e:
+    print(f"[baseline] WARN: cannot read tx_bytes for {iface}: {e}", flush=True)
+
+cur_total = max(cur_rx, 0) + max(cur_tx, 0)
+if cur_total > 0:
+    used_rx = (used_bytes * max(cur_rx, 0)) // cur_total
+else:
+    used_rx = used_bytes // 2
+used_tx = used_bytes - used_rx
+
+# base_rx/base_tx 允许为负值，用于表达用户手动设置的已使用流量偏移
+new_base_rx = cur_rx - used_rx
+new_base_tx = cur_tx - used_tx
+
+tmp = state_path + ".tmp"
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump({"cycle_key": cycle_key, "base_rx": new_base_rx, "base_tx": new_base_tx}, f, separators=(",", ":"))
+import subprocess
+ret = subprocess.run(
+    ["install", "-o", "subsrv", "-g", "subsrv", "-m", "640", tmp, state_path],
+    capture_output=True
+)
+if ret.returncode != 0:
+    # install 失败时退回到直接移动（root 写入），并修正属主和权限
+    import shutil
+    shutil.move(tmp, state_path)
+    try:
+        import pwd, grp
+        uid = pwd.getpwnam("subsrv").pw_uid
+        gid = grp.getgrnam("subsrv").gr_gid
+        os.chown(state_path, uid, gid)
+    except Exception:
+        pass
+    os.chmod(state_path, 0o640)
+    print(f"[baseline] WARN: install failed ({ret.stderr.decode().strip()}), wrote as root fallback", flush=True)
+else:
+    try:
+        os.unlink(tmp)
+    except Exception:
+        pass
+print(f"[baseline] set: iface={iface} cur_rx={cur_rx} cur_tx={cur_tx} used_bytes={used_bytes} used_rx={used_rx} used_tx={used_tx} new_base_rx={new_base_rx} new_base_tx={new_base_tx} cycle_key={cycle_key}", flush=True)
+PYEOF
+elif [ "$NEED_RESET" = true ]; then
     /usr/local/bin/reset_tx_baseline.sh "$IFACE"
 fi
 
@@ -865,11 +1502,12 @@ Environment=TZ=$TZ_NAME
 ExecStart=/usr/local/bin/reset_tx_baseline.sh $IFACE
 UNIT
 
-cat > /etc/systemd/system/reset-tx-baseline.timer <<'UNIT'
+cat > /etc/systemd/system/reset-tx-baseline.timer <<UNIT
 [Unit]
-Description=Run reset-tx-baseline at 00:00 on day 1 each month
+Description=Run reset-tx-baseline every 10 minutes (guarded by cycle key)
 [Timer]
-OnCalendar=*-*-01 00:00:00
+OnBootSec=2min
+OnUnitActiveSec=10min
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -882,6 +1520,7 @@ import json, os
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from urllib.parse import urlparse
 from datetime import datetime, timezone
+from calendar import monthrange
 
 try:
     from zoneinfo import ZoneInfo
@@ -902,10 +1541,15 @@ TXT_PATH   = os.environ.get("SUB_TXT_PATH",   "/var/lib/subsrv/client.txt")
 LIMIT_GIB  = float(os.environ.get("SUB_LIMIT_GIB", "0"))
 TZ_NAME    = os.environ.get("SUB_TZ",          "America/Los_Angeles")
 STATE_PATH = os.environ.get("SUB_STATE_PATH",  "/var/lib/subsrv/tx_state.json")
+RESET_MODE = os.environ.get("SUB_RESET_MODE", "natural_month")
+RESET_ANCHOR_DATE = os.environ.get("SUB_RESET_ANCHOR_DATE", "")
+RESET_DAY = int(os.environ.get("SUB_RESET_DAY", "1"))
+RESET_HOUR = int(os.environ.get("SUB_RESET_HOUR", "0"))
+RESET_MINUTE = int(os.environ.get("SUB_RESET_MINUTE", "0"))
 
-# 0 表示无限流量，用 1 TiB 作为显示值 (客户端会显示几乎用不完的额度)
+# 0 表示无限流量，用 999 TiB 作为显示值 (客户端会显示几乎用不完的额度)
 if LIMIT_GIB <= 0:
-    TOTAL_BYTES = int(1024 * 1024 * 1024 * 1024)  # 1 TiB
+    TOTAL_BYTES = int(999 * 1024 * 1024 * 1024 * 1024)  # 999 TiB
 else:
     TOTAL_BYTES = int(LIMIT_GIB * 1024 * 1024 * 1024)
 
@@ -921,25 +1565,87 @@ def pt_now():
         return datetime.now(ZoneInfo(TZ_NAME))
     return datetime.now(timezone.utc)
 
-def current_ym_pt():
-    now = pt_now()
-    return f"{now.year:04d}-{now.month:02d}"
+def shift_month(year, month, delta):
+    total = year * 12 + (month - 1) + delta
+    y = total // 12
+    m = total % 12 + 1
+    return y, m
+
+def cycle_start_for(year, month):
+    if RESET_MODE == "natural_month":
+        d = 1
+        hh = 0
+        mm = 0
+    else:
+        last = monthrange(year, month)[1]
+        d = min(max(RESET_DAY, 1), last)
+        hh = min(max(RESET_HOUR, 0), 23)
+        mm = min(max(RESET_MINUTE, 0), 59)
+
+    if ZoneInfo:
+        return datetime(year, month, d, hh, mm, 0, tzinfo=ZoneInfo(TZ_NAME))
+    return datetime(year, month, d, hh, mm, 0, tzinfo=timezone.utc)
+
+def anchor_dt():
+    if RESET_MODE != "anchored_monthly" or not RESET_ANCHOR_DATE:
+        return None
+    try:
+        y, m, d = map(int, RESET_ANCHOR_DATE.split("-"))
+    except Exception:
+        return None
+
+    hh = min(max(RESET_HOUR, 0), 23)
+    mm = min(max(RESET_MINUTE, 0), 59)
+    if ZoneInfo:
+        return datetime(y, m, d, hh, mm, 0, tzinfo=ZoneInfo(TZ_NAME))
+    return datetime(y, m, d, hh, mm, 0, tzinfo=timezone.utc)
+
+def current_cycle_start(now=None):
+    now = now or pt_now()
+    if RESET_MODE == "fixed_expire":
+        adt = anchor_dt()
+        if adt: return adt
+        return datetime(2000, 1, 1, tzinfo=timezone.utc)
+    this_cycle = cycle_start_for(now.year, now.month)
+    if now >= this_cycle:
+        return this_cycle
+    py, pm = shift_month(now.year, now.month, -1)
+    return cycle_start_for(py, pm)
+
+def cycle_key_from_dt(dt):
+    if RESET_MODE == "fixed_expire":
+        return f"fixed:{dt.strftime('%Y-%m-%dT%H:%M')}"
+    return dt.strftime("%Y-%m-%dT%H:%M")
 
 def next_reset_epoch_pt():
     now = pt_now()
-    y, m = now.year, now.month
-    if m == 12:
-        y2, m2 = y + 1, 1
+    adt = anchor_dt()
+    if RESET_MODE == "fixed_expire":
+        if adt:
+            return int(adt.timestamp())
+        return 0
+    if adt and now < adt:
+        return int(adt.timestamp())
+
+    this_cycle = cycle_start_for(now.year, now.month)
+    if now < this_cycle:
+        next_cycle = this_cycle
     else:
-        y2, m2 = y, m + 1
-    if ZoneInfo:
-        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=ZoneInfo(TZ_NAME))
-    else:
-        dt = datetime(y2, m2, 1, 0, 0, 0, tzinfo=timezone.utc)
-    return int(dt.timestamp())
+        ny, nm = shift_month(now.year, now.month, 1)
+        next_cycle = cycle_start_for(ny, nm)
+    return int(next_cycle.timestamp())
 
 def read_tx_bytes_sysfs():
     p = f"/sys/class/net/{IFACE}/statistics/tx_bytes"
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception as e:
+        log(f"WARN: cannot read {p}: {e}")
+        return 0
+
+def read_rx_bytes_sysfs():
+    p = f"/sys/class/net/{IFACE}/statistics/rx_bytes"
     try:
         with open(p, "r", encoding="utf-8") as f:
             return int(f.read().strip())
@@ -954,31 +1660,40 @@ def load_state():
     except Exception:
         return {}
 
-def save_state(ym, base_tx):
-    tmp = STATE_PATH + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"ym": ym, "base_tx": int(base_tx)}, f, separators=(",", ":"))
-    os.replace(tmp, STATE_PATH)
+def get_state_cycle_key(st):
+    ck = st.get("cycle_key")
+    if isinstance(ck, str) and ck:
+        return ck
+    ym = st.get("ym")
+    if isinstance(ym, str) and len(ym) == 7:
+        return f"{ym}-01T00:00"
+    return None
 
-def month_used_tx_bytes_realtime():
-    ym = current_ym_pt()
-    cur = read_tx_bytes_sysfs()
+def month_used_total_bytes_realtime():
+    """只读计算本周期已用流量，不写入状态文件。
+    状态文件的创建/更新由 reset_tx_baseline.sh (定时任务) 和部署脚本独占。
+    """
+    cur_rx = read_rx_bytes_sysfs()
+    cur_tx = read_tx_bytes_sysfs()
     st = load_state()
-    st_ym = st.get("ym")
-    base = st.get("base_tx")
+    st_cycle_key = get_state_cycle_key(st)
+    base_rx = st.get("base_rx")
+    base_tx = st.get("base_tx")
 
-    if st_ym != ym or base is None:
-        save_state(ym, cur)
-        log(f"state reset: ym={ym} base_tx={cur} (reason: missing or month changed)")
-        return 0, cur, cur
+    # 状态文件缺失或损坏：等待 reset_tx_baseline.sh 初始化
+    if st_cycle_key is None or base_rx is None or base_tx is None:
+        log(f"state not ready: st_cycle_key={st_cycle_key} base_rx={base_rx} base_tx={base_tx} (waiting for reset_tx_baseline.sh)")
+        return 0, 0, 0, 0, 0, cur_rx, cur_tx
 
-    used = cur - int(base)
-    if used < 0:
-        save_state(ym, cur)
-        log(f"state reset: ym={ym} base_tx={cur} (reason: counter wrapped)")
-        return 0, cur, cur
+    used_rx = cur_rx - int(base_rx)
+    used_tx = cur_tx - int(base_tx)
 
-    return int(used), int(base), int(cur)
+    # 计数器回绕（重启后 cur_rx/cur_tx < base_rx/base_tx）：返回 0，等待定时任务修正
+    if used_rx < 0 or used_tx < 0:
+        log(f"counter wrapped: cur_rx={cur_rx} cur_tx={cur_tx} base_rx={base_rx} base_tx={base_tx} used_rx={used_rx} used_tx={used_tx} (waiting for reset_tx_baseline.sh)")
+        return 0, 0, 0, int(base_rx), int(base_tx), cur_rx, cur_tx
+
+    return int(used_rx + used_tx), int(used_rx), int(used_tx), int(base_rx), int(base_tx), int(cur_rx), int(cur_tx)
 
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -1000,18 +1715,35 @@ class Handler(BaseHTTPRequestHandler):
         file_path, content_type = route
 
         try:
-            used_tx, base_tx, cur_tx = month_used_tx_bytes_realtime()
+            used_total, used_rx, used_tx, base_rx, base_tx, cur_rx, cur_tx = month_used_total_bytes_realtime()
         except Exception as e:
-            log(f"ERROR reading tx_bytes: {e}")
-            used_tx, base_tx, cur_tx = 0, 0, 0
+            log(f"ERROR reading traffic bytes: {e}")
+            used_total, used_rx, used_tx, base_rx, base_tx, cur_rx, cur_tx = 0, 0, 0, 0, 0, 0, 0
+
+        if used_total > TOTAL_BYTES and used_total > 0:
+            used_rx = (used_rx * TOTAL_BYTES) // used_total
+            used_tx = TOTAL_BYTES - used_rx
+            used_total = TOTAL_BYTES
 
         expire = next_reset_epoch_pt()
-        remain = max(TOTAL_BYTES - used_tx, 0)
+        remain = max(TOTAL_BYTES - used_total, 0)
+
+        is_expired = False
+        if RESET_MODE == "fixed_expire" and expire > 0:
+            if pt_now().timestamp() >= expire:
+                is_expired = True
 
         try:
-            with open(file_path, "rb") as f:
-                body = f.read()
-            log(f"read ok: {file_path} bytes={len(body)}")
+            if is_expired:
+                if content_type.startswith("application/json"):
+                    body = b'{"log":{"level":"warn"},"dns":{},"inbounds":[],"outbounds":[]}\n'
+                else:
+                    body = b"# Subscription expired. Your plan has ended.\n"
+                log("Subscription expired, returning empty config")
+            else:
+                with open(file_path, "rb") as f:
+                    body = f.read()
+                log(f"read ok: {file_path} bytes={len(body)}")
         except Exception as e:
             log(f"ERROR read file: {e}")
             if content_type.startswith("application/json"):
@@ -1019,8 +1751,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 body = b"# subscription source missing\n"
 
-        header_val = f"upload=0; download={used_tx}; total={TOTAL_BYTES}; expire={expire}"
-        log(f"userinfo: used_tx={used_tx} remain={remain} ym={current_ym_pt()} base_tx={base_tx} cur_tx={cur_tx}")
+        header_val = f"upload={used_tx}; download={used_rx}; total={TOTAL_BYTES}; expire={expire}"
+        log(f"userinfo: used_total={used_total} used_rx={used_rx} used_tx={used_tx} remain={remain} cycle={cycle_key_from_dt(current_cycle_start())} base_rx={base_rx} base_tx={base_tx} cur_rx={cur_rx} cur_tx={cur_tx}")
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -1070,6 +1802,11 @@ Environment=SUB_TXT_PATH=/var/lib/subsrv/client.txt
 Environment=SUB_LIMIT_GIB=$TRAFFIC_LIMIT_GIB
 Environment=SUB_TZ=$TZ_NAME
 Environment=SUB_STATE_PATH=/var/lib/subsrv/tx_state.json
+Environment=SUB_RESET_MODE=$RESET_MODE
+Environment=SUB_RESET_ANCHOR_DATE=$RESET_ANCHOR_DATE
+Environment=SUB_RESET_DAY=$RESET_DAY
+Environment=SUB_RESET_HOUR=$RESET_HOUR
+Environment=SUB_RESET_MINUTE=$RESET_MINUTE
 Environment=SUB_LISTEN=127.0.0.1
 Environment=SUB_PORT=$BACKEND_PORT
 ExecStart=/usr/local/bin/sub_server.py
@@ -1082,6 +1819,8 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now refresh-sub-copy.timer
+# sub_server.py 已改为只读模式，不再写入 tx_state.json
+# 即使 Persistent=true 导致 reset_tx_baseline.sh 立即触发也无害（cycle_key 匹配会跳过）
 systemctl enable --now reset-tx-baseline.timer
 # 使用 restart 而非 start，确保覆盖部署时环境变量生效
 systemctl enable sub-server

@@ -2,22 +2,29 @@
 set -euo pipefail
 
 # ==============================================================================
-# VPS 流量统计与订阅管理 自动配置脚本
+# VPS 流量统计与订阅管理 自动配置脚本 (统一安装器)
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/setup.sh)
 #
 # 功能:
-#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
-#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON)
-#   - 同时支持 Clash Meta (YAML) 和 sing-box (JSON) 订阅格式
+#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量 (RX + TX 双向)
+#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON + TXT)
+#   - 同时支持 Clash Meta (YAML)、sing-box (JSON)、Shadowrocket (TXT) 订阅格式
 #   - Caddy 反向代理提供 HTTPS + Basic Auth 鉴权
 #   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
-#   - 每月自动重置流量基线
+#   - 多种流量重置模式: 自然月 / 指定日期循环 / 固定到期日
 #   - 每 5 分钟同步上游订阅配置
+#   - Caddy 证书自动同步到 sing-box
 # ==============================================================================
 
 # 配置文件路径
 CONFIG_FILE="/etc/sub-srv/config.conf"
+
+# 是否自动把 Caddy 证书同步给 sing-box-yg
+SYNC_SINGBOX_CERT="${SYNC_SINGBOX_CERT:-true}"
+SINGBOX_CERT_DIR="${SINGBOX_CERT_DIR:-/root/ygkkkca}"
+SINGBOX_SERVICE="${SINGBOX_SERVICE:-sing-box}"
+SINGBOX_CERT_SYNC_READY=false
 
 # 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
 if [ ! -t 0 ]; then
@@ -221,6 +228,174 @@ PYEOF
     return 1
 }
 
+# 配置 Caddy -> sing-box-yg 证书自动同步
+install_singbox_cert_sync() {
+    if [ "$SYNC_SINGBOX_CERT" != "true" ]; then
+        echo "=> 已跳过 Caddy -> sing-box 证书同步配置"
+        return 0
+    fi
+
+    if ! systemctl cat "${SINGBOX_SERVICE}.service" >/dev/null 2>&1; then
+        echo "=> 未检测到 ${SINGBOX_SERVICE}.service，跳过 sing-box 证书同步"
+        return 0
+    fi
+
+    if [ ! -d "$SINGBOX_CERT_DIR" ]; then
+        echo "=> 未检测到 sing-box-yg 证书目录 $SINGBOX_CERT_DIR，跳过证书同步"
+        return 0
+    fi
+
+    echo "=> 配置 Caddy 证书自动同步到 sing-box..."
+
+    install -d -m 755 /etc/default
+    {
+        printf 'DOMAIN=%q\n' "$DOMAIN"
+        printf 'SINGBOX_CERT_DIR=%q\n' "$SINGBOX_CERT_DIR"
+        printf 'SINGBOX_SERVICE=%q\n' "$SINGBOX_SERVICE"
+    } > /etc/default/sync-caddy-cert-to-singbox
+    chmod 600 /etc/default/sync-caddy-cert-to-singbox
+
+    cat > /usr/local/bin/sync-caddy-cert-to-singbox.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+
+CONFIG_FILE="/etc/default/sync-caddy-cert-to-singbox"
+CADDY_CERT_ROOT="/var/lib/caddy/.local/share/caddy/certificates"
+
+log() {
+    echo "[sync-caddy-cert-to-singbox] $(date -Is) $*"
+}
+
+if [ ! -r "$CONFIG_FILE" ]; then
+    log "WARN: config file not found: $CONFIG_FILE"
+    exit 0
+fi
+
+# shellcheck disable=SC1090
+source "$CONFIG_FILE"
+
+if [ -z "${DOMAIN:-}" ]; then
+    log "ERROR: DOMAIN is empty"
+    exit 1
+fi
+
+if [ ! -d "$CADDY_CERT_ROOT" ]; then
+    log "WARN: Caddy certificate root not found: $CADDY_CERT_ROOT"
+    exit 0
+fi
+
+CADDY_CERT="$(
+    find "$CADDY_CERT_ROOT" -type f -name "${DOMAIN}.crt" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -nr \
+        | sed -n '1s/^[^ ]* //p'
+)"
+
+if [ -z "$CADDY_CERT" ] || [ ! -f "$CADDY_CERT" ]; then
+    log "WARN: Caddy certificate not found for domain: $DOMAIN"
+    exit 0
+fi
+
+CADDY_KEY="${CADDY_CERT%.crt}.key"
+if [ ! -f "$CADDY_KEY" ]; then
+    log "WARN: Caddy private key not found: $CADDY_KEY"
+    exit 0
+fi
+
+if ! openssl x509 -checkend 0 -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
+    log "WARN: Caddy certificate is expired, skip sync"
+    exit 0
+fi
+
+if ! openssl x509 -checkhost "$DOMAIN" -noout -in "$CADDY_CERT" >/dev/null 2>&1; then
+    log "WARN: Caddy certificate does not match domain: $DOMAIN"
+    exit 0
+fi
+
+if ! CERT_PUBKEY="$(
+    openssl x509 -pubkey -noout -in "$CADDY_CERT" \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+)"; then
+    log "WARN: failed to read public key from Caddy certificate"
+    exit 0
+fi
+
+if ! KEY_PUBKEY="$(
+    openssl pkey -pubout -in "$CADDY_KEY" 2>/dev/null \
+        | openssl pkey -pubin -outform DER 2>/dev/null \
+        | sha256sum \
+        | awk '{print $1}'
+)"; then
+    log "WARN: failed to read Caddy private key"
+    exit 0
+fi
+
+if [ -z "$CERT_PUBKEY" ] || [ "$CERT_PUBKEY" != "$KEY_PUBKEY" ]; then
+    log "WARN: Caddy certificate and private key do not match"
+    exit 0
+fi
+
+install -d -m 700 "$SINGBOX_CERT_DIR"
+SING_CERT="${SINGBOX_CERT_DIR}/cert.crt"
+SING_KEY="${SINGBOX_CERT_DIR}/private.key"
+
+if [ -f "$SING_CERT" ] && [ -f "$SING_KEY" ] \
+    && cmp -s "$CADDY_CERT" "$SING_CERT" \
+    && cmp -s "$CADDY_KEY" "$SING_KEY"; then
+    log "certificate unchanged, no restart needed"
+    exit 0
+fi
+
+TMP_CERT="$(mktemp "${SINGBOX_CERT_DIR}/.cert.crt.XXXXXX")"
+TMP_KEY="$(mktemp "${SINGBOX_CERT_DIR}/.private.key.XXXXXX")"
+cleanup() {
+    rm -f "$TMP_CERT" "$TMP_KEY"
+}
+trap cleanup EXIT
+
+install -m 644 "$CADDY_CERT" "$TMP_CERT"
+install -m 600 "$CADDY_KEY" "$TMP_KEY"
+mv -f "$TMP_KEY" "$SING_KEY"
+mv -f "$TMP_CERT" "$SING_CERT"
+
+log "certificate changed, restarting ${SINGBOX_SERVICE}"
+systemctl restart "${SINGBOX_SERVICE}.service"
+openssl x509 -in "$SING_CERT" -noout -subject -issuer -dates
+SH
+    chmod 755 /usr/local/bin/sync-caddy-cert-to-singbox.sh
+
+    cat > /etc/systemd/system/sync-caddy-cert-to-singbox.service <<'UNIT'
+[Unit]
+Description=Sync Caddy certificate to sing-box
+After=caddy.service
+Wants=caddy.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sync-caddy-cert-to-singbox.sh
+UNIT
+
+    cat > /etc/systemd/system/sync-caddy-cert-to-singbox.timer <<'UNIT'
+[Unit]
+Description=Run Caddy certificate sync for sing-box daily
+
+[Timer]
+OnBootSec=2min
+OnCalendar=*-*-* 03:30:00
+RandomizedDelaySec=20min
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
+
+    systemctl daemon-reload
+    systemctl enable --now sync-caddy-cert-to-singbox.timer
+    SINGBOX_CERT_SYNC_READY=true
+    echo "=> 已创建证书同步定时任务: sync-caddy-cert-to-singbox.timer"
+}
+
 echo "=================================================="
 echo "      VPS 流量统计与订阅管理 - 自动配置向导       "
 echo "=================================================="
@@ -378,19 +553,28 @@ iface = sys.argv[2] if len(sys.argv) > 2 else ""
 try:
     with open(state_path, encoding="utf-8") as f:
         st = json.load(f)
+    base_rx = st.get("base_rx")
     base_tx = st.get("base_tx")
-    if base_tx is None:
+    if base_rx is None or base_tx is None:
         sys.exit(0)
-    # 尝试读取当前 tx_bytes
+    # 尝试读取当前 rx/tx bytes
+    cur_rx = None
     cur_tx = None
     if iface:
+        try:
+            with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
+                cur_rx = int(f.read().strip())
+        except Exception:
+            pass
         try:
             with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
                 cur_tx = int(f.read().strip())
         except Exception:
             pass
-    if cur_tx is not None:
-        used = max(0, cur_tx - int(base_tx))
+    if cur_rx is not None and cur_tx is not None:
+        used_rx = max(0, cur_rx - int(base_rx))
+        used_tx = max(0, cur_tx - int(base_tx))
+        used = used_rx + used_tx
         used_gib = used / (1024 ** 3)
         print(f"{used_gib:.3f}")
     else:
@@ -784,7 +968,62 @@ chmod 640 /var/lib/subsrv/client.yaml
 
 # 初始化订阅配置副本 — sing-box (JSON)
 if [ -f /etc/s-box/sing_box_client.json ]; then
-    cp -f /etc/s-box/sing_box_client.json /var/lib/subsrv/client.json
+    TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    cp -f /etc/s-box/sing_box_client.json "$TMP_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        read -r -d '' _SB11_JQ_FILTER <<'JQEOF' || true
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
+| del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
+    if ((.type // "") == "selector" or (.type // "") == "urltest") then
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
+    else .
+    end
+) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+JQEOF
+        if jq "$_SB11_JQ_FILTER" \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留复制后的原始副本"
+        fi
+    fi
+    mv -f "$TMP_JSON" /var/lib/subsrv/client.json
 else
     echo '{"log":{"level":"warn"},"dns":{},"inbounds":[],"outbounds":[]}' > /var/lib/subsrv/client.json
     echo "=> 警告: /etc/s-box/sing_box_client.json 不存在，已创建默认空配置"
@@ -833,10 +1072,68 @@ SRC_JSON="/etc/s-box/sing_box_client.json"
 DST_JSON="/var/lib/subsrv/client.json"
 if [ -f "$SRC_JSON" ]; then
     TMP_JSON="/var/lib/subsrv/client.json.tmp"
+    JSON_SYNC_READY=1
     cp -f "$SRC_JSON" "$TMP_JSON"
-    chown subsrv:subsrv "$TMP_JSON"
-    chmod 640 "$TMP_JSON"
-    mv -f "$TMP_JSON" "$DST_JSON"
+    if command -v jq >/dev/null 2>&1; then
+        TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        # 此 jq 过滤逻辑与 setup.sh [4/8] 中的 _SB11_JQ_FILTER 保持一致
+        if jq '
+def keep_legacy_dns_server:
+    {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
+    | with_entries(select(.value != null));
+def keep_legacy_dial_fields:
+    del(.domain_resolver);
+def in_drop($drop; $value):
+    ($value != null) and any($drop[]?; . == $value);
+def sb11_dns_server:
+    (if (.type // "") == "" then .
+     elif .type == "local" then . + {address: "local"}
+     elif .type == "tcp" then . + {address: ("tcp://" + .server + (if (.server_port // 53) == 53 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "udp" then . + {address: (if (.server_port // 53) == 53 then .server else "udp://" + .server + ":" + (.server_port | tostring) end)}
+     elif .type == "tls" then . + {address: ("tls://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "https" then . + {address: ("https://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "quic" then . + {address: ("quic://" + .server + (if (.server_port // 853) == 853 then "" else ":" + (.server_port | tostring) end))}
+     elif .type == "h3" then . + {address: ("h3://" + .server + (if (.server_port // 443) == 443 then "" else ":" + (.server_port | tostring) end) + (.path // "/dns-query"))}
+     elif .type == "dhcp" then . + {address: (if (.interface // "") == "" then "dhcp://auto" else "dhcp://" + .interface end)}
+     elif .type == "fakeip" then . + {address: "fakeip"}
+     else .
+     end)
+    | if (.domain_resolver // null) != null then . + {address_resolver: .domain_resolver} else . end
+    | if (.domain_strategy // null) != null then . + {address_strategy: .domain_strategy} else . end
+    | keep_legacy_dns_server;
+([.dns.servers[]? | select((.type // "") == "fakeip") | {enabled: true, inet4_range, inet6_range} | with_entries(select(.value != null))] | .[0]) as $fakeip
+| ([.outbounds[]? | select(.type == "anytls") | .tag] | map(select(. != null))) as $drop
+| del(.dns.independent_cache, .dns.store_rdrc)
+| del(.route.default_domain_resolver)
+| if (.dns.rules | type) == "array" then .dns.rules |= map(del(.independent_cache)) else . end
+| if (.dns.servers | type) == "array" then .dns.servers |= map(sb11_dns_server) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(select(.type != "anytls")) | .outbounds |= map(
+    if ((.type // "") == "selector" or (.type // "") == "urltest") then
+        .outbounds |= map(select(in_drop($drop; .) | not))
+        | if in_drop($drop; (.default // null)) then del(.default) else . end
+    else .
+    end
+) else . end
+| if (.outbounds | type) == "array" then .outbounds |= map(keep_legacy_dial_fields) else . end
+| if (.endpoints | type) == "array" then .endpoints |= map(keep_legacy_dial_fields) else . end
+| if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
+| if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
+| if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
+' \
+            "$TMP_JSON" > "$TMP_JSON_FIXED"; then
+            mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
+        else
+            rm -f "$TMP_JSON_FIXED"
+            rm -f "$TMP_JSON"
+            echo "=> 警告: sing-box 配置兼容性清洗失败，保留现有副本"
+            JSON_SYNC_READY=0
+        fi
+    fi
+    if [ "$JSON_SYNC_READY" -eq 1 ]; then
+        chown subsrv:subsrv "$TMP_JSON"
+        chmod 640 "$TMP_JSON"
+        mv -f "$TMP_JSON" "$DST_JSON"
+    fi
 fi
 
 # 同步 Shadowrocket 配置 (TXT)
@@ -951,14 +1248,14 @@ calc_cycle_key() {
 }
 
 cycle_key="\$(calc_cycle_key)"
+rx="\$(cat /sys/class/net/"\$IFACE"/statistics/rx_bytes 2>/dev/null || echo 0)"
 tx="\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)"
 
 if [[ "\$cycle_key" == fixed:* ]]; then
     now_ts="\$(TZ=\$TZNAME date +%s)"
     anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$RESET_HOUR:\$RESET_MINUTE:00" +%s 2>/dev/null || echo 0)"
     if [ "\$now_ts" -ge "\$anchor_ts" ]; then
-        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Stopping proxy services..."
-        systemctl stop sing-box clash-meta xray v2ray caddy sub-server 2>/dev/null || true
+        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Returning empty config (sub_server.py handles client-side)"
         exit 0
     fi
 fi
@@ -989,26 +1286,57 @@ PYEOF
 fi
 
 if [ "\$saved_cycle_key" = "\$cycle_key" ]; then
-    # cycle_key 匹配，检查计数器是否回绕（重启后 tx_bytes 归零）
-    saved_base="\$(python3 - "\$STATE" <<'PYEOF'
+    # cycle_key 匹配，检查计数器是否回绕（重启后 rx/tx_bytes 归零）
+    saved_bases="\$(python3 - "\$STATE" <<'PYEOF'
 import json, sys
 try:
     with open(sys.argv[1], encoding='utf-8') as f:
         st = json.load(f)
-    b = st.get('base_tx')
-    if b is not None:
-        print(int(b))
+    brx = st.get('base_rx')
+    btx = st.get('base_tx')
+    if brx is not None and btx is not None:
+        print(f"{int(brx)}:{int(btx)}")
 except Exception:
     pass
 PYEOF
     )"
-    if [ -n "\$saved_base" ] && [ "\$tx" -lt "\$saved_base" ]; then
-        # 计数器回绕：cur_tx < base_tx，重置基线
+    if [ -n "\$saved_bases" ]; then
+        saved_base_rx="\${saved_bases%%:*}"
+        saved_base_tx="\${saved_bases##*:}"
+    else
+        saved_base_rx=""
+        saved_base_tx=""
+    fi
+    # 迁移旧格式 {ym, base_tx} → {cycle_key, base_rx, base_tx}
+    if [ -z "\$saved_base_rx" ] && [ -n "\$saved_cycle_key" ]; then
+        saved_old_tx="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        st = json.load(f)
+    btx = st.get('base_tx')
+    if btx is not None:
+        print(int(btx))
+except Exception:
+    pass
+PYEOF
+        )"
+        if [ -n "\$saved_old_tx" ]; then
+            tmp="\$(mktemp)"
+            printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$saved_old_tx" > "\$tmp"
+            install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+            rm -f "\$tmp"
+            echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE migrated old format: cycle_key=\$cycle_key base_rx=\$rx base_tx=\$saved_old_tx"
+            exit 0
+        fi
+    fi
+    if [ -n "\$saved_base_rx" ] && [ -n "\$saved_base_tx" ] && { [ "\$rx" -lt "\$saved_base_rx" ] || [ "\$tx" -lt "\$saved_base_tx" ]; }; then
+        # 计数器回绕：cur_rx < base_rx 或 cur_tx < base_tx，重置基线
         tmp="\$(mktemp)"
-        printf '{"cycle_key":"%s","base_tx":%s}\n' "\$cycle_key" "\$tx" > "\$tmp"
+        printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
         install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
         rm -f "\$tmp"
-        echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_tx=\$tx wrote=\$STATE (reason: counter wrapped, old_base=\$saved_base)"
+        echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE (reason: counter wrapped, old_base_rx=\$saved_base_rx old_base_tx=\$saved_base_tx)"
         exit 0
     fi
     echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key already up-to-date, skip"
@@ -1016,10 +1344,10 @@ PYEOF
 fi
 
 tmp="\$(mktemp)"
-printf '{"cycle_key":"%s","base_tx":%s}\n' "\$cycle_key" "\$tx" > "\$tmp"
+printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
 install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
 rm -f "\$tmp"
-echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_tx=\$tx wrote=\$STATE"
+echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE"
 SH
 chmod +x /usr/local/bin/reset_tx_baseline.sh
 
@@ -1033,7 +1361,7 @@ import json, sys
 try:
     with open(sys.argv[1]) as f:
         st = json.load(f)
-    print('yes' if ('base_tx' in st and ('cycle_key' in st or 'ym' in st)) else 'no')
+    print('yes' if ('base_rx' in st and 'base_tx' in st and ('cycle_key' in st or 'ym' in st)) else 'no')
 except:
     print('no')
 " "$STATE_FILE")
@@ -1100,23 +1428,35 @@ else:
         cycle_start = cycle_start_for(py, pm)
     cycle_key = cycle_start.strftime("%Y-%m-%dT%H:%M")
 
-# 读取当前网卡 tx_bytes
+# 读取当前网卡 rx/tx_bytes
+cur_rx = 0
 cur_tx = 0
+try:
+    with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
+        cur_rx = int(f.read().strip())
+except Exception as e:
+    print(f"[baseline] WARN: cannot read rx_bytes for {iface}: {e}", flush=True)
+
 try:
     with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
         cur_tx = int(f.read().strip())
 except Exception as e:
     print(f"[baseline] WARN: cannot read tx_bytes for {iface}: {e}", flush=True)
 
-# base_tx = cur_tx - used_bytes
-# 允许负值：当用户设置的已用流量超过当前计数器（例如 VPS 重启后计数器归零，
-# 但本周期实际已用流量很大），base_tx 为负数可正确表达偏移量。
-# used = cur_tx - base_tx = cur_tx - (cur_tx - used_bytes) = used_bytes ✓
-new_base = cur_tx - used_bytes
+cur_total = max(cur_rx, 0) + max(cur_tx, 0)
+if cur_total > 0:
+    used_rx = (used_bytes * max(cur_rx, 0)) // cur_total
+else:
+    used_rx = used_bytes // 2
+used_tx = used_bytes - used_rx
+
+# base_rx/base_tx 允许为负值，用于表达用户手动设置的已使用流量偏移
+new_base_rx = cur_rx - used_rx
+new_base_tx = cur_tx - used_tx
 
 tmp = state_path + ".tmp"
 with open(tmp, "w", encoding="utf-8") as f:
-    json.dump({"cycle_key": cycle_key, "base_tx": new_base}, f, separators=(",", ":"))
+    json.dump({"cycle_key": cycle_key, "base_rx": new_base_rx, "base_tx": new_base_tx}, f, separators=(",", ":"))
 import subprocess
 ret = subprocess.run(
     ["install", "-o", "subsrv", "-g", "subsrv", "-m", "640", tmp, state_path],
@@ -1140,7 +1480,7 @@ else:
         os.unlink(tmp)
     except Exception:
         pass
-print(f"[baseline] set: iface={iface} cur_tx={cur_tx} used_bytes={used_bytes} new_base={new_base} cycle_key={cycle_key}", flush=True)
+print(f"[baseline] set: iface={iface} cur_rx={cur_rx} cur_tx={cur_tx} used_bytes={used_bytes} used_rx={used_rx} used_tx={used_tx} new_base_rx={new_base_rx} new_base_tx={new_base_tx} cycle_key={cycle_key}", flush=True)
 PYEOF
 elif [ "$NEED_RESET" = true ]; then
     /usr/local/bin/reset_tx_baseline.sh "$IFACE"
@@ -1164,9 +1504,10 @@ UNIT
 
 cat > /etc/systemd/system/reset-tx-baseline.timer <<UNIT
 [Unit]
-Description=Run reset-tx-baseline every minute (guarded by cycle key)
+Description=Run reset-tx-baseline every 10 minutes (guarded by cycle key)
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnBootSec=2min
+OnUnitActiveSec=10min
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -1303,6 +1644,15 @@ def read_tx_bytes_sysfs():
         log(f"WARN: cannot read {p}: {e}")
         return 0
 
+def read_rx_bytes_sysfs():
+    p = f"/sys/class/net/{IFACE}/statistics/rx_bytes"
+    try:
+        with open(p, "r", encoding="utf-8") as f:
+            return int(f.read().strip())
+    except Exception as e:
+        log(f"WARN: cannot read {p}: {e}")
+        return 0
+
 def load_state():
     try:
         with open(STATE_PATH, "r", encoding="utf-8") as f:
@@ -1319,28 +1669,31 @@ def get_state_cycle_key(st):
         return f"{ym}-01T00:00"
     return None
 
-def month_used_tx_bytes_realtime():
+def month_used_total_bytes_realtime():
     """只读计算本周期已用流量，不写入状态文件。
     状态文件的创建/更新由 reset_tx_baseline.sh (定时任务) 和部署脚本独占。
     """
-    cur = read_tx_bytes_sysfs()
+    cur_rx = read_rx_bytes_sysfs()
+    cur_tx = read_tx_bytes_sysfs()
     st = load_state()
     st_cycle_key = get_state_cycle_key(st)
-    base = st.get("base_tx")
+    base_rx = st.get("base_rx")
+    base_tx = st.get("base_tx")
 
     # 状态文件缺失或损坏：等待 reset_tx_baseline.sh 初始化
-    if st_cycle_key is None or base is None:
-        log(f"state not ready: st_cycle_key={st_cycle_key} base={base} (waiting for reset_tx_baseline.sh)")
-        return 0, cur, cur
+    if st_cycle_key is None or base_rx is None or base_tx is None:
+        log(f"state not ready: st_cycle_key={st_cycle_key} base_rx={base_rx} base_tx={base_tx} (waiting for reset_tx_baseline.sh)")
+        return 0, 0, 0, 0, 0, cur_rx, cur_tx
 
-    used = cur - int(base)
+    used_rx = cur_rx - int(base_rx)
+    used_tx = cur_tx - int(base_tx)
 
-    # 计数器回绕（重启后 cur_tx < base_tx）：返回 0，等待定时任务修正
-    if used < 0:
-        log(f"counter wrapped: cur={cur} base={base} used={used} (waiting for reset_tx_baseline.sh)")
-        return 0, int(base), cur
+    # 计数器回绕（重启后 cur_rx/cur_tx < base_rx/base_tx）：返回 0，等待定时任务修正
+    if used_rx < 0 or used_tx < 0:
+        log(f"counter wrapped: cur_rx={cur_rx} cur_tx={cur_tx} base_rx={base_rx} base_tx={base_tx} used_rx={used_rx} used_tx={used_tx} (waiting for reset_tx_baseline.sh)")
+        return 0, 0, 0, int(base_rx), int(base_tx), cur_rx, cur_tx
 
-    return int(used), int(base), int(cur)
+    return int(used_rx + used_tx), int(used_rx), int(used_tx), int(base_rx), int(base_tx), int(cur_rx), int(cur_tx)
 
 class Handler(BaseHTTPRequestHandler):
     def do_HEAD(self):
@@ -1362,13 +1715,18 @@ class Handler(BaseHTTPRequestHandler):
         file_path, content_type = route
 
         try:
-            used_tx, base_tx, cur_tx = month_used_tx_bytes_realtime()
+            used_total, used_rx, used_tx, base_rx, base_tx, cur_rx, cur_tx = month_used_total_bytes_realtime()
         except Exception as e:
-            log(f"ERROR reading tx_bytes: {e}")
-            used_tx, base_tx, cur_tx = 0, 0, 0
+            log(f"ERROR reading traffic bytes: {e}")
+            used_total, used_rx, used_tx, base_rx, base_tx, cur_rx, cur_tx = 0, 0, 0, 0, 0, 0, 0
+
+        if used_total > TOTAL_BYTES and used_total > 0:
+            used_rx = (used_rx * TOTAL_BYTES) // used_total
+            used_tx = TOTAL_BYTES - used_rx
+            used_total = TOTAL_BYTES
 
         expire = next_reset_epoch_pt()
-        remain = max(TOTAL_BYTES - used_tx, 0)
+        remain = max(TOTAL_BYTES - used_total, 0)
 
         is_expired = False
         if RESET_MODE == "fixed_expire" and expire > 0:
@@ -1393,8 +1751,8 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 body = b"# subscription source missing\n"
 
-        header_val = f"upload=0; download={used_tx}; total={TOTAL_BYTES}; expire={expire}"
-        log(f"userinfo: used_tx={used_tx} remain={remain} cycle={cycle_key_from_dt(current_cycle_start())} base_tx={base_tx} cur_tx={cur_tx}")
+        header_val = f"upload={used_tx}; download={used_rx}; total={TOTAL_BYTES}; expire={expire}"
+        log(f"userinfo: used_total={used_total} used_rx={used_rx} used_tx={used_tx} remain={remain} cycle={cycle_key_from_dt(current_cycle_start())} base_rx={base_rx} base_tx={base_tx} cur_rx={cur_rx} cur_tx={cur_tx}")
 
         self.send_response(200)
         self.send_header("Content-Type", content_type)
@@ -1552,6 +1910,7 @@ if caddy validate --config /etc/caddy/Caddyfile; then
     # reload 有时不能正确切换到新域名的 TLS 证书申请
     systemctl restart caddy
     echo "=> Caddy 配置验证通过并已重启"
+    install_singbox_cert_sync
 else
     echo "错误: Caddyfile 验证失败，请手动检查 /etc/caddy/Caddyfile"
     echo "Caddy 仍在使用旧配置运行"
@@ -1602,6 +1961,13 @@ done
 
 if [ "$caddy_success" = true ]; then
     echo "   [OK] Caddy HTTPS 转发正常 (SSL 证书申请成功)"
+    if [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
+        if systemctl start sync-caddy-cert-to-singbox.service; then
+            echo "   [OK] Caddy 证书已同步到 sing-box"
+        else
+            echo "   [WARN] sing-box 证书同步失败，请检查: journalctl -u sync-caddy-cert-to-singbox.service -n 50"
+        fi
+    fi
 else
     echo ""
     echo -e "\033[31m#########################################################################\033[0m"
@@ -1763,11 +2129,18 @@ echo "=================================================="
 echo ""
 echo "服务状态:"
 echo "  systemctl status sub-server caddy"
-echo "  systemctl list-timers --all | grep -E 'refresh|reset'"
+echo "  systemctl list-timers --all | grep -E 'refresh|reset|sync-caddy-cert'"
 echo ""
 echo "常用排查命令:"
 echo "  journalctl -u sub-server -n 80 --no-pager"
 echo "  journalctl -u caddy -n 80 --no-pager"
+if [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
+    echo ""
+    echo "证书同步状态检查:"
+    echo "  systemctl status sync-caddy-cert-to-singbox.timer --no-pager"
+    echo "  journalctl -u sync-caddy-cert-to-singbox.service -n 50 --no-pager"
+    echo "  openssl x509 -in '${SINGBOX_CERT_DIR}/cert.crt' -noout -subject -issuer -dates"
+fi
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
 if [ "$SAVED_PASSWORD_MODE" = false ]; then

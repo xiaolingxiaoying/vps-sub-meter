@@ -2,18 +2,19 @@
 set -euo pipefail
 
 # ==============================================================================
-# VPS 流量统计与订阅管理 自动配置脚本
+# VPS 流量统计与订阅管理 自动配置脚本 (统一安装器)
 # 用法:
-#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/auto_setup.sh)
+#   bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/setup.sh)
 #
 # 功能:
-#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量
-#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON)
-#   - 同时支持 Clash Meta (YAML) 和 sing-box (JSON) 订阅格式
+#   - 通过 vnstat + sysfs 实时监控 VPS 出口流量 (RX + TX 双向)
+#   - Python HTTP 服务下发带 subscription-userinfo 的订阅 (YAML + JSON + TXT)
+#   - 同时支持 Clash Meta (YAML)、sing-box (JSON)、Shadowrocket (TXT) 订阅格式
 #   - Caddy 反向代理提供 HTTPS + Basic Auth 鉴权
 #   - 支持 ?token= 参数免密访问 (给 CMFA 等不支持 BasicAuth 的客户端)
-#   - 每月自动重置流量基线
+#   - 多种流量重置模式: 自然月 / 指定日期循环 / 固定到期日
 #   - 每 5 分钟同步上游订阅配置
+#   - Caddy 证书自动同步到 sing-box
 # ==============================================================================
 
 # 配置文件路径
@@ -971,7 +972,7 @@ if [ -f /etc/s-box/sing_box_client.json ]; then
     cp -f /etc/s-box/sing_box_client.json "$TMP_JSON"
     if command -v jq >/dev/null 2>&1; then
         TMP_JSON_FIXED="${TMP_JSON}.fixed"
-        if jq '
+        read -r -d '' _SB11_JQ_FILTER <<'JQEOF' || true
 def keep_legacy_dns_server:
     {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
     | with_entries(select(.value != null));
@@ -1013,7 +1014,8 @@ def sb11_dns_server:
 | if (.route.rules | type) == "array" then .route.rules |= map(select(in_drop($drop; (.outbound // null)) | not)) else . end
 | if in_drop($drop; (.route.final // null)) then del(.route.final) else . end
 | if $fakeip != null then .dns.fakeip = ((.dns.fakeip // {}) + $fakeip) else . end
-' \
+JQEOF
+        if jq "$_SB11_JQ_FILTER" \
             "$TMP_JSON" > "$TMP_JSON_FIXED"; then
             mv -f "$TMP_JSON_FIXED" "$TMP_JSON"
         else
@@ -1074,6 +1076,7 @@ if [ -f "$SRC_JSON" ]; then
     cp -f "$SRC_JSON" "$TMP_JSON"
     if command -v jq >/dev/null 2>&1; then
         TMP_JSON_FIXED="${TMP_JSON}.fixed"
+        # 此 jq 过滤逻辑与 setup.sh [4/8] 中的 _SB11_JQ_FILTER 保持一致
         if jq '
 def keep_legacy_dns_server:
     {tag, address, address_resolver, address_strategy, strategy, detour, client_subnet}
@@ -1252,8 +1255,7 @@ if [[ "\$cycle_key" == fixed:* ]]; then
     now_ts="\$(TZ=\$TZNAME date +%s)"
     anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$RESET_HOUR:\$RESET_MINUTE:00" +%s 2>/dev/null || echo 0)"
     if [ "\$now_ts" -ge "\$anchor_ts" ]; then
-        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Stopping proxy services..."
-        systemctl stop sing-box clash-meta xray v2ray caddy sub-server 2>/dev/null || true
+        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Returning empty config (sub_server.py handles client-side)"
         exit 0
     fi
 fi
@@ -1304,6 +1306,29 @@ PYEOF
     else
         saved_base_rx=""
         saved_base_tx=""
+    fi
+    # 迁移旧格式 {ym, base_tx} → {cycle_key, base_rx, base_tx}
+    if [ -z "\$saved_base_rx" ] && [ -n "\$saved_cycle_key" ]; then
+        saved_old_tx="\$(python3 - "\$STATE" <<'PYEOF'
+import json, sys
+try:
+    with open(sys.argv[1]) as f:
+        st = json.load(f)
+    btx = st.get('base_tx')
+    if btx is not None:
+        print(int(btx))
+except Exception:
+    pass
+PYEOF
+        )"
+        if [ -n "\$saved_old_tx" ]; then
+            tmp="\$(mktemp)"
+            printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$saved_old_tx" > "\$tmp"
+            install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
+            rm -f "\$tmp"
+            echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE migrated old format: cycle_key=\$cycle_key base_rx=\$rx base_tx=\$saved_old_tx"
+            exit 0
+        fi
     fi
     if [ -n "\$saved_base_rx" ] && [ -n "\$saved_base_tx" ] && { [ "\$rx" -lt "\$saved_base_rx" ] || [ "\$tx" -lt "\$saved_base_tx" ]; }; then
         # 计数器回绕：cur_rx < base_rx 或 cur_tx < base_tx，重置基线
@@ -1479,9 +1504,10 @@ UNIT
 
 cat > /etc/systemd/system/reset-tx-baseline.timer <<UNIT
 [Unit]
-Description=Run reset-tx-baseline every minute (guarded by cycle key)
+Description=Run reset-tx-baseline every 10 minutes (guarded by cycle key)
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnBootSec=2min
+OnUnitActiveSec=10min
 Persistent=true
 [Install]
 WantedBy=timers.target
