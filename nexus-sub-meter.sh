@@ -1200,6 +1200,7 @@ calc_cycle_key() {
         local anchor_ts
         anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$hh:\$mm:00" +%s 2>/dev/null || echo 0)"
         if [ "\$now_ts" -lt "\$anchor_ts" ]; then
+            # 首个锚点前也建立稳定的临时周期基线；到达锚点后会自动切换并重置。
             printf "pre-anchor:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$hh))" "\$((10#\$mm))"
             return
         fi
@@ -1246,11 +1247,6 @@ if [[ "\$cycle_key" == fixed:* ]]; then
         systemctl stop sing-box clash-meta xray v2ray caddy sub-server 2>/dev/null || true
         exit 0
     fi
-fi
-
-if [[ "\$cycle_key" == pre-anchor:* ]]; then
-    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE next_anchor=\${cycle_key#pre-anchor:} not reached, skip"
-    exit 0
 fi
 
 saved_cycle_key=""
@@ -1448,7 +1444,69 @@ else:
 print(f"[baseline] set: iface={iface} cur_rx={cur_rx} cur_tx={cur_tx} used_bytes={used_bytes} used_rx={used_rx} used_tx={used_tx} new_base_rx={new_base_rx} new_base_tx={new_base_tx} cycle_key={cycle_key}", flush=True)
 PYEOF
 elif [ "$NEED_RESET" = true ]; then
-    /usr/local/bin/reset_tx_baseline.sh "$IFACE"
+    # 首次部署（或状态文件缺失）时直接写入基线，不能依赖定时器或
+    # reset_tx_baseline.sh 的执行时机；否则锚定日尚未来临时会一直返回 0。
+    python3 - "$STATE_FILE" "$IFACE" "$RESET_MODE" "${RESET_ANCHOR_DATE:-}" "$RESET_DAY" "$RESET_HOUR" "$RESET_MINUTE" "$TZ_NAME" <<'PYEOF'
+import json, os, sys
+from datetime import datetime, timezone
+from calendar import monthrange
+
+state_path, iface, reset_mode, anchor_date, reset_day, reset_hour, reset_minute, tz_name = sys.argv[1:]
+reset_day = int(reset_day)
+reset_hour = int(reset_hour)
+reset_minute = int(reset_minute)
+
+try:
+    from zoneinfo import ZoneInfo
+    tz = ZoneInfo(tz_name)
+except Exception:
+    tz = timezone.utc
+
+now = datetime.now(tz)
+
+if reset_mode == "fixed_expire":
+    cycle_key = f"fixed:{anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
+elif reset_mode == "anchored_monthly" and anchor_date:
+    try:
+        anchor = datetime.strptime(
+            f"{anchor_date} {reset_hour:02d}:{reset_minute:02d}", "%Y-%m-%d %H:%M"
+        ).replace(tzinfo=tz)
+    except ValueError:
+        anchor = None
+    if anchor and now < anchor:
+        cycle_key = f"pre-anchor:{anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
+    else:
+        last_day = monthrange(now.year, now.month)[1]
+        day = min(max(reset_day, 1), last_day)
+        this_cycle = now.replace(day=day, hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
+        if now < this_cycle:
+            previous_month = now.month - 1 or 12
+            previous_year = now.year - 1 if now.month == 1 else now.year
+            day = min(max(reset_day, 1), monthrange(previous_year, previous_month)[1])
+            this_cycle = this_cycle.replace(year=previous_year, month=previous_month, day=day)
+        cycle_key = this_cycle.strftime("%Y-%m-%dT%H:%M")
+else:
+    cycle_key = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+
+with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
+    rx = int(f.read().strip())
+with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
+    tx = int(f.read().strip())
+
+tmp_path = state_path + ".tmp"
+with open(tmp_path, "w", encoding="utf-8") as f:
+    json.dump({"cycle_key": cycle_key, "base_rx": rx, "base_tx": tx}, f, separators=(",", ":"))
+    f.write("\n")
+
+try:
+    import grp, pwd
+    os.chown(tmp_path, pwd.getpwnam("subsrv").pw_uid, grp.getgrnam("subsrv").gr_gid)
+except KeyError:
+    pass
+os.chmod(tmp_path, 0o640)
+os.replace(tmp_path, state_path)
+print(f"[baseline] initialized: iface={iface} cycle_key={cycle_key} base_rx={rx} base_tx={tx}", flush=True)
+PYEOF
 fi
 
 # 设置系统时区以确保 systemd timer 在正确时间触发
