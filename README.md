@@ -1,4 +1,12 @@
-先运行yonggekkk/sing-box-yg脚本
+# VPS 节点订阅与流量统计
+
+推荐使用一体化脚本；它会以固定版本安装/导入 sing-box-yg 核心节点，并配置 Clash、sing-box、Shadowrocket 订阅与实时流量头。
+
+```bash
+bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/vps-sub-meter.sh)
+```
+
+旧流程：先运行 yonggekkk/sing-box-yg 脚本
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)
 ```
