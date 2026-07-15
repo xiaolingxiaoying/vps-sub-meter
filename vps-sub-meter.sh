@@ -28,7 +28,9 @@ SINGBOX_CERT_SYNC_READY=false
 
 # 固定的 yonggekkk/sing-box-yg 上游快照。仅在显式维护时更新此 commit。
 UPSTREAM_SINGBOX_YG_COMMIT="8faa21d368bc93c0a99b358168fc913d5ab2b9c2"
-UPSTREAM_SINGBOX_YG_URL="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/${UPSTREAM_SINGBOX_YG_COMMIT}/sb.sh"
+# 发布后从本仓库的 vendored 快照下载，而不是再次请求上游仓库。
+VPS_SUB_METER_RAW_BASE="${VPS_SUB_METER_RAW_BASE:-https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main}"
+UPSTREAM_SINGBOX_YG_URL="${VPS_SUB_METER_RAW_BASE}/third_party/sing-box-yg/sb.sh"
 UPSTREAM_SINGBOX_YG_SCRIPT="/usr/local/lib/vps-sub-meter/sing-box-yg-${UPSTREAM_SINGBOX_YG_COMMIT}.sh"
 UPSTREAM_MANIFEST="/etc/sub-srv/upstream.conf"
 MIGRATION_BACKUP_DONE=false
@@ -134,6 +136,10 @@ switch_singbox_outbound() {
     echo "1) 原生 IPv4 出站"
     echo "2) IPv6 优先（仅在现有配置包含 warp-out 时使用）"
     read -rp "请选择 [1-2]: " choice
+    if [ "$choice" = "2" ] && ! jq -e '.outbounds[]? | select(.tag == "warp-out")' "$config" >/dev/null; then
+        echo "错误: 当前 sing-box 配置未启用 warp-out，不能使用 WARP IPv6 出站模式"
+        return 1
+    fi
     cp -f "$config" "$backup"
     tmp=$(mktemp)
     if [ "$choice" = "1" ]; then
@@ -242,6 +248,15 @@ validate_domain() {
     return 0
 }
 
+validate_ipv4() {
+    local ip="$1" octet
+    [[ "$ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] || return 1
+    IFS='.' read -r -a octet <<< "$ip"
+    for value in "${octet[@]}"; do
+        [ "$value" -ge 0 ] && [ "$value" -le 255 ] || return 1
+    done
+}
+
 # 验证用户名 (BasicAuth 用户名限制)
 validate_username() {
     local username="$1"
@@ -291,6 +306,7 @@ save_config() {
     python3 - \
         "$CONFIG_FILE" \
         "${DOMAIN}" \
+        "${ACCESS_MODE:-domain_https}" \
         "${CADDY_USER}" \
         "${PASSWORD_HASH:-}" \
         "${TRAFFIC_LIMIT_GIB}" \
@@ -309,24 +325,26 @@ from datetime import datetime
 
 cfg_file   = sys.argv[1]
 domain     = sys.argv[2]
-caddy_user = sys.argv[3]
-pass_hash  = sys.argv[4]
-limit_gib  = sys.argv[5]
-tz_name    = sys.argv[6]
-reset_mode = sys.argv[7]
-reset_anchor_date = sys.argv[8]
-reset_hour = sys.argv[9]
-reset_minute = sys.argv[10]
-iface      = sys.argv[11]
-token      = sys.argv[12]
-backend_port = sys.argv[13]
-used_gib   = sys.argv[14]
+access_mode = sys.argv[3]
+caddy_user = sys.argv[4]
+pass_hash  = sys.argv[5]
+limit_gib  = sys.argv[6]
+tz_name    = sys.argv[7]
+reset_mode = sys.argv[8]
+reset_anchor_date = sys.argv[9]
+reset_hour = sys.argv[10]
+reset_minute = sys.argv[11]
+iface      = sys.argv[12]
+token      = sys.argv[13]
+backend_port = sys.argv[14]
+used_gib   = sys.argv[15]
 
 lines = [
     "# VPS 订阅服务配置文件",
     f"# 生成时间: {datetime.now().astimezone().isoformat()}",
     "",
     f"DOMAIN={domain!r}",
+    f"ACCESS_MODE={access_mode!r}",
     f"CADDY_USER={caddy_user!r}",
     f"CADDY_PASS_HASH={pass_hash!r}",
     f"TRAFFIC_LIMIT_GIB={limit_gib!r}",
@@ -397,6 +415,7 @@ PYEOF
             # 将配置文件中的字段映射到脚本使用的变量名
             CADDY_PASS_HASH="${CADDY_PASS_HASH:-}"
             PASSWORD_HASH="${CADDY_PASS_HASH:-}"
+            ACCESS_MODE="${ACCESS_MODE:-domain_https}"
             TZ_NAME="${TZ_NAME:-America/Los_Angeles}"
             RESET_MODE="${RESET_MODE:-natural_month}"
             RESET_ANCHOR_DATE="${RESET_ANCHOR_DATE:-}"
@@ -413,6 +432,10 @@ PYEOF
 
 # 配置 Caddy -> sing-box-yg 证书自动同步
 install_singbox_cert_sync() {
+    if [ "${ACCESS_MODE:-domain_https}" != "domain_https" ]; then
+        echo "=> IP/HTTP 模式没有 Caddy 证书，跳过 sing-box 证书同步"
+        return 0
+    fi
     if [ "$SYNC_SINGBOX_CERT" != "true" ]; then
         echo "=> 已跳过 Caddy -> sing-box 证书同步配置"
         return 0
@@ -592,24 +615,50 @@ fi
 echo ""
 
 # 3. 交互式收集配置信息
-# 域名输入与验证
+# 访问模式与域名/IP 输入
+ACCESS_MODE="${ACCESS_MODE:-domain_https}"
+echo "请选择订阅访问模式:"
+echo "  1) 域名 HTTPS（默认，客户端兼容性最佳）"
+echo "  2) IPv4 HTTP（不申请证书；订阅与凭据会明文传输）"
+read -rp "请输入选项 [当前: $ACCESS_MODE，默认: 1]: " access_choice
+access_choice=${access_choice:-$([ "$ACCESS_MODE" = "ip_http" ] && echo 2 || echo 1)}
+case "$access_choice" in
+    1) ACCESS_MODE="domain_https" ;;
+    2) ACCESS_MODE="ip_http" ;;
+    *) echo "错误: 请输入 1 或 2"; exit 1 ;;
+esac
+
 while true; do
     if [ -n "${DOMAIN:-}" ]; then
-        read -rp "请输入绑定的域名 [当前: $DOMAIN]: " input_domain
+        if [ "$ACCESS_MODE" = "ip_http" ]; then
+            read -rp "请输入 VPS 公网 IPv4 [当前: $DOMAIN]: " input_domain
+        else
+            read -rp "请输入绑定的域名 [当前: $DOMAIN]: " input_domain
+        fi
         if [ -z "$input_domain" ]; then
             break  # 保持原值
         fi
         DOMAIN="$input_domain"
     else
-        read -rp "请输入绑定的域名 (例如: sub.example.com): " DOMAIN
+        if [ "$ACCESS_MODE" = "ip_http" ]; then
+            read -rp "请输入 VPS 公网 IPv4: " DOMAIN
+        else
+            read -rp "请输入绑定的域名 (例如: sub.example.com): " DOMAIN
+        fi
     fi
 
     if [ -z "$DOMAIN" ]; then
-        echo "错误: 域名不能为空"
+        echo "错误: 地址不能为空"
         continue
     fi
 
-    if ! validate_domain "$DOMAIN"; then
+    if [ "$ACCESS_MODE" = "ip_http" ]; then
+        if ! validate_ipv4 "$DOMAIN"; then
+            echo "错误: IPv4 地址无效 '$DOMAIN'"
+            DOMAIN=""
+            continue
+        fi
+    elif ! validate_domain "$DOMAIN"; then
         echo "错误: 域名格式无效 '$DOMAIN'"
         echo "       请使用类似 sub.example.com 的格式"
         DOMAIN=""
@@ -617,6 +666,15 @@ while true; do
     fi
     break
 done
+
+if [ "$ACCESS_MODE" = "ip_http" ]; then
+    PUBLIC_SCHEME="http"
+    CADDY_SITE_ADDRESS="http://$DOMAIN"
+    echo "=> 警告: IP/HTTP 模式不会加密订阅、Token 或 BasicAuth 凭据"
+else
+    PUBLIC_SCHEME="https"
+    CADDY_SITE_ADDRESS="$DOMAIN"
+fi
 
 # 用户名输入与验证
 while true; do
@@ -2068,7 +2126,7 @@ cp -a /etc/caddy/Caddyfile "/etc/caddy/Caddyfile.bak.$(date +%F_%H%M%S)" 2>/dev/
 # (shell 会把 $2a、$14 等当作变量展开导致哈希损坏)
 # 解决方案：先用占位符写模板，再用 printf %s 原样替换密码哈希
 cat > /etc/caddy/Caddyfile <<EOF
-$DOMAIN {
+$CADDY_SITE_ADDRESS {
 	# 订阅文件的精确路径 (Clash Meta YAML + sing-box JSON + Shadowrocket TXT)
 	@sub_path {
 		path /sub/$TOKEN.yaml /sub/$TOKEN.json /sub/$TOKEN.txt
@@ -2149,15 +2207,19 @@ else
     echo "   [WARN] Python 订阅服务未响应 (TXT)，请检查: journalctl -u sub-server -n 40"
 fi
 
-# 验证 Caddy 是否正常转发，并等待证书申请完成
-echo "=> 正在等待 Caddy 申请 SSL 证书并验证 HTTPS 访问..."
-echo "   (这可能需要 5-15 秒，请耐心等待。如果云服务商安全组未放行 80 和 443 端口，将会超时)"
+# 验证 Caddy 是否正常转发；域名 HTTPS 模式会同时等待证书签发。
+if [ "$ACCESS_MODE" = "domain_https" ]; then
+    echo "=> 正在等待 Caddy 申请 SSL 证书并验证 HTTPS 访问..."
+    echo "   (这可能需要 5-15 秒，请耐心等待。如果云服务商安全组未放行 80 和 443 端口，将会超时)"
+else
+    echo "=> 正在验证 Caddy HTTP 转发（IP/HTTP 模式）..."
+fi
 
 max_attempts=15
 caddy_success=false
 for ((i=1; i<=max_attempts; i++)); do
     # 设置 3 秒超时，静默模式
-    HTTP_CODE=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "https://$DOMAIN/sub/$TOKEN.yaml?token=$TOKEN" || echo "000")
+    HTTP_CODE=$(curl -m 3 -s -o /dev/null -w "%{http_code}" "${PUBLIC_SCHEME}://$DOMAIN/sub/$TOKEN.yaml?token=$TOKEN" || echo "000")
     if [ "$HTTP_CODE" = "200" ]; then
         caddy_success=true
         break
@@ -2166,15 +2228,15 @@ for ((i=1; i<=max_attempts; i++)); do
 done
 
 if [ "$caddy_success" = true ]; then
-    echo "   [OK] Caddy HTTPS 转发正常 (SSL 证书申请成功)"
-    if [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
+    echo "   [OK] Caddy ${PUBLIC_SCHEME^^} 转发正常"
+    if [ "$ACCESS_MODE" = "domain_https" ] && [ "$SINGBOX_CERT_SYNC_READY" = true ]; then
         if systemctl start sync-caddy-cert-to-singbox.service; then
             echo "   [OK] Caddy 证书已同步到 sing-box"
         else
             echo "   [WARN] sing-box 证书同步失败，请检查: journalctl -u sync-caddy-cert-to-singbox.service -n 50"
         fi
     fi
-else
+elif [ "$ACCESS_MODE" = "domain_https" ]; then
     echo ""
     echo -e "\033[31m#########################################################################\033[0m"
     echo -e "\033[31m                        [ 警告: HTTPS 证书申请失败 ]                     \033[0m"
@@ -2195,6 +2257,8 @@ else
     echo -e "\033[31m#########################################################################\033[0m"
     echo ""
     read -rp ">> 按回车键继续查看订阅链接 (请在修复网络后使用)... "
+else
+    echo "[WARN] Caddy HTTP 转发未通过，请确认安全组/防火墙已放行 TCP 80 端口"
 fi
 
 # ===================== 输出部署信息 =====================
@@ -2239,7 +2303,7 @@ echo "============= Clash Meta (YAML) 订阅 ============="
 echo ""
 echo "--- 方式一: BasicAuth 认证访问 (Clash Party / Stash) ---"
 echo ""
-echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.yaml"
+echo "  订阅地址: ${PUBLIC_SCHEME}://$DOMAIN/sub/$TOKEN.yaml"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
@@ -2250,28 +2314,28 @@ if [ "$SHOW_ONE_CLICK" = true ]; then
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
     fi
-    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+    echo "  ${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
     echo ""
     echo "  扫码导入 (BasicAuth):"
-    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
+    print_qr "${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.yaml"
 else
     echo "  一键导入链接:"
-    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.yaml"
+    echo "  ${PUBLIC_SCHEME}://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.yaml"
     echo "  (请手动替换 <用户名> 和 <密码>)"
 fi
 echo ""
 echo "--- 方式二: Token 免密访问 (CMFA / 不支持 BasicAuth 的客户端) ---"
 echo ""
-echo "  https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
+echo "  ${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
 echo ""
 echo "  扫码导入 (Token 免密):"
-print_qr "https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
+print_qr "${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}"
 echo ""
 echo "============= sing-box (JSON) 订阅 ============="
 echo ""
 echo "--- 方式一: BasicAuth 认证访问 ---"
 echo ""
-echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.json"
+echo "  订阅地址: ${PUBLIC_SCHEME}://$DOMAIN/sub/$TOKEN.json"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
@@ -2282,28 +2346,28 @@ if [ "$SHOW_ONE_CLICK" = true ]; then
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
     fi
-    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+    echo "  ${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
     echo ""
     echo "  扫码导入 (BasicAuth):"
-    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
+    print_qr "${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.json"
 else
     echo "  一键导入链接:"
-    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.json"
+    echo "  ${PUBLIC_SCHEME}://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.json"
     echo "  (请手动替换 <用户名> 和 <密码>)"
 fi
 echo ""
 echo "--- 方式二: Token 免密访问 (SFA / SFI / SFM 等 sing-box 客户端) ---"
 echo ""
-echo "  https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
+echo "  ${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
 echo "  扫码导入 (Token 免密):"
-print_qr "https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
+print_qr "${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}"
 echo ""
 echo "========== Shadowrocket (TXT) 订阅 =========="
 echo ""
 echo "--- 方式一: BasicAuth 认证访问 ---"
 echo ""
-echo "  订阅地址: https://$DOMAIN/sub/$TOKEN.txt"
+echo "  订阅地址: ${PUBLIC_SCHEME}://$DOMAIN/sub/$TOKEN.txt"
 echo "  认证方式: Basic Auth"
 echo "  用户名:   $CADDY_USER"
 echo "  密码:     $SHOW_PASSWORD"
@@ -2314,22 +2378,22 @@ if [ "$SHOW_ONE_CLICK" = true ]; then
     else
         echo "  一键导入链接 (请手动替换 <密码>):"
     fi
-    echo "  https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
+    echo "  ${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
     echo ""
     echo "  扫码导入 (BasicAuth):"
-    print_qr "https://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
+    print_qr "${PUBLIC_SCHEME}://${ENCODED_USER}:${ENCODED_PASS}@${DOMAIN}/sub/${TOKEN}.txt"
 else
     echo "  一键导入链接:"
-    echo "  https://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.txt"
+    echo "  ${PUBLIC_SCHEME}://<用户名>:<密码>@${DOMAIN}/sub/${TOKEN}.txt"
     echo "  (请手动替换 <用户名> 和 <密码>)"
 fi
 echo ""
 echo "--- 方式二: Token 免密访问 (推荐 Shadowrocket 使用) ---"
 echo ""
-echo "  https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
+echo "  ${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
 echo ""
 echo "  扫码导入 (Token 免密):"
-print_qr "https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
+print_qr "${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}"
 echo ""
 echo "=================================================="
 echo ""
@@ -2350,31 +2414,31 @@ fi
 echo ""
 echo "测试命令 (Clash Meta YAML - BasicAuth):"
 if [ "$SAVED_PASSWORD_MODE" = false ]; then
-    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 else
-    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.yaml' -o /dev/null | head -20"
 fi
 echo ""
 echo "测试命令 (Clash Meta YAML - Token 免密):"
-echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
+echo "  curl -sD - '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.yaml?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (sing-box JSON - BasicAuth):"
 if [ "$SAVED_PASSWORD_MODE" = false ]; then
-    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 else
-    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.json' -o /dev/null | head -20"
 fi
 echo ""
 echo "测试命令 (sing-box JSON - Token 免密):"
-echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
+echo "  curl -sD - '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.json?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
 echo "测试命令 (Shadowrocket TXT - BasicAuth):"
 if [ "$SAVED_PASSWORD_MODE" = false ]; then
-    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:${CADDY_PASS}' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
 else
-    echo "  curl -sD - -u '${CADDY_USER}:<密码>' 'https://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
+    echo "  curl -sD - -u '${CADDY_USER}:<密码>' '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.txt' -o /dev/null | head -20"
 fi
 echo ""
 echo "测试命令 (Shadowrocket TXT - Token 免密):"
-echo "  curl -sD - 'https://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}' -o /dev/null | head -20"
+echo "  curl -sD - '${PUBLIC_SCHEME}://${DOMAIN}/sub/${TOKEN}.txt?token=${TOKEN}' -o /dev/null | head -20"
 echo ""
