@@ -20,6 +20,12 @@ WARP 默认不启用。启用后仅代理在菜单中添加的域名后缀，未
 
 > 分支命令仅用于测试本分支内容；合并到 `main` 后，请改用 `main` 地址。
 
+订阅流量头排查与自修复状态检查：
+
+```bash
+sudo /usr/local/bin/subsrv-traffic-health.sh
+```
+
 ## 旧脚本入口
 
 旧流程：先运行 yonggekkk/sing-box-yg 脚本

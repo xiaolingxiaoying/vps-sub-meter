@@ -1423,7 +1423,6 @@ while true; do
                 continue
             fi
 
-            RESET_MODE="anchored_monthly"
             RESET_ANCHOR_DATE=$(TZ="$TZ_NAME" date -d "$input_anchor_date" +%F)
             RESET_HOUR="$input_reset_hour"
             RESET_MINUTE="$input_reset_minute"
@@ -1436,6 +1435,9 @@ while true; do
 done
 
 if [ "$RESET_MODE" = "anchored_monthly" ]; then
+    RESET_DAY=$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)
+    RESET_DAY=$((10#$RESET_DAY))
+elif [ "$RESET_MODE" = "fixed_expire" ]; then
     RESET_DAY=$(echo "$RESET_ANCHOR_DATE" | cut -d- -f3)
     RESET_DAY=$((10#$RESET_DAY))
 else
@@ -1828,350 +1830,227 @@ UNIT
 
 echo "[6/8] 配置流量基线重置机制..."
 # 使用 printf 代替嵌套 heredoc，避免 heredoc 标记冲突
-cat > /usr/local/bin/reset_tx_baseline.sh <<SH
-#!/usr/bin/env bash
-set -euo pipefail
-IFACE="\${1:-$IFACE}"
-STATE="/var/lib/subsrv/tx_state.json"
-TZNAME="$TZ_NAME"
-RESET_MODE="$RESET_MODE"
-RESET_ANCHOR_DATE="$RESET_ANCHOR_DATE"
-RESET_DAY="$RESET_DAY"
-RESET_HOUR="$RESET_HOUR"
-RESET_MINUTE="$RESET_MINUTE"
-
-calc_cycle_key() {
-    local now_ts y m d hh mm
-    now_ts="\$(TZ=\$TZNAME date +%s)"
-    y="\$(TZ=\$TZNAME date +%Y)"
-    m="\$(TZ=\$TZNAME date +%m)"
-
-    if [ "\$RESET_MODE" = "natural_month" ]; then
-        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" 1 0 0
-        return
-    fi
-
-    if [ "\$RESET_MODE" = "fixed_expire" ]; then
-        printf "fixed:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$RESET_HOUR))" "\$((10#\$RESET_MINUTE))"
-        return
-    fi
-
-    d="\$RESET_DAY"
-    hh="\$RESET_HOUR"
-    mm="\$RESET_MINUTE"
-
-    if [ -n "\$RESET_ANCHOR_DATE" ]; then
-        local anchor_ts
-        anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$hh:\$mm:00" +%s 2>/dev/null || echo 0)"
-        if [ "\$now_ts" -lt "\$anchor_ts" ]; then
-            # 首个锚点前也建立稳定的临时周期基线；到达锚点后会自动切换并重置。
-            printf "pre-anchor:%sT%02d:%02d" "\$RESET_ANCHOR_DATE" "\$((10#\$hh))" "\$((10#\$mm))"
-            return
-        fi
-    fi
-
-    local this_last this_d this_cycle this_ts
-    this_last="\$(TZ=\$TZNAME date -d "\$((10#\$y))-\$((10#\$m))-01 +1 month -1 day" +%d)"
-    this_d="\$d"
-    if [ "\$this_d" -gt "\$this_last" ]; then
-        this_d="\$this_last"
-    fi
-    printf -v this_cycle "%04d-%02d-%02d %02d:%02d:00" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-    this_ts="\$(TZ=\$TZNAME date -d "\$this_cycle" +%s)"
-
-    if [ "\$now_ts" -ge "\$this_ts" ]; then
-        printf "%04d-%02d-%02dT%02d:%02d" "\$((10#\$y))" "\$((10#\$m))" "\$((10#\$this_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-        return
-    fi
-
-    local prev_y prev_m prev_last prev_d
-    prev_y="\$((10#\$y))"
-    prev_m="\$((10#\$m - 1))"
-    if [ "\$prev_m" -eq 0 ]; then
-        prev_m=12
-        prev_y="\$((prev_y - 1))"
-    fi
-    prev_last="\$(TZ=\$TZNAME date -d "\$prev_y-\$prev_m-01 +1 month -1 day" +%d)"
-    prev_d="\$d"
-    if [ "\$prev_d" -gt "\$prev_last" ]; then
-        prev_d="\$prev_last"
-    fi
-    printf "%04d-%02d-%02dT%02d:%02d" "\$prev_y" "\$prev_m" "\$((10#\$prev_d))" "\$((10#\$hh))" "\$((10#\$mm))"
-}
-
-cycle_key="\$(calc_cycle_key)"
-rx="\$(cat /sys/class/net/"\$IFACE"/statistics/rx_bytes 2>/dev/null || echo 0)"
-tx="\$(cat /sys/class/net/"\$IFACE"/statistics/tx_bytes 2>/dev/null || echo 0)"
-
-if [[ "\$cycle_key" == fixed:* ]]; then
-    now_ts="\$(TZ=\$TZNAME date +%s)"
-    anchor_ts="\$(TZ=\$TZNAME date -d "\$RESET_ANCHOR_DATE \$RESET_HOUR:\$RESET_MINUTE:00" +%s 2>/dev/null || echo 0)"
-    if [ "\$now_ts" -ge "\$anchor_ts" ]; then
-        echo "[reset_tx_baseline] \$(date -Is) EXPIRED! Stopping proxy services..."
-        systemctl stop sing-box clash-meta xray v2ray caddy sub-server 2>/dev/null || true
-        exit 0
-    fi
-fi
-
-saved_cycle_key=""
-if [ -f "\$STATE" ] && [ -s "\$STATE" ]; then
-    saved_cycle_key="\$(python3 - "\$STATE" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as f:
-        st = json.load(f)
-    ck = st.get('cycle_key')
-    if ck:
-        print(ck)
-    else:
-        ym = st.get('ym', '')
-        if ym:
-            print(f"{ym}-01T00:00")
-except Exception:
-    pass
-PYEOF
-    )"
-fi
-
-if [ "\$saved_cycle_key" = "\$cycle_key" ]; then
-    # cycle_key 匹配，检查计数器是否回绕（重启后 rx/tx_bytes 归零）
-    saved_bases="\$(python3 - "\$STATE" <<'PYEOF'
-import json, sys
-try:
-    with open(sys.argv[1], encoding='utf-8') as f:
-        st = json.load(f)
-    brx = st.get('base_rx')
-    btx = st.get('base_tx')
-    if brx is not None and btx is not None:
-        print(f"{int(brx)}:{int(btx)}")
-except Exception:
-    pass
-PYEOF
-    )"
-    if [ -n "\$saved_bases" ]; then
-        saved_base_rx="\${saved_bases%%:*}"
-        saved_base_tx="\${saved_bases##*:}"
-    else
-        saved_base_rx=""
-        saved_base_tx=""
-    fi
-    if [ -n "\$saved_base_rx" ] && [ -n "\$saved_base_tx" ] && { [ "\$rx" -lt "\$saved_base_rx" ] || [ "\$tx" -lt "\$saved_base_tx" ]; }; then
-        # 计数器回绕：cur_rx < base_rx 或 cur_tx < base_tx，重置基线
-        tmp="\$(mktemp)"
-        printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
-        install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
-        rm -f "\$tmp"
-        echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE (reason: counter wrapped, old_base_rx=\$saved_base_rx old_base_tx=\$saved_base_tx)"
-        exit 0
-    fi
-    echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key already up-to-date, skip"
-    exit 0
-fi
-
-tmp="\$(mktemp)"
-printf '{"cycle_key":"%s","base_rx":%s,"base_tx":%s}\n' "\$cycle_key" "\$rx" "\$tx" > "\$tmp"
-install -o subsrv -g subsrv -m 640 "\$tmp" "\$STATE"
-rm -f "\$tmp"
-echo "[reset_tx_baseline] \$(date -Is) IFACE=\$IFACE cycle_key=\$cycle_key base_rx=\$rx base_tx=\$tx wrote=\$STATE"
-SH
-chmod +x /usr/local/bin/reset_tx_baseline.sh
-
-# 流量基线初始化：根据用户设置的"已使用流量"写入 tx_state.json
-STATE_FILE="/var/lib/subsrv/tx_state.json"
-NEED_RESET=true
-
-if [ -f "$STATE_FILE" ] && [ -s "$STATE_FILE" ]; then
-    HAS_BASELINE=$(python3 -c "
-import json, sys
-try:
-    with open(sys.argv[1]) as f:
-        st = json.load(f)
-    print('yes' if ('base_rx' in st and 'base_tx' in st and ('cycle_key' in st or 'ym' in st)) else 'no')
-except:
-    print('no')
-" "$STATE_FILE")
-    if [ "$HAS_BASELINE" = "yes" ]; then
-        NEED_RESET=false
-        echo "=> 检测到已有流量基线，跳过初始化以保留已累计流量"
-    else
-        echo "=> 检测到状态文件损坏或缺少基线信息，将重新初始化"
-    fi
-fi
-
-# 如果用户指定了已使用流量 (USED_TRAFFIC_GIB > 0)，
-# 则无论是否首次部署，均根据该值重新计算基线并写入状态文件
-_USED_GIB="${USED_TRAFFIC_GIB:-0}"
-if python3 -c "import sys; sys.exit(0 if float(sys.argv[1]) > 0 else 1)" "$_USED_GIB" 2>/dev/null; then
-    echo "=> 根据已使用流量 ${_USED_GIB} GiB 重新计算流量基线..."
-    python3 - "$STATE_FILE" "$_USED_GIB" "$IFACE" "$RESET_MODE" "${RESET_ANCHOR_DATE:-}" "$RESET_DAY" "$RESET_HOUR" "$RESET_MINUTE" "$TZ_NAME" <<'PYEOF'
-import sys, os, json
-from datetime import datetime, timezone
+cat > /usr/local/bin/subsrv-traffic-state.py <<'PY'
+#!/usr/bin/env python3
+"""Atomic baseline state manager for the dynamic subscription service."""
+import argparse
+import fcntl
+import json
+import os
+import pwd
+import grp
+import sys
+import tempfile
 from calendar import monthrange
-
-state_path        = sys.argv[1]
-used_gib          = float(sys.argv[2])
-iface             = sys.argv[3]
-reset_mode        = sys.argv[4]
-reset_anchor_date = sys.argv[5]
-reset_day         = int(sys.argv[6])
-reset_hour        = int(sys.argv[7])
-reset_minute      = int(sys.argv[8])
-tz_name           = sys.argv[9]
-used_bytes        = int(used_gib * 1024 ** 3)
+from datetime import datetime, timezone
 
 try:
     from zoneinfo import ZoneInfo
-    tz = ZoneInfo(tz_name)
-except Exception:
-    tz = timezone.utc
+except ImportError:
+    ZoneInfo = None
+
+
+def timezone_for(name):
+    if ZoneInfo:
+        try:
+            return ZoneInfo(name)
+        except Exception:
+            pass
+    return timezone.utc
+
 
 def shift_month(year, month, delta):
     total = year * 12 + (month - 1) + delta
-    y = total // 12
-    m = total % 12 + 1
-    return y, m
+    return total // 12, total % 12 + 1
 
-def cycle_start_for(year, month):
-    if reset_mode == "natural_month":
-        d, hh, mm = 1, 0, 0
-    else:
-        last = monthrange(year, month)[1]
-        d  = min(max(reset_day, 1), last)
-        hh = min(max(reset_hour, 0), 23)
-        mm = min(max(reset_minute, 0), 59)
-    return datetime(year, month, d, hh, mm, 0, tzinfo=tz)
 
-now = datetime.now(tz)
-if reset_mode == "fixed_expire":
-    cycle_key = f"fixed:{reset_anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
-else:
-    this_cycle = cycle_start_for(now.year, now.month)
-    if now >= this_cycle:
-        cycle_start = this_cycle
-    else:
-        py, pm = shift_month(now.year, now.month, -1)
-        cycle_start = cycle_start_for(py, pm)
-    cycle_key = cycle_start.strftime("%Y-%m-%dT%H:%M")
+def monthly_cycle(now, reset_day, reset_hour, reset_minute, tz):
+    day = min(max(reset_day, 1), monthrange(now.year, now.month)[1])
+    current = datetime(now.year, now.month, day, reset_hour, reset_minute, tzinfo=tz)
+    if now >= current:
+        return current
+    year, month = shift_month(now.year, now.month, -1)
+    day = min(max(reset_day, 1), monthrange(year, month)[1])
+    return datetime(year, month, day, reset_hour, reset_minute, tzinfo=tz)
 
-# 读取当前网卡 rx/tx_bytes
-cur_rx = 0
-cur_tx = 0
-try:
-    with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
-        cur_rx = int(f.read().strip())
-except Exception as e:
-    print(f"[baseline] WARN: cannot read rx_bytes for {iface}: {e}", flush=True)
 
-try:
-    with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
-        cur_tx = int(f.read().strip())
-except Exception as e:
-    print(f"[baseline] WARN: cannot read tx_bytes for {iface}: {e}", flush=True)
+def desired_cycle(args, now, tz):
+    if args.reset_mode == "fixed_expire":
+        return f"fixed:{args.anchor_date}T{args.reset_hour:02d}:{args.reset_minute:02d}", None
+    if args.reset_mode == "anchored_monthly" and args.anchor_date:
+        try:
+            anchor = datetime.strptime(
+                f"{args.anchor_date} {args.reset_hour:02d}:{args.reset_minute:02d}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=tz)
+        except ValueError:
+            anchor = None
+        if anchor and now < anchor:
+            return f"pre-anchor:{args.anchor_date}T{args.reset_hour:02d}:{args.reset_minute:02d}", anchor
+    if args.reset_mode == "natural_month":
+        return datetime(now.year, now.month, 1, 0, 0, tzinfo=tz).strftime("%Y-%m-%dT%H:%M"), None
+    return monthly_cycle(now, args.reset_day, args.reset_hour, args.reset_minute, tz).strftime("%Y-%m-%dT%H:%M"), None
 
-cur_total = max(cur_rx, 0) + max(cur_tx, 0)
-if cur_total > 0:
-    used_rx = (used_bytes * max(cur_rx, 0)) // cur_total
-else:
-    used_rx = used_bytes // 2
-used_tx = used_bytes - used_rx
 
-# base_rx/base_tx 允许为负值，用于表达用户手动设置的已使用流量偏移
-new_base_rx = cur_rx - used_rx
-new_base_tx = cur_tx - used_tx
+def read_counter(root, iface, name):
+    path = os.path.join(root, iface, "statistics", name)
+    with open(path, encoding="utf-8") as f:
+        return int(f.read().strip())
 
-tmp = state_path + ".tmp"
-with open(tmp, "w", encoding="utf-8") as f:
-    json.dump({"cycle_key": cycle_key, "base_rx": new_base_rx, "base_tx": new_base_tx}, f, separators=(",", ":"))
-import subprocess
-ret = subprocess.run(
-    ["install", "-o", "subsrv", "-g", "subsrv", "-m", "640", tmp, state_path],
-    capture_output=True
-)
-if ret.returncode != 0:
-    # install 失败时退回到直接移动（root 写入），并修正属主和权限
-    import shutil
-    shutil.move(tmp, state_path)
+
+def load_state(path):
     try:
-        import pwd, grp
-        uid = pwd.getpwnam("subsrv").pw_uid
-        gid = grp.getgrnam("subsrv").gr_gid
-        os.chown(state_path, uid, gid)
-    except Exception:
-        pass
-    os.chmod(state_path, 0o640)
-    print(f"[baseline] WARN: install failed ({ret.stderr.decode().strip()}), wrote as root fallback", flush=True)
-else:
+        with open(path, encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict):
+            raise ValueError("not an object")
+        if not isinstance(state.get("cycle_key"), str) or not state["cycle_key"]:
+            raise ValueError("missing cycle_key")
+        for key in ("base_rx", "base_tx"):
+            if isinstance(state.get(key), bool):
+                raise ValueError(f"invalid {key}")
+            int(state[key])
+        return state, None
+    except Exception as exc:
+        return {}, str(exc)
+
+
+def write_state(path, state):
+    directory = os.path.dirname(path)
+    os.makedirs(directory, mode=0o750, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=".tx_state.", dir=directory)
     try:
-        os.unlink(tmp)
-    except Exception:
-        pass
-print(f"[baseline] set: iface={iface} cur_rx={cur_rx} cur_tx={cur_tx} used_bytes={used_bytes} used_rx={used_rx} used_tx={used_tx} new_base_rx={new_base_rx} new_base_tx={new_base_tx} cycle_key={cycle_key}", flush=True)
-PYEOF
-elif [ "$NEED_RESET" = true ]; then
-    # 首次部署（或状态文件缺失）时直接写入基线，不能依赖定时器或
-    # reset_tx_baseline.sh 的执行时机；否则锚定日尚未来临时会一直返回 0。
-    python3 - "$STATE_FILE" "$IFACE" "$RESET_MODE" "${RESET_ANCHOR_DATE:-}" "$RESET_DAY" "$RESET_HOUR" "$RESET_MINUTE" "$TZ_NAME" <<'PYEOF'
-import json, os, sys
-from datetime import datetime, timezone
-from calendar import monthrange
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(state, f, separators=(",", ":"))
+            f.write("\n")
+            f.flush()
+            os.fsync(f.fileno())
+        try:
+            os.chown(tmp, pwd.getpwnam("subsrv").pw_uid, grp.getgrnam("subsrv").gr_gid)
+        except (KeyError, PermissionError):
+            pass
+        os.chmod(tmp, 0o640)
+        os.replace(tmp, path)
+    finally:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
 
-state_path, iface, reset_mode, anchor_date, reset_day, reset_hour, reset_minute, tz_name = sys.argv[1:]
-reset_day = int(reset_day)
-reset_hour = int(reset_hour)
-reset_minute = int(reset_minute)
 
-try:
-    from zoneinfo import ZoneInfo
-    tz = ZoneInfo(tz_name)
-except Exception:
-    tz = timezone.utc
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--state", default="/var/lib/subsrv/tx_state.json")
+    parser.add_argument("--iface", required=True)
+    parser.add_argument("--sysfs-root", default="/sys/class/net")
+    parser.add_argument("--tz", default="UTC")
+    parser.add_argument("--reset-mode", choices=("natural_month", "anchored_monthly", "fixed_expire"), required=True)
+    parser.add_argument("--anchor-date", default="")
+    parser.add_argument("--reset-day", type=int, default=1)
+    parser.add_argument("--reset-hour", type=int, default=0)
+    parser.add_argument("--reset-minute", type=int, default=0)
+    parser.add_argument("--status", action="store_true")
+    parser.add_argument("--enforce-expiry", action="store_true")
+    args = parser.parse_args()
 
-now = datetime.now(tz)
+    args.reset_hour = min(max(args.reset_hour, 0), 23)
+    args.reset_minute = min(max(args.reset_minute, 0), 59)
+    tz = timezone_for(args.tz)
+    now = datetime.now(tz)
+    cycle_key, anchor = desired_cycle(args, now, tz)
 
-if reset_mode == "fixed_expire":
-    cycle_key = f"fixed:{anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
-elif reset_mode == "anchored_monthly" and anchor_date:
-    try:
-        anchor = datetime.strptime(
-            f"{anchor_date} {reset_hour:02d}:{reset_minute:02d}", "%Y-%m-%d %H:%M"
-        ).replace(tzinfo=tz)
-    except ValueError:
-        anchor = None
-    if anchor and now < anchor:
-        cycle_key = f"pre-anchor:{anchor_date}T{reset_hour:02d}:{reset_minute:02d}"
-    else:
-        last_day = monthrange(now.year, now.month)[1]
-        day = min(max(reset_day, 1), last_day)
-        this_cycle = now.replace(day=day, hour=reset_hour, minute=reset_minute, second=0, microsecond=0)
-        if now < this_cycle:
-            previous_month = now.month - 1 or 12
-            previous_year = now.year - 1 if now.month == 1 else now.year
-            day = min(max(reset_day, 1), monthrange(previous_year, previous_month)[1])
-            this_cycle = this_cycle.replace(year=previous_year, month=previous_month, day=day)
-        cycle_key = this_cycle.strftime("%Y-%m-%dT%H:%M")
-else:
-    cycle_key = now.replace(day=1, hour=0, minute=0, second=0, microsecond=0).strftime("%Y-%m-%dT%H:%M")
+    if args.reset_mode == "fixed_expire" and args.anchor_date:
+        try:
+            expiry = datetime.strptime(
+                f"{args.anchor_date} {args.reset_hour:02d}:{args.reset_minute:02d}",
+                "%Y-%m-%d %H:%M",
+            ).replace(tzinfo=tz)
+        except ValueError:
+            expiry = None
+        if args.enforce_expiry and expiry and now >= expiry:
+            print(json.dumps({"ok": False, "reason": "expired", "cycle_key": cycle_key}))
+            return 3
 
-with open(f"/sys/class/net/{iface}/statistics/rx_bytes", encoding="utf-8") as f:
-    rx = int(f.read().strip())
-with open(f"/sys/class/net/{iface}/statistics/tx_bytes", encoding="utf-8") as f:
-    tx = int(f.read().strip())
+    lock_path = args.state + ".lock"
+    os.makedirs(os.path.dirname(args.state), mode=0o750, exist_ok=True)
+    with open(lock_path, "a+", encoding="utf-8") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        rx = read_counter(args.sysfs_root, args.iface, "rx_bytes")
+        tx = read_counter(args.sysfs_root, args.iface, "tx_bytes")
+        state, error = load_state(args.state)
+        valid = error is None
+        reason = "unchanged"
+        if not valid:
+            reason = "missing-or-invalid"
+        elif state["cycle_key"] != cycle_key:
+            reason = "cycle-changed"
+        elif rx < int(state["base_rx"]) or tx < int(state["base_tx"]):
+            reason = "counter-wrapped"
 
-tmp_path = state_path + ".tmp"
-with open(tmp_path, "w", encoding="utf-8") as f:
-    json.dump({"cycle_key": cycle_key, "base_rx": rx, "base_tx": tx}, f, separators=(",", ":"))
-    f.write("\n")
+        if args.status:
+            print(json.dumps({
+                "ok": valid,
+                "reason": error or reason,
+                "expected_cycle_key": cycle_key,
+                "state": state,
+                "current_rx": rx,
+                "current_tx": tx,
+            }, ensure_ascii=False))
+            return 0 if valid else 1
 
-try:
-    import grp, pwd
-    os.chown(tmp_path, pwd.getpwnam("subsrv").pw_uid, grp.getgrnam("subsrv").gr_gid)
-except KeyError:
-    pass
-os.chmod(tmp_path, 0o640)
-os.replace(tmp_path, state_path)
-print(f"[baseline] initialized: iface={iface} cycle_key={cycle_key} base_rx={rx} base_tx={tx}", flush=True)
-PYEOF
+        if reason != "unchanged":
+            state = {
+                "cycle_key": cycle_key,
+                "base_rx": rx,
+                "base_tx": tx,
+                "initialized_at": now.isoformat(),
+                "repair_reason": reason,
+            }
+            write_state(args.state, state)
+
+        print(json.dumps({
+            "ok": True,
+            "reason": reason,
+            "cycle_key": state["cycle_key"],
+            "base_rx": int(state["base_rx"]),
+            "base_tx": int(state["base_tx"]),
+            "current_rx": rx,
+            "current_tx": tx,
+            "next_anchor": anchor.isoformat() if anchor else None,
+        }, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+PY
+chmod 755 /usr/local/bin/subsrv-traffic-state.py
+
+cat > /usr/local/bin/reset_tx_baseline.sh <<SH
+#!/usr/bin/env bash
+set -euo pipefail
+set +e
+/usr/local/bin/subsrv-traffic-state.py --enforce-expiry \
+    --iface "$IFACE" --tz "$TZ_NAME" --reset-mode "$RESET_MODE" \
+    --anchor-date "$RESET_ANCHOR_DATE" --reset-day "$RESET_DAY" \
+    --reset-hour "$RESET_HOUR" --reset-minute "$RESET_MINUTE"
+rc=\$?
+set -e
+if [ "\$rc" -eq 3 ]; then
+    echo "[reset_tx_baseline] $(date -Is) subscription expired; stopping proxy services"
+    systemctl stop sing-box clash-meta xray v2ray caddy sub-server 2>/dev/null || true
+    exit 0
 fi
+exit "\$rc"
+SH
+chmod 755 /usr/local/bin/reset_tx_baseline.sh
+
+# 立即修复旧部署的空/损坏状态；基线从修复时的网卡计数开始。
+echo "=> 检查并修复流量基线..."
+/usr/local/bin/subsrv-traffic-state.py \
+    --iface "$IFACE" --tz "$TZ_NAME" --reset-mode "$RESET_MODE" \
+    --anchor-date "${RESET_ANCHOR_DATE:-}" --reset-day "$RESET_DAY" \
+    --reset-hour "$RESET_HOUR" --reset-minute "$RESET_MINUTE"
 
 # 设置系统时区以确保 systemd timer 在正确时间触发
 echo "=> 设置系统时区为 $TZ_NAME (确保 Timer 在正确时间触发)..."
@@ -2182,7 +2061,7 @@ timedatectl set-timezone "$TZ_NAME" 2>/dev/null || {
 
 cat > /etc/systemd/system/reset-tx-baseline.service <<UNIT
 [Unit]
-Description=Reset monthly tx baseline
+Description=Repair and rotate subscription traffic baseline
 [Service]
 Type=oneshot
 Environment=TZ=$TZ_NAME
@@ -2191,9 +2070,11 @@ UNIT
 
 cat > /etc/systemd/system/reset-tx-baseline.timer <<UNIT
 [Unit]
-Description=Run reset-tx-baseline every minute (guarded by cycle key)
+Description=Repair and rotate subscription traffic baseline
 [Timer]
-OnCalendar=*-*-* *:*:00
+OnBootSec=15s
+OnUnitActiveSec=1min
+AccuracySec=1s
 Persistent=true
 [Install]
 WantedBy=timers.target
@@ -2472,7 +2353,7 @@ chmod +x /usr/local/bin/sub_server.py
 cat > /etc/systemd/system/sub-server.service <<UNIT
 [Unit]
 Description=Dynamic subscription server with subscription-userinfo
-After=network-online.target vnstat.service
+After=network-online.target vnstat.service reset-tx-baseline.service
 Wants=network-online.target
 
 [Service]
@@ -2495,6 +2376,7 @@ Environment=SUB_RESET_HOUR=$RESET_HOUR
 Environment=SUB_RESET_MINUTE=$RESET_MINUTE
 Environment=SUB_LISTEN=127.0.0.1
 Environment=SUB_PORT=$BACKEND_PORT
+ExecStartPre=+/usr/local/bin/subsrv-traffic-state.py --enforce-expiry --iface=$IFACE --tz=$TZ_NAME --reset-mode=$RESET_MODE --anchor-date=$RESET_ANCHOR_DATE --reset-day=$RESET_DAY --reset-hour=$RESET_HOUR --reset-minute=$RESET_MINUTE
 ExecStart=/usr/local/bin/sub_server.py
 Restart=always
 RestartSec=2
@@ -2505,12 +2387,46 @@ UNIT
 
 systemctl daemon-reload
 systemctl enable --now refresh-sub-copy.timer
-# sub_server.py 已改为只读模式，不再写入 tx_state.json
-# 即使 Persistent=true 导致 reset_tx_baseline.sh 立即触发也无害（cycle_key 匹配会跳过）
 systemctl enable --now reset-tx-baseline.timer
+systemctl start reset-tx-baseline.service
 # 使用 restart 而非 start，确保覆盖部署时环境变量生效
 systemctl enable sub-server
 systemctl restart sub-server
+
+cat > /usr/local/bin/subsrv-traffic-health.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+# shellcheck disable=SC1091
+source /etc/sub-srv/config.conf
+RESET_DAY="${RESET_DAY:-1}"
+if [ "$RESET_MODE" = "anchored_monthly" ] && [ -n "${RESET_ANCHOR_DATE:-}" ]; then
+  RESET_DAY=$((10#${RESET_ANCHOR_DATE##*-}))
+fi
+
+args=(
+  --status
+  --iface="$IFACE"
+  --tz="$TZ_NAME"
+  --reset-mode="$RESET_MODE"
+  --anchor-date="${RESET_ANCHOR_DATE:-}"
+  --reset-day="$RESET_DAY"
+  --reset-hour="$RESET_HOUR"
+  --reset-minute="$RESET_MINUTE"
+)
+echo "== traffic state =="
+/usr/local/bin/subsrv-traffic-state.py "${args[@]}"
+echo "== subscription-userinfo =="
+for ext in yaml json txt; do
+  printf '%s: ' "$ext"
+  curl -fsSI "http://127.0.0.1:${BACKEND_PORT}/sub/${TOKEN}.$ext" \
+    | tr -d '\r' \
+    | awk 'BEGIN{IGNORECASE=1} /^subscription-userinfo:/ {print; found=1} END{if (!found) exit 1}'
+done
+SH
+chmod 755 /usr/local/bin/subsrv-traffic-health.sh
+if ! /usr/local/bin/subsrv-traffic-health.sh; then
+    echo "=> 警告: 流量头健康检查失败，请执行 journalctl -u sub-server -n 80 --no-pager"
+fi
 
 echo "[8/8] 配置 Caddy (反向代理与鉴权)..."
 # 生成密码哈希 (如果是新密码)
