@@ -6,6 +6,8 @@
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/vps-sub-meter.sh)
 ```
 
+脚本主菜单的“WARP 与出站管理”可按需启用固定版本的标准 WARP、WARP-plus 本地 SOCKS5 或多地区 Psiphon SOCKS5。默认不启用，且只会代理你在菜单中添加的域名后缀；订阅的 `subscription-userinfo` 流量头仍按 VPS 网卡实时统计。
+
 旧流程：先运行 yonggekkk/sing-box-yg 脚本
 ```bash
 bash <(wget -qO- https://raw.githubusercontent.com/yonggekkk/sing-box-yg/main/sb.sh)

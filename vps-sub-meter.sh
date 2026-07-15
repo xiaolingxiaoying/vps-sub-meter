@@ -35,6 +35,25 @@ UPSTREAM_SINGBOX_YG_SCRIPT="/usr/local/lib/vps-sub-meter/sing-box-yg-${UPSTREAM_
 UPSTREAM_MANIFEST="/etc/sub-srv/upstream.conf"
 MIGRATION_BACKUP_DONE=false
 
+# WARP 组件同样使用受控快照。warp-yg 上游没有发布 LICENSE 文件；本项目只
+# 保存来源与 commit，维护者更新快照前必须重新核实其授权状态。
+UPSTREAM_WARP_YG_COMMIT="f2f634ba79452a0ffadcd93a6e6524cf4b7b84df"
+UPSTREAM_WARP_YG_URL="${VPS_SUB_METER_RAW_BASE}/third_party/warp-yg/CFwarp.sh"
+UPSTREAM_WARP_YG_SCRIPT="/usr/local/lib/vps-sub-meter/warp-yg-${UPSTREAM_WARP_YG_COMMIT}.sh"
+UPSTREAM_WARP_YG_SHA256="68420275344b7e7f29ef2b6f77d3a35d8443e26d12112495d593495c63f8f19b"
+WARP_STATE_DIR="/etc/sub-srv"
+WARP_STATE_FILE="${WARP_STATE_DIR}/warp.conf"
+WARP_DOMAINS_FILE="${WARP_STATE_DIR}/warp-domains.txt"
+WARP_PLUS_ENV="/etc/default/vps-sub-meter-warp-plus"
+WARP_PLUS_BINARY="/usr/local/lib/vps-sub-meter/sbwpph"
+WARP_PLUS_UNIT="vps-sub-meter-warp-plus.service"
+WARP_PLUS_SOURCE_BASE="https://raw.githubusercontent.com/yonggekkk/sing-box-yg/${UPSTREAM_SINGBOX_YG_COMMIT}"
+WARP_PLUS_AMD64_SHA256="93c7c5d7cb2c82cef44de782ae030b5f8fdb15038e3e95662e451bce7d3ee531"
+WARP_PLUS_ARM64_SHA256="4a8f0419e4b848b99017128d532bd760f6daa4a7b0bc9f59ff166105db5c6e33"
+WARP_ROUTE_STANDARD="vps-sub-meter-warp-domain"
+WARP_ROUTE_PLUS="vps-sub-meter-warp-plus-socks"
+WARP_ROUTE_IPV6="vps-sub-meter-warp-ipv6"
+
 # 0. 确保交互式输入可用 (兼容 bash <(curl ...) 方式)
 if [ ! -t 0 ]; then
     exec < /dev/tty
@@ -89,7 +108,7 @@ run_singbox_yg_core() {
     echo "=================================================="
     echo "  sing-box-yg 核心节点管理（固定快照）"
     echo "  仅选择五协议、证书和节点生成相关功能；"
-    echo "  WARP/Psiphon、Argo 等可选扩展不会由本脚本自动启用。"
+    echo "  WARP/Psiphon 请从一体化脚本的 WARP 管理菜单启用。"
     echo "=================================================="
     bash "$UPSTREAM_SINGBOX_YG_SCRIPT"
 }
@@ -105,6 +124,10 @@ CORE_CONFIG='/etc/s-box/sb.json'
 YAML_SOURCE='/etc/s-box/clmi.yaml'
 JSON_SOURCE='/etc/s-box/sbox.json'
 TXT_SOURCE='/etc/s-box/jhsub.txt'
+WARP_YG_COMMIT='$UPSTREAM_WARP_YG_COMMIT'
+WARP_YG_SCRIPT='$UPSTREAM_WARP_YG_SCRIPT'
+WARP_PLUS_SOURCE_COMMIT='$UPSTREAM_SINGBOX_YG_COMMIT'
+WARP_PLUS_SERVICE='$WARP_PLUS_UNIT'
 EOF
     chmod 600 "$UPSTREAM_MANIFEST"
 }
@@ -118,11 +141,55 @@ backup_existing_singbox_yg() {
     mkdir -p "$backup_dir"
     cp -a /etc/s-box "$backup_dir/" 2>/dev/null || true
     cp -a /root/ygkkkca "$backup_dir/" 2>/dev/null || true
+    cp -a /etc/default/vps-sub-meter-warp-plus "$backup_dir/" 2>/dev/null || true
+    cp -a /etc/sub-srv/warp.conf "$backup_dir/" 2>/dev/null || true
+    cp -a /etc/sub-srv/warp-domains.txt "$backup_dir/" 2>/dev/null || true
     systemctl cat sing-box.service > "$backup_dir/sing-box.service.txt" 2>/dev/null || true
+    systemctl cat "$WARP_PLUS_UNIT" > "$backup_dir/warp-plus.service.txt" 2>/dev/null || true
+    systemctl cat warp-go.service > "$backup_dir/warp-go.service.txt" 2>/dev/null || true
+    systemctl cat wg-quick@wgcf.service > "$backup_dir/wgcf.service.txt" 2>/dev/null || true
+    crontab -l 2>/dev/null | grep -E 'sbwpph|warp-go|wgcf' > "$backup_dir/warp.crontab.txt" || true
     printf 'upstream_commit=%s\nbackup_time=%s\n' "$UPSTREAM_SINGBOX_YG_COMMIT" "$(date -Is)" > "$backup_dir/manifest.txt"
     chmod -R go-rwx "$backup_dir"
     MIGRATION_BACKUP_DONE=true
     echo "=> 已备份现有 sing-box-yg 节点与证书: $backup_dir"
+}
+
+validate_and_restart_singbox() {
+    local config="$1" backup="$2"
+    if ! jq empty "$config" >/dev/null 2>&1; then
+        echo "错误: 生成的 sing-box JSON 无效"
+        cp -f "$backup" /etc/s-box/sb.json
+        return 1
+    fi
+    if [ -x /etc/s-box/sing-box ] && ! /etc/s-box/sing-box check -c "$config" >/dev/null 2>&1; then
+        echo "错误: sing-box 配置检查失败"
+        cp -f "$backup" /etc/s-box/sb.json
+        return 1
+    fi
+    mv -f "$config" /etc/s-box/sb.json
+    if ! systemctl restart "$SINGBOX_SERVICE"; then
+        cp -f "$backup" /etc/s-box/sb.json
+        systemctl restart "$SINGBOX_SERVICE" || true
+        echo "错误: sing-box 重启失败，已恢复备份"
+        return 1
+    fi
+}
+
+remove_managed_warp_routes() {
+    local config="/etc/s-box/sb.json" backup tmp
+    [ -s "$config" ] || return 0
+    apt-get update -qq
+    apt-get install -y -qq jq
+    backup="${config}.vps-sub-meter-warp.bak"
+    tmp=$(mktemp "${config}.tmp.XXXXXX")
+    cp -f "$config" "$backup"
+    jq --arg standard "$WARP_ROUTE_STANDARD" --arg plus "$WARP_ROUTE_PLUS" --arg ipv6 "$WARP_ROUTE_IPV6" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] |
+        .outbounds |= map(select(.tag != $standard and .tag != $plus and .tag != $ipv6)) |
+        .route.rules |= map(select(.outbound != $standard and .outbound != $plus and .outbound != $ipv6))
+    ' "$config" > "$tmp"
+    validate_and_restart_singbox "$tmp" "$backup"
 }
 
 switch_singbox_outbound() {
@@ -133,7 +200,7 @@ switch_singbox_outbound() {
     fi
     apt-get update -qq
     apt-get install -y -qq jq
-    echo "1) 原生 IPv4 出站"
+    echo "1) 原生 IPv4 出站（移除本脚本管理的 IPv6 WARP 规则）"
     echo "2) IPv6 优先（仅在现有配置包含 warp-out 时使用）"
     read -rp "请选择 [1-2]: " choice
     if [ "$choice" = "2" ] && ! jq -e '.outbounds[]? | select(.tag == "warp-out")' "$config" >/dev/null; then
@@ -143,20 +210,24 @@ switch_singbox_outbound() {
     cp -f "$config" "$backup"
     tmp=$(mktemp)
     if [ "$choice" = "1" ]; then
-        jq 'del(.route.rules[] | select(.strategy == "prefer_ipv6" and .domain_suffix == null)) |
-            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr != null) and (.ip_cidr | contains(["::/0"]))))' \
+        jq --arg ipv6 "$WARP_ROUTE_IPV6" 'del(.route.rules[] | select(.outbound == $ipv6)) |
+            .outbounds |= map(select(.tag != $ipv6))' \
             "$config" > "$tmp"
     elif [ "$choice" = "2" ]; then
-        jq 'del(.route.rules[] | select(.strategy == "prefer_ipv6" and .domain_suffix == null)) |
-            del(.route.rules[] | select(.outbound == "warp-out" and (.ip_cidr != null) and (.ip_cidr | contains(["::/0"])))) |
-            .route.rules |= [.[0]] + [{"action":"resolve","strategy":"prefer_ipv6"},{"ip_cidr":["::/0"],"outbound":"warp-out"}] + .[1:]' \
+        jq --arg ipv6 "$WARP_ROUTE_IPV6" 'del(.route.rules[] | select(.outbound == $ipv6)) |
+            .outbounds |= (map(select(.tag != $ipv6)) + [{"type":"selector","tag":$ipv6,"outbounds":["warp-out"]}]) |
+            .route.rules |= (if length == 0 then
+                [{"action":"resolve","strategy":"prefer_ipv6"},{"ip_cidr":["::/0"],"outbound":$ipv6}]
+            else
+                [.[0]] + [{"action":"resolve","strategy":"prefer_ipv6"},{"ip_cidr":["::/0"],"outbound":$ipv6}] + .[1:]
+            end)' \
             "$config" > "$tmp"
     else
         rm -f "$tmp"
         echo "错误: 请输入 1 或 2"
         return 1
     fi
-    if jq empty "$tmp" >/dev/null 2>&1 && mv -f "$tmp" "$config" && systemctl restart sing-box; then
+    if validate_and_restart_singbox "$tmp" "$backup"; then
         echo "=> 出站策略已更新"
     else
         rm -f "$tmp"
@@ -165,6 +236,352 @@ switch_singbox_outbound() {
         echo "错误: 配置验证或服务重启失败，已恢复备份"
         return 1
     fi
+}
+
+# ===================== WARP 双模式管理 =====================
+fetch_pinned_warp_yg() {
+    mkdir -p /usr/local/lib/vps-sub-meter
+    if [ ! -s "$UPSTREAM_WARP_YG_SCRIPT" ]; then
+        echo "=> 下载固定 warp-yg 快照: ${UPSTREAM_WARP_YG_COMMIT:0:12}"
+        apt-get update -qq
+        apt-get install -y -qq curl ca-certificates
+        curl -fsSL "$UPSTREAM_WARP_YG_URL" -o "$UPSTREAM_WARP_YG_SCRIPT"
+        if [ "$(sha256sum "$UPSTREAM_WARP_YG_SCRIPT" | awk '{print $1}')" != "$UPSTREAM_WARP_YG_SHA256" ]; then
+            rm -f "$UPSTREAM_WARP_YG_SCRIPT"
+            echo "错误: 固定 warp-yg 快照 SHA-256 校验失败"
+            return 1
+        fi
+        # 禁止其自身的更新入口跳回上游 main；固定版本只允许项目维护者更新。
+        sed -i \
+            -e "s#https://raw.githubusercontent.com/yonggekkk/warp-yg/main/#${VPS_SUB_METER_RAW_BASE}/third_party/warp-yg/#g" \
+            "$UPSTREAM_WARP_YG_SCRIPT"
+        chmod 700 "$UPSTREAM_WARP_YG_SCRIPT"
+    fi
+}
+
+run_pinned_warp_yg() {
+    fetch_pinned_warp_yg
+    echo ""
+    echo "=================================================="
+    echo " 固定版本 warp-yg 主机 WARP 管理"
+    echo " 快照: ${UPSTREAM_WARP_YG_COMMIT}"
+    echo " 该功能管理 VPS 本机 WARP；订阅节点域名分流请返回本菜单配置。"
+    echo "=================================================="
+    bash "$UPSTREAM_WARP_YG_SCRIPT"
+}
+
+detect_warp_migration() {
+    local found=()
+    command -v warp-go >/dev/null 2>&1 && found+=("warp-go")
+    [ -e /etc/wireguard/wgcf.conf ] && found+=("wgcf")
+    [ -e /etc/s-box/sbwpph ] && found+=("旧 sbwpph")
+    [ -e "$WARP_PLUS_ENV" ] && found+=("受管 WARP-plus")
+    [ -s /etc/s-box/sb.json ] && jq -e '.outbounds[]? | select(.tag == "warp-out")' /etc/s-box/sb.json >/dev/null 2>&1 && found+=("sing-box warp-out")
+    if [ "${#found[@]}" -gt 0 ]; then
+        echo "=> 检测到现有 WARP 组件: ${found[*]}"
+        echo "=> 首次改动前将创建迁移备份；不会自动接管或清理它们。"
+    else
+        echo "=> 未检测到已有 WARP 组件"
+    fi
+}
+
+warp_state_init() {
+    mkdir -p "$WARP_STATE_DIR"
+    chmod 700 "$WARP_STATE_DIR"
+    [ -f "$WARP_DOMAINS_FILE" ] || : > "$WARP_DOMAINS_FILE"
+    chmod 600 "$WARP_DOMAINS_FILE"
+}
+
+validate_domain_suffix() {
+    local domain="${1,,}"
+    [[ "$domain" =~ ^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$ ]] || return 1
+    [ "${#domain}" -le 253 ]
+}
+
+write_warp_state() {
+    local target="$1"
+    warp_state_init
+    printf 'WARP_DOMAIN_TARGET=%q\n' "$target" > "$WARP_STATE_FILE"
+    chmod 600 "$WARP_STATE_FILE"
+}
+
+read_warp_target() {
+    WARP_DOMAIN_TARGET=""
+    if [ -r "$WARP_STATE_FILE" ]; then
+        # shellcheck disable=SC1090
+        source "$WARP_STATE_FILE"
+    fi
+}
+
+configure_warp_domain_route() {
+    local target="$1" config="/etc/s-box/sb.json" backup tmp domains_json plus_port="0"
+    if [ ! -s "$config" ]; then
+        echo "错误: 未找到 $config"
+        return 1
+    fi
+    warp_state_init
+    if [ ! -s "$WARP_DOMAINS_FILE" ]; then
+        echo "错误: 请先添加至少一个域名分流规则"
+        return 1
+    fi
+    apt-get update -qq
+    apt-get install -y -qq jq
+    if [ "$target" = "$WARP_ROUTE_STANDARD" ] && ! jq -e '.outbounds[]? | select(.tag == "warp-out")' "$config" >/dev/null; then
+        echo "错误: 当前 sing-box 配置没有 warp-out；请先在节点配置中创建并验证它"
+        return 1
+    fi
+    if [ "$target" = "$WARP_ROUTE_PLUS" ]; then
+        if [ ! -r "$WARP_PLUS_ENV" ] || ! systemctl is-active --quiet "$WARP_PLUS_UNIT"; then
+            echo "错误: WARP-plus SOCKS5 未启动"
+            return 1
+        fi
+        # shellcheck disable=SC1090
+        source "$WARP_PLUS_ENV"
+        plus_port="${WARP_PLUS_PORT:-0}"
+        [[ "$plus_port" =~ ^[0-9]+$ ]] || { echo "错误: WARP-plus 端口配置无效"; return 1; }
+    fi
+    domains_json=$(jq -Rsc 'split("\n") | map(select(length > 0))' "$WARP_DOMAINS_FILE")
+    backup="${config}.vps-sub-meter-warp.bak"
+    tmp=$(mktemp "${config}.tmp.XXXXXX")
+    cp -f "$config" "$backup"
+    jq --arg target "$target" --arg standard "$WARP_ROUTE_STANDARD" --arg plus "$WARP_ROUTE_PLUS" --argjson domains "$domains_json" --argjson plus_port "$plus_port" '
+        .outbounds //= [] | .route //= {} | .route.rules //= [] |
+        .outbounds |= map(select(.tag != $standard and .tag != $plus)) |
+        .route.rules |= map(select(.outbound != $standard and .outbound != $plus)) |
+        if $target == $standard then
+            .outbounds += [{"type":"selector","tag":$standard,"outbounds":["warp-out"]}]
+        else
+            .outbounds += [{"type":"socks","tag":$plus,"server":"127.0.0.1","server_port":$plus_port,"version":"5"}]
+        end |
+        .route.rules |= (if length == 0 then
+            [{"domain_suffix":$domains,"outbound":$target}]
+        else
+            [.[0]] + [{"domain_suffix":$domains,"outbound":$target}] + .[1:]
+        end)
+    ' "$config" > "$tmp"
+    if validate_and_restart_singbox "$tmp" "$backup"; then
+        write_warp_state "$target"
+        echo "=> 已应用域名分流到: $target"
+    fi
+}
+
+manage_warp_domains() {
+    local choice domain
+    warp_state_init
+    while true; do
+        echo ""
+        echo "--- WARP 域名分流规则 ---"
+        if [ -s "$WARP_DOMAINS_FILE" ]; then
+            nl -ba "$WARP_DOMAINS_FILE"
+        else
+            echo "(尚无规则)"
+        fi
+        echo "1) 添加域名后缀"
+        echo "2) 删除域名后缀"
+        echo "3) 清空规则并恢复直连"
+        echo "0) 返回"
+        read -rp "请选择 [0-3]: " choice
+        case "$choice" in
+            1)
+                read -rp "域名后缀（例如 openai.com）: " domain
+                domain="${domain,,}"
+                if ! validate_domain_suffix "$domain"; then
+                    echo "错误: 无效域名后缀"
+                elif grep -Fxq "$domain" "$WARP_DOMAINS_FILE"; then
+                    echo "=> 规则已存在"
+                else
+                    printf '%s\n' "$domain" >> "$WARP_DOMAINS_FILE"
+                    sort -u -o "$WARP_DOMAINS_FILE" "$WARP_DOMAINS_FILE"
+                    read_warp_target
+                    [ -n "${WARP_DOMAIN_TARGET:-}" ] && configure_warp_domain_route "$WARP_DOMAIN_TARGET" || true
+                fi
+                ;;
+            2)
+                read -rp "要删除的域名后缀: " domain
+                domain="${domain,,}"
+                grep -Fxv "$domain" "$WARP_DOMAINS_FILE" > "${WARP_DOMAINS_FILE}.tmp" || true
+                mv -f "${WARP_DOMAINS_FILE}.tmp" "$WARP_DOMAINS_FILE"
+                read_warp_target
+                if [ -s "$WARP_DOMAINS_FILE" ] && [ -n "${WARP_DOMAIN_TARGET:-}" ]; then
+                    configure_warp_domain_route "$WARP_DOMAIN_TARGET"
+                else
+                    remove_managed_warp_routes
+                    : > "$WARP_STATE_FILE"
+                fi
+                ;;
+            3)
+                read -rp "确认清空受管规则并恢复直连? [y/N]: " choice
+                if [[ "$choice" =~ ^[Yy]$ ]]; then
+                    backup_existing_singbox_yg
+                    : > "$WARP_DOMAINS_FILE"
+                    : > "$WARP_STATE_FILE"
+                    remove_managed_warp_routes
+                fi
+                ;;
+            0) return 0 ;;
+            *) echo "错误: 请输入 0-3" ;;
+        esac
+    done
+}
+
+install_warp_plus_binary() {
+    local arch file expected tmp actual
+    case "$(uname -m)" in
+        x86_64) arch="amd64"; expected="$WARP_PLUS_AMD64_SHA256" ;;
+        aarch64) arch="arm64"; expected="$WARP_PLUS_ARM64_SHA256" ;;
+        *) echo "错误: WARP-plus 仅支持 x86_64 和 aarch64"; return 1 ;;
+    esac
+    file="sbwpph_${arch}"
+    mkdir -p /usr/local/lib/vps-sub-meter
+    tmp=$(mktemp)
+    echo "=> 下载固定 WARP-plus 二进制: ${UPSTREAM_SINGBOX_YG_COMMIT:0:12}/$file"
+    if ! curl -fL --retry 2 --connect-timeout 15 "$WARP_PLUS_SOURCE_BASE/$file" -o "$tmp"; then
+        rm -f "$tmp"
+        echo "错误: WARP-plus 下载失败"
+        return 1
+    fi
+    actual=$(sha256sum "$tmp" | awk '{print $1}')
+    if [ "$actual" != "$expected" ]; then
+        rm -f "$tmp"
+        echo "错误: WARP-plus SHA-256 校验失败，已拒绝安装"
+        return 1
+    fi
+    install -m 0755 "$tmp" "$WARP_PLUS_BINARY"
+    rm -f "$tmp"
+}
+
+install_warp_plus_service() {
+    install -d -m 755 /usr/local/lib/vps-sub-meter
+    cat > /usr/local/lib/vps-sub-meter/run-warp-plus.sh <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/default/vps-sub-meter-warp-plus
+case "${WARP_PLUS_MODE:-}" in
+  local) exec /usr/local/lib/vps-sub-meter/sbwpph -b "127.0.0.1:${WARP_PLUS_PORT}" "-${WARP_PLUS_FAMILY}" --endpoint 162.159.192.1:2408 ;;
+  psiphon) exec /usr/local/lib/vps-sub-meter/sbwpph -b "127.0.0.1:${WARP_PLUS_PORT}" --cfon --country "${WARP_PLUS_COUNTRY}" "-${WARP_PLUS_FAMILY}" --endpoint 162.159.192.1:2408 ;;
+  *) echo "Invalid WARP_PLUS_MODE" >&2; exit 64 ;;
+esac
+SH
+    chmod 700 /usr/local/lib/vps-sub-meter/run-warp-plus.sh
+    cat > "/etc/systemd/system/${WARP_PLUS_UNIT}" <<EOF
+[Unit]
+Description=VPS Sub Meter WARP-plus SOCKS5
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/vps-sub-meter/run-warp-plus.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+}
+
+warp_plus_healthy() {
+    local port="$1"
+    systemctl is-active --quiet "$WARP_PLUS_UNIT" || return 1
+    ss -ltn | grep -qE "127\.0\.0\.1:${port}[[:space:]]" || return 1
+    curl -fsS --max-time 12 --socks5-hostname "127.0.0.1:${port}" https://www.cloudflare.com/cdn-cgi/trace | grep -q '^warp='
+}
+
+configure_warp_plus() {
+    local mode="$1" port family country="" choice
+    backup_existing_singbox_yg
+    apt-get update -qq
+    apt-get install -y -qq curl iproute2
+    systemctl stop "$WARP_PLUS_UNIT" 2>/dev/null || true
+    read -rp "SOCKS5 端口 [40000]: " port
+    port=${port:-40000}
+    if [[ ! "$port" =~ ^[0-9]+$ ]] || [ "$port" -lt 1024 ] || [ "$port" -gt 65535 ] || ! check_port_available "$port"; then
+        echo "错误: 端口必须为未占用的 1024-65535"
+        return 1
+    fi
+    family=4
+    ip -4 route get 1.1.1.1 >/dev/null 2>&1 || family=6
+    if [ "$mode" = "psiphon" ]; then
+        read -rp "Psiphon 国家代码（两个大写字母，例如 US）: " country
+        [[ "$country" =~ ^[A-Z]{2}$ ]] || { echo "错误: 国家代码必须是两个大写字母"; return 1; }
+    fi
+    install_warp_plus_binary
+    install_warp_plus_service
+    {
+        printf 'WARP_PLUS_MODE=%q\n' "$mode"
+        printf 'WARP_PLUS_PORT=%q\n' "$port"
+        printf 'WARP_PLUS_FAMILY=%q\n' "$family"
+        printf 'WARP_PLUS_COUNTRY=%q\n' "$country"
+    } > "$WARP_PLUS_ENV"
+    chmod 600 "$WARP_PLUS_ENV"
+    systemctl enable --now "$WARP_PLUS_UNIT"
+    echo "=> 正在验证本地 SOCKS5 出口..."
+    for _ in 1 2 3 4; do
+        sleep 5
+        if warp_plus_healthy "$port"; then
+            echo "=> WARP-plus 已启动，仅监听 127.0.0.1:${port}"
+            read -rp "是否将当前域名规则切换到 WARP-plus? [y/N]: " choice
+            [[ "$choice" =~ ^[Yy]$ ]] && configure_warp_domain_route "$WARP_ROUTE_PLUS"
+            return 0
+        fi
+    done
+    systemctl disable --now "$WARP_PLUS_UNIT" || true
+    echo "错误: WARP-plus 连通性验证失败，服务已停止"
+    return 1
+}
+
+show_warp_status() {
+    local port="" mode=""
+    if [ -r "$WARP_PLUS_ENV" ]; then
+        # shellcheck disable=SC1090
+        source "$WARP_PLUS_ENV"
+        port="${WARP_PLUS_PORT:-}"; mode="${WARP_PLUS_MODE:-}"
+    fi
+    echo "标准 WARP 服务: warp-go=$(systemctl is-active warp-go 2>/dev/null || true), wgcf=$(systemctl is-active wg-quick@wgcf 2>/dev/null || true)"
+    if [ -s /etc/s-box/sb.json ] && command -v jq >/dev/null 2>&1 && jq -e '.outbounds[]? | select(.tag == "warp-out")' /etc/s-box/sb.json >/dev/null 2>&1; then
+        echo "sing-box warp-out: 已检测到"
+    else
+        echo "sing-box warp-out: 未检测到"
+    fi
+    echo "WARP-plus: $(systemctl is-active "$WARP_PLUS_UNIT" 2>/dev/null || true) ${mode:+($mode, 127.0.0.1:$port)}"
+    read_warp_target
+    echo "受管域名目标: ${WARP_DOMAIN_TARGET:-直连}"
+}
+
+warp_management_menu() {
+    local choice
+    detect_warp_migration
+    while true; do
+        echo ""
+        echo "=================================================="
+        echo " WARP 与出站管理（默认不启用，域名分流优先）"
+        echo "=================================================="
+        echo "1) 标准 WARP：打开固定 warp-yg 管理菜单"
+        echo "2) 标准 WARP：将域名规则转到现有 sing-box warp-out"
+        echo "3) WARP-plus SOCKS5：本地 WARP 模式"
+        echo "4) WARP-plus SOCKS5：多地区 Psiphon 模式"
+        echo "5) 停止 WARP-plus 并移除其受管路由"
+        echo "6) 域名分流规则管理"
+        echo "7) IPv4 / IPv6 WARP 出站策略"
+        echo "8) 查看 WARP 状态"
+        echo "0) 返回"
+        read -rp "请选择 [0-8]: " choice
+        case "$choice" in
+            1) backup_existing_singbox_yg; run_pinned_warp_yg ;;
+            2) backup_existing_singbox_yg; configure_warp_domain_route "$WARP_ROUTE_STANDARD" ;;
+            3) configure_warp_plus local ;;
+            4) configure_warp_plus psiphon ;;
+            5) backup_existing_singbox_yg; systemctl disable --now "$WARP_PLUS_UNIT" 2>/dev/null || true; read_warp_target; if [ "${WARP_DOMAIN_TARGET:-}" = "$WARP_ROUTE_PLUS" ]; then remove_managed_warp_routes; : > "$WARP_STATE_FILE"; fi; echo "=> WARP-plus 已停止" ;;
+            6) manage_warp_domains ;;
+            7) backup_existing_singbox_yg; switch_singbox_outbound ;;
+            8) show_warp_status ;;
+            0) return 0 ;;
+            *) echo "错误: 请输入 0-8" ;;
+        esac
+    done
 }
 
 choose_integrated_mode() {
@@ -176,7 +593,8 @@ choose_integrated_mode() {
     echo "  3) 节点/协议管理：打开固定版本 sing-box-yg 菜单"
     echo "  4) 仅更新订阅与流量服务"
     echo "  5) 切换 sing-box IPv4/IPv6 出站策略"
-    read -rp "请选择 [1-5，默认 1]: " integrated_mode
+    echo "  6) WARP 与出站管理（标准 WARP / WARP-plus SOCKS5）"
+    read -rp "请选择 [1-6，默认 1]: " integrated_mode
     integrated_mode=${integrated_mode:-1}
 
     case "$integrated_mode" in
@@ -213,8 +631,12 @@ choose_integrated_mode() {
             switch_singbox_outbound
             exit $?
             ;;
+        6)
+            warp_management_menu
+            exit $?
+            ;;
         *)
-            echo "错误: 请输入 1-5"
+            echo "错误: 请输入 1-6"
             exit 1
             ;;
     esac
