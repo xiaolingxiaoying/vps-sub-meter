@@ -1,0 +1,534 @@
+//! `sbctl install`: the install transaction, the post-install checklist it
+//! prints, and the firewall commands that checklist offers to copy.
+
+use crate::cli::args::InstallOptions;
+use crate::cli::prompt::{protocol_ports, required_install_value, select_protocols};
+use std::io::{self, IsTerminal};
+use std::path::Path;
+use std::process::ExitCode;
+
+pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
+    if options.subscription_host.is_none()
+        && options.interface.is_none()
+        && options.reality_decoy_sni.is_none()
+        && options.sing_box_bin.is_none()
+        && options.manifest.is_none()
+        && !options.guided
+        && !io::stdin().is_terminal()
+    {
+        return match sbctl::preflight::preflight(root) {
+            Ok(()) => {
+                println!("install preflight passed: host is ready for interactive installation");
+                ExitCode::SUCCESS
+            }
+            Err(error) => {
+                eprintln!("install preflight failed: {error}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if options.guided && has_manual_configuration(&options) {
+        eprintln!("--guided 不能与单项安装配置参数同时使用");
+        return ExitCode::from(2);
+    }
+    let mut installation_started = false;
+    let mut state_before_install = sbctl::lifecycle::PreexistingState::default();
+    let mut replacement_backup = None;
+    if let Err(error) = sbctl::preflight::require_install_privileges(root) {
+        eprintln!("install preflight failed: {error}");
+        return ExitCode::from(2);
+    }
+    if options.guided
+        && let Err(error) = sbctl::preflight::preflight(root)
+    {
+        eprintln!("install preflight failed: {error}");
+        return ExitCode::from(2);
+    }
+    if !options.guided
+        && let Err(error) = sbctl::preflight::preflight_install(
+            root,
+            matches!(&options.mode, crate::cli::args::CliSubscriptionMode::Direct),
+            options.replace_existing,
+        )
+    {
+        eprintln!("install preflight failed: {error}");
+        return ExitCode::from(2);
+    }
+    let guided_config = if options.guided {
+        let default_interface = sbctl::traffic::detect_default_route_interface(root).ok();
+        let mut prompts = crate::cli::prompt::ConsolePrompts;
+        match sbctl::wizard::run(None, default_interface, &mut prompts) {
+            Ok(sbctl::wizard::WizardOutcome::Changed(config)) => Some(config),
+            Ok(sbctl::wizard::WizardOutcome::Cancelled) => {
+                println!("installation cancelled; the host was not changed");
+                return ExitCode::SUCCESS;
+            }
+            Ok(sbctl::wizard::WizardOutcome::Unchanged) => {
+                unreachable!("a fresh installation has no prior configuration")
+            }
+            Err(error) => {
+                eprintln!("installation wizard failed: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
+    let result = (|| {
+        let config = if let Some(config) = guided_config {
+            config
+        } else {
+            let subscription_host =
+                required_install_value(options.subscription_host, "订阅主机名（域名或 IP）")?;
+            let interface = options.interface.map(Ok).unwrap_or_else(|| {
+                sbctl::traffic::detect_default_route_interface(root).map_err(|error| {
+                    sbctl::config::ConfigError::StateContent(format!(
+                        "could not detect a default-route interface ({error}); specify --interface"
+                    ))
+                })
+            })?;
+            let protocols = select_protocols(&options.disable_protocol)?;
+            let needs_reality_sni =
+                protocols.contains(&sbctl::config::ManagedProtocol::VlessReality);
+            let reality_decoy_sni = if needs_reality_sni {
+                Some(required_install_value(
+                    options.reality_decoy_sni,
+                    "Reality 伪装域名",
+                )?)
+            } else {
+                None
+            };
+            let mut config = sbctl::config::DeploymentConfig::new_with_ports(
+                options.mode.into(),
+                subscription_host,
+                options.proxy_host,
+                options.http_port,
+                interface,
+                protocols,
+                reality_decoy_sni,
+                protocol_ports(
+                    options.vless_port,
+                    options.vmess_port,
+                    options.hysteria2_port,
+                    options.tuic_port,
+                    options.anytls_port,
+                ),
+            )?;
+            config.protocol_sni = options.protocol_sni;
+            config.ipv4_only = options.ipv4_only;
+            config
+        };
+        if options.guided {
+            sbctl::preflight::preflight_install(
+                root,
+                config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+                options.replace_existing,
+            )
+            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        }
+        config.validate()?;
+        if options.sing_box_bin.is_some() && options.manifest.is_some() {
+            return Err(sbctl::config::ConfigError::InvalidValue(
+                "installation accepts either --sing-box-bin or a signed --manifest, not both",
+            ));
+        }
+        if options.replace_existing {
+            let conflicts = sbctl::preflight::existing_deployment_paths(root);
+            if !conflicts.is_empty() {
+                replacement_backup = Some(
+                    sbctl::lifecycle::prepare_reinstall(root, &conflicts)
+                        .map_err(sbctl::config::ConfigError::StateContent)?,
+                );
+            }
+            sbctl::preflight::preflight_install(
+                root,
+                config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+                false,
+            )
+            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        }
+        // Capture only after an explicitly requested replacement has moved the
+        // previous deployment into its protected backup. A failed fresh install
+        // is then rolled back before the old deployment is restored.
+        state_before_install = sbctl::lifecycle::preexisting_state(root);
+        let sing_box_bin = match options.sing_box_bin {
+            Some(path) => path,
+            None => match options.manifest {
+                Some(manifest_path) => {
+                    let manifest =
+                        sbctl::update::read_manifest(&manifest_path).map_err(|error| {
+                            sbctl::config::ConfigError::StateContent(error.to_string())
+                        })?;
+                    let download = tempfile::NamedTempFile::new().map_err(|error| {
+                        sbctl::config::ConfigError::StateContent(error.to_string())
+                    })?;
+                    sbctl::update::download_sing_box(&manifest, download.path()).map_err(
+                        |error| sbctl::config::ConfigError::StateContent(error.to_string()),
+                    )?;
+                    download
+                        .keep()
+                        .map_err(|error| {
+                            sbctl::config::ConfigError::StateContent(error.to_string())
+                        })?
+                        .1
+                }
+                None => {
+                    // 默认：直接从官方 SagerNet 仓库安装最新稳定版 sing-box 内核。
+                    let version = sbctl::update::fetch_latest_official_sing_box_version().map_err(
+                        |error| sbctl::config::ConfigError::StateContent(error.to_string()),
+                    )?;
+                    println!("从官方仓库下载 sing-box 最新稳定版 {version} …");
+                    let download = tempfile::NamedTempFile::new().map_err(|error| {
+                        sbctl::config::ConfigError::StateContent(error.to_string())
+                    })?;
+                    sbctl::update::download_sing_box_official(&version, download.path()).map_err(
+                        |error| sbctl::config::ConfigError::StateContent(error.to_string()),
+                    )?;
+                    download
+                        .keep()
+                        .map_err(|error| {
+                            sbctl::config::ConfigError::StateContent(error.to_string())
+                        })?
+                        .1
+                }
+            },
+        };
+        let artifacts = sbctl::subscription::generated_artifacts_for_kernel(
+            &config,
+            root,
+            Some(sing_box_bin.as_path()),
+        )
+        .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        let server = artifacts
+            .iter()
+            .find(|(name, _)| *name == "sing-box-server.json")
+            .map(|(_, contents)| contents)
+            .expect("generated server config");
+        sbctl::subscription::check_sing_box_config(&sing_box_bin, server)
+            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        installation_started = true;
+        sbctl::lifecycle::install_checked_sing_box(root, &sing_box_bin)?;
+        let references = artifacts
+            .iter()
+            .map(|(name, contents)| (name.clone(), contents.as_bytes()))
+            .collect::<Vec<_>>();
+        let store = sbctl::config::DeploymentStore::new(root);
+        store.initialize_with_artifacts(&config, &references)?;
+        let direct = config.subscription_mode == sbctl::config::SubscriptionMode::Direct;
+        if !options.no_start {
+            sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)
+                .map_err(sbctl::config::ConfigError::StateContent)?;
+            if direct {
+                sbctl::certificate::pin_if_present(&store, &config)
+                    .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+            }
+            sbctl::traffic::reset(&store, &config)
+                .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        }
+        sbctl::lifecycle::install_units(&store, server, direct)?;
+        let mut certificate = SubscriptionCertificate::Deferred;
+        if !options.no_start {
+            sbctl::lifecycle::start_services(root, direct)
+                .map_err(sbctl::config::ConfigError::StateContent)?;
+            sbctl::lifecycle::check_service_health(root, direct)
+                .map_err(sbctl::config::ConfigError::StateContent)?;
+            // Direct mode serves the subscription over the socket-activated
+            // HTTPS listener, which silently drops every handshake until a
+            // certificate is pinned — independently of `certificate_mode`,
+            // which only decides what the protocol listeners use. Obtaining it
+            // here, instead of leaving it to a second manual
+            // `certificate obtain`, is what makes the first install actually
+            // usable.
+            if direct {
+                certificate = obtain_install_certificate(&store, &config, root);
+            }
+            if options.manage_firewall {
+                open_firewall_ports(root, &config, direct);
+            }
+            // The ownership marker is the commit point of the complete
+            // transaction. A `--no-start` fixture install defers startup and
+            // the health check, so it never claims ownership.
+            sbctl::lifecycle::write_ownership_marker(&store)?;
+        }
+        Ok::<_, sbctl::config::ConfigError>((config, certificate))
+    })();
+    match result {
+        Ok((config, certificate)) => {
+            print_post_install_checklist_with(&config, certificate, options.manage_firewall);
+            if let Some(backup) = replacement_backup {
+                println!("旧部署备份保存在 {}", backup.archive_path().display());
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            if installation_started {
+                sbctl::lifecycle::rollback_fresh_installation(root, state_before_install);
+            }
+            if let Some(backup) = replacement_backup {
+                if let Err(restore_error) =
+                    sbctl::lifecycle::restore_replaced_deployment(root, &backup)
+                {
+                    eprintln!(
+                        "恢复旧部署失败: {restore_error}; 完整备份仍保存在 {}",
+                        backup.archive_path().display()
+                    );
+                } else {
+                    eprintln!(
+                        "新安装失败，旧部署已从备份恢复。备份: {}",
+                        backup.archive_path().display()
+                    );
+                }
+            }
+            eprintln!("installation failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn has_manual_configuration(options: &InstallOptions) -> bool {
+    options.subscription_host.is_some()
+        || options.proxy_host.is_some()
+        || options.http_port.is_some()
+        || options.interface.is_some()
+        || options.reality_decoy_sni.is_some()
+        || options.protocol_sni.is_some()
+        || !options.disable_protocol.is_empty()
+        || options.vless_port.is_some()
+        || options.vmess_port.is_some()
+        || options.hysteria2_port.is_some()
+        || options.tuic_port.is_some()
+        || options.anytls_port.is_some()
+}
+
+/// What the install transaction did about the Direct-mode subscription
+/// certificate. `Deferred` matters because a `--no-start` install never reaches
+/// the services at all: reporting it as issued would tell the operator their
+/// subscription is live when nothing was even attempted.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum SubscriptionCertificate {
+    Obtained,
+    Pending(&'static str, String),
+    Deferred,
+}
+
+/// Obtains the Direct-mode subscription certificate inside the install
+/// transaction.
+///
+/// A failure is reported as a to-do rather than rolling the install back:
+/// un-propagated DNS or a blocked port 80 leaves the deployment itself healthy,
+/// and the reason is printed so the operator knows what to fix before retrying.
+fn obtain_install_certificate(
+    store: &sbctl::config::DeploymentStore,
+    config: &sbctl::config::DeploymentConfig,
+    root: &Path,
+) -> SubscriptionCertificate {
+    if let Err(error) = sbctl::certificate::require_certbot(root) {
+        return SubscriptionCertificate::Pending("certbot 不可用", error.to_string());
+    }
+    match sbctl::certificate::obtain(store, config, config.certbot_email.as_deref()) {
+        Ok(_) => {
+            println!("订阅证书已签发并固定，HTTPS 订阅立即可用");
+            SubscriptionCertificate::Obtained
+        }
+        Err(error) => SubscriptionCertificate::Pending("签发失败", error.to_string()),
+    }
+}
+
+/// `--manage-firewall`: add the required UFW rules.
+///
+/// Only `ufw allow` is ever executed, and only when ufw is installed and
+/// reporting `Status: active`; rule deletion and any other firewall state
+/// remain the administrator's. When ufw is missing or inactive the commands
+/// are printed instead, which keeps the default behaviour of this tool
+/// untouched.
+fn open_firewall_ports(root: &Path, config: &sbctl::config::DeploymentConfig, direct: bool) {
+    let runtime = sbctl::runtime::Runtime::live(root);
+    let status = runtime
+        .run_command_output("ufw", &["status"])
+        .map(|(_, output)| output)
+        .unwrap_or_default();
+    if !status.contains("Status: active") {
+        println!("UFW 未安装或未启用，防火墙命令见下方清单（sbctl 未修改防火墙）");
+        return;
+    }
+    let mut opened = Vec::new();
+    for (port, transport) in required_firewall_ports(config, direct) {
+        let rule = format!("{port}/{transport}");
+        match runtime.run_command("ufw", &["allow", rule.as_str()]) {
+            Ok(status) if status.success() => opened.push(rule),
+            Ok(status) => eprintln!("ufw allow {rule} 失败（退出码 {status}）"),
+            Err(error) => eprintln!("ufw allow {rule} 失败：{error}"),
+        }
+    }
+    if !opened.is_empty() {
+        println!("UFW 已放行：{}", opened.join(", "));
+    }
+}
+
+/// Every port a working deployment must reach, as `(port, transport)` pairs:
+/// the subscription listener for this mode plus each enabled protocol listener.
+fn required_firewall_ports(
+    config: &sbctl::config::DeploymentConfig,
+    direct: bool,
+) -> Vec<(u16, &'static str)> {
+    use sbctl::config::ManagedProtocol;
+    let mut ports = Vec::new();
+    if direct {
+        ports.push((80, "tcp"));
+        ports.push((443, "tcp"));
+    } else if config.subscription_mode == sbctl::config::SubscriptionMode::IpFallback
+        && let Some(port) = config.http_port
+    {
+        ports.push((port, "tcp"));
+    }
+    for protocol in &config.enabled_protocols {
+        let transport = match protocol {
+            ManagedProtocol::VlessReality
+            | ManagedProtocol::VmessWebsocket
+            | ManagedProtocol::Anytls => "tcp",
+            ManagedProtocol::Hysteria2 | ManagedProtocol::Tuic => "udp",
+        };
+        if let Some(port) = config.protocol_listener_port(protocol) {
+            ports.push((port, transport));
+        }
+    }
+    ports
+}
+
+/// The step-by-step checklist printed after a successful install. sbctl never
+/// touches the firewall or DNS unless explicitly opted in, so these are the
+/// steps the administrator must not skip; every line is a command that can be
+/// copied verbatim. `certificate_pending` replaces the certificate step with
+/// the concrete reason the in-transaction obtain did not succeed.
+fn print_post_install_checklist_with(
+    config: &sbctl::config::DeploymentConfig,
+    certificate: SubscriptionCertificate,
+    firewall_managed: bool,
+) {
+    use sbctl::config::SubscriptionMode;
+    let firewall_note = if firewall_managed {
+        "sbctl 已在 UFW 放行"
+    } else {
+        "sbctl 未自动修改防火墙"
+    };
+    println!("安装完成");
+    println!(
+        "启用协议: {}",
+        config
+            .enabled_protocols
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    println!();
+    println!("后续必做清单（按顺序执行）:");
+    match config.subscription_mode {
+        SubscriptionMode::Direct => {
+            println!(
+                "  1. 确认域名解析: dig +short {} 应返回本机公网 IP",
+                config.subscription_host
+            );
+            match certificate {
+                SubscriptionCertificate::Obtained => {
+                    println!("  2. 订阅证书已随安装签发并固定，无需再操作")
+                }
+                SubscriptionCertificate::Pending(reason, detail) => {
+                    println!(
+                        "  2. 订阅证书未签发（{reason}：{detail}），完成后订阅才能通过 HTTPS 访问:"
+                    );
+                    println!("     sbctl certificate obtain --email admin@example.com");
+                }
+                // Nothing was attempted (a deferred start): the certificate
+                // still has to be obtained by hand.
+                SubscriptionCertificate::Deferred => {
+                    println!("  2. 签发订阅证书（替换为你的邮箱，仅用于 ACME 到期通知）:");
+                    println!("     sbctl certificate obtain --email admin@example.com");
+                }
+            }
+            println!("  3. 放行防火墙端口（{firewall_note}）:");
+            println!("     sudo ufw allow 80/tcp && sudo ufw allow 443/tcp");
+            for port in firewall_port_commands(config) {
+                println!("     {port}");
+            }
+            println!("  4. 检查证书与服务: sbctl certificate status && sbctl status");
+        }
+        SubscriptionMode::ExternalProxy => {
+            println!(
+                "  1. 在 Nginx/Caddy 中把 /sub/ 反代到 127.0.0.1:{}（HTTPS 与证书由反代负责）",
+                config.subscription_listen_port.unwrap_or(2080)
+            );
+            println!("  2. 协议防火墙端口（{firewall_note}）:");
+            for port in firewall_port_commands(config) {
+                println!("     {port}");
+            }
+            println!("  3. 自检订阅（替换为你的域名与订阅凭据）:");
+            println!("     curl -fsS https://<域名>/sub/<凭据>/uri >/dev/null && echo OK");
+        }
+        SubscriptionMode::IpFallback => {
+            println!(
+                "  注意: IP fallback 订阅走明文 HTTP（端口 {}），安全性较低",
+                config.http_port.unwrap_or(2080)
+            );
+            println!("  1. 订阅端口（{firewall_note}）:");
+            println!(
+                "     sudo ufw allow {}/tcp",
+                config.http_port.unwrap_or(2080)
+            );
+            println!("  2. 协议防火墙端口（{firewall_note}）:");
+            for port in firewall_port_commands(config) {
+                println!("     {port}");
+            }
+            println!("  3. 自检订阅（替换为订阅凭据）:");
+            println!(
+                "     curl -fsS http://{}:{}/sub/<凭据>/uri >/dev/null && echo OK",
+                config.subscription_host,
+                config.http_port.unwrap_or(2080)
+            );
+        }
+    }
+    println!("  5. 查看订阅链接与二维码: sbctl sub   单条二维码: sbctl qr");
+    println!("  6. 订阅总览页（手机扫码导入）: sbctl sub 输出中的 index 链接");
+    println!("再次进入管理菜单: sbctl menu");
+}
+
+/// Copy-paste-ready `ufw allow` commands for every enabled protocol port.
+fn firewall_port_commands(config: &sbctl::config::DeploymentConfig) -> Vec<String> {
+    use sbctl::config::ManagedProtocol;
+    let mut commands = Vec::new();
+    for protocol in &config.enabled_protocols {
+        let transport = match protocol {
+            ManagedProtocol::VlessReality
+            | ManagedProtocol::VmessWebsocket
+            | ManagedProtocol::Anytls => "tcp",
+            ManagedProtocol::Hysteria2 | ManagedProtocol::Tuic => "udp",
+        };
+        if let Some(port) = config.protocol_listener_port(protocol) {
+            commands.push(format!("sudo ufw allow {port}/{transport}  # {protocol}"));
+        }
+    }
+    commands
+}
+
+/// Reprint copy-paste-ready firewall guidance after an existing deployment's
+/// ports or subscription mode change. sbctl deliberately leaves host firewall
+/// policy under the administrator's control.
+pub(crate) fn print_firewall_review(config: &sbctl::config::DeploymentConfig) {
+    use sbctl::config::SubscriptionMode;
+
+    println!();
+    println!("防火墙端口核对（sbctl 不会自动修改防火墙；若使用 UFW，请检查并执行所需命令）:");
+    match config.subscription_mode {
+        SubscriptionMode::Direct => {
+            println!("  sudo ufw allow 80/tcp");
+            println!("  sudo ufw allow 443/tcp");
+        }
+        SubscriptionMode::ExternalProxy => {}
+        SubscriptionMode::IpFallback => {
+            println!("  sudo ufw allow {}/tcp", config.http_port.unwrap_or(2080));
+        }
+    }
+    for command in firewall_port_commands(config) {
+        println!("  {command}");
+    }
+}

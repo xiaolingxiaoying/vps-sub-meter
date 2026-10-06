@@ -1,0 +1,127 @@
+name: CI
+
+# Server-side CI: the sbctl binary, its subscription renderer, and the real
+# cores that validate every generated version profile. The client crates
+# (sbtui, sbcli, sbgui, client-core) are not in this workspace, so the monorepo's
+# GUI, prototype, MSI and macOS jobs live where those crates live.
+
+on:
+  push:
+    branches: [main]
+  workflow_call:
+  workflow_dispatch:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  build-sbctl-linux-amd64:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Build sbctl production binary
+        run: cargo build --release --locked -p sbctl --no-default-features
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbctl-linux-amd64
+          path: target/release/sbctl
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - run: cargo fmt --all -- --check
+      - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --features sbctl/test-signing
+      - run: cargo test -p sbctl --no-default-features --test release_trust
+
+  # The systemd acceptance suite (`sh tests/acceptance/run.sh`) is copied here
+  # verbatim, but two of its legs drive the terminal client and `sbcli`, which
+  # this workspace does not contain. Enable the job again by exporting
+  # SBCTUI_ARTIFACT/SBCLI_ARTIFACT from a singbox-sub-me build, then restore the
+  # job the monorepo's ci.yml defines.
+  #
+  # server-acceptance:
+  #   needs: [build-sbctl-linux-amd64, test]
+  #   runs-on: ubuntu-22.04
+  #   ...
+
+  sing-box-profiles:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Download pinned sing-box cores
+        run: |
+          set -euo pipefail
+          for version in 1.10.7 1.11.15 1.12.25 1.13.21 1.14.1; do
+            directory="sing-box-$version"
+            mkdir -p "$directory"
+            curl -fsSL --retry 3 -o "$directory/archive.tar.gz" \
+              "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-amd64.tar.gz"
+            tar -xzf "$directory/archive.tar.gz" -C "$directory" --strip-components=1
+          done
+      - name: Record the latest stable sing-box release
+        id: upstream
+        run: |
+          set -euo pipefail
+          # `releases/latest` already excludes drafts and prereleases, so this
+          # is the version `sbctl install` will actually download.
+          release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+            https://github.com/SagerNet/sing-box/releases/latest)
+          case "$release_url" in
+            https://github.com/SagerNet/sing-box/releases/tag/*) tag=${release_url##*/} ;;
+            *)
+              echo "could not resolve the latest sing-box release URL; refusing to skip the band check" >&2
+              exit 1
+              ;;
+          esac
+          [ -n "$tag" ] || {
+            echo "could not read the latest sing-box tag; refusing to skip the band check" >&2
+            exit 1
+          }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "latest stable sing-box: $tag"
+      - name: Validate every generated profile with its real core
+        env:
+          SING_BOX_BIN_1_10: ${{ github.workspace }}/sing-box-1.10.7/sing-box
+          SING_BOX_BIN_1_11: ${{ github.workspace }}/sing-box-1.11.15/sing-box
+          SING_BOX_BIN_1_12: ${{ github.workspace }}/sing-box-1.12.25/sing-box
+          SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
+          SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
+          SBCTL_UPSTREAM_LATEST: ${{ steps.upstream.outputs.tag }}
+        run: cargo test --test version_profiles -- --ignored --nocapture
+
+  mihomo-profiles:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Download a pinned mihomo core
+        run: |
+          set -euo pipefail
+          mkdir -p mihomo
+          curl -fsSL --retry 3 -o mihomo/mihomo.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-compatible-v1.19.31.gz"
+          gunzip -c mihomo/mihomo.gz > mihomo/mihomo
+          chmod +x mihomo/mihomo
+          mihomo/mihomo -v
+      - name: Load every generated clash artifact in mihomo
+        env:
+          MIHOMO_BIN: ${{ github.workspace }}/mihomo/mihomo
+        run: cargo test --test clash_mihomo -- --ignored --nocapture
