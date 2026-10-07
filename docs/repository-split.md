@@ -15,27 +15,46 @@
 | `scripts/` | `install.sh`、`prepare-installer.py`、`generate-manifest.sh`、`dev-signing-key.hex` 与 `scripts/dev/` 的 WSL/真核/验收脚本 |
 | `tests/acceptance/`、`docker-compose.acceptance.yml` | systemd L3 验收套件 |
 | `docs/adr/`（32 篇）、`docs/agents/`、服务端文档 | 见下方"文档取舍" |
+| `AGENTS.md`、`CLAUDE.md`、`CONTEXT.md` | agent 约定与术语表（`CONTEXT.md` 的标题就是 sbctl，被多篇文档引用） |
+
+数量可核对：`src` 58 文件（含 13 个 `.snap`）、`tests` 25、`crates/json-merge` 2、`scripts` 5 个顶层文件 + `scripts/dev` 5 个、`docs/adr` 32、`docs` 顶层 17（16 篇服务端文档 + 本文）、`docs/research` 4。
 
 ## 不包含什么（以及为什么）
 
 - `crates/sbcli`、`crates/sbtui`、`crates/sbgui`、`crates/client-core`：客户端栈。
   拆分前已验证 `src/` 与 `tests/` 对它们**只有注释级引用**（`src/lifecycle.rs:761,775`、
   `src/subscription/render/singbox.rs:132`），没有任何代码或构建依赖，所以删除后服务端自洽。
-- `prototypes/`、`packaging/windows/`、`scripts/sbgui-*`、`scripts/winvm`、
-  `scripts/dev/wsl-signal-exit.sh`：GUI/TUI 专用资产。
+- `prototypes/`、`packaging/windows/`、GUI/TUI 专用脚本。未复制的 `scripts` 顶层项是
+  `package-sbgui-qml.ps1`、`package-sbgui-slint.ps1`、`smoke-sbgui-qml.ps1`、
+  `smoke-sbgui-slint.ps1` 与 `sbgui-performance/`、`sbgui-qml/`、`sbgui-shot/`、`winvm/`
+  四个目录；`scripts/dev` 少的那一个是 `wsl-signal-exit.sh`（用 pty 证明 sbtui 退出清理的门）。
 - `.github/workflows/release.yml`：该工作流的 acceptance/publish 任务串了
   `build-sbtui`、`build-sbgui-qml`、MSI 与共享 daemon 产物，照搬必然失败。
   若本仓库要独立发 Release，需按 `docs/release-signing.md` 重新设计。
-- 客户端主题文档：`client-core-control-api.md`、`client-description.md`、
-  `DESIGN.md`（QML 视觉系统）、`gpui-*`、`qml-*`、`sbgui-*`、
-  `code-review-2026-09-25.md`、`project-review-2026-09-24.md`、
-  `project-review-round-3-2026-10-02.md`（后两篇的主体是客户端）、
-  `docs/research/` 里的 gpui/ratatui/client 篇。
-- `.scratch/`（本地工单目录）、`target/`、`dist/`。
+- 客户端主题文档（`docs` 顶层 11 项）：`client-core-control-api.md`、
+  `client-description.md`、`code-review-2026-09-25.md`、`gpui-platform-acceptance.md`、
+  `gui-ui-redesign-recommendations.md`、`legacy-gui-known-issues.md`、
+  `project-review-2026-09-24.md`、`project-review-round-3-2026-10-02.md`（后两篇主体是客户端，
+  服务端与发布治理结论在已复制的 round-2 里）、`qml-prototype-rewrite-acceptance.md`、
+  `qml-ui-layout-acceptance.md`、`sbgui-qml-gui-and-kernel-interface.md`；
+  `docs/research/` 少 10 篇（gpui 系列 8 篇 + `ratatui-study-for-sbtui.md` + 两篇客户端综述）；
+  根目录的 `DESIGN.md`（QML 视觉系统）与 `PRODUCT.md`（含客户端的产品定位）不复制。
+- `.scratch/`（本地工单目录）、`target/`、`dist/`。注意 `AGENTS.md` 与
+  `docs/agents/issue-tracker.md` 约定工单落在 `.scratch/` 下，本仓库首次建工单需要自己建目录。
 
-保留的服务端文档里仍有指向已删除文件的链接（例如 ADR 提到 `crates/sbgui/…`、
-`docs/round-2` 报告含客户端章节）。这些是决策记录原文，**故意不改写**，断链指向的是
-`singbox-sub-me` 里的对应文件。
+保留的服务端文档里有 5 条指向已删除文件的相对链接（链接扫描：48 条相对链接、5 条断链），
+逐条列出以免含糊：
+
+| 出处 | 断链目标 | 该文件在哪 |
+|---|---|---|
+| `docs/adr/0025-keep-gpui-and-slint-clients.md` | `../research/gpui-current-gui-assessment.md` | monorepo |
+| `docs/adr/0025-keep-gpui-and-slint-clients.md` | `../research/gpui-enhancement-strategy.md` | monorepo |
+| `docs/adr/0028-client-pure-official-grpc.md` | `../client-core-control-api.md` | monorepo |
+| `docs/target-spec-gap-and-verification-plan.md` | `../DESIGN.md` | monorepo |
+| `docs/target-spec-gap-and-verification-plan.md` | `../PRODUCT.md` | monorepo |
+
+这些是决策记录原文，**故意不改写**，断链指向的是 `singbox-sub-me` 里的对应文件。
+
 
 ## 拆分后必须知道的三件事
 
@@ -57,8 +76,27 @@
    的总结里写着"吸收 `vps-sub-meter` Shell 脚本中的有效能力"——本仓库沿用了这个名字，
    但与那套 Shell 脚本没有代码继承关系，包名与二进制名仍是 `sbctl`。
 
-## 验证状态
+## 验证状态（2026-10-07 实测）
 
-拆分时本仓库独立跑过的门控（详见 README"验证"一节）：Linux 的 fmt / clippy / 全量测试、
-真核矩阵、以及 Windows 侧构建。**未**在本仓库跑过的：Docker systemd 验收（宿主机 Docker
-守护进程未启动）、生产签名 Release 链。
+本仓库独立跑过、有输出为证的门控：
+
+| 探针 | 命令 | 结果 |
+|---|---|---|
+| Linux 全量门控 | `scripts/dev/wsl-gate.sh` | fmt 干净；workspace clippy（`--all-targets --all-features -D warnings`）干净；**sbctl lib 255、cli 125、json-merge 10** 全通过；`wsl gate passed` |
+| 真核矩阵 | `scripts/dev/wsl-real-cores.sh` | sing-box 1.10–1.14 五核 + 固定 mihomo：`real-core matrix passed` |
+| Windows 门控 | `cargo fmt --check` / clippy / test | fmt 与 clippy 退出码 0；**sbctl lib 248、cli 104、json-merge 7** 全通过 |
+| CI 的 `--locked` 前提 | `cargo build --locked -p sbctl --no-default-features` | 退出码 0（缩减后的 `Cargo.lock` 自洽） |
+| CI 的 python 腿 | `python3 -m unittest discover -s scripts -p 'test_*.py'` | Ran 2 tests，OK |
+| CI 的独立信任锚腿 | `cargo test -p sbctl --no-default-features --test release_trust` | 1 passed |
+| 改过的验收产物脚本 | `bash scripts/dev/build-acceptance-artifacts.sh` | 退出码 0；打印 `branch: server-only workspace - skipping the client leg`；只产出 `sbctl-linux-amd64` 与 `sbctl-test-signing` |
+| 工作区成员 | `cargo metadata --no-deps` | `['json-merge', 'sbctl']`，无客户端 crate |
+| 复制完整性 | `diff -r` src / tests / crates/json-merge / scripts/install.sh | 全部逐字节一致；文件数 src 58/58、tests 25/25、snapshots 13/13、ADR 32/32 |
+| 索引换行符 | `git ls-files --eol` | 所有 `*.sh` 为 `i/lf`（带 `attr/text eol=lf`），安装脚本不会被 CRLF 破坏 |
+| 文档链接 | 相对链接扫描 | 48 条中 5 条断链，全部指向客户端文件，逐条见上表 |
+
+测试计数与源仓库**完全相同**（Windows 248/104、Linux 255/125），这是"服务端测试一个没丢"的直接证据；
+同时 Linux 侧源仓库那 3 个 sbtui 既有失败在本仓库不存在，因为客户端 crate 不在这里。
+
+**未**在本仓库跑过的：Docker systemd L3 验收（这台宿主机 Docker 守护进程没起，且缺 sbtui/sbcli 二进制）、
+生产签名 Release 链（`release.yml` 未复制）。
+
