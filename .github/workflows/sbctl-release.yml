@@ -79,9 +79,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v4
@@ -112,9 +112,9 @@ jobs:
       matrix:
         include:
           - arch: amd64
-            runner: ubuntu-24.04
+            runner: ubuntu-22.04
           - arch: arm64
-            runner: ubuntu-24.04-arm
+            runner: ubuntu-22.04-arm
     runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
@@ -203,13 +203,51 @@ jobs:
         run: |
           set -euo pipefail
           version=${RELEASE_TAG#sbctl-v}
-          gh release create "$RELEASE_TAG" \
-            dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
-            dist/sing-box-linux-amd64 dist/sing-box-linux-arm64 \
-            dist/manifest-amd64.json dist/manifest-arm64.json \
-            dist/install.sh dist/SHA256SUMS \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "sbctl v$version" \
-            --notes "Prebuilt sbctl and sing-box for Linux amd64/arm64. The signed manifests pin the binary digests; install.sh verifies the signature before installation." \
-            --latest
+          assets=(
+            dist/sbctl-linux-amd64 dist/sbctl-linux-arm64
+            dist/sing-box-linux-amd64 dist/sing-box-linux-arm64
+            dist/manifest-amd64.json dist/manifest-arm64.json
+            dist/install.sh dist/SHA256SUMS
+          )
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$RELEASE_TAG" "${assets[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --title "sbctl v$version" \
+              --notes "Prebuilt sbctl and sing-box for Linux amd64/arm64. The signed manifests pin the binary digests; install.sh verifies the signature before installation." \
+              --latest
+          else
+            gh release create "$RELEASE_TAG" "${assets[@]}" \
+              --repo "$GITHUB_REPOSITORY" \
+              --target "$GITHUB_SHA" \
+              --title "sbctl v$version" \
+              --notes "Prebuilt sbctl and sing-box for Linux amd64/arm64. The signed manifests pin the binary digests; install.sh verifies the signature before installation." \
+              --latest
+          fi
+
+  verify-release:
+    needs: publish
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - name: Download assets from the published release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --dir dist
+      - name: Verify downloaded release assets
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum -c SHA256SUMS)
+          chmod 0755 dist/sbctl-linux-amd64
+          dist/sbctl-linux-amd64 release verify --manifest dist/manifest-amd64.json
+          dist/sbctl-linux-amd64 release verify --manifest dist/manifest-arm64.json
+          bash -n dist/install.sh
+          if grep -q '@SBCTL_RELEASE_PUBLIC_KEY_PEM@' dist/install.sh; then
+            echo "Published installer still contains the public-key placeholder." >&2
+            exit 1
+          fi
