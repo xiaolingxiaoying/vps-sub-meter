@@ -73,10 +73,15 @@ jobs:
         env:
           SBCTL_RELEASE_PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
         run: cargo build --release --locked -p sbctl --no-default-features
+      - name: Stage architecture-specific binary
+        working-directory: sbctl
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/dist"
+          install -m 0755 target/release/sbctl "$GITHUB_WORKSPACE/dist/sbctl-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
           name: sbctl-linux-${{ matrix.arch }}
-          path: sbctl/target/release/sbctl
+          path: dist/sbctl-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 3
 
