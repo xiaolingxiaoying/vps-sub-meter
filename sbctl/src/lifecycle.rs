@@ -645,12 +645,11 @@ pub fn rollback_fresh_installation(root: &Path, preexisting: PreexistingState) {
     // emptied (a fixture root, or a failure before the lock was taken) goes, so
     // a rolled-back install leaves no trace.
     let _ = fs::remove_dir(root.join("var/lib/sbctl"));
-    for directory in ["etc/sing-box"] {
-        if let Err(error) = fs::remove_dir(root.join(directory))
-            && error.kind() != std::io::ErrorKind::NotFound
-        {
-            warnings.push(format!("{directory}: {error}"));
-        }
+    let directory = "etc/sing-box";
+    if let Err(error) = fs::remove_dir(root.join(directory))
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        warnings.push(format!("{directory}: {error}"));
     }
     if !warnings.is_empty() {
         eprintln!(
