@@ -1,0 +1,1522 @@
+use std::fs;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Component, Path, PathBuf};
+use std::process::Command;
+use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+use crate::config::{ConfigError, DeploymentConfig, DeploymentStore, ManagedProtocol};
+
+const SING_BOX_UNIT: &str = "etc/systemd/system/sing-box.service";
+const SBCTL_UNIT: &str = "etc/systemd/system/sbctl.service";
+const SBCTL_HTTP_SOCKET: &str = "etc/systemd/system/sbctl-http.socket";
+const ACCOUNTING_RESET_UNIT: &str = "etc/systemd/system/sbctl-accounting-reset.service";
+const ACCOUNTING_RESET_TIMER: &str = "etc/systemd/system/sbctl-accounting-reset.timer";
+/// Opt-in scheduled rotation of the default subscription credential. Not part
+/// of `managed_units`: a deployment that never asked for it must not have its
+/// `enable --now` fail because the unit does not exist.
+const CREDENTIAL_ROTATE_UNIT: &str = "etc/systemd/system/sbctl-credential-rotate.service";
+const CREDENTIAL_ROTATE_TIMER: &str = "etc/systemd/system/sbctl-credential-rotate.timer";
+
+/// Installs or removes the scheduled credential rotation.
+///
+/// Opt-in only: an unattended rotation invalidates every printed QR code and
+/// saved link at once, which is exactly what some operators want on a shared
+/// VPS and exactly what others would not expect from an update.
+pub fn set_credential_rotate_timer(root: &Path, enable: bool) -> Result<(), String> {
+    if enable {
+        write_unit(
+            root,
+            CREDENTIAL_ROTATE_UNIT,
+            "[Unit]\nDescription=sbctl scheduled subscription credential rotation\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=sbctl\nGroup=sbctl\nExecStart=/usr/local/bin/sbctl credential rotate\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/etc/sbctl /var/lib/sbctl\n",
+        )
+        .map_err(|error| error.to_string())?;
+        write_unit(
+            root,
+            CREDENTIAL_ROTATE_TIMER,
+            "[Unit]\nDescription=sbctl scheduled subscription credential rotation timer\n\n[Timer]\nOnCalendar=monthly\nPersistent=true\nUnit=sbctl-credential-rotate.service\n\n[Install]\nWantedBy=timers.target\n",
+        )
+        .map_err(|error| error.to_string())?;
+        systemctl(root, &["daemon-reload"])?;
+        systemctl(root, &["enable", "--now", "sbctl-credential-rotate.timer"])?;
+        return Ok(());
+    }
+    // Disabling is tolerant of the unit never having existed: `--remove-timer`
+    // on a deployment without one is a no-op, not an error.
+    let _ = systemctl(root, &["disable", "--now", "sbctl-credential-rotate.timer"]);
+    remove_file_if_present(&root.join(CREDENTIAL_ROTATE_TIMER))?;
+    remove_file_if_present(&root.join(CREDENTIAL_ROTATE_UNIT))?;
+    systemctl(root, &["daemon-reload"])?;
+    Ok(())
+}
+
+const OWNERSHIP_MARKER: &str = "var/lib/sbctl/ownership";
+const SING_BOX_UNIT_MARKER: &str = "Description=sing-box data plane managed by sbctl";
+const SBCTL_UNIT_MARKER: &str = "Description=sbctl private subscription service";
+const SBCTL_HTTP_SOCKET_MARKER: &str = "Description=sbctl Direct HTTPS public listeners";
+const ACCOUNTING_RESET_MARKER: &str = "Description=sbctl accounting period reset";
+const CERTBOT_DEPLOY_HOOK: &str =
+    "etc/letsencrypt/renewal-hooks/deploy/sbctl-certificate-deploy-hook";
+/// The same deploy-hook path relative to the deployment root, for status
+/// reporting and diagnostics outside the install/uninstall transactions.
+pub const CERTBOT_DEPLOY_HOOK_RELATIVE_PATH: &str = CERTBOT_DEPLOY_HOOK;
+const CERTBOT_DEPLOY_HOOK_MARKER: &str = "sbctl-managed Direct HTTPS certificate deploy hook";
+const CERTIFICATE_GROUP: &str = crate::certificate::CERTIFICATE_GROUP;
+
+const BACKED_UP_PATHS: &[&str] = &[
+    "etc/sbctl/config.toml",
+    OWNERSHIP_MARKER,
+    "etc/sing-box/config.json",
+    "var/lib/sbctl/state.json",
+    "var/lib/sbctl/artifacts/sing-box-server.json",
+    "var/lib/sbctl/artifacts/subscription-sing-box.json",
+    "var/lib/sbctl/artifacts/subscription-clash.yaml",
+    "var/lib/sbctl/artifacts/subscription-uri.txt",
+    CERTBOT_DEPLOY_HOOK,
+];
+
+fn sing_box_unit() -> &'static str {
+    "[Unit]\nDescription=sing-box data plane managed by sbctl\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=sing-box\nGroup=sing-box\nExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n\n[Install]\nWantedBy=multi-user.target\n"
+}
+
+/// Direct subscription mode runs under systemd socket activation: the
+/// `sbctl-http.socket` unit owns public TCP 80/443 and passes the listeners to
+/// the non-root sbctl service. External-proxy and IP-fallback modes serve only
+/// high ports and never install this socket.
+fn sbctl_unit(direct: bool) -> String {
+    let socket_dependency = if direct {
+        "\nRequires=sbctl-http.socket\nAfter=sbctl-http.socket"
+    } else {
+        ""
+    };
+    format!(
+        "[Unit]\nDescription=sbctl private subscription service\nAfter=network-online.target\nWants=network-online.target{socket_dependency}\n\n[Service]\nType=simple\nUser=sbctl\nGroup=sbctl\nExecStart=/usr/local/bin/sbctl serve\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths=/var/lib/sbctl\n\n[Install]\nWantedBy=multi-user.target\n"
+    )
+}
+
+const SBCTL_HTTP_SOCKET_CONTENTS: &str = "[Unit]\nDescription=sbctl Direct HTTPS public listeners\n\n[Socket]\nListenStream=80\nListenStream=443\nService=sbctl.service\nAccept=no\n\n[Install]\nWantedBy=sockets.target\n";
+
+/// The Certbot renewal-hook script. Certbot runs it after every renewal in
+/// Direct subscription mode; it re-validates the certificate and re-pins it so
+/// the next TLS handshake serves the new certificate. A failure keeps Certbot's
+/// previous certificate.
+fn certbot_deploy_hook() -> &'static str {
+    "#!/bin/sh\n# sbctl-managed Direct HTTPS certificate deploy hook\nset -eu\nexec /usr/local/bin/sbctl certificate verify\n"
+}
+
+pub fn install_units(
+    store: &DeploymentStore,
+    server_config: &str,
+    direct: bool,
+) -> Result<(), ConfigError> {
+    let mut units = vec![
+        SING_BOX_UNIT,
+        SBCTL_UNIT,
+        ACCOUNTING_RESET_UNIT,
+        ACCOUNTING_RESET_TIMER,
+    ];
+    if direct {
+        units.push(SBCTL_HTTP_SOCKET);
+        units.push(CERTBOT_DEPLOY_HOOK);
+    }
+    for unit in units {
+        if store.root().join(unit).exists() {
+            return Err(ConfigError::AlreadyExists);
+        }
+    }
+    store.write_active_sing_box_config(server_config.as_bytes())?;
+    write_unit(store.root(), SING_BOX_UNIT, sing_box_unit())?;
+    write_unit(store.root(), SBCTL_UNIT, &sbctl_unit(direct))?;
+    write_unit(
+        store.root(),
+        ACCOUNTING_RESET_UNIT,
+        "[Unit]\nDescription=sbctl accounting period reset task\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=sbctl\nGroup=sbctl\nExecStart=/usr/local/bin/sbctl accounting-reset\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/sbctl\n",
+    )?;
+    write_unit(
+        store.root(),
+        ACCOUNTING_RESET_TIMER,
+        "[Unit]\nDescription=sbctl accounting period reset timer\n\n[Timer]\nOnCalendar=minutely\nPersistent=true\nUnit=sbctl-accounting-reset.service\n\n[Install]\nWantedBy=timers.target\n",
+    )?;
+    if direct {
+        write_unit(store.root(), SBCTL_HTTP_SOCKET, SBCTL_HTTP_SOCKET_CONTENTS)?;
+        write_unit(store.root(), CERTBOT_DEPLOY_HOOK, certbot_deploy_hook())?;
+        set_executable(&store.root().join(CERTBOT_DEPLOY_HOOK))?;
+    }
+    Ok(())
+}
+
+/// The final commit point of a successful installation. The ownership marker is
+/// written only after the complete transaction — download verification, accounts
+/// and directories, configuration and artifacts, units, daemon reload, startup,
+/// and the health check — has succeeded, so a failed install never leaves a
+/// marker that would make an Existing deployment look sbctl-managed.
+pub fn write_ownership_marker(store: &DeploymentStore) -> Result<(), ConfigError> {
+    store.write_relative_locked(OWNERSHIP_MARKER, b"sbctl-managed-v1\n")
+}
+
+/// Copies the binary that successfully validated the generated configuration to
+/// the exact path used by the managed service.
+pub fn install_checked_sing_box(root: &Path, candidate: &Path) -> Result<(), ConfigError> {
+    let destination = root.join("usr/local/bin/sing-box");
+    let parent = destination.parent().expect("binary path has a parent");
+    fs::create_dir_all(parent)?;
+    // Copy beside the target and rename: `fs::copy` truncates the destination in
+    // place, which fails with ETXTBSY while the service is running and can leave
+    // a live process reading a half-written image.
+    let temporary = parent.join(format!(
+        ".{}.new",
+        destination
+            .file_name()
+            .expect("binary path has a file name")
+            .to_string_lossy()
+    ));
+    fs::copy(candidate, &temporary)?;
+    set_executable(&temporary)?;
+    fs::rename(&temporary, &destination)?;
+    Ok(())
+}
+
+/// Restarts the data plane and requires it to survive the same observation
+/// window as an install. A single `is-active` probe is not enough: `Type=simple`
+/// reports active the moment the process forks, so a candidate that passes
+/// `sing-box check` and then exits immediately would be committed as a healthy
+/// update while `Restart=on-failure` loops it. The standalone `sbctl sing-box
+/// update` path used to do exactly that; sharing the window with
+/// `restart_services` is what makes its rollback trigger.
+pub fn restart_sing_box_service(root: &Path) -> Result<(), String> {
+    systemctl(root, &["restart", "sing-box.service"])?;
+    wait_for_stable_activation(root, "sing-box.service")
+}
+
+pub fn remove_managed_sing_box(root: &Path) -> Result<(), String> {
+    if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)? {
+        return Err("sing-box is not an sbctl-managed deployment".to_owned());
+    }
+    systemctl(root, &["disable", "--now", "sing-box.service"])?;
+    remove_file_if_present(&root.join(SING_BOX_UNIT))?;
+    remove_file_if_present(&root.join("usr/local/bin/sing-box"))?;
+    systemctl(root, &["daemon-reload"])
+}
+
+pub fn start_services(root: &Path, direct: bool) -> Result<(), String> {
+    prepare_daemon_prerequisites(root, direct)?;
+    prepare_daemon_storage(root, direct)?;
+    systemctl(root, &["daemon-reload"])?;
+    let mut arguments = vec!["enable", "--now"];
+    arguments.extend(managed_units(direct));
+    systemctl(root, &arguments)
+}
+
+/// Creates the service identities required by a deployment before any
+/// daemon-readable state or certificate copy is published.
+pub fn prepare_daemon_prerequisites(root: &Path, direct: bool) -> Result<(), String> {
+    ensure_daemon_accounts(root)?;
+    if direct {
+        ensure_certificate_group(root)?;
+    }
+    Ok(())
+}
+
+/// The units an installation transaction enables. Direct subscription mode
+/// additionally owns the socket unit that holds public TCP 80/443.
+fn managed_units(direct: bool) -> Vec<&'static str> {
+    let mut units = vec![
+        "sing-box.service",
+        "sbctl.service",
+        "sbctl-accounting-reset.timer",
+    ];
+    if direct {
+        units.push("sbctl-http.socket");
+    }
+    units
+}
+
+/// The health check phase of an installation: every unit the transaction
+/// enabled must report active for the whole observation window. The ownership
+/// marker is written only after this passes, so a unit that starts but
+/// immediately fails keeps the installation rolled back instead of leaving a
+/// misleading deployment.
+pub fn check_service_health(root: &Path, direct: bool) -> Result<(), String> {
+    for unit in managed_units(direct) {
+        wait_for_stable_activation(root, unit)?;
+    }
+    // Direct mode reaches the subscription through the socket-activated
+    // listener, so an "active" unit can still mean an unreachable port:
+    // `sbctl serve` exits immediately when systemd did not hand it a socket.
+    // One loopback connection proves both halves. Fixture roots have no real
+    // listener, so the probe is a live-host check only.
+    if direct && root == Path::new("/") {
+        trigger_direct_socket()?;
+    }
+    Ok(())
+}
+
+/// Probes a unit repeatedly and fails if it is ever seen not active.
+///
+/// `Type=simple` units report active the moment the process forks, and
+/// `Restart=on-failure` brings them back after `RestartSec=2`, so a single
+/// `is-active` probe commits a configuration whose daemon dies a second later
+/// — the crash loop then looks healthy. Probing every 1.1s guarantees at least
+/// one sample lands inside the ≥2s window during which a crashed unit is
+/// failed or activating, which is what catches a fast-failing daemon.
+fn wait_for_stable_activation(root: &Path, unit: &str) -> Result<(), String> {
+    const PROBES: usize = 3;
+    const PROBE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1100);
+    for probe in 0..PROBES {
+        if let Err(error) = systemctl(root, &["is-active", "--quiet", unit]) {
+            return Err(format!(
+                "unit {unit} is not staying active: {error}; run `systemctl status {unit}` \
+                 and `journalctl -u {unit} -n 50` for details"
+            ));
+        }
+        if probe + 1 < PROBES {
+            std::thread::sleep(PROBE_INTERVAL);
+        }
+    }
+    Ok(())
+}
+
+/// Which persistent state already existed when a fresh install started.
+///
+/// Preflight refuses an install over either of these, so in practice both are
+/// false. The rollback keeps asking anyway: it is the one step that deletes
+/// credentials and accounting history irreversibly, and a hostile or racing
+/// writer that creates them mid-install must not turn a rollback into the
+/// destruction of somebody else's deployment.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct PreexistingState {
+    pub config: bool,
+    pub data_directory: bool,
+}
+
+pub fn preexisting_state(root: &Path) -> PreexistingState {
+    PreexistingState {
+        config: root.join("etc/sbctl/config.toml").exists(),
+        // The directory alone is not evidence: a rolled-back install leaves the
+        // operation lock in it, and that is state this install created.
+        data_directory: root.join("var/lib/sbctl/state.json").exists()
+            || root.join(OWNERSHIP_MARKER).exists()
+            || root.join("var/lib/sbctl/artifacts").is_dir()
+            || root.join("var/lib/sbctl/certificates").is_dir(),
+    }
+}
+
+#[derive(Debug)]
+pub struct ReinstallBackup {
+    archive: PathBuf,
+    services: Vec<PreviousServiceState>,
+}
+
+impl ReinstallBackup {
+    pub fn archive_path(&self) -> &Path {
+        &self.archive
+    }
+}
+
+#[derive(Debug)]
+struct PreviousServiceState {
+    unit: String,
+    was_active: bool,
+    was_enabled: bool,
+}
+
+/// Saves every preflight conflict, stops matching systemd services, and removes
+/// only the listed paths. The archive is root-only and retains ownership,
+/// permissions, directories, and symlinks so an unsuccessful new install can
+/// restore the old deployment.
+pub fn prepare_reinstall(root: &Path, conflicts: &[String]) -> Result<ReinstallBackup, String> {
+    let conflicts = validate_conflict_paths(conflicts)?;
+    if conflicts.is_empty() {
+        return Err("no existing deployment paths were supplied for replacement".into());
+    }
+
+    let _operation_lock = DeploymentStore::new(root)
+        .acquire_operation_lock()
+        .map_err(|error| format!("could not lock sbctl state for replacement: {error}"))?;
+    let services = previous_service_states(root, &conflicts);
+    let backup_directory = new_reinstall_backup_directory(root)?;
+    let archive = backup_directory.join("existing-deployment.tar");
+    let partial_archive = backup_directory.join("existing-deployment.tar.part");
+
+    let operation = (|| {
+        create_conflict_archive(root, &conflicts, &partial_archive)?;
+        set_root_readable_file_permissions(&partial_archive)?;
+        fs::rename(&partial_archive, &archive).map_err(|error| {
+            format!("could not finalize the existing-deployment backup: {error}")
+        })?;
+        stop_previous_services(root, &services)?;
+
+        for relative in &conflicts {
+            remove_conflict_path(&root.join(relative))?;
+        }
+        systemctl(root, &["daemon-reload"])?;
+        Ok::<_, String>(())
+    })();
+
+    if let Err(error) = operation {
+        let restore_error = if archive.is_file() {
+            restore_reinstall_backup(root, &archive)
+                .and_then(|()| systemctl(root, &["daemon-reload"]))
+                .and_then(|()| restore_previous_services(root, &services))
+                .err()
+        } else {
+            restore_previous_services(root, &services).err()
+        };
+        return Err(match restore_error {
+            Some(restore_error) => format!(
+                "could not prepare replacement ({error}); recovery also failed ({restore_error}). Backup: {}",
+                archive.display()
+            ),
+            None => format!("could not prepare replacement: {error}"),
+        });
+    }
+
+    Ok(ReinstallBackup { archive, services })
+}
+
+/// Restores a prior deployment after the replacement install fails. The backup
+/// remains available even after a successful new installation for manual recovery.
+pub fn restore_replaced_deployment(root: &Path, backup: &ReinstallBackup) -> Result<(), String> {
+    let _operation_lock = DeploymentStore::new(root)
+        .acquire_operation_lock()
+        .map_err(|error| format!("could not lock sbctl state for recovery: {error}"))?;
+    restore_reinstall_backup(root, &backup.archive)?;
+    systemctl(root, &["daemon-reload"])?;
+    restore_previous_services(root, &backup.services)
+}
+
+fn validate_conflict_paths(paths: &[String]) -> Result<Vec<String>, String> {
+    let mut validated = std::collections::BTreeSet::new();
+    for path in paths {
+        let parsed = Path::new(path);
+        if path.is_empty()
+            || parsed
+                .components()
+                .any(|component| !matches!(component, Component::Normal(_)))
+            || parsed.starts_with("var/backups/sbctl")
+        {
+            return Err(format!("refusing unsafe replacement path: {path}"));
+        }
+        validated.insert(path.replace('\\', "/"));
+    }
+    Ok(validated.into_iter().collect())
+}
+
+fn previous_service_states(root: &Path, paths: &[String]) -> Vec<PreviousServiceState> {
+    let mut units = std::collections::BTreeSet::new();
+    for path in paths {
+        if !is_systemd_path(path) {
+            continue;
+        }
+        for component in Path::new(path).components() {
+            let Component::Normal(component) = component else {
+                continue;
+            };
+            let component = component.to_string_lossy();
+            let unit = component
+                .strip_suffix(".service.d")
+                .map(|prefix| format!("{prefix}.service"))
+                .or_else(|| {
+                    [".service", ".socket", ".timer"]
+                        .iter()
+                        .any(|suffix| component.ends_with(suffix))
+                        .then(|| component.to_string())
+                });
+            if let Some(unit) = unit {
+                units.insert(unit);
+            }
+        }
+    }
+
+    units
+        .into_iter()
+        .map(|unit| PreviousServiceState {
+            was_active: systemctl_probe(root, &["is-active", "--quiet", &unit]),
+            was_enabled: systemctl_probe(root, &["is-enabled", "--quiet", &unit]),
+            unit,
+        })
+        .collect()
+}
+
+fn is_systemd_path(path: &str) -> bool {
+    [
+        "etc/systemd/system/",
+        "lib/systemd/system/",
+        "usr/lib/systemd/system/",
+        "run/systemd/system/",
+    ]
+    .iter()
+    .any(|prefix| path.starts_with(prefix))
+}
+
+fn stop_previous_services(root: &Path, services: &[PreviousServiceState]) -> Result<(), String> {
+    for service in services {
+        if service.was_active {
+            systemctl(root, &["stop", &service.unit])?;
+        }
+        if service.was_enabled {
+            systemctl(root, &["disable", &service.unit])?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_previous_services(root: &Path, services: &[PreviousServiceState]) -> Result<(), String> {
+    for service in services {
+        if service.was_enabled {
+            systemctl(root, &["enable", &service.unit])?;
+        }
+        if service.was_active {
+            systemctl(root, &["start", &service.unit])?;
+        }
+    }
+    Ok(())
+}
+
+fn systemctl_probe(root: &Path, args: &[&str]) -> bool {
+    let command = root.join("usr/bin/systemctl");
+    let program = if command.is_file() {
+        command
+    } else {
+        "systemctl".into()
+    };
+    Command::new(program)
+        .args(args)
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+fn new_reinstall_backup_directory(root: &Path) -> Result<PathBuf, String> {
+    let parent = root.join("var/backups/sbctl/reinstall");
+    fs::create_dir_all(&parent).map_err(|error| {
+        format!("could not create the protected reinstall backup directory: {error}")
+    })?;
+    set_private_directory_permissions(&parent)?;
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let directory = parent.join(format!("{timestamp}-{}", std::process::id()));
+    fs::create_dir(&directory)
+        .map_err(|error| format!("could not create reinstall backup directory: {error}"))?;
+    set_private_directory_permissions(&directory)?;
+    Ok(directory)
+}
+
+fn create_conflict_archive(root: &Path, paths: &[String], archive: &Path) -> Result<(), String> {
+    let rooted_tar = root.join("usr/bin/tar");
+    let program = if rooted_tar.is_file() {
+        rooted_tar
+    } else {
+        "tar".into()
+    };
+    let status = Command::new(program)
+        .arg("-cpf")
+        .arg(archive)
+        .arg("--numeric-owner")
+        .arg("-C")
+        .arg(root)
+        .arg("--")
+        .args(paths)
+        .status()
+        .map_err(|error| format!("could not create the existing-deployment backup: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("tar exited with {status} while backing up the existing deployment"))
+}
+
+fn restore_reinstall_backup(root: &Path, archive: &Path) -> Result<(), String> {
+    let rooted_tar = root.join("usr/bin/tar");
+    let program = if rooted_tar.is_file() {
+        rooted_tar
+    } else {
+        "tar".into()
+    };
+    let status = Command::new(program)
+        .arg("-xpf")
+        .arg(archive)
+        .arg("--same-owner")
+        .arg("--same-permissions")
+        .arg("--numeric-owner")
+        .arg("-C")
+        .arg(root)
+        .status()
+        .map_err(|error| format!("could not restore the existing-deployment backup: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("tar exited with {status} while restoring the existing deployment"))
+}
+
+fn remove_conflict_path(path: &Path) -> Result<(), String> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
+    };
+    if metadata.file_type().is_dir() {
+        fs::remove_dir_all(path)
+    } else {
+        fs::remove_file(path)
+    }
+    .map_err(|error| format!("could not remove {}: {error}", path.display()))
+}
+
+/// True for paths owned by a deployment that predates the transaction being
+/// rolled back, which the rollback must leave alone.
+fn predates_transaction(relative: &str, preexisting: PreexistingState) -> bool {
+    (preexisting.config && relative == "etc/sbctl/config.toml")
+        || (preexisting.data_directory && relative.starts_with("var/lib/sbctl"))
+}
+
+/// Removes only files created by a failed fresh installation. Preflight has
+/// already established that no sing-box deployment existed at these paths.
+/// Failures are collected and reported instead of silently swallowed, so an
+/// incomplete rollback is visible to the administrator.
+pub fn rollback_fresh_installation(root: &Path, preexisting: PreexistingState) {
+    if preexisting.config || preexisting.data_directory {
+        eprintln!(
+            "warning: sbctl configuration or state predates this install, so the rollback left \
+             it in place; run `sbctl uninstall --purge` first to start from a clean slate"
+        );
+    }
+    let _ = systemctl(
+        root,
+        &[
+            "disable",
+            "--now",
+            "sbctl-http.socket",
+            "sbctl-accounting-reset.timer",
+            "sbctl-credential-rotate.timer",
+            "sbctl.service",
+            "sing-box.service",
+        ],
+    );
+    let _ = systemctl(root, &["daemon-reload"]);
+    let mut warnings = Vec::new();
+    for relative in [
+        "etc/systemd/system/sbctl-http.socket",
+        "etc/systemd/system/sbctl.service",
+        "etc/systemd/system/sing-box.service",
+        "etc/systemd/system/sbctl-accounting-reset.service",
+        "etc/systemd/system/sbctl-accounting-reset.timer",
+        // Opt-in, so it may not exist; removal tolerates that. Leaving it
+        // behind would keep rotating credentials for a deployment sbctl no
+        // longer manages.
+        CREDENTIAL_ROTATE_UNIT,
+        CREDENTIAL_ROTATE_TIMER,
+        "etc/sing-box/config.json",
+        "usr/local/bin/sing-box",
+        "usr/local/bin/sbctl",
+        "etc/sbctl/config.toml",
+        CERTBOT_DEPLOY_HOOK,
+        OWNERSHIP_MARKER,
+        "var/lib/sbctl/artifacts/sing-box-server.json",
+        "var/lib/sbctl/artifacts/subscription-sing-box.json",
+        "var/lib/sbctl/artifacts/subscription-clash.yaml",
+        "var/lib/sbctl/artifacts/subscription-uri.txt",
+        "var/lib/sbctl/artifacts/subscription-base64-uri.txt",
+        "var/lib/sbctl/artifacts/subscription-shadowrocket.txt",
+        "var/lib/sbctl/state.json",
+    ] {
+        if predates_transaction(relative, preexisting) {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(root.join(relative))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warnings.push(format!("{relative}: {error}"));
+        }
+    }
+    // Everything under var/lib/sbctl belongs to the failed installation (the
+    // pinned certificates, the ACME webroot, the remaining versioned
+    // artifacts, and the operation lock), so it can be removed wholesale —
+    // except the lock file itself, which is what keeps a concurrent transaction
+    // out. See `remove_data_directory_keeping_lock`.
+    // etc/sbctl is only pruned when empty: administrator override templates
+    // under etc/sbctl/overrides predate the install and must survive.
+    if !preexisting.data_directory
+        && let Some(warning) = remove_data_directory_keeping_lock(root)
+    {
+        warnings.push(warning);
+    }
+    // A data directory left holding nothing but the lock stays; one that was
+    // emptied (a fixture root, or a failure before the lock was taken) goes, so
+    // a rolled-back install leaves no trace.
+    let _ = fs::remove_dir(root.join("var/lib/sbctl"));
+    for directory in ["etc/sing-box"] {
+        if let Err(error) = fs::remove_dir(root.join(directory))
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            warnings.push(format!("{directory}: {error}"));
+        }
+    }
+    if !warnings.is_empty() {
+        eprintln!(
+            "warning: the installation rollback left files behind; remove them manually:\n  {}",
+            warnings.join("\n  ")
+        );
+    }
+}
+
+/// Removes only paths created by sbctl. A normal uninstall leaves persistent
+/// data in place and first makes a root-readable backup; --purge removes the
+/// explicitly owned configuration and state instead.
+pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>, String> {
+    if !root.join("etc/sbctl/config.toml").is_file() || !root.join(OWNERSHIP_MARKER).is_file() {
+        return Err("no sbctl-managed deployment configuration was found".to_owned());
+    }
+
+    let backup = (!purge).then(|| backup_persistent_data(root)).transpose()?;
+    let sbctl_unit_owned = unit_has_marker(root, SBCTL_UNIT, SBCTL_UNIT_MARKER)?;
+    let sing_box_unit_owned = unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)?;
+    let reset_timer_owned = unit_has_marker(root, ACCOUNTING_RESET_TIMER, ACCOUNTING_RESET_MARKER)?;
+    let http_socket_owned = unit_has_marker(root, SBCTL_HTTP_SOCKET, SBCTL_HTTP_SOCKET_MARKER)?;
+    let deploy_hook_owned = unit_has_marker(root, CERTBOT_DEPLOY_HOOK, CERTBOT_DEPLOY_HOOK_MARKER)?;
+    let sing_box_config_owned = sing_box_unit_owned || !root.join(SING_BOX_UNIT).exists();
+    if sbctl_unit_owned {
+        systemctl(root, &["disable", "--now", "sbctl.service"])?;
+    }
+    if sing_box_unit_owned {
+        systemctl(root, &["disable", "--now", "sing-box.service"])?;
+    }
+    if reset_timer_owned {
+        systemctl(root, &["disable", "--now", "sbctl-accounting-reset.timer"])?;
+    }
+    if http_socket_owned {
+        systemctl(root, &["disable", "--now", "sbctl-http.socket"])?;
+    }
+
+    if sbctl_unit_owned {
+        remove_file_if_present(&root.join(SBCTL_UNIT))?;
+        remove_file_if_present(&root.join("usr/local/bin/sbctl"))?;
+        remove_ly_symlink_if_owned(root);
+    }
+    if sing_box_unit_owned {
+        remove_file_if_present(&root.join(SING_BOX_UNIT))?;
+        remove_file_if_present(&root.join("usr/local/bin/sing-box"))?;
+    }
+    if reset_timer_owned {
+        remove_file_if_present(&root.join(ACCOUNTING_RESET_TIMER))?;
+        remove_file_if_present(&root.join(ACCOUNTING_RESET_UNIT))?;
+    }
+    if http_socket_owned {
+        remove_file_if_present(&root.join(SBCTL_HTTP_SOCKET))?;
+    }
+    if deploy_hook_owned {
+        remove_file_if_present(&root.join(CERTBOT_DEPLOY_HOOK))?;
+    }
+    if sbctl_unit_owned || sing_box_unit_owned || reset_timer_owned || http_socket_owned {
+        systemctl(root, &["daemon-reload"])?;
+    }
+
+    if purge {
+        // A prior non-purge uninstall removes the unit but deliberately keeps
+        // persistent configuration. Conversely, a replacement non-sbctl unit
+        // signals a hand-managed deployment and must leave its config alone.
+        if sing_box_config_owned {
+            remove_file_if_present(&root.join("etc/sing-box/config.json"))?;
+            remove_empty_directory_if_present(&root.join("etc/sing-box"))?;
+        }
+        remove_file_if_present(&root.join("etc/sbctl/config.toml"))?;
+        remove_directory_if_present(&root.join("var/lib/sbctl"))?;
+        // The uninstall menu double-confirmation promises that --purge deletes
+        // the backups too, so the backup directory must not survive it.
+        remove_directory_if_present(&root.join(BACKUP_ROOT))?;
+    }
+    Ok(backup)
+}
+
+/// Removes the contents of the data directory but keeps the operation lock.
+///
+/// Deleting the lock file with everything else is not cosmetic: a transaction
+/// still holding it would then be excluded by nothing, because a later acquirer
+/// locks a freshly created inode while the old holder still believes it owns the
+/// deleted one. The directory survives holding only that file, which preflight
+/// does not count as a deployment.
+fn remove_data_directory_keeping_lock(root: &Path) -> Option<String> {
+    let directory = root.join("var/lib/sbctl");
+    let Ok(entries) = fs::read_dir(&directory) else {
+        return None;
+    };
+    for entry in entries.flatten() {
+        if entry.file_name().to_string_lossy() == ".operation.lock" {
+            continue;
+        }
+        let path = entry.path();
+        let removed = if path.is_dir() {
+            fs::remove_dir_all(&path)
+        } else {
+            fs::remove_file(&path)
+        };
+        if let Err(error) = removed {
+            return Some(format!("{}: {error}", path.display()));
+        }
+    }
+    None
+}
+
+/// Removes the `ly` convenience symlink only when it points at the sbctl
+/// binary. The shell installer links `ly` to sbctl, but the sbtui desktop
+/// installer reuses the same name for its own binary, which must survive an
+/// sbctl uninstall.
+fn remove_ly_symlink_if_owned(root: &Path) {
+    let path = root.join("usr/local/bin/ly");
+    match fs::read_link(&path) {
+        Ok(target) => {
+            if target.to_string_lossy().ends_with("sbctl")
+                && let Err(error) = fs::remove_file(&path)
+            {
+                eprintln!("warning: could not remove the ly shortcut symlink: {error}");
+            }
+        }
+        Err(_) => {
+            // Missing, or a real binary owned by another tool (sbtui): leave it.
+        }
+    }
+}
+
+fn unit_has_marker(root: &Path, relative: &str, marker: &str) -> Result<bool, String> {
+    match fs::read_to_string(root.join(relative)) {
+        Ok(contents) => Ok(contents.contains(marker)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!(
+            "could not inspect {}: {error}",
+            root.join(relative).display()
+        )),
+    }
+}
+
+pub fn restart_services(root: &Path) -> Result<(), String> {
+    // Isolated deployment roots used by CLI tests and image builders do not
+    // control the host's systemd units or sockets. Keep their historical
+    // service-command behavior; socket reconciliation is for the live host.
+    if root != Path::new("/") {
+        systemctl(root, &["restart", "sing-box.service", "sbctl.service"])?;
+        for unit in ["sing-box.service", "sbctl.service"] {
+            wait_for_stable_activation(root, unit)?;
+        }
+        return Ok(());
+    }
+
+    let direct = DeploymentStore::new(root)
+        .load()
+        .map(|config| config.subscription_mode == crate::config::SubscriptionMode::Direct)
+        .map_err(|error| {
+            format!("could not determine subscription mode before restart: {error}")
+        })?;
+    reconcile_subscription_units(root, direct)?;
+
+    systemctl(root, &["restart", "sing-box.service"])?;
+    if direct {
+        // A socket-activated service must be started by a connection to its
+        // socket. `systemctl restart sbctl.service` starts it without LISTEN_FDS,
+        // so `sbctl serve` exits and systemd enters a restart loop.
+        systemctl(root, &["stop", "sbctl.service"])?;
+        systemctl(root, &["enable", "--now", "sbctl-http.socket"])?;
+        trigger_direct_socket()?;
+    } else {
+        if root.join(SBCTL_HTTP_SOCKET).is_file() {
+            systemctl(root, &["disable", "--now", "sbctl-http.socket"])?;
+        }
+        systemctl(root, &["restart", "sbctl.service"])?;
+    }
+    // A configuration change has to survive the same observation window as an
+    // install, or the caller's rollback never triggers for a daemon that dies
+    // just after `restart` returned.
+    let mut health_units = vec!["sing-box.service", "sbctl.service"];
+    if direct {
+        health_units.push("sbctl-http.socket");
+    }
+    for unit in health_units {
+        wait_for_stable_activation(root, unit)?;
+    }
+    Ok(())
+}
+
+/// Keeps the generated service/socket units in step with the committed
+/// subscription mode. A configuration edit can change modes without running
+/// the installer, so relying on the install-time unit files leaves Direct mode
+/// without socket activation (and makes `sbctl serve` exit immediately).
+fn reconcile_subscription_units(root: &Path, direct: bool) -> Result<(), String> {
+    let service_path = root.join(SBCTL_UNIT);
+    let existing_service = fs::read_to_string(&service_path)
+        .map_err(|error| format!("could not read {}: {error}", service_path.display()))?;
+    if !existing_service.contains(SBCTL_UNIT_MARKER) {
+        return Err(
+            "sbctl.service is not an sbctl-managed unit; refusing to replace it".to_owned(),
+        );
+    }
+
+    let desired_service = sbctl_unit(direct);
+    let mut changed = existing_service != desired_service;
+    if changed {
+        write_unit(root, SBCTL_UNIT, &desired_service).map_err(|error| error.to_string())?;
+    }
+    if direct {
+        let socket_path = root.join(SBCTL_HTTP_SOCKET);
+        if socket_path.exists() {
+            let existing_socket = fs::read_to_string(&socket_path)
+                .map_err(|error| format!("could not read {}: {error}", socket_path.display()))?;
+            if !existing_socket.contains(SBCTL_HTTP_SOCKET_MARKER) {
+                return Err(
+                    "sbctl-http.socket is not an sbctl-managed unit; refusing to replace it"
+                        .to_owned(),
+                );
+            }
+            changed |= existing_socket != SBCTL_HTTP_SOCKET_CONTENTS;
+        } else {
+            changed = true;
+        }
+        if changed {
+            write_unit(root, SBCTL_HTTP_SOCKET, SBCTL_HTTP_SOCKET_CONTENTS)
+                .map_err(|error| error.to_string())?;
+        }
+    } else {
+        let socket_path = root.join(SBCTL_HTTP_SOCKET);
+        if socket_path.exists() {
+            let existing_socket = fs::read_to_string(&socket_path)
+                .map_err(|error| format!("could not read {}: {error}", socket_path.display()))?;
+            if !existing_socket.contains(SBCTL_HTTP_SOCKET_MARKER) {
+                return Err(
+                    "sbctl-http.socket is not an sbctl-managed unit; refusing to alter it"
+                        .to_owned(),
+                );
+            }
+        }
+    }
+    reconcile_certificate_hook(root, direct)?;
+    if changed {
+        systemctl(root, &["daemon-reload"])?;
+    }
+    Ok(())
+}
+
+fn reconcile_certificate_hook(root: &Path, direct: bool) -> Result<(), String> {
+    let path = root.join(CERTBOT_DEPLOY_HOOK);
+    if direct {
+        if path.exists() {
+            let existing = fs::read_to_string(&path)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            if !existing.contains(CERTBOT_DEPLOY_HOOK_MARKER) {
+                return Err(
+                    "the Certbot deploy hook path is occupied by an unmanaged file; refusing to replace it"
+                        .to_owned(),
+                );
+            }
+            if existing != certbot_deploy_hook() {
+                write_unit(root, CERTBOT_DEPLOY_HOOK, certbot_deploy_hook())
+                    .map_err(|error| error.to_string())?;
+            }
+        } else {
+            write_unit(root, CERTBOT_DEPLOY_HOOK, certbot_deploy_hook())
+                .map_err(|error| error.to_string())?;
+        }
+        set_executable(&path).map_err(|error| error.to_string())?;
+    } else if path.exists() {
+        let existing = fs::read_to_string(&path)
+            .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+        if !existing.contains(CERTBOT_DEPLOY_HOOK_MARKER) {
+            return Err(
+                "the Certbot deploy hook path is occupied by an unmanaged file; refusing to remove it"
+                    .to_owned(),
+            );
+        }
+        remove_file_if_present(&path)?;
+    }
+    Ok(())
+}
+
+fn trigger_direct_socket() -> Result<(), String> {
+    let timeout = Duration::from_secs(2);
+    let mut last_error = None;
+    for address in ["[::1]:443", "127.0.0.1:443"] {
+        let address: SocketAddr = address.parse().expect("literal loopback socket address");
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => {
+                drop(stream);
+                return Ok(());
+            }
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(format!(
+        "could not activate sbctl-http.socket through localhost:443: {}",
+        last_error.expect("at least one loopback address was attempted")
+    ))
+}
+
+pub fn service_status_entries(root: &Path) -> Vec<(&'static str, String)> {
+    [
+        "sing-box.service",
+        "sbctl.service",
+        "sbctl-http.socket",
+        "sbctl-accounting-reset.timer",
+    ]
+    .into_iter()
+    .map(|unit| {
+        let state = match systemctl(root, &["is-active", "--quiet", unit]) {
+            Ok(()) => "active".to_owned(),
+            Err(_) => "inactive or unavailable".to_owned(),
+        };
+        (unit, state)
+    })
+    .collect()
+}
+
+pub fn service_status(root: &Path) -> String {
+    service_status_entries(root)
+        .into_iter()
+        .map(|(unit, state)| format!("{unit}: {state}"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+pub fn required_firewall_ports(config: &DeploymentConfig) -> Vec<String> {
+    let mut ports = Vec::new();
+    if matches!(
+        config.subscription_mode,
+        crate::config::SubscriptionMode::Direct
+    ) {
+        ports.extend(["TCP 80 (ACME)", "TCP 443 (subscription)"].map(str::to_owned));
+    }
+    if let Some(node) = &config.vless_reality {
+        ports.push(format!("TCP {} (VLESS Reality)", node.listen_port));
+    }
+    if let Some(node) = &config.vmess_websocket {
+        ports.push(format!("TCP {} (VMess WebSocket)", node.listen_port));
+    }
+    if let Some(node) = &config.hysteria2 {
+        ports.push(format!("UDP {} (Hysteria2)", node.listen_port));
+    }
+    if let Some(node) = &config.tuic {
+        ports.push(format!("UDP {} (TUIC v5)", node.listen_port));
+    }
+    if let Some(node) = &config.anytls {
+        ports.push(format!("TCP {} (AnyTLS)", node.listen_port));
+    }
+    ports
+}
+
+pub fn enabled_nodes(config: &DeploymentConfig) -> String {
+    enabled_nodes_for_protocol(config, None)
+}
+
+pub fn enabled_nodes_for_protocol(
+    config: &DeploymentConfig,
+    protocol: Option<&ManagedProtocol>,
+) -> String {
+    crate::canonical::nodes(config)
+        .iter()
+        .filter(|node| protocol.is_none_or(|protocol| &node.protocol() == protocol))
+        .map(|node| {
+            format!(
+                "{}: {} {}",
+                node.protocol(),
+                node.transport().to_uppercase(),
+                node.port()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Each enabled node's native share link, one per line, matching the `uri`
+/// subscription artifact byte-for-byte.
+///
+/// These carry the proxy credentials, so they belong on the operator's own
+/// terminal and on the index page (which already sits behind the path
+/// credential) — never in the journal, per ADR-0013, and never in `sbctl sub`,
+/// which is routinely piped into logs and screenshots.
+pub fn node_share_links(config: &DeploymentConfig) -> String {
+    crate::canonical::nodes(config)
+        .iter()
+        .map(|node| crate::subscription::node_share_link(config, node))
+        .collect::<Vec<_>>()
+        .join("")
+}
+
+fn write_unit(root: &Path, relative_path: &str, contents: &str) -> Result<(), ConfigError> {
+    let path = root.join(relative_path);
+    let parent = path.parent().expect("unit path has parent");
+    fs::create_dir_all(parent)?;
+    // systemd parses whatever is on disk the next time the unit is referenced,
+    // so an interrupted install must not be able to leave half a unit behind.
+    let temporary = path.with_file_name(format!(
+        ".{}.new",
+        path.file_name()
+            .expect("unit path has a file name")
+            .to_string_lossy()
+    ));
+    fs::write(&temporary, contents)?;
+    fs::rename(&temporary, &path)?;
+    Ok(())
+}
+
+fn set_executable(path: &Path) -> Result<(), ConfigError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+/// The directory holding every uninstall backup; --purge removes it wholesale.
+const BACKUP_ROOT: &str = "var/backups/sbctl";
+
+fn backup_persistent_data(root: &Path) -> Result<std::path::PathBuf, String> {
+    let timestamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let destination = root.join(BACKUP_ROOT).join(timestamp.to_string());
+    fs::create_dir_all(&destination).map_err(|error| error.to_string())?;
+    set_private_directory_permissions(&destination)?;
+    for relative in BACKED_UP_PATHS {
+        let source = root.join(relative);
+        if !source.is_file() {
+            continue;
+        }
+        let target = destination.join(relative);
+        let parent = target
+            .parent()
+            .expect("backup target for a managed file has a parent");
+        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+        set_private_directory_permissions(parent)?;
+        fs::copy(&source, &target).map_err(|error| error.to_string())?;
+        set_root_readable_file_permissions(&target)?;
+    }
+    Ok(destination)
+}
+
+fn remove_file_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
+fn remove_directory_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
+fn remove_empty_directory_if_present(path: &Path) -> Result<(), String> {
+    match fs::remove_dir(path) {
+        Ok(()) => Ok(()),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(format!("could not remove {}: {error}", path.display())),
+    }
+}
+
+pub(crate) fn set_private_directory_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn set_root_readable_file_permissions(path: &Path) -> Result<(), String> {
+    #[cfg(not(unix))]
+    let _ = path;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+fn systemctl(root: &Path, args: &[&str]) -> Result<(), String> {
+    let command = root.join("usr/bin/systemctl");
+    #[cfg(windows)]
+    let command = if command.is_file() {
+        command
+    } else {
+        root.join("usr/bin/systemctl.cmd")
+    };
+    let program = if command.is_file() {
+        command
+    } else {
+        "systemctl".into()
+    };
+    let status = Command::new(program)
+        .args(args)
+        .status()
+        .map_err(|error| error.to_string())?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("systemctl {} exited with {status}", args.join(" ")))
+}
+
+fn ensure_daemon_accounts(root: &Path) -> Result<(), String> {
+    for account in ["sbctl", "sing-box"] {
+        ensure_daemon_account(root, account)?;
+    }
+    Ok(())
+}
+
+fn ensure_daemon_account(root: &Path, account: &str) -> Result<(), String> {
+    let passwd = root.join("etc/passwd");
+    if fs::read_to_string(&passwd).ok().is_some_and(|contents| {
+        contents
+            .lines()
+            .any(|line| line.starts_with(&format!("{account}:")))
+    }) {
+        return Ok(());
+    }
+    let candidate = root.join("usr/sbin/useradd");
+    let program = if candidate.is_file() {
+        candidate
+    } else {
+        "useradd".into()
+    };
+    let status = Command::new(program)
+        .args([
+            "--system",
+            "--no-create-home",
+            "--shell",
+            "/usr/sbin/nologin",
+            account,
+        ])
+        .status()
+        .map_err(|error| format!("could not create {account} service account: {error}"))?;
+    status.success().then_some(()).ok_or_else(|| {
+        format!("could not create {account} service account: useradd exited with {status}")
+    })
+}
+
+/// Creates the shared certificate group and adds both service accounts to it.
+/// The deploy hook stores the pinned private key as `root:{group} 0640`, so
+/// only the sbctl daemon and the sing-box data plane can read it while the
+/// subscription credential and node credentials stay private to their owners.
+fn ensure_certificate_group(root: &Path) -> Result<(), String> {
+    let group_file = root.join("etc/group");
+    let groups = fs::read_to_string(&group_file).unwrap_or_default();
+    let group_exists = groups
+        .lines()
+        .any(|line| line.starts_with(&format!("{CERTIFICATE_GROUP}:")));
+    if !group_exists {
+        run_account_command(root, "groupadd", &["--system", CERTIFICATE_GROUP])?;
+    }
+    for account in ["sbctl", "sing-box"] {
+        let is_member = groups.lines().any(|line| {
+            line.starts_with(&format!("{CERTIFICATE_GROUP}:"))
+                && line
+                    .split(':')
+                    .nth(3)
+                    .unwrap_or_default()
+                    .split(',')
+                    .any(|member| member == account)
+        });
+        if !is_member {
+            run_account_command(root, "usermod", &["-aG", CERTIFICATE_GROUP, account])?;
+        }
+    }
+    Ok(())
+}
+
+fn run_account_command(root: &Path, program: &str, args: &[&str]) -> Result<(), String> {
+    let candidate = root.join("usr/sbin").join(program);
+    let executable = if candidate.is_file() {
+        candidate
+    } else {
+        program.into()
+    };
+    let status = Command::new(executable)
+        .args(args)
+        .status()
+        .map_err(|error| format!("could not run {program}: {error}"))?;
+    status
+        .success()
+        .then_some(())
+        .ok_or_else(|| format!("{program} {} exited with {status}", args.join(" ")))
+}
+
+pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
+    // Fixture roots intentionally do not have real passwd entries or ownership
+    // metadata. Only change ownership when operating on the live host root.
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    let status = Command::new("chown")
+        .args(["-R", "sbctl:sbctl", "/etc/sbctl", "/var/lib/sbctl"])
+        .status()
+        .map_err(|error| format!("could not prepare sbctl service storage: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not prepare sbctl service storage: chown exited with {status}"
+        ));
+    }
+    // The /etc/sing-box directory is created private (0700 root:root). The
+    // sing-box data plane runs as its own account, so grant that group
+    // traversal of the directory while root keeps ownership. Without this the
+    // account cannot enter the directory to read its configuration.
+    let status = Command::new("chown")
+        .args(["root:sing-box", "/etc/sing-box"])
+        .status()
+        .map_err(|error| format!("could not grant sing-box config directory access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant sing-box config directory access: chown exited with {status}"
+        ));
+    }
+    let status = Command::new("chmod")
+        .args(["0750", "/etc/sing-box"])
+        .status()
+        .map_err(|error| format!("could not grant sing-box config directory access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant sing-box config directory access: chmod exited with {status}"
+        ));
+    }
+    // The generated sing-box configuration is written root-only (0600). The
+    // sing-box data plane runs as its own account, so the file must be owned
+    // and readable by that account while staying private to the host.
+    let status = Command::new("chown")
+        .args(["sing-box:sing-box", "/etc/sing-box/config.json"])
+        .status()
+        .map_err(|error| format!("could not grant sing-box service config access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant sing-box service config access: chown exited with {status}"
+        ));
+    }
+    let status = Command::new("chmod")
+        .args(["0640", "/etc/sing-box/config.json"])
+        .status()
+        .map_err(|error| format!("could not restrict sing-box service config: {error}"))?;
+    status.success().then_some(()).ok_or_else(|| {
+        format!("could not restrict sing-box service config: chmod exited with {status}")
+    })?;
+    if direct {
+        grant_certificate_storage(root)?;
+    } else {
+        grant_self_signed_certificate_access(root)?;
+    }
+    Ok(())
+}
+
+/// In self-signed certificate mode the sing-box data plane reads the pinned
+/// certificate under /var/lib/sbctl/certificates. Grant the sing-box service
+/// account traversal of the storage root and read access to the pinned
+/// certificate copy, keeping the private key group-readable only.
+fn grant_self_signed_certificate_access(root: &Path) -> Result<(), String> {
+    let status = Command::new("chmod")
+        .args(["0755", "/var/lib/sbctl"])
+        .status()
+        .map_err(|error| format!("could not grant certificate traversal: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant certificate traversal: chmod exited with {status}"
+        ));
+    }
+    let certificates = root.join("var/lib/sbctl/certificates");
+    if certificates.is_dir() {
+        let status = Command::new("chown")
+            .args(["-R", "root:sing-box", &certificates.to_string_lossy()])
+            .status()
+            .map_err(|error| format!("could not grant certificate file access: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "could not grant certificate file access: chown exited with {status}"
+            ));
+        }
+        let status = Command::new("find")
+            .args([
+                &certificates.to_string_lossy(),
+                "-type",
+                "d",
+                "-exec",
+                "chmod",
+                "0755",
+                "{}",
+                "+",
+            ])
+            .status()
+            .map_err(|error| format!("could not restrict certificate directories: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "could not restrict certificate directories: find exited with {status}"
+            ));
+        }
+        let status = Command::new("find")
+            .args([
+                &certificates.to_string_lossy(),
+                "-type",
+                "f",
+                "-exec",
+                "chmod",
+                "0640",
+                "{}",
+                "+",
+            ])
+            .status()
+            .map_err(|error| format!("could not restrict certificate files: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "could not restrict certificate files: find exited with {status}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Both service accounts read the pinned certificate copy under
+/// /var/lib/sbctl/certificates in Direct subscription mode. Grant the shared
+/// certificate group traversal of the storage root while every sbctl-owned
+/// state file stays 0600, so sing-box gains access to the certificate and
+/// nothing else. External proxy mode never touches certificate storage.
+fn grant_certificate_storage(root: &Path) -> Result<(), String> {
+    let status = Command::new("chgrp")
+        .args([CERTIFICATE_GROUP, "/var/lib/sbctl"])
+        .status()
+        .map_err(|error| format!("could not grant certificate storage access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant certificate storage access: chgrp exited with {status}"
+        ));
+    }
+    let status = Command::new("chmod")
+        .args(["0750", "/var/lib/sbctl"])
+        .status()
+        .map_err(|error| format!("could not restrict certificate storage: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not restrict certificate storage: chmod exited with {status}"
+        ));
+    }
+    let certificates = root.join(crate::config::CERTIFICATES_RELATIVE_PATH);
+    if certificates.is_dir() {
+        let status = Command::new("chgrp")
+            .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
+            .status()
+            .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
+        if !status.success() {
+            return Err(format!(
+                "could not grant certificate copy access: chgrp exited with {status}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_rollback_only_deletes_what_the_failed_install_created() {
+        let root = tempfile::tempdir().expect("fixture root");
+        // Persistent state a previous deployment left behind, e.g. on purpose
+        // via a non-purge uninstall.
+        let state = root.path().join("var/lib/sbctl/state.json");
+        fs::create_dir_all(state.parent().expect("state has a parent"))
+            .expect("fixture state directory");
+        fs::write(&state, "accumulated traffic").expect("fixture state");
+        let config = root.path().join("etc/sbctl/config.toml");
+        fs::create_dir_all(config.parent().expect("config has a parent"))
+            .expect("fixture configuration directory");
+        fs::write(&config, "subscription_credential = 'keep me'").expect("fixture configuration");
+        // And the unit this install did create.
+        let unit = root.path().join("etc/systemd/system/sbctl.service");
+        fs::create_dir_all(unit.parent().expect("unit has a parent"))
+            .expect("fixture unit directory");
+        fs::write(&unit, "[Unit]\n").expect("fixture unit");
+
+        rollback_fresh_installation(
+            root.path(),
+            PreexistingState {
+                config: true,
+                data_directory: true,
+            },
+        );
+
+        assert!(
+            state.is_file(),
+            "a rollback must not delete accounting state it did not create"
+        );
+        assert!(
+            config.is_file(),
+            "a rollback must not delete credentials it did not create"
+        );
+        assert!(
+            !unit.is_file(),
+            "a rollback must still remove what the install created"
+        );
+    }
+
+    #[test]
+    fn a_rollback_keeps_the_operation_lock_that_excludes_other_transactions() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let data = root.path().join("var/lib/sbctl");
+        fs::create_dir_all(&data).expect("fixture data directory");
+        let lock = data.join(".operation.lock");
+        fs::write(&lock, "").expect("fixture lock file");
+        fs::write(data.join("state.json"), "created by this install").expect("fixture state");
+
+        rollback_fresh_installation(root.path(), PreexistingState::default());
+
+        assert!(
+            lock.is_file(),
+            "deleting the lock lets a later transaction lock a new inode while an \
+             older holder still believes it owns the deleted one"
+        );
+        assert!(!data.join("state.json").exists());
+    }
+
+    #[test]
+    fn a_rollback_of_a_fresh_install_clears_the_data_directory() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let artifacts = root.path().join("var/lib/sbctl/artifacts");
+        fs::create_dir_all(&artifacts).expect("fixture artifact directory");
+        fs::write(artifacts.join("subscription-uri.txt"), "link").expect("fixture artifact");
+
+        rollback_fresh_installation(root.path(), PreexistingState::default());
+
+        assert!(!root.path().join("var/lib/sbctl").exists());
+    }
+
+    /// `Sockets=` is not a valid `[Unit]` key: Ubuntu 22.04 systemd logs
+    /// `Unknown key name 'Sockets' in section 'Unit', ignoring.` and the unit
+    /// no longer passes a warning-free `systemd-analyze verify`. The socket
+    /// unit already names the service (`Service=sbctl.service`), and the
+    /// service declares the dependency explicitly.
+    #[test]
+    fn the_direct_service_unit_uses_valid_dependency_keys_only() {
+        let direct = sbctl_unit(true);
+        assert!(direct.contains("Requires=sbctl-http.socket"));
+        assert!(direct.contains("After=sbctl-http.socket"));
+        assert!(
+            !direct.contains("Sockets="),
+            "Sockets= belongs to no valid [Unit] key and is ignored by systemd"
+        );
+
+        let external = sbctl_unit(false);
+        assert!(!external.contains("Requires=sbctl-http.socket"));
+        assert!(!external.contains("After=sbctl-http.socket"));
+        assert!(!external.contains("Sockets="));
+    }
+}

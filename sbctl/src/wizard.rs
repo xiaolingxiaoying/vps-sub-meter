@@ -1,0 +1,1504 @@
+//! Interactive configuration wizard.
+//!
+//! The wizard reads an existing deployment, walks the administrator through
+//! each field with the current value as the empty-input default, validates each
+//! answer, shows a complete redacted summary, and only then produces the new
+//! configuration for the caller to commit through the artifact/check/health
+//! transaction. No deployment file is touched by this module: cancellation,
+//! invalid input, and an unconfirmed summary all leave the existing deployment
+//! exactly as it was.
+
+use std::io;
+
+use thiserror::Error;
+
+use crate::config::{
+    AccountingPolicy, CertificateMode, ConfigError, DeploymentConfig, DeploymentOptions,
+    ManagedProtocol, ProtocolPorts, SubscriptionMode,
+};
+
+#[derive(Debug, Error)]
+pub enum WizardError {
+    #[error("configuration wizard input failed: {0}")]
+    Io(#[from] io::Error),
+    #[error("configuration wizard produced an invalid deployment: {0}")]
+    Config(#[from] ConfigError),
+    #[error("configuration wizard input is invalid: {0}")]
+    Invalid(String),
+}
+
+#[allow(clippy::large_enum_variant)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum WizardOutcome {
+    /// The administrator cancelled before confirmation; nothing changed.
+    Cancelled,
+    /// The collected answers reproduce the existing configuration.
+    Unchanged,
+    /// A new configuration was confirmed and is ready for the commit transaction.
+    Changed(DeploymentConfig),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ConfigurationTopic {
+    Subscription,
+    Protocols,
+    Traffic,
+    ClientTemplate,
+}
+
+/// The interactive prompt boundary. Production uses the console; tests drive a
+/// script of answers through the same flow so the wizard logic is exercised
+/// without a terminal.
+pub trait Prompts {
+    /// Ask a free-text question. `default` is displayed as the current value;
+    /// an empty answer keeps the current value (or means "no value").
+    fn ask(&mut self, label: &str, default: Option<&str>) -> io::Result<String>;
+    /// Show a message (validation error, summary line, or header).
+    fn report(&mut self, message: &str);
+    /// Ask a yes/no confirmation. An empty answer selects `default`.
+    fn confirm(&mut self, question: &str, default: bool) -> io::Result<bool>;
+}
+
+/// Asks the five client-template fields, carrying each current value as the
+/// default. Shared by the focused topic and the first-install wizard so a
+/// fresh deployment cannot silently ship the compiled-in defaults — the second
+/// configuration pass operators had to take after installing.
+fn ask_client_template_fields<C: Prompts>(
+    config: &mut DeploymentConfig,
+    prompts: &mut C,
+) -> Result<(), WizardError> {
+    // Asked first because it is the axis the rest of the answers feed:
+    // the template decides which groups, rule-sets and routing verdicts
+    // exist, and only then does `client_rule_profile` decide whether the
+    // external rule-sets are reachable (ADR-0022).
+    config.client_template = ask_required(
+        prompts,
+        "客户端内容模板（1 standard 历史结构 / 2 global 除私有地址外走代理 / 3 split 按规则分流，广告阻断）",
+        Some(config.client_template.to_string()),
+        parse_client_template,
+    )?;
+    config.client_dns_mode = ask_required(
+        prompts,
+        "客户端 DNS 模式（1 fake-ip：便于 TUN 按域名分流 / 2 redir-host：返回真实 IP）",
+        Some(config.client_dns_mode.to_string()),
+        parse_dns_mode,
+    )?;
+    config.client_dns_preset = ask_required(
+        prompts,
+        "直连 DNS 传输（1 cn-direct：UDP 223.5.5.5，大陆解析最快 / 2 privacy：同一地址改用 DoH，防 ISP 窥探或劫持明文 DNS）",
+        Some(config.client_dns_preset.to_string()),
+        parse_dns_preset,
+    )?;
+    config.ipv4_only = ask_required(
+        prompts,
+        "仅使用 IPv4 出站解析？（1 yes / 2 no；本机无可用 IPv6 路由时 sbctl 已自动钉住）",
+        Some(if config.ipv4_only { "yes" } else { "no" }.to_owned()),
+        parse_yes_no,
+    )?;
+    config.client_rule_profile = ask_required(
+        prompts,
+        "规则来源（1 standard：远程规则集，客户端需能访问规则源 / 2 minimal：内置规则，不下载规则集）",
+        Some(config.client_rule_profile.to_string()),
+        parse_rule_profile,
+    )?;
+    config.client_rule_set_base_url = ask_required(
+        prompts,
+        "规则集镜像根 URL（standard 使用；不要加分支或末尾斜杠，sbctl 会补全路径）",
+        Some(config.client_rule_set_base_url.clone()),
+        parse_http_url,
+    )?;
+    config.client_latency_probe_url = ask_required(
+        prompts,
+        "节点测速 URL（客户端必须可访问；选择组含 DIRECT，请用直连也能访问的地址）",
+        Some(config.client_latency_probe_url.clone()),
+        parse_http_url,
+    )?;
+    let secret = ask_required(
+        prompts,
+        "客户端面板 clash_api secret（留空 = 不设，与既有订阅字节一致；random = 由 sbctl 生成；或直接输入字符串）",
+        Some(
+            config
+                .client_clash_api_secret
+                .clone()
+                .unwrap_or_else(|| "none".to_owned()),
+        ),
+        parse_clash_api_secret,
+    )?;
+    config.client_clash_api_secret = match secret.as_str() {
+        "" | "none" | "off" | "0" => None,
+        "random" | "1" => Some(sbctl_random_secret()?),
+        explicit => Some(explicit.to_owned()),
+    };
+    Ok(())
+}
+
+/// Generates the client panel secret. Kept out of the renderer on purpose:
+/// generation is read-only over the config, so a secret minted there would
+/// change the subscriber bytes on every regeneration.
+fn sbctl_random_secret() -> Result<String, WizardError> {
+    crate::config::generate_subscription_credential().map_err(WizardError::Config)
+}
+
+/// Accepts the three answers the secret question allows; validation of the
+/// resulting value happens in `DeploymentConfig::validate`.
+fn parse_clash_api_secret(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.split_whitespace().count() > 1 {
+        return Err("secret 只能是单个不含空格的词，或留空 / random".to_owned());
+    }
+    Ok(trimmed.to_ascii_lowercase())
+}
+
+/// Runs the wizard. `existing` is the loaded deployment (`None` for a fresh
+/// one); `default_interface` supplies the detected default-route interface as
+/// the suggested default for a fresh deployment. Returns the confirmed outcome
+/// without writing anything.
+pub fn run<C: Prompts>(
+    existing: Option<&DeploymentConfig>,
+    default_interface: Option<String>,
+    prompts: &mut C,
+) -> Result<WizardOutcome, WizardError> {
+    prompts.report("=== sbctl 配置向导 ===");
+
+    let mode = ask_required(
+        prompts,
+        "订阅模式 (direct / external-proxy / ip-fallback)",
+        existing
+            .map(|config| config.subscription_mode.to_string())
+            .or_else(|| Some(SubscriptionMode::Direct.to_string())),
+        parse_mode,
+    )?;
+
+    let subscription_host = ask_required(
+        prompts,
+        "订阅主机名（域名或 IP）",
+        existing.map(|config| config.subscription_host.clone()),
+        parse_host,
+    )?;
+
+    let proxy_host = ask_value(
+        prompts,
+        "代理节点地址（留空则与订阅主机相同）",
+        existing.and_then(|config| config.proxy_host.clone()),
+        parse_optional_host,
+    )?;
+
+    let certbot_email = if mode == SubscriptionMode::Direct {
+        ask_certbot_email(
+            prompts,
+            existing.and_then(|config| config.certbot_email.clone()),
+        )?
+    } else {
+        None
+    };
+
+    let http_port = if mode == SubscriptionMode::IpFallback {
+        Some(ask_required(
+            prompts,
+            "IP fallback HTTP 端口（大于 1024）",
+            existing.and_then(|config| config.http_port.map(|port| port.to_string())),
+            parse_high_port,
+        )?)
+    } else {
+        None
+    };
+
+    let listen_port = if mode == SubscriptionMode::ExternalProxy {
+        Some(ask_required(
+            prompts,
+            "External proxy loopback 监听端口（大于 1024）",
+            existing
+                .and_then(|config| config.subscription_listen_port.map(|port| port.to_string())),
+            parse_high_port,
+        )?)
+    } else {
+        None
+    };
+
+    let interface = ask_required(
+        prompts,
+        "流量统计网卡",
+        existing
+            .map(|config| config.interface.clone())
+            .or(default_interface),
+        parse_interface,
+    )?;
+
+    let certificate_mode = ask_required(
+        prompts,
+        "协议监听证书 (domain / self-signed)",
+        existing
+            .map(|config| config.certificate_mode.to_string())
+            .or_else(|| Some(CertificateMode::SelfSigned.to_string())),
+        parse_certificate_mode,
+    )?;
+
+    // Ask about every protocol in the canonical order, then merge the answers
+    // with the persisted order: protocols that stay enabled keep their existing
+    // position so an unchanged selection does not reorder the generated node
+    // list (which would rewrite artifacts and restart services), and newly
+    // enabled protocols append in the canonical order.
+    let mut selected = Vec::new();
+    for protocol in [
+        ManagedProtocol::VlessReality,
+        ManagedProtocol::VmessWebsocket,
+        ManagedProtocol::Hysteria2,
+        ManagedProtocol::Tuic,
+        ManagedProtocol::Anytls,
+    ] {
+        let currently_enabled =
+            existing.is_none_or(|config| config.enabled_protocols.contains(&protocol));
+        if ask_yes_no(
+            prompts,
+            &format!("启用 {protocol} 协议？"),
+            currently_enabled,
+        )? {
+            selected.push(protocol);
+        }
+    }
+    let enabled_protocols = merge_protocol_order(
+        existing.map(|config| config.enabled_protocols.as_slice()),
+        &selected,
+    );
+
+    let mut ports = ProtocolPorts::default();
+    for protocol in &enabled_protocols {
+        let current_port = existing
+            .and_then(|config| config.protocol_listener_port(protocol))
+            .map(|port| port.to_string());
+        let port = ask_value(
+            prompts,
+            &format!("{protocol} 监听端口（留空 = 保持当前/自动分配）"),
+            current_port,
+            parse_protocol_port,
+        )?;
+        match protocol {
+            ManagedProtocol::VlessReality => ports.vless_reality = port,
+            ManagedProtocol::VmessWebsocket => ports.vmess_websocket = port,
+            ManagedProtocol::Hysteria2 => ports.hysteria2 = port,
+            ManagedProtocol::Tuic => ports.tuic = port,
+            ManagedProtocol::Anytls => ports.anytls = port,
+        }
+    }
+
+    let reality_decoy_sni = if enabled_protocols.contains(&ManagedProtocol::VlessReality) {
+        Some(ask_required(
+            prompts,
+            "Reality decoy SNI",
+            existing.and_then(|config| config.reality_decoy_sni.clone()),
+            parse_hostname,
+        )?)
+    } else {
+        None
+    };
+
+    let protocol_sni = if enabled_protocols.iter().any(|protocol| {
+        matches!(
+            protocol,
+            ManagedProtocol::VmessWebsocket
+                | ManagedProtocol::Hysteria2
+                | ManagedProtocol::Tuic
+                | ManagedProtocol::Anytls
+        )
+    }) {
+        ask_value(
+            prompts,
+            "协议 TLS 伪装域名（protocol_sni，留空 = 自动：www.bing.com 或订阅域名）",
+            existing.and_then(|config| config.protocol_sni.clone()),
+            parse_hostname,
+        )?
+    } else {
+        None
+    };
+
+    let monthly_traffic_limit = ask_value(
+        prompts,
+        "每月流量上限（GiB，0 = 不限；可输入 GB）",
+        existing.map(|config| crate::traffic::format_gib(config.monthly_traffic_limit)),
+        crate::traffic::parse_traffic_amount,
+    )?
+    .unwrap_or(0);
+
+    let accounting_timezone = ask_required(
+        prompts,
+        "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
+        Some(
+            existing
+                .map(|config| config.accounting_timezone.clone())
+                .unwrap_or_else(|| "America/Los_Angeles".to_owned()),
+        ),
+        parse_accounting_timezone,
+    )?;
+
+    let client_display_timezone = ask_required(
+        prompts,
+        "客户端显示时区（只影响可读时间，不改变实际刷新时刻）",
+        existing
+            .map(|config| config.client_display_timezone.clone())
+            .or_else(|| Some("Asia/Shanghai".to_owned())),
+        parse_timezone,
+    )?;
+
+    let accounting_policy = ask_required(
+        prompts,
+        "账期策略 (natural-month / anchored-month)",
+        existing
+            .map(|config| config.accounting_policy.to_string())
+            .or_else(|| Some(AccountingPolicy::NaturalMonth.to_string())),
+        parse_policy,
+    )?;
+
+    let anchored_reset_at = if accounting_policy == AccountingPolicy::AnchoredMonth {
+        Some(ask_required(
+            prompts,
+            "Anchored reset 首次重置时间 (YYYY-MM-DDTHH:MM)",
+            existing.and_then(|config| config.anchored_reset_at.clone()),
+            parse_reset_at,
+        )?)
+    } else {
+        None
+    };
+
+    let mut new = DeploymentConfig::apply_options(
+        existing,
+        &DeploymentOptions {
+            subscription_mode: mode,
+            subscription_host,
+            proxy_host,
+            certbot_email,
+            http_port,
+            subscription_listen_port: listen_port,
+            certificate_mode,
+            interface,
+            enabled_protocols,
+            reality_decoy_sni,
+            protocol_sni,
+            monthly_traffic_limit,
+            accounting_policy,
+            accounting_timezone,
+            client_display_timezone,
+            anchored_reset_at,
+            ports,
+        },
+    )?;
+
+    // The client template knobs used to be reachable only through the focused
+    // menu topic, so a first install silently shipped standard/fake-ip/remote
+    // rules and left the operator a second pass. Only a fresh deployment is
+    // asked: an existing one already carries whatever the operator chose, and
+    // those preferences survive a wizard rebuild. One confirmation keeps the
+    // common path short while making the knobs part of installing.
+    if existing.is_none()
+        && prompts.confirm(
+            "自定义客户端模板与规则来源？（默认：标准模板 + fake-ip + 远程规则集）",
+            false,
+        )?
+    {
+        ask_client_template_fields(&mut new, prompts)?;
+    }
+
+    if existing.is_some_and(|current| current == &new) {
+        return Ok(WizardOutcome::Unchanged);
+    }
+
+    prompts.report("");
+    prompts.report(&new.summary());
+    prompts.report("");
+
+    if !prompts.confirm("确认提交以上配置？", false)? {
+        return Ok(WizardOutcome::Cancelled);
+    }
+
+    Ok(WizardOutcome::Changed(new))
+}
+
+/// Runs a focused editor for an existing deployment. The editor carries all
+/// untouched choices forward and only asks about the selected configuration
+/// topic, so menu users do not have to walk through unrelated settings.
+pub fn run_topic<C: Prompts>(
+    existing: &DeploymentConfig,
+    topic: ConfigurationTopic,
+    prompts: &mut C,
+) -> Result<WizardOutcome, WizardError> {
+    if topic == ConfigurationTopic::Protocols
+        && existing.subscription_mode == SubscriptionMode::IpFallback
+    {
+        prompts.report("IP fallback 模式可启用证书类协议，但需自签证书 + 协议伪装域名");
+    }
+
+    let mut mode = existing.subscription_mode.clone();
+    let mut subscription_host = existing.subscription_host.clone();
+    let mut proxy_host = existing.proxy_host.clone();
+    let mut certbot_email = existing.certbot_email.clone();
+    let mut http_port = existing.http_port;
+    let mut subscription_listen_port = existing.subscription_listen_port;
+    let mut certificate_mode = existing.certificate_mode.clone();
+    let mut interface = existing.interface.clone();
+    let mut enabled_protocols = existing.enabled_protocols.clone();
+    let mut reality_decoy_sni = existing.reality_decoy_sni.clone();
+    let mut protocol_sni = existing.protocol_sni.clone();
+    let mut monthly_traffic_limit = existing.monthly_traffic_limit;
+    let mut accounting_policy = existing.accounting_policy.clone();
+    let mut accounting_timezone = existing.accounting_timezone.clone();
+    let mut client_display_timezone = existing.client_display_timezone.clone();
+    let mut anchored_reset_at = existing.anchored_reset_at.clone();
+    let mut ports = ProtocolPorts {
+        vless_reality: existing.protocol_listener_port(&ManagedProtocol::VlessReality),
+        vmess_websocket: existing.protocol_listener_port(&ManagedProtocol::VmessWebsocket),
+        hysteria2: existing.protocol_listener_port(&ManagedProtocol::Hysteria2),
+        tuic: existing.protocol_listener_port(&ManagedProtocol::Tuic),
+        anytls: existing.protocol_listener_port(&ManagedProtocol::Anytls),
+    };
+
+    match topic {
+        ConfigurationTopic::Subscription => {
+            mode = ask_required(
+                prompts,
+                "订阅模式（1 直连 HTTPS / 2 外部反向代理 / 3 IP 回退）",
+                Some(mode.to_string()),
+                parse_mode,
+            )?;
+            subscription_host = ask_required(
+                prompts,
+                "订阅主机（域名或 IP）",
+                Some(subscription_host.clone()),
+                parse_host,
+            )?;
+            proxy_host = ask_value(
+                prompts,
+                "代理主机（留空 = 使用订阅主机）",
+                proxy_host.clone(),
+                parse_optional_host,
+            )?;
+            certbot_email = if mode == SubscriptionMode::Direct {
+                ask_certbot_email(prompts, certbot_email.clone())?
+            } else {
+                None
+            };
+            http_port = if mode == SubscriptionMode::IpFallback {
+                Some(ask_required(
+                    prompts,
+                    "公网回退端口（大于 1024）",
+                    Some(http_port.unwrap_or(2080).to_string()),
+                    parse_high_port,
+                )?)
+            } else {
+                None
+            };
+            subscription_listen_port = if mode == SubscriptionMode::ExternalProxy {
+                Some(ask_required(
+                    prompts,
+                    "反向代理回环端口（大于 1024）",
+                    Some(subscription_listen_port.unwrap_or(2080).to_string()),
+                    parse_high_port,
+                )?)
+            } else {
+                None
+            };
+        }
+        ConfigurationTopic::Protocols => {
+            let protocols = [
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::VmessWebsocket,
+                ManagedProtocol::Hysteria2,
+                ManagedProtocol::Tuic,
+                ManagedProtocol::Anytls,
+            ];
+            let mut selected = Vec::new();
+            for protocol in protocols {
+                let enabled = ask_yes_no(
+                    prompts,
+                    &format!("启用 {protocol}？"),
+                    existing.enabled_protocols.contains(&protocol),
+                )?;
+                if enabled {
+                    selected.push(protocol);
+                }
+            }
+            if selected.is_empty() {
+                prompts.report("至少需要启用一个协议");
+                return Ok(WizardOutcome::Cancelled);
+            }
+            // Preserve the persisted order for protocols that stay enabled so
+            // an unchanged selection does not rewrite the generated node list.
+            enabled_protocols =
+                merge_protocol_order(Some(existing.enabled_protocols.as_slice()), &selected);
+            // A protocol the user just switched off still carries its old port
+            // from the prefill above, and validation rejects a port for a
+            // disabled protocol — which would fail the entire edit.
+            clear_ports_for_disabled(&mut ports, &enabled_protocols);
+            certificate_mode = ask_required(
+                prompts,
+                "协议证书（1 domain / 2 self-signed）",
+                Some(certificate_mode.to_string()),
+                parse_certificate_mode,
+            )?;
+            for protocol in &enabled_protocols {
+                let current_port = existing
+                    .protocol_listener_port(protocol)
+                    .map(|port| port.to_string());
+                let port = ask_value(
+                    prompts,
+                    &format!("{protocol} 监听端口（留空 = 保持当前）"),
+                    current_port,
+                    parse_protocol_port,
+                )?;
+                match protocol {
+                    ManagedProtocol::VlessReality => ports.vless_reality = port,
+                    ManagedProtocol::VmessWebsocket => ports.vmess_websocket = port,
+                    ManagedProtocol::Hysteria2 => ports.hysteria2 = port,
+                    ManagedProtocol::Tuic => ports.tuic = port,
+                    ManagedProtocol::Anytls => ports.anytls = port,
+                }
+            }
+            reality_decoy_sni = if enabled_protocols.contains(&ManagedProtocol::VlessReality) {
+                Some(ask_required(
+                    prompts,
+                    "Reality 伪装 SNI",
+                    reality_decoy_sni,
+                    parse_hostname,
+                )?)
+            } else {
+                None
+            };
+            protocol_sni = if enabled_protocols.iter().any(|protocol| {
+                matches!(
+                    protocol,
+                    ManagedProtocol::VmessWebsocket
+                        | ManagedProtocol::Hysteria2
+                        | ManagedProtocol::Tuic
+                        | ManagedProtocol::Anytls
+                )
+            }) {
+                ask_value(
+                    prompts,
+                    "协议 TLS 伪装域名（protocol_sni，留空 = 自动：www.bing.com 或订阅域名）",
+                    protocol_sni,
+                    parse_hostname,
+                )?
+            } else {
+                None
+            };
+        }
+        ConfigurationTopic::ClientTemplate => {
+            // The client template fields never flow through DeploymentOptions;
+            // this topic mutates them directly and returns before the shared
+            // apply_options path so an unchanged deployment still detects.
+            let mut new = existing.clone();
+            ask_client_template_fields(&mut new, prompts)?;
+            new.validate()?;
+            if new == *existing {
+                return Ok(WizardOutcome::Unchanged);
+            }
+            prompts.report("");
+            prompts.report("配置变更预览：");
+            prompts.report(&new.summary());
+            if !prompts.confirm("确认应用以上配置？", false)? {
+                return Ok(WizardOutcome::Cancelled);
+            }
+            return Ok(WizardOutcome::Changed(new));
+        }
+        ConfigurationTopic::Traffic => {
+            monthly_traffic_limit = ask_value(
+                prompts,
+                "每月流量上限（GiB，0 = 不限；可输入 GB）",
+                Some(crate::traffic::format_gib(monthly_traffic_limit)),
+                crate::traffic::parse_traffic_amount,
+            )?
+            .unwrap_or(0);
+            accounting_timezone = ask_required(
+                prompts,
+                "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
+                Some(accounting_timezone.clone()),
+                parse_accounting_timezone,
+            )?;
+            client_display_timezone = ask_required(
+                prompts,
+                "客户端显示时区（只影响可读时间）",
+                Some(client_display_timezone.clone()),
+                parse_timezone,
+            )?;
+            accounting_policy = ask_required(
+                prompts,
+                "流量刷新规则（1 自然月 / 2 锚定月）",
+                Some(accounting_policy.to_string()),
+                parse_policy,
+            )?;
+            anchored_reset_at = if accounting_policy == AccountingPolicy::AnchoredMonth {
+                Some(ask_required(
+                    prompts,
+                    "首次重置时间（YYYY-MM-DDTHH:MM，按 VPS 刷新时区）",
+                    anchored_reset_at.clone(),
+                    parse_reset_at,
+                )?)
+            } else {
+                None
+            };
+            interface = ask_required(
+                prompts,
+                "出口网卡名称",
+                Some(interface.clone()),
+                parse_interface,
+            )?;
+        }
+    }
+
+    let new = DeploymentConfig::apply_options(
+        Some(existing),
+        &DeploymentOptions {
+            subscription_mode: mode,
+            subscription_host,
+            proxy_host,
+            certbot_email,
+            http_port,
+            subscription_listen_port,
+            certificate_mode,
+            interface,
+            enabled_protocols,
+            reality_decoy_sni,
+            protocol_sni,
+            monthly_traffic_limit,
+            accounting_policy,
+            accounting_timezone,
+            client_display_timezone,
+            anchored_reset_at,
+            ports,
+        },
+    )?;
+    if new == *existing {
+        return Ok(WizardOutcome::Unchanged);
+    }
+    prompts.report("");
+    prompts.report("配置变更预览：");
+    prompts.report(&new.summary());
+    if topic == ConfigurationTopic::Traffic
+        && (new.interface != existing.interface
+            || new.accounting_policy != existing.accounting_policy
+            || new.accounting_timezone != existing.accounting_timezone
+            || new.anchored_reset_at != existing.anchored_reset_at)
+    {
+        prompts.report("注意：修改 VPS 刷新时区、刷新规则或出口网卡会开始新的统计周期。");
+    }
+    if !prompts.confirm("确认应用以上配置？", false)? {
+        return Ok(WizardOutcome::Cancelled);
+    }
+    Ok(WizardOutcome::Changed(new))
+}
+
+/// Merges the wizard's protocol answers with the persisted protocol order:
+/// protocols that remain enabled keep their existing position, newly enabled
+/// protocols append in the canonical order, and disabled protocols drop out.
+fn merge_protocol_order(
+    existing: Option<&[ManagedProtocol]>,
+    selected: &[ManagedProtocol],
+) -> Vec<ManagedProtocol> {
+    let mut merged = existing
+        .unwrap_or(&[])
+        .iter()
+        .filter(|protocol| selected.contains(protocol))
+        .cloned()
+        .collect::<Vec<_>>();
+    for protocol in selected {
+        if !merged.contains(protocol) {
+            merged.push(protocol.clone());
+        }
+    }
+    merged
+}
+
+/// Drops the listener port of every protocol the edit disabled, so a
+/// deselected protocol cannot keep the port it was prefilled with.
+fn clear_ports_for_disabled(ports: &mut ProtocolPorts, enabled: &[ManagedProtocol]) {
+    let requested = [
+        (ManagedProtocol::VlessReality, &mut ports.vless_reality),
+        (ManagedProtocol::VmessWebsocket, &mut ports.vmess_websocket),
+        (ManagedProtocol::Hysteria2, &mut ports.hysteria2),
+        (ManagedProtocol::Tuic, &mut ports.tuic),
+        (ManagedProtocol::Anytls, &mut ports.anytls),
+    ];
+    for (protocol, port) in requested {
+        if !enabled.contains(&protocol) {
+            *port = None;
+        }
+    }
+}
+
+/// Asks a required value, re-prompting until a valid answer is supplied.
+fn ask_required<C: Prompts, T>(
+    prompts: &mut C,
+    label: &str,
+    current: Option<String>,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<T, WizardError> {
+    loop {
+        if let Some(value) = ask_value(prompts, label, current.clone(), &parse)? {
+            return Ok(value);
+        }
+        prompts.report("此项必填");
+    }
+}
+
+/// Asks an optional value. An empty answer returns the current value (`None`
+/// when there is none); a non-empty answer must parse, otherwise the wizard
+/// re-prompts with the validation message. A persisted value that no longer
+/// parses (a legacy format, for example) surfaces as a wizard error instead
+/// of aborting the process.
+fn ask_value<C: Prompts, T>(
+    prompts: &mut C,
+    label: &str,
+    current: Option<String>,
+    parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<Option<T>, WizardError> {
+    loop {
+        let answer = prompts.ask(label, current.as_deref())?;
+        if answer.is_empty() {
+            return match current.as_deref().map(&parse) {
+                None => Ok(None),
+                Some(Ok(value)) => Ok(Some(value)),
+                Some(Err(message)) => Err(WizardError::Invalid(format!(
+                    "当前保存的值无法解析（{message}）；请重新输入一个合法值"
+                ))),
+            };
+        }
+        match parse(&answer) {
+            Ok(value) => return Ok(Some(value)),
+            Err(message) => prompts.report(&message),
+        }
+    }
+}
+
+fn ask_yes_no<C: Prompts>(
+    prompts: &mut C,
+    label: &str,
+    default: bool,
+) -> Result<bool, WizardError> {
+    loop {
+        let answer = prompts.ask(label, Some(if default { "y" } else { "n" }))?;
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" => return Ok(true),
+            "n" | "no" => return Ok(false),
+            _ => prompts.report("请输入 y 或 n"),
+        }
+    }
+}
+
+fn parse_certificate_mode(value: &str) -> Result<CertificateMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "domain" | "1" => Ok(CertificateMode::Domain),
+        "self-signed" | "2" => Ok(CertificateMode::SelfSigned),
+        _ => Err("证书模式必须是 domain 或 self-signed".to_owned()),
+    }
+}
+
+fn parse_mode(value: &str) -> Result<SubscriptionMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "direct" | "1" => Ok(SubscriptionMode::Direct),
+        "external-proxy" | "2" => Ok(SubscriptionMode::ExternalProxy),
+        "ip-fallback" | "3" => Ok(SubscriptionMode::IpFallback),
+        _ => Err("订阅模式必须是 direct、external-proxy 或 ip-fallback".to_owned()),
+    }
+}
+
+fn parse_host(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if crate::config::host_is_valid(&value) {
+        Ok(value)
+    } else {
+        Err("Subscription host 必须是合法主机名或 IP 地址".to_owned())
+    }
+}
+
+fn parse_optional_host(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if crate::config::host_is_valid(&value) {
+        Ok(value)
+    } else {
+        Err("Proxy host 必须是合法主机名或 IP 地址；不需要请直接回车".to_owned())
+    }
+}
+
+fn parse_hostname(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if crate::config::hostname_is_valid(&value) {
+        Ok(value)
+    } else {
+        Err("Reality decoy SNI 必须是合法主机名".to_owned())
+    }
+}
+
+fn parse_interface(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    let valid = !value.is_empty()
+        && value.len() <= 15
+        && value.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.'
+        });
+    if valid {
+        Ok(value)
+    } else {
+        Err("网卡必须是有效的 Linux interface 名称".to_owned())
+    }
+}
+
+fn parse_high_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "端口必须是数字".to_owned())?;
+    if port <= 1024 {
+        return Err("端口必须大于 1024".to_owned());
+    }
+    Ok(port)
+}
+
+fn parse_protocol_port(value: &str) -> Result<u16, String> {
+    let port = value
+        .trim()
+        .parse::<u16>()
+        .map_err(|_| "端口必须是数字".to_owned())?;
+    if !(10_000..=65_535).contains(&port) {
+        return Err("Managed protocol 端口必须在 10000-65535".to_owned());
+    }
+    Ok(port)
+}
+
+fn parse_timezone(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    value.parse::<chrono_tz::Tz>().map_err(|_| {
+        "必须是有效 IANA 时区，例如 Asia/Shanghai 或 America/Los_Angeles".to_owned()
+    })?;
+    Ok(value)
+}
+
+fn parse_accounting_timezone(value: &str) -> Result<String, String> {
+    match value.trim() {
+        "1" => Ok("America/Los_Angeles".to_owned()),
+        "2" => Ok("America/New_York".to_owned()),
+        "3" => Ok("Asia/Shanghai".to_owned()),
+        _ => parse_timezone(value),
+    }
+}
+
+fn parse_policy(value: &str) -> Result<AccountingPolicy, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "natural-month" | "natural" | "1" => Ok(AccountingPolicy::NaturalMonth),
+        "anchored-month" | "anchored" | "2" => Ok(AccountingPolicy::AnchoredMonth),
+        _ => Err("账期策略必须是 natural-month 或 anchored-month".to_owned()),
+    }
+}
+
+/// Validates the Certbot registration email: it is optional (an empty answer
+/// skips ACME email registration) and only ever used for expiry notices.
+fn parse_certbot_email(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if value.is_empty() {
+        return Ok(value);
+    }
+    let domain_valid = value.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && !domain.is_empty() && crate::config::host_is_valid(domain)
+    });
+    if !value.contains(char::is_whitespace) && value.matches('@').count() == 1 && domain_valid {
+        Ok(value)
+    } else {
+        Err(
+            "邮箱格式无效（示例 admin@example.com）；该邮箱仅用于证书到期通知，可留空跳过"
+                .to_owned(),
+        )
+    }
+}
+
+/// Asks for the Certbot registration email. An empty answer only skips ACME
+/// email registration after an explicit confirmation, matching Certbot's
+/// `--register-unsafely-without-email` behavior.
+fn ask_certbot_email<C: Prompts>(
+    prompts: &mut C,
+    existing: Option<String>,
+) -> Result<Option<String>, WizardError> {
+    let mut current = existing;
+    loop {
+        let email = ask_value(
+            prompts,
+            "Certbot 证书邮箱（仅用于 ACME 到期通知；留空可不使用邮箱）",
+            current.clone(),
+            parse_certbot_email,
+        )?;
+        match email {
+            Some(email) if !email.trim().is_empty() => return Ok(Some(email)),
+            _ => {
+                if prompts.confirm(
+                    "确认不使用邮箱注册证书（--register-unsafely-without-email）？",
+                    false,
+                )? {
+                    return Ok(None);
+                }
+                prompts.report("未确认免邮箱注册；请填写证书邮箱。");
+                current = None;
+            }
+        }
+    }
+}
+
+fn parse_dns_preset(value: &str) -> Result<crate::config::ClientDnsPreset, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "cn-direct" | "1" => Ok(crate::config::ClientDnsPreset::CnDirect),
+        "privacy" | "2" => Ok(crate::config::ClientDnsPreset::Privacy),
+        _ => Err("DNS 档位必须是 cn-direct 或 privacy".to_owned()),
+    }
+}
+
+fn parse_yes_no(value: &str) -> Result<bool, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "yes" | "y" | "1" => Ok(true),
+        "no" | "n" | "2" | "" => Ok(false),
+        _ => Err("请选择 yes 或 no".to_owned()),
+    }
+}
+
+fn parse_dns_mode(value: &str) -> Result<crate::config::ClientDnsMode, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "fake-ip" | "1" => Ok(crate::config::ClientDnsMode::FakeIp),
+        "redir-host" | "2" => Ok(crate::config::ClientDnsMode::RedirHost),
+        _ => Err("DNS 模式必须是 fake-ip 或 redir-host".to_owned()),
+    }
+}
+
+fn parse_rule_profile(value: &str) -> Result<crate::config::ClientRuleProfile, String> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standard" | "1" => Ok(crate::config::ClientRuleProfile::Standard),
+        "minimal" | "2" => Ok(crate::config::ClientRuleProfile::Minimal),
+        _ => Err("规则档位必须是 standard 或 minimal".to_owned()),
+    }
+}
+
+/// The client content template axis (ADR-0022). This is the only place an
+/// administrator can reach `global` / `split`: the flag-free surface is the
+/// wizard and the `sbctl menu` 客户端模板 entry that drives it.
+fn parse_client_template(value: &str) -> Result<crate::subscription::ClientTemplate, String> {
+    use crate::subscription::ClientTemplate;
+    match value.trim().to_ascii_lowercase().as_str() {
+        "standard" | "1" => Ok(ClientTemplate::Standard),
+        "global" | "2" => Ok(ClientTemplate::Global),
+        "split" | "3" => Ok(ClientTemplate::Split),
+        _ => Err("内容模板必须是 standard、global 或 split".to_owned()),
+    }
+}
+
+fn parse_http_url(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    if value.starts_with("http://") || value.starts_with("https://") {
+        Ok(value.trim_end_matches('/').to_owned())
+    } else {
+        Err("必须是 http:// 或 https:// 开头的 URL".to_owned())
+    }
+}
+
+fn parse_reset_at(value: &str) -> Result<String, String> {
+    let value = value.trim().to_owned();
+    chrono::NaiveDateTime::parse_from_str(&value, "%Y-%m-%dT%H:%M")
+        .map_err(|_| "必须使用 YYYY-MM-DDTHH:MM 格式".to_owned())?;
+    Ok(value)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::io;
+
+    use super::{ConfigurationTopic, Prompts, WizardOutcome, run, run_topic};
+    use crate::config::{DeploymentConfig, ManagedProtocol, SubscriptionMode};
+
+    struct ScriptPrompts {
+        answers: VecDeque<String>,
+        confirms: VecDeque<bool>,
+        reports: Vec<String>,
+    }
+
+    impl ScriptPrompts {
+        fn new(answers: &[&str], confirms: &[bool]) -> Self {
+            Self {
+                answers: answers.iter().map(|answer| (*answer).to_owned()).collect(),
+                confirms: confirms.iter().copied().collect(),
+                reports: Vec::new(),
+            }
+        }
+
+        fn reports(&self) -> &[String] {
+            &self.reports
+        }
+    }
+
+    impl Prompts for ScriptPrompts {
+        fn ask(&mut self, _label: &str, _default: Option<&str>) -> io::Result<String> {
+            Ok(self.answers.pop_front().unwrap_or_default())
+        }
+        fn report(&mut self, message: &str) {
+            self.reports.push(message.to_owned());
+        }
+        fn confirm(&mut self, _question: &str, _default: bool) -> io::Result<bool> {
+            Ok(self.confirms.pop_front().unwrap_or(false))
+        }
+    }
+
+    fn ip_fallback_config() -> DeploymentConfig {
+        DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("an IP fallback VLESS deployment is valid")
+    }
+
+    fn empty_answers(count: usize) -> Vec<&'static str> {
+        vec![""; count]
+    }
+
+    /// The template axis is only real if an administrator can move it: this
+    /// topic used to ask about everything *except* `client_template`.
+    #[test]
+    fn the_client_template_topic_moves_the_template_axis_and_nothing_else() {
+        use crate::config::{ClientDnsMode, ClientRuleProfile};
+        use crate::subscription::ClientTemplate;
+
+        let config = ip_fallback_config();
+        // One answer per question, in prompt order: template, DNS mode, rule
+        // profile, rule-set base URL, latency probe URL.
+        let answers = ["3", "", "", "", ""];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::ClientTemplate, &mut prompts)
+            .expect("the client template topic completes");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("selecting split must produce a new configuration");
+        };
+        assert_eq!(updated.client_template, ClientTemplate::Split);
+        // The control: the answer that moved is the only one that moved.
+        assert_eq!(updated.client_dns_mode, ClientDnsMode::FakeIp);
+        assert_eq!(updated.client_rule_profile, ClientRuleProfile::Standard);
+        assert_eq!(
+            updated.client_rule_set_base_url,
+            config.client_rule_set_base_url
+        );
+        assert_eq!(
+            updated.client_latency_probe_url,
+            config.client_latency_probe_url
+        );
+        assert!(
+            updated.summary().contains("client content template: split"),
+            "the preview must show which template was selected"
+        );
+        assert!(
+            updated.summary().contains("client DNS mode: fake-ip")
+                && updated.summary().contains("client rule profile: standard")
+                && updated.summary().contains(&format!(
+                    "client rule-set base URL: {}",
+                    config.client_rule_set_base_url
+                ))
+                && updated.summary().contains(&format!(
+                    "client latency probe URL: {}",
+                    config.client_latency_probe_url
+                )),
+            "the preview must show the other client settings affected by this topic"
+        );
+    }
+
+    #[test]
+    fn the_client_template_topic_reprompts_for_an_invalid_rule_mirror_url() {
+        let config = ip_fallback_config();
+        let answers = [
+            "",
+            "",
+            "",
+            "",
+            "",
+            "ftp://mirror.example/rules",
+            "https://mirror.example/rules/",
+            "",
+            "",
+        ];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::ClientTemplate, &mut prompts)
+            .expect("the wizard recovers from an invalid mirror URL");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("a valid replacement URL must produce a configuration change");
+        };
+        assert_eq!(
+            updated.client_rule_set_base_url,
+            "https://mirror.example/rules"
+        );
+        assert!(
+            prompts
+                .reports()
+                .iter()
+                .any(|message| message == "必须是 http:// 或 https:// 开头的 URL"),
+            "the wizard must explain why the rejected URL cannot be used"
+        );
+    }
+
+    /// A typed answer is validated, and a bad one re-prompts instead of
+    /// silently keeping the previous template.
+    #[test]
+    fn an_unknown_template_answer_is_rejected_and_re_prompted() {
+        use crate::subscription::ClientTemplate;
+
+        let config = ip_fallback_config();
+        let answers = ["nope", "2", "", "", "", ""];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::ClientTemplate, &mut prompts)
+            .expect("the wizard recovers from a bad template answer");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("a corrected template answer must produce a new configuration");
+        };
+        assert_eq!(updated.client_template, ClientTemplate::Global);
+        assert!(
+            prompts
+                .reports()
+                .iter()
+                .any(|message| message.contains("内容模板必须是 standard、global 或 split")),
+            "the rejected answer has to say what it expected"
+        );
+    }
+
+    #[test]
+    fn traffic_topic_updates_client_display_timezone_without_reset_warning() {
+        let config = ip_fallback_config();
+        let answers = ["", "", "Asia/Tokyo", "", ""];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::Traffic, &mut prompts)
+            .expect("traffic topic completes");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("changing the display timezone must produce a new configuration");
+        };
+        assert_eq!(updated.accounting_timezone, "America/Los_Angeles");
+        assert_eq!(updated.client_display_timezone, "Asia/Tokyo");
+        assert!(
+            !prompts
+                .reports()
+                .iter()
+                .any(|message| message.contains("新的统计周期")),
+            "display-only timezone changes must not warn about resetting accounting"
+        );
+    }
+
+    #[test]
+    fn traffic_topic_accepts_the_east_coast_timezone_preset() {
+        let config = ip_fallback_config();
+        let answers = ["", "2", "", "", ""];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::Traffic, &mut prompts)
+            .expect("traffic topic completes");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("selecting the east coast preset must update the configuration");
+        };
+        assert_eq!(updated.accounting_timezone, "America/New_York");
+        assert!(
+            prompts
+                .reports()
+                .iter()
+                .any(|message| message.contains("新的统计周期")),
+            "changing the accounting timezone warns that a new period begins"
+        );
+    }
+
+    #[test]
+    fn an_unchanged_protocol_selection_preserves_the_persisted_order() {
+        use crate::config::DeploymentConfig;
+
+        let config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![
+                ManagedProtocol::Anytls,
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::Tuic,
+            ],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a custom-order deployment is valid");
+        let mut prompts = ScriptPrompts::new(&empty_answers(16), &[true]);
+
+        let outcome = run(Some(&config), None, &mut prompts).expect("wizard completes");
+
+        assert_eq!(
+            outcome,
+            WizardOutcome::Unchanged,
+            "keeping every protocol enabled must not reorder the node list"
+        );
+    }
+
+    #[test]
+    fn disabling_a_protocol_through_the_topic_clears_its_prefilled_port() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality, ManagedProtocol::Tuic],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a two-protocol deployment is valid");
+        assert!(
+            config
+                .protocol_listener_port(&ManagedProtocol::Tuic)
+                .is_some(),
+            "the fixture needs a persisted TUIC listener to disable"
+        );
+        // Canonical question order is VLESS, VMess, Hysteria2, TUIC, AnyTLS.
+        let answers = ["y", "n", "n", "n", "n"];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::Protocols, &mut prompts)
+            .expect("disabling a protocol must not fail validation");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("switching TUIC off must produce a changed configuration");
+        };
+        assert_eq!(
+            updated.enabled_protocols,
+            vec![ManagedProtocol::VlessReality]
+        );
+        assert!(
+            updated.tuic.is_none(),
+            "a disabled protocol must not keep the port it was prefilled with"
+        );
+    }
+
+    #[test]
+    fn a_protocol_topic_edit_preserves_the_persisted_order_and_appends_new_protocols() {
+        let config = ip_fallback_config();
+        let mut edited = config.clone();
+        edited.enabled_protocols = vec![ManagedProtocol::Tuic, ManagedProtocol::VlessReality];
+        // Canonical question order is VLESS, VMess, Hysteria2, TUIC, AnyTLS.
+        // Keep VLESS/TUIC enabled, enable VMess; the merged order must keep the
+        // persisted [TUIC, VLESS] order and append VMess.
+        let answers = ["y", "y", "n", "y", "n"];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&edited, ConfigurationTopic::Protocols, &mut prompts)
+            .expect("the protocol topic completes");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("enabling VMess must produce a changed configuration");
+        };
+        assert_eq!(
+            updated.enabled_protocols,
+            vec![
+                ManagedProtocol::Tuic,
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::VmessWebsocket,
+            ],
+            "kept protocols keep their order; newly enabled protocols append"
+        );
+    }
+
+    #[test]
+    fn empty_answers_keep_the_existing_configuration() {
+        let config = ip_fallback_config();
+        let mut prompts = ScriptPrompts::new(&empty_answers(16), &[true]);
+
+        let outcome = run(Some(&config), None, &mut prompts).expect("wizard completes");
+
+        assert_eq!(outcome, WizardOutcome::Unchanged);
+    }
+
+    #[test]
+    fn declining_the_summary_cancels_without_changing_the_deployment() {
+        let config = ip_fallback_config();
+        let mut answers = empty_answers(16);
+        answers[1] = "198.51.100.9";
+        let mut prompts = ScriptPrompts::new(&answers, &[false]);
+
+        let outcome = run(Some(&config), None, &mut prompts).expect("wizard completes");
+
+        assert_eq!(outcome, WizardOutcome::Cancelled);
+    }
+
+    #[test]
+    fn an_invalid_answer_is_rejected_and_re_prompted() {
+        let config = ip_fallback_config();
+        let mut answers = empty_answers(16);
+        answers[1] = "not a valid host!!";
+        answers.insert(2, "198.51.100.9");
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome =
+            run(Some(&config), None, &mut prompts).expect("wizard recovers from a bad host");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("a corrected host must produce a confirmed configuration");
+        };
+        assert_eq!(updated.subscription_host, "198.51.100.9");
+        assert!(
+            prompts
+                .reports()
+                .iter()
+                .any(|message| message.contains("Subscription host 必须是合法主机名"))
+        );
+    }
+
+    #[test]
+    fn a_mode_precondition_violation_fails_before_any_commit() {
+        let config = ip_fallback_config();
+        let mut answers = empty_answers(19);
+        answers[5] = "domain";
+        answers[7] = "y";
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let result = run(Some(&config), None, &mut prompts);
+
+        assert!(
+            result.is_err(),
+            "VMess in IP fallback mode with a domain certificate must be rejected"
+        );
+    }
+
+    #[test]
+    fn a_fresh_deployment_uses_the_default_timezone_pair_and_all_five_protocols() {
+        let answers = [
+            "",
+            "sub.example.test",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "www.cloudflare.com",
+            "",
+            "",
+            "",
+            "",
+        ];
+        let mut prompts = ScriptPrompts::new(&answers, &[true, false, true]);
+
+        let outcome =
+            run(None, Some("ens3".to_owned()), &mut prompts).expect("a fresh wizard completes");
+
+        let WizardOutcome::Changed(config) = outcome else {
+            panic!("a fresh deployment must be committed");
+        };
+        assert_eq!(config.subscription_mode, SubscriptionMode::Direct);
+        assert_eq!(config.subscription_host, "sub.example.test");
+        assert_eq!(config.interface, "ens3");
+        assert_eq!(config.accounting_timezone, "America/Los_Angeles");
+        assert_eq!(config.client_display_timezone, "Asia/Shanghai");
+        assert_eq!(
+            config.accounting_policy,
+            crate::config::AccountingPolicy::NaturalMonth
+        );
+        assert_eq!(config.enabled_protocols.len(), 5);
+        assert_eq!(config.certbot_email, None);
+    }
+
+    #[test]
+    fn a_fresh_deployment_can_customize_the_client_template() {
+        // These knobs used to exist only behind the focused menu topic, which
+        // is what forced a second configuration pass after installing.
+        // Accepting the offer must actually land on the fresh deployment.
+        let answers = [
+            "",
+            "sub.example.test",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "www.cloudflare.com",
+            "",
+            "",
+            "",
+            "",
+            "",
+            // template / dns mode / preset / ipv4-only / rule profile / mirror / probe
+            "3",
+            "2",
+            "2",
+            "",
+            "2",
+            "https://cdn.jsdelivr.net/gh/Custom/rules",
+            "http://aliyun.com/generate_204",
+        ];
+        let mut prompts = ScriptPrompts::new(&answers, &[true, true, true]);
+
+        let outcome = run(None, Some("ens3".to_owned()), &mut prompts)
+            .expect("a fresh wizard with template answers completes");
+
+        let WizardOutcome::Changed(config) = outcome else {
+            panic!("a fresh deployment with template answers must be committed");
+        };
+        assert_eq!(
+            config.client_template,
+            crate::subscription::ClientTemplate::Split
+        );
+        assert_eq!(
+            config.client_dns_mode,
+            crate::config::ClientDnsMode::RedirHost
+        );
+        assert_eq!(
+            config.client_dns_preset,
+            crate::config::ClientDnsPreset::Privacy,
+            "the new direct-DNS transport question must reach the fresh deployment"
+        );
+        assert!(!config.ipv4_only, "an empty answer keeps the default");
+        assert_eq!(
+            config.client_rule_profile,
+            crate::config::ClientRuleProfile::Minimal
+        );
+        assert_eq!(
+            config.client_rule_set_base_url,
+            "https://cdn.jsdelivr.net/gh/Custom/rules"
+        );
+    }
+
+    #[test]
+    fn the_summary_and_prompts_never_print_credentials() {
+        let config = ip_fallback_config();
+        let credential = config.subscription_credential.clone();
+        let mut answers = empty_answers(16);
+        answers[1] = "198.51.100.9";
+        let mut prompts = ScriptPrompts::new(&answers, &[false]);
+
+        run(Some(&config), None, &mut prompts).expect("wizard completes");
+
+        let joined = prompts.reports().join("\n");
+        assert!(
+            !joined.contains(&credential),
+            "the wizard summary must redact the Subscription credential"
+        );
+        assert!(joined.contains("subscription credential: [redacted]"));
+    }
+}

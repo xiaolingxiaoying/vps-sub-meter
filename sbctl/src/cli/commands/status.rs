@@ -1,0 +1,335 @@
+//! Reporting and accounting: `sbctl status` (human and JSON), `sbctl node`,
+//! `sbctl traffic`, and the periodic accounting reset the timer runs.
+
+use std::path::Path;
+use std::process::ExitCode;
+
+pub(crate) fn format_local_time(instant: chrono::DateTime<chrono::Utc>, timezone: &str) -> String {
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map(|timezone| {
+            instant
+                .with_timezone(&timezone)
+                .format("%Y-%m-%d %H:%M:%S")
+                .to_string()
+        })
+        .unwrap_or_else(|_| instant.to_rfc3339())
+}
+
+pub(crate) fn print_nodes(
+    root: &Path,
+    links: bool,
+    protocol: Option<sbctl::config::ManagedProtocol>,
+    qr: bool,
+) -> ExitCode {
+    match sbctl::config::DeploymentStore::new(root).load() {
+        Ok(config) => {
+            let protocol_name = protocol.as_ref().map(ToString::to_string);
+            let nodes = sbctl::canonical::nodes(&config)
+                .into_iter()
+                .filter(|node| {
+                    protocol
+                        .as_ref()
+                        .is_none_or(|selected| &node.protocol() == selected)
+                })
+                .collect::<Vec<_>>();
+            if let Some(protocol) = &protocol_name
+                && nodes.is_empty()
+            {
+                eprintln!("未启用协议：{protocol}");
+                return ExitCode::from(2);
+            }
+            let summary = sbctl::lifecycle::enabled_nodes_for_protocol(&config, protocol.as_ref());
+            println!("{summary}");
+            if links && !nodes.is_empty() {
+                if qr {
+                    for node in &nodes {
+                        let link = sbctl::subscription::node_share_link(&config, node);
+                        println!("\n{}", node.protocol().label_zh());
+                        println!("{}", link.trim_end());
+                        match sbctl::qr::render_ansi(link.trim()) {
+                            Ok(rendered) => print!("{rendered}"),
+                            Err(error) => {
+                                eprintln!("节点二维码生成失败：{error}");
+                                return ExitCode::from(2);
+                            }
+                        }
+                    }
+                } else {
+                    println!("\n原生分享链接（含节点凭据，仅输出到本终端）:");
+                    for node in &nodes {
+                        println!("{}:", node.protocol().label_zh());
+                        print!("{}", sbctl::subscription::node_share_link(&config, node));
+                    }
+                }
+            }
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("节点命令失败：{error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(crate) fn days_until(timestamp: i64) -> Option<i64> {
+    let now = chrono::Utc::now().timestamp();
+    Some((timestamp - now).div_euclid(86_400))
+}
+
+pub(crate) fn print_status(root: &Path) -> ExitCode {
+    match sbctl::config::DeploymentStore::new(root).load() {
+        Ok(config) => {
+            println!("{}", config.summary());
+            println!("\n{}", sbctl::lifecycle::service_status(root));
+            if config.subscription_mode == sbctl::config::SubscriptionMode::Direct {
+                let status =
+                    sbctl::certificate::status(&sbctl::config::DeploymentStore::new(root), &config);
+                if status.state == "ok"
+                    && let Some(not_after) = status.not_after
+                    && let Some(days) = days_until(not_after)
+                {
+                    let hint = if days < 14 {
+                        "（即将到期，请检查 certbot.timer）"
+                    } else {
+                        ""
+                    };
+                    println!("\n证书剩余有效期: {days} 天{hint}");
+                } else if let Some(error) = &status.error {
+                    println!("\n证书状态: 异常（{error}）；运行 sbctl certificate status 查看详情");
+                }
+            }
+            match sbctl::traffic::report(&sbctl::config::DeploymentStore::new(root), &config) {
+                Ok(report) => println!(
+                    "\n{}\n下一次刷新（VPS: {}）: {}\n下一次刷新（客户端: {}）: {}",
+                    report.summary(),
+                    config.accounting_timezone,
+                    format_local_time(report.next_reset, &config.accounting_timezone),
+                    config.client_display_timezone,
+                    format_local_time(report.next_reset, &config.client_display_timezone)
+                ),
+                Err(error) => println!("\nVPS traffic: unavailable ({error})"),
+            }
+            // The data plane's process facts, one line: state, PID, memory,
+            // uptime. Every unknown fact prints as 未知 rather than failing the
+            // whole status command.
+            {
+                let observation =
+                    sbctl::observe::observe_sing_box_process(root, chrono::Utc::now());
+                if observation.error.is_none() {
+                    let uptime = observation
+                        .uptime
+                        .map(|duration| format!("{}s", duration.as_secs()))
+                        .unwrap_or_else(|| "未知".into());
+                    println!(
+                        "\nsing-box: {} / {}  PID {}  内存 {}  已运行 {}",
+                        observation.active_state.as_deref().unwrap_or("未知"),
+                        observation.sub_state.as_deref().unwrap_or("未知"),
+                        observation
+                            .main_pid
+                            .map(|pid| pid.to_string())
+                            .as_deref()
+                            .unwrap_or("未知"),
+                        observation.memory_label().unwrap_or_else(|| "未知".into()),
+                        uptime,
+                    );
+                }
+            }
+            // Advisory only: an installed kernel newer than the version table is
+            // a gap in this tool's registry, not a fault in the deployment, so
+            // it is printed here and never changes the exit status.
+            if let Some(warning) = sbctl::subscription::kernel_band_warning(
+                super::config::resolve_sing_box_bin(root, None).as_deref(),
+            ) {
+                println!("\n{warning}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(sbctl::config::ConfigError::Missing) => {
+            println!("sbctl status: unmanaged (not installed)");
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("status failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(crate) fn print_status_json(root: &Path) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
+    match store.load() {
+        Ok(config) => {
+            let traffic = sbctl::traffic::report(&store, &config)
+                .map(|report| {
+                    serde_json::json!({
+                        "interface": report.interface,
+                        "received": report.received,
+                        "transmitted": report.transmitted,
+                        "total_adjustment": report.total_adjustment,
+                        "total": report.total(),
+                        "monthly_traffic_limit": report.monthly_traffic_limit,
+                        "accounting_period": report.accounting_period,
+                        "next_reset": report.next_reset.to_rfc3339(),
+                        "next_reset_vps_refresh": format_local_time(
+                            report.next_reset,
+                            &config.accounting_timezone
+                        ),
+                        "next_reset_client_display": format_local_time(
+                            report.next_reset,
+                            &config.client_display_timezone
+                        ),
+                    })
+                })
+                .unwrap_or_else(|error| serde_json::json!({ "error": error.to_string() }));
+            let services = sbctl::lifecycle::service_status_entries(root)
+                .into_iter()
+                .map(|(unit, state)| (unit.to_owned(), state))
+                .collect::<std::collections::BTreeMap<_, _>>();
+            let certificate = (config.subscription_mode == sbctl::config::SubscriptionMode::Direct)
+                .then(|| sbctl::certificate::status(&store, &config));
+            let kernel_warning = sbctl::subscription::kernel_band_warning(
+                super::config::resolve_sing_box_bin(root, None).as_deref(),
+            );
+            let kernel_version = super::config::resolve_sing_box_bin(root, None)
+                .and_then(|binary| sbctl::observe::kernel_version_string(&binary));
+            let sing_box = sing_box_status_json(root);
+            let status = serde_json::json!({
+                "configured": true,
+                "mode": config.subscription_mode.to_string(),
+                "subscription_host": config.subscription_host,
+                "proxy_host": config.proxy_host.as_deref().unwrap_or(&config.subscription_host),
+                "interface": config.interface,
+                "monthly_traffic_limit": config.monthly_traffic_limit,
+                "accounting_policy": config.accounting_policy.to_string(),
+                "accounting_timezone": config.accounting_timezone,
+                "client_display_timezone": config.client_display_timezone,
+                "enabled_protocols": config
+                    .enabled_protocols
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+                "services": services,
+                "traffic": traffic,
+                "certificate": certificate,
+                "kernel_version": kernel_version,
+                "sing_box": sing_box,
+                "kernel_version_warning": kernel_warning,
+            });
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&status).expect("status JSON serializes")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(sbctl::config::ConfigError::Missing) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({ "configured": false }))
+                    .expect("status JSON serializes")
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("status failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+/// The `sing_box` object in `sbctl status --json`: process facts from systemd,
+/// each `null` when the fact is unavailable so a degraded host still parses.
+fn sing_box_status_json(root: &Path) -> serde_json::Value {
+    let observation = sbctl::observe::observe_sing_box_process(root, chrono::Utc::now());
+    serde_json::json!({
+        "active_state": observation.active_state,
+        "sub_state": observation.sub_state,
+        "main_pid": observation.main_pid,
+        "restart_count": observation.restart_count,
+        "memory_bytes": observation.memory_bytes,
+        "cpu_time_nsecs": observation.cpu_time_nsecs,
+        "task_count": observation.task_count,
+        "active_enter": observation.active_enter,
+        "uptime_secs": observation.uptime.map(|duration| duration.as_secs()),
+        "error": observation.error,
+    })
+}
+
+pub(crate) fn print_traffic(root: &Path) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
+    let result = match store.load() {
+        Ok(config) => match sbctl::traffic::report(&store, &config) {
+            Ok(report) => {
+                println!(
+                    "{}\n下一次刷新（VPS: {}）: {}\n下一次刷新（客户端: {}）: {}",
+                    report.summary(),
+                    config.accounting_timezone,
+                    format_local_time(report.next_reset, &config.accounting_timezone),
+                    config.client_display_timezone,
+                    format_local_time(report.next_reset, &config.client_display_timezone)
+                );
+                return ExitCode::SUCCESS;
+            }
+            Err(error) => Err(error.to_string()),
+        },
+        Err(error) => Err(error.to_string()),
+    };
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("traffic failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(crate) fn traffic_set_used(
+    root: &Path,
+    bytes: Option<u64>,
+    rx: Option<u64>,
+    tx: Option<u64>,
+) -> ExitCode {
+    let target = if let Some(bytes) = bytes {
+        sbctl::traffic::CorrectionTarget::Total(bytes)
+    } else {
+        sbctl::traffic::CorrectionTarget::Directions {
+            rx: rx.expect("validated: --rx requires --tx"),
+            tx: tx.expect("validated: --tx requires --rx"),
+        }
+    };
+    let store = sbctl::config::DeploymentStore::new(root);
+    let result = match store.load() {
+        Ok(config) => {
+            sbctl::traffic::set_used(&store, &config, target).map_err(|error| error.to_string())
+        }
+        Err(error) => Err(error.to_string()),
+    };
+    match result {
+        Ok(_) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("traffic correction failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+pub(crate) fn run_accounting_reset(root: &Path) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
+    let result = match store.load() {
+        Ok(config) => sbctl::traffic::reset(&store, &config).map_err(|error| error.to_string()),
+        Err(error) => Err(error.to_string()),
+    };
+    match result {
+        Ok(report) => {
+            println!(
+                "accounting period: {}; received: {} bytes; transmitted: {} bytes",
+                report.accounting_period, report.received, report.transmitted
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("accounting reset failed: {error}");
+            ExitCode::from(2)
+        }
+    }
+}

@@ -1,0 +1,39 @@
+name: sbctl branch validation
+
+on:
+  push:
+    branches:
+      - codex/vps-override-cli-fixes
+    paths:
+      - 'sbctl/**'
+      - '.github/workflows/sbctl-branch-ci.yml'
+  pull_request:
+    paths:
+      - 'sbctl/**'
+      - '.github/workflows/sbctl-branch-ci.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          components: rustfmt, clippy
+      - name: Check formatting
+        run: cargo fmt --manifest-path sbctl/Cargo.toml --all -- --check
+      - name: Test installer scripts
+        run: python3 -m unittest discover -s sbctl/scripts -p 'test_*.py'
+      - name: Run clippy
+        run: cargo clippy --manifest-path sbctl/Cargo.toml --locked --workspace --all-targets --all-features -- -D warnings
+      - name: Run Rust tests
+        run: cargo test --manifest-path sbctl/Cargo.toml --locked --workspace --features sbctl/test-signing
+      - name: Verify release trust tests
+        run: cargo test --manifest-path sbctl/Cargo.toml --locked -p sbctl --no-default-features --test release_trust
+      - name: Build release binary
+        run: cargo build --manifest-path sbctl/Cargo.toml --locked -p sbctl --release --no-default-features

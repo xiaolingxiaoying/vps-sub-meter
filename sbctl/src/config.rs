@@ -1,0 +1,2638 @@
+use std::fmt;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Write};
+use std::net::IpAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use base64::Engine;
+use chrono::{Datelike, LocalResult, TimeZone, Timelike};
+use fs2::FileExt;
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
+
+use crate::subscription::{ClientTemplate, default_client_template};
+
+pub const CONFIG_RELATIVE_PATH: &str = "etc/sbctl/config.toml";
+pub const STATE_RELATIVE_PATH: &str = "var/lib/sbctl/state.json";
+const ARTIFACTS_RELATIVE_PATH: &str = "var/lib/sbctl/artifacts";
+const ACME_WEBROOT_RELATIVE_PATH: &str = "var/lib/sbctl/acme-webroot";
+/// The sbctl-owned pinned certificate copy relative to the deployment root.
+pub const CERTIFICATES_RELATIVE_PATH: &str = "var/lib/sbctl/certificates";
+/// The same directory on the live host, used by the generated sing-box
+/// configuration and the deploy hook diagnostics.
+pub const CERTIFICATES_ABSOLUTE_PATH: &str = "/var/lib/sbctl/certificates";
+const MIN_PROTOCOL_PORT: u16 = 10_000;
+const MAX_PROTOCOL_PORT: u16 = 65_535;
+/// The fake TLS server name used by the certificate-based Managed protocols in
+/// a no-domain (IP) deployment, so the self-signed certificate and the client
+/// handshake agree on a hostname even though the node host is an IP address.
+const DEFAULT_PROTOCOL_SNI: &str = "www.bing.com";
+static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct DeploymentConfig {
+    pub subscription_mode: SubscriptionMode,
+    pub subscription_host: String,
+    pub proxy_host: Option<String>,
+    pub http_port: Option<u16>,
+    #[serde(default)]
+    pub subscription_listen_port: Option<u16>,
+    /// Administrator contact for Direct-mode Certbot issuance; never printed.
+    #[serde(default)]
+    pub certbot_email: Option<String>,
+    /// Certificate used by the Managed protocol listeners: the managed domain
+    /// certificate, or a long-lived self-signed certificate (sing-box-yg style).
+    #[serde(default)]
+    pub certificate_mode: CertificateMode,
+    pub interface: String,
+    /// Force server-side domain resolution, including the independent
+    /// Reality handshake dialer, to IPv4 even on dual-stack hosts. IPv4-only
+    /// is also applied automatically on hosts without an IPv6 route.
+    #[serde(default)]
+    pub ipv4_only: bool,
+    pub enabled_protocols: Vec<ManagedProtocol>,
+    pub reality_decoy_sni: Option<String>,
+    /// TLS server name used by the certificate-based Managed protocols
+    /// (VMess WebSocket, Hysteria2, TUIC, AnyTLS) and by the self-signed
+    /// certificate. In a domain deployment it defaults to the subscription
+    /// host; in a no-domain (IP) deployment it is a fake SNI so the certificate
+    /// and the client handshake agree on a hostname.
+    #[serde(default)]
+    pub protocol_sni: Option<String>,
+    pub subscription_credential: String,
+    /// Optional bearer secret for the `clash_api` listener the client profiles
+    /// carry (`127.0.0.1:9090`). Unset keeps the shipped bytes exactly as they
+    /// are; mihomo's own docs warn that a controller without a secret is
+    /// drivable by anything on the client machine, so this is offered rather
+    /// than forced — some panels cannot send an Authorization header.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_clash_api_secret: Option<String>,
+    /// Loopback observation API of the running data plane; `None` keeps the
+    /// server configuration byte-identical to a deployment that never opted in.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_clash_api: Option<ServerClashApi>,
+    /// Extra named subscription credentials issued on top of the default one
+    /// above: one per device or per friend, so a leaked link can be revoked
+    /// without cutting every client off. Empty unless the operator issues one,
+    /// and `#[serde(default)]` keeps a config written by an older sbctl loading
+    /// unchanged.
+    #[serde(default)]
+    pub subscription_credentials: Vec<NamedCredential>,
+    #[serde(default)]
+    pub monthly_traffic_limit: u64,
+    #[serde(default)]
+    pub accounting_policy: AccountingPolicy,
+    #[serde(default = "default_accounting_timezone")]
+    pub accounting_timezone: String,
+    #[serde(default = "default_client_display_timezone")]
+    pub client_display_timezone: String,
+    #[serde(default)]
+    pub anchored_reset_at: Option<String>,
+    /// Client artifact DNS mode: fake-ip (default) or redir-host.
+    #[serde(default = "default_client_dns_mode")]
+    pub client_dns_mode: ClientDnsMode,
+    /// Transport of the client's direct resolver: plaintext UDP (default, the
+    /// historical bytes) or DoH under `privacy`.
+    #[serde(default)]
+    pub client_dns_preset: ClientDnsPreset,
+    /// Client artifact routing profile: standard pulls remote rule-sets,
+    /// minimal uses only built-in rules (ADR-0018 vendor neutrality).
+    #[serde(default = "default_client_rule_profile")]
+    pub client_rule_profile: ClientRuleProfile,
+    /// Client content template (ADR-0022): `standard` reproduces the historical
+    /// artifact structure byte-for-byte, `global` proxies everything but private
+    /// destinations, `split` sends CN and private destinations direct and blocks
+    /// ads. The default stays `standard`, because a flipped default rewrites
+    /// every client artifact and restarts the managed core on upgrade.
+    #[serde(default = "default_client_template")]
+    pub client_template: ClientTemplate,
+    /// Base URL for remote rule-set downloads (jsDelivr + MetaCubeX by
+    /// default); change it to a mirror without touching generated templates.
+    #[serde(default = "default_client_rule_set_base_url")]
+    pub client_rule_set_base_url: String,
+    /// Extra remote rule-sets the operator registered, each steering matched
+    /// traffic to one of the built-in verdicts. Rendered into the same
+    /// `rule_set`/`rule-providers` machinery as the built-in CN and private
+    /// sets, so they follow the template's own rule ordering.
+    #[serde(default)]
+    pub client_extra_rule_sets: Vec<ExtraRuleSet>,
+    /// How often subscribers re-download remote rule-sets. A day is the
+    /// historical value; a shared VPS whose clients sit on flaky CDN routes
+    /// benefits from longer, and an operator updating a custom list wants
+    /// shorter.
+    #[serde(default = "default_rule_set_update_interval")]
+    pub client_rule_set_update_interval: String,
+    /// Latency probe URL for selector groups. Defaults to a China-reachable
+    /// URL because the groups hold DIRECT (see the aliyun probe history).
+    #[serde(default = "default_client_latency_probe_url")]
+    pub client_latency_probe_url: String,
+    #[serde(default)]
+    pub vless_reality: Option<VlessRealityCredentials>,
+    #[serde(default)]
+    pub vmess_websocket: Option<VmessWebsocketCredentials>,
+    #[serde(default)]
+    pub hysteria2: Option<Hysteria2Credentials>,
+    #[serde(default)]
+    pub tuic: Option<TuicCredentials>,
+    #[serde(default)]
+    pub anytls: Option<AnytlsCredentials>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VlessRealityCredentials {
+    pub listen_port: u16,
+    pub uuid: String,
+    pub private_key: String,
+    pub public_key: String,
+    pub short_id: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct VmessWebsocketCredentials {
+    pub listen_port: u16,
+    pub uuid: String,
+    pub path: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct Hysteria2Credentials {
+    pub listen_port: u16,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct TuicCredentials {
+    pub listen_port: u16,
+    pub uuid: String,
+    pub password: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct AnytlsCredentials {
+    pub listen_port: u16,
+    pub password: String,
+}
+
+/// Optional administrator-selected listener ports for the Managed protocols.
+/// A missing value keeps the existing random high-port allocation behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ProtocolPorts {
+    pub vless_reality: Option<u16>,
+    pub vmess_websocket: Option<u16>,
+    pub hysteria2: Option<u16>,
+    pub tuic: Option<u16>,
+    pub anytls: Option<u16>,
+}
+
+/// The complete set of administrator-selected deployment choices carried by the
+/// interactive wizard and rebuilt into a `DeploymentConfig`. Optional fields
+/// are `None` when the deployment does not use that feature.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DeploymentOptions {
+    pub subscription_mode: SubscriptionMode,
+    pub subscription_host: String,
+    pub proxy_host: Option<String>,
+    pub certbot_email: Option<String>,
+    pub http_port: Option<u16>,
+    pub subscription_listen_port: Option<u16>,
+    pub certificate_mode: CertificateMode,
+    pub interface: String,
+    pub enabled_protocols: Vec<ManagedProtocol>,
+    pub reality_decoy_sni: Option<String>,
+    /// Optional fake TLS server name for the certificate-based protocols in a
+    /// no-domain deployment; `None` resolves to the subscription host (domain)
+    /// or the default fake SNI (IP).
+    pub protocol_sni: Option<String>,
+    pub monthly_traffic_limit: u64,
+    pub accounting_policy: AccountingPolicy,
+    pub accounting_timezone: String,
+    pub client_display_timezone: String,
+    pub anchored_reset_at: Option<String>,
+    pub ports: ProtocolPorts,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AccountingPolicy {
+    #[default]
+    NaturalMonth,
+    AnchoredMonth,
+}
+
+impl fmt::Display for AccountingPolicy {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::NaturalMonth => "natural-month",
+            Self::AnchoredMonth => "anchored-month",
+        })
+    }
+}
+
+fn default_accounting_timezone() -> String {
+    "America/Los_Angeles".to_owned()
+}
+
+fn default_client_display_timezone() -> String {
+    "Asia/Shanghai".to_owned()
+}
+
+/// Client artifact DNS mode: fake-ip answers with fake IPs so connections are
+/// routed before real resolution; redir-host resolves normally.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDnsMode {
+    #[default]
+    FakeIp,
+    RedirHost,
+}
+
+impl fmt::Display for ClientDnsMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::FakeIp => "fake-ip",
+            Self::RedirHost => "redir-host",
+        })
+    }
+}
+
+/// How the client's *direct* resolver reaches DNS.
+///
+/// `cn-direct` is the historical shape and the default: plaintext UDP to
+/// 223.5.5.5, which is what a mainland client expects for CN domains and what
+/// keeps the generated bytes identical for everybody already subscribed.
+/// `privacy` upgrades that same resolver to DoH (`https://223.5.5.5/dns-query`),
+/// so an ISP can no longer read or redirect the direct half of the client's DNS
+/// traffic. The proxy half already runs through DoH inside the tunnel, and the
+/// anti-leak skeleton (`sniff`, `hijack-dns`, `dns.final = dns-proxy`) is the
+/// same either way.
+///
+/// Full control means replacing `dns.servers` wholesale through a client
+/// override (arrays replace by default), which is why there is no third value
+/// here that would only switch generation off.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientDnsPreset {
+    #[default]
+    CnDirect,
+    Privacy,
+}
+
+impl fmt::Display for ClientDnsPreset {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::CnDirect => "cn-direct",
+            Self::Privacy => "privacy",
+        })
+    }
+}
+
+/// The loopback `clash_api` endpoint the data plane can expose for observation.
+///
+/// Absent means disabled, so an existing deployment keeps the exact server
+/// bytes it has today. When enabled, sbctl generates a high port and a fresh
+/// 256-bit secret: the API can list and modify live connections, so it is
+/// loopback-only and authenticated even though nothing else on the host can
+/// reach it.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ServerClashApi {
+    pub port: u16,
+    pub secret: String,
+}
+
+impl ServerClashApi {
+    pub fn listener(&self) -> String {
+        format!("127.0.0.1:{}", self.port)
+    }
+}
+
+/// A fresh loopback observation endpoint: random high port, random secret.
+pub fn generate_server_clash_api() -> Result<ServerClashApi, ConfigError> {
+    let mut port_bytes = [0_u8; 2];
+    getrandom::fill(&mut port_bytes).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    let port = 20_000 + (u16::from_be_bytes(port_bytes) % 20_000);
+    let mut secret = [0_u8; 32];
+    getrandom::fill(&mut secret).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(ServerClashApi {
+        port,
+        secret: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(secret),
+    })
+}
+
+/// Client artifact routing profile. `standard` references remote rule-sets
+/// (geosite-cn / geoip-cn); `minimal` keeps every rule built-in so the client
+/// never contacts a rule CDN (ADR-0018 vendor neutrality). In the clash
+/// artifact that also means no `GEOIP,*`: mihomo answers those from a geo
+/// database it downloads on first use, so `minimal` spells the same verdicts out
+/// as compiled-in lists.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ClientRuleProfile {
+    #[default]
+    Standard,
+    Minimal,
+}
+
+impl fmt::Display for ClientRuleProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Standard => "standard",
+            Self::Minimal => "minimal",
+        })
+    }
+}
+
+fn default_client_dns_mode() -> ClientDnsMode {
+    ClientDnsMode::FakeIp
+}
+
+fn default_client_rule_profile() -> ClientRuleProfile {
+    ClientRuleProfile::Standard
+}
+
+/// jsDelivr serving the MetaCubeX/meta-rules-dat repository root. Branches
+/// are appended by the generators: `@sing/geo` for sing-box `.srs` rule-sets
+/// and `@meta/geo` for mihomo `.mrs` rule-providers.
+/// One operator-registered remote rule-set and the verdict it drives.
+///
+/// `url` decides the shape: a `.srs`/`.mrs` binary rule-set is referenced
+/// directly (sing-box and mihomo each take their own extension), anything else
+/// is rejected at validation rather than shipped to every client as a set that
+/// cannot be parsed. Importing a plain-text list is a CLI operation that turns
+/// it into `etc/sbctl/rules/*.list` entries instead, because generation must
+/// stay free of network access to keep artifacts reproducible.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct ExtraRuleSet {
+    pub name: String,
+    pub url: String,
+    /// One of `direct`, `proxy`, `reject`, or a generated group tag.
+    pub outbound: String,
+}
+
+impl ExtraRuleSet {
+    /// sing-box takes `.srs`, mihomo takes `.mrs`.
+    pub fn format_is_expected(&self) -> bool {
+        self.url.ends_with(".srs") || self.url.ends_with(".mrs")
+    }
+}
+
+fn default_rule_set_update_interval() -> String {
+    "1d".to_owned()
+}
+
+fn default_client_rule_set_base_url() -> String {
+    "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat".to_owned()
+}
+
+/// The selector group holds DIRECT, so the probe must succeed without a
+/// proxy; aliyun.com answers with a redirect, which mihomo counts as success.
+fn default_client_latency_probe_url() -> String {
+    "http://aliyun.com/generate_204".to_owned()
+}
+
+/// Keeps endpoint locations useful in previews while ensuring credentials and
+/// opaque query/fragment values never land in status output or logs.
+fn client_url_summary(value: &str) -> String {
+    let Ok(mut url) = url::Url::parse(value) else {
+        return "[invalid URL]".to_owned();
+    };
+    if !url.username().is_empty() || url.password().is_some() {
+        let _ = url.set_username("redacted");
+        let _ = url.set_password(Some("redacted"));
+    }
+    if url.query().is_some() {
+        url.set_query(Some("redacted"));
+    }
+    if url.fragment().is_some() {
+        url.set_fragment(Some("redacted"));
+    }
+    url.to_string()
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum SubscriptionMode {
+    Direct,
+    ExternalProxy,
+    IpFallback,
+}
+
+impl fmt::Display for SubscriptionMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Direct => "direct",
+            Self::ExternalProxy => "external-proxy",
+            Self::IpFallback => "ip-fallback",
+        })
+    }
+}
+
+/// One named subscription credential.
+///
+/// `revoked_at` is a grace window rather than a delete: a credential retired
+/// with `--grace 30m` keeps serving until that instant, so a phone that has not
+/// refreshed yet is not cut off mid-download, and stops working afterwards with
+/// no further action. Serving an expired one is impossible because every
+/// request compares against the same clock.
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct NamedCredential {
+    pub name: String,
+    pub credential: String,
+    #[serde(default)]
+    pub revoked_at: Option<i64>,
+}
+
+impl NamedCredential {
+    pub fn is_active(&self, now: i64) -> bool {
+        self.revoked_at.is_none_or(|expires| expires > now)
+    }
+}
+
+/// Whether the Managed protocol listeners use a long-lived self-signed
+/// certificate (the sing-box-yg default, no ACME dependency, never expires) or
+/// the administrator-managed domain certificate (Let's Encrypt / Certbot).
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CertificateMode {
+    #[default]
+    Domain,
+    SelfSigned,
+}
+
+impl fmt::Display for CertificateMode {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Domain => "domain",
+            Self::SelfSigned => "self-signed",
+        })
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ManagedProtocol {
+    VlessReality,
+    VmessWebsocket,
+    Hysteria2,
+    Tuic,
+    Anytls,
+}
+
+impl fmt::Display for ManagedProtocol {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::VlessReality => "vless-reality",
+            Self::VmessWebsocket => "vmess-websocket",
+            Self::Hysteria2 => "hysteria2",
+            Self::Tuic => "tuic",
+            Self::Anytls => "anytls",
+        })
+    }
+}
+
+impl ManagedProtocol {
+    pub fn label_zh(&self) -> &'static str {
+        match self {
+            Self::VlessReality => "VLESS Reality 节点",
+            Self::VmessWebsocket => "VMess WebSocket 节点",
+            Self::Hysteria2 => "Hysteria2 节点",
+            Self::Tuic => "TUIC 节点",
+            Self::Anytls => "AnyTLS 节点",
+        }
+    }
+
+    pub fn has_generated_subscription_artifacts(&self) -> bool {
+        matches!(
+            self,
+            Self::VlessReality | Self::VmessWebsocket | Self::Hysteria2 | Self::Tuic | Self::Anytls
+        )
+    }
+}
+
+impl DeploymentConfig {
+    pub fn new(
+        subscription_mode: SubscriptionMode,
+        subscription_host: String,
+        proxy_host: Option<String>,
+        http_port: Option<u16>,
+        interface: String,
+        enabled_protocols: Vec<ManagedProtocol>,
+        reality_decoy_sni: Option<String>,
+    ) -> Result<Self, ConfigError> {
+        Self::new_with_ports(
+            subscription_mode,
+            subscription_host,
+            proxy_host,
+            http_port,
+            interface,
+            enabled_protocols,
+            reality_decoy_sni,
+            ProtocolPorts::default(),
+        )
+    }
+
+    // Keep the compatibility constructor's positional shape explicit while the
+    // protocol port bundle remains grouped in `ProtocolPorts`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_ports(
+        subscription_mode: SubscriptionMode,
+        subscription_host: String,
+        proxy_host: Option<String>,
+        http_port: Option<u16>,
+        interface: String,
+        enabled_protocols: Vec<ManagedProtocol>,
+        reality_decoy_sni: Option<String>,
+        ports: ProtocolPorts,
+    ) -> Result<Self, ConfigError> {
+        let subscription_credential = generate_subscription_credential()?;
+        let mut allocated_ports = Vec::new();
+        validate_requested_ports(&enabled_protocols, &ports)?;
+        let vless_reality = enabled_protocols
+            .contains(&ManagedProtocol::VlessReality)
+            .then(|| generate_vless_reality_credentials(&mut allocated_ports, ports.vless_reality))
+            .transpose()?;
+        let vmess_websocket = enabled_protocols
+            .contains(&ManagedProtocol::VmessWebsocket)
+            .then(|| {
+                generate_vmess_websocket_credentials(&mut allocated_ports, ports.vmess_websocket)
+            })
+            .transpose()?;
+        let hysteria2 = enabled_protocols
+            .contains(&ManagedProtocol::Hysteria2)
+            .then(|| generate_hysteria2_credentials(&mut allocated_ports, ports.hysteria2))
+            .transpose()?;
+        let tuic = enabled_protocols
+            .contains(&ManagedProtocol::Tuic)
+            .then(|| generate_tuic_credentials(&mut allocated_ports, ports.tuic))
+            .transpose()?;
+        let anytls = enabled_protocols
+            .contains(&ManagedProtocol::Anytls)
+            .then(|| generate_anytls_credentials(&mut allocated_ports, ports.anytls))
+            .transpose()?;
+        let subscription_listen_port =
+            (subscription_mode == SubscriptionMode::ExternalProxy).then_some(2080);
+        let config = Self {
+            subscription_mode,
+            subscription_host,
+            proxy_host,
+            http_port,
+            subscription_listen_port,
+            certificate_mode: CertificateMode::SelfSigned,
+            interface,
+            ipv4_only: false,
+            enabled_protocols,
+            reality_decoy_sni,
+            protocol_sni: None,
+            subscription_credential,
+            client_clash_api_secret: None,
+            server_clash_api: None,
+            subscription_credentials: Vec::new(),
+            monthly_traffic_limit: 0,
+            accounting_policy: AccountingPolicy::NaturalMonth,
+            accounting_timezone: default_accounting_timezone(),
+            client_display_timezone: default_client_display_timezone(),
+            anchored_reset_at: None,
+            certbot_email: None,
+            client_dns_mode: default_client_dns_mode(),
+            client_dns_preset: ClientDnsPreset::default(),
+            client_rule_profile: default_client_rule_profile(),
+            client_template: default_client_template(),
+            client_rule_set_base_url: default_client_rule_set_base_url(),
+            client_extra_rule_sets: Vec::new(),
+            client_rule_set_update_interval: default_rule_set_update_interval(),
+            client_latency_probe_url: default_client_latency_probe_url(),
+            vless_reality,
+            vmess_websocket,
+            hysteria2,
+            tuic,
+            anytls,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    /// Rebuilds a deployment from a complete set of administrator-selected
+    /// options, preserving every existing Proxy credential and the Subscription
+    /// credential when an existing deployment is being edited. Protocols that
+    /// remain enabled keep their credentials (with an optionally changed port);
+    /// newly enabled protocols receive fresh credentials; a fresh deployment
+    /// allocates every credential and the Subscription credential.
+    pub fn apply_options(
+        existing: Option<&DeploymentConfig>,
+        options: &DeploymentOptions,
+    ) -> Result<Self, ConfigError> {
+        let DeploymentOptions {
+            subscription_mode,
+            subscription_host,
+            proxy_host,
+            certbot_email,
+            http_port,
+            subscription_listen_port,
+            certificate_mode,
+            interface,
+            enabled_protocols,
+            reality_decoy_sni,
+            protocol_sni,
+            monthly_traffic_limit,
+            accounting_policy,
+            accounting_timezone,
+            client_display_timezone,
+            anchored_reset_at,
+            ports,
+        } = options;
+        validate_requested_ports(enabled_protocols, ports)?;
+        let mut allocated_ports = Vec::new();
+        let vless_reality = build_protocol_credentials(
+            existing.and_then(|config| config.vless_reality.as_ref()),
+            enabled_protocols.contains(&ManagedProtocol::VlessReality),
+            ports.vless_reality,
+            &mut allocated_ports,
+            generate_vless_reality_credentials,
+            |credentials| credentials.listen_port,
+            |credentials, port| credentials.listen_port = port,
+        )?;
+        let vmess_websocket = build_protocol_credentials(
+            existing.and_then(|config| config.vmess_websocket.as_ref()),
+            enabled_protocols.contains(&ManagedProtocol::VmessWebsocket),
+            ports.vmess_websocket,
+            &mut allocated_ports,
+            generate_vmess_websocket_credentials,
+            |credentials| credentials.listen_port,
+            |credentials, port| credentials.listen_port = port,
+        )?;
+        let hysteria2 = build_protocol_credentials(
+            existing.and_then(|config| config.hysteria2.as_ref()),
+            enabled_protocols.contains(&ManagedProtocol::Hysteria2),
+            ports.hysteria2,
+            &mut allocated_ports,
+            generate_hysteria2_credentials,
+            |credentials| credentials.listen_port,
+            |credentials, port| credentials.listen_port = port,
+        )?;
+        let tuic = build_protocol_credentials(
+            existing.and_then(|config| config.tuic.as_ref()),
+            enabled_protocols.contains(&ManagedProtocol::Tuic),
+            ports.tuic,
+            &mut allocated_ports,
+            generate_tuic_credentials,
+            |credentials| credentials.listen_port,
+            |credentials, port| credentials.listen_port = port,
+        )?;
+        let anytls = build_protocol_credentials(
+            existing.and_then(|config| config.anytls.as_ref()),
+            enabled_protocols.contains(&ManagedProtocol::Anytls),
+            ports.anytls,
+            &mut allocated_ports,
+            generate_anytls_credentials,
+            |credentials| credentials.listen_port,
+            |credentials, port| credentials.listen_port = port,
+        )?;
+        let subscription_credential = match existing {
+            Some(config) => config.subscription_credential.clone(),
+            None => generate_subscription_credential()?,
+        };
+        let config = Self {
+            subscription_mode: subscription_mode.clone(),
+            subscription_host: subscription_host.clone(),
+            proxy_host: proxy_host.clone(),
+            http_port: *http_port,
+            subscription_listen_port: *subscription_listen_port,
+            certificate_mode: certificate_mode.clone(),
+            interface: interface.clone(),
+            ipv4_only: existing.is_some_and(|config| config.ipv4_only),
+            enabled_protocols: enabled_protocols.clone(),
+            reality_decoy_sni: reality_decoy_sni.clone(),
+            protocol_sni: protocol_sni.clone(),
+            subscription_credential,
+            // A wizard rebuild must not silently close the observation endpoint
+            // an operator enabled, nor keep one they disabled.
+            server_clash_api: existing.and_then(|config| config.server_clash_api.clone()),
+            client_clash_api_secret: existing
+                .and_then(|config| config.client_clash_api_secret.clone()),
+            // Named credentials are the operator's per-device links; a wizard
+            // rebuild carries them over untouched, exactly like the default one.
+            subscription_credentials: existing
+                .map(|config| config.subscription_credentials.clone())
+                .unwrap_or_default(),
+            monthly_traffic_limit: *monthly_traffic_limit,
+            accounting_policy: accounting_policy.clone(),
+            accounting_timezone: accounting_timezone.clone(),
+            client_display_timezone: client_display_timezone.clone(),
+            anchored_reset_at: anchored_reset_at.clone(),
+            certbot_email: certbot_email.clone(),
+            // Client template preferences survive a wizard rebuild; a fresh
+            // deployment takes the defaults.
+            client_dns_mode: existing
+                .map(|config| config.client_dns_mode.clone())
+                .unwrap_or_default(),
+            client_dns_preset: existing
+                .map(|config| config.client_dns_preset.clone())
+                .unwrap_or_default(),
+            client_rule_profile: existing
+                .map(|config| config.client_rule_profile.clone())
+                .unwrap_or_default(),
+            client_template: existing
+                .map(|config| config.client_template.clone())
+                .unwrap_or_default(),
+            client_rule_set_base_url: existing
+                .map(|config| config.client_rule_set_base_url.clone())
+                .unwrap_or_else(default_client_rule_set_base_url),
+            client_extra_rule_sets: existing
+                .map(|config| config.client_extra_rule_sets.clone())
+                .unwrap_or_default(),
+            client_rule_set_update_interval: existing
+                .map(|config| config.client_rule_set_update_interval.clone())
+                .unwrap_or_else(default_rule_set_update_interval),
+            client_latency_probe_url: existing
+                .map(|config| config.client_latency_probe_url.clone())
+                .unwrap_or_else(default_client_latency_probe_url),
+            vless_reality,
+            vmess_websocket,
+            hysteria2,
+            tuic,
+            anytls,
+        };
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn protocol_listener_port(&self, protocol: &ManagedProtocol) -> Option<u16> {
+        match protocol {
+            ManagedProtocol::VlessReality => {
+                self.vless_reality.as_ref().map(|node| node.listen_port)
+            }
+            ManagedProtocol::VmessWebsocket => {
+                self.vmess_websocket.as_ref().map(|node| node.listen_port)
+            }
+            ManagedProtocol::Hysteria2 => self.hysteria2.as_ref().map(|node| node.listen_port),
+            ManagedProtocol::Tuic => self.tuic.as_ref().map(|node| node.listen_port),
+            ManagedProtocol::Anytls => self.anytls.as_ref().map(|node| node.listen_port),
+        }
+    }
+
+    /// The TLS server name presented by the certificate-based Managed protocols
+    /// and used as the self-signed certificate Common Name. When an explicit
+    /// `protocol_sni` is configured it wins; otherwise a domain subscription host
+    /// is used, and an IP-only (no-domain) host falls back to the default fake
+    /// SNI so the certificate and the client handshake agree on a hostname.
+    pub fn protocol_server_name(&self) -> &str {
+        self.protocol_sni.as_deref().unwrap_or_else(|| {
+            if self.subscription_host.parse::<IpAddr>().is_ok() {
+                DEFAULT_PROTOCOL_SNI
+            } else {
+                &self.subscription_host
+            }
+        })
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_deployment_identity()?;
+        self.validate_protocols()?;
+        self.validate_secret_and_accounting()?;
+        self.validate_subscription_mode()
+    }
+
+    fn validate_deployment_identity(&self) -> Result<(), ConfigError> {
+        validate_host("subscription host", &self.subscription_host)?;
+        if let Some(proxy_host) = &self.proxy_host {
+            validate_host("proxy host", proxy_host)?;
+        }
+        if self.interface.is_empty()
+            || self.interface.len() > 15
+            || self.interface.starts_with('.')
+            || self.interface.bytes().any(|byte| {
+                !(byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-' || byte == b'.')
+            })
+        {
+            // `.` and `..` satisfy the character set but resolve out of
+            // /sys/class/net, so a typo would read some other device's counters
+            // and report them as this one's.
+            return Err(ConfigError::InvalidValue(
+                "interface must be a Linux interface name",
+            ));
+        }
+        for (field, url) in [
+            ("client_rule_set_base_url", &self.client_rule_set_base_url),
+            ("client_latency_probe_url", &self.client_latency_probe_url),
+        ] {
+            if url.is_empty()
+                || url.contains(char::is_whitespace)
+                || (!url.starts_with("http://") && !url.starts_with("https://"))
+            {
+                let message = match field {
+                    "client_rule_set_base_url" => {
+                        "client_rule_set_base_url must be an absolute http(s) URL without whitespace"
+                    }
+                    _ => {
+                        "client_latency_probe_url must be an absolute http(s) URL without whitespace"
+                    }
+                };
+                return Err(ConfigError::InvalidValue(message));
+            }
+        }
+        let mut rule_set_names = std::collections::HashSet::new();
+        for set in &self.client_extra_rule_sets {
+            if set.name.trim().is_empty()
+                || !rule_set_names.insert(set.name.as_str())
+                || set.name.contains(char::is_whitespace)
+            {
+                return Err(ConfigError::InvalidValue(
+                    "each extra rule-set needs a distinct name without whitespace",
+                ));
+            }
+            if set.url.is_empty()
+                || set.url.contains(char::is_whitespace)
+                || (!set.url.starts_with("http://") && !set.url.starts_with("https://"))
+            {
+                return Err(ConfigError::InvalidValue(
+                    "extra rule-set url must be an absolute http(s) URL without whitespace",
+                ));
+            }
+            // Shipping a URL the subscribers' cores cannot parse would break
+            // every client at once, so the extension decides acceptance here.
+            if !set.format_is_expected() {
+                return Err(ConfigError::InvalidValue(
+                    "extra rule-set url must end in .srs (sing-box) or .mrs (mihomo); \
+                     import a plain-text list with sbctl rule-set import-list instead",
+                ));
+            }
+            // `direct`/`proxy`/`reject` are the three verdict words; anything
+            // else names a group tag, which is deliberately not checked here
+            // because the group set depends on the template and the client
+            // version. A name that does not exist is caught by the merged
+            // real-kernel check regeneration runs for customized deployments,
+            // and the message is the core's own unknown-outbound error.
+            if set.outbound.is_empty() || set.outbound.contains(char::is_whitespace) {
+                return Err(ConfigError::InvalidValue(
+                    "extra rule-set outbound must be direct, proxy, reject or a group tag",
+                ));
+            }
+        }
+        if self.client_rule_set_update_interval.is_empty()
+            || self
+                .client_rule_set_update_interval
+                .contains(char::is_whitespace)
+        {
+            return Err(ConfigError::InvalidValue(
+                "client_rule_set_update_interval must be a Go duration like 1d or 12h",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_protocols(&self) -> Result<(), ConfigError> {
+        if self.enabled_protocols.is_empty() {
+            return Err(ConfigError::InvalidValue(
+                "at least one Managed protocol must be enabled",
+            ));
+        }
+        let listener_ports = self
+            .vless_reality
+            .as_ref()
+            .map(|node| node.listen_port)
+            .into_iter()
+            .chain(self.vmess_websocket.as_ref().map(|node| node.listen_port))
+            .chain(self.hysteria2.as_ref().map(|node| node.listen_port))
+            .chain(self.tuic.as_ref().map(|node| node.listen_port))
+            .chain(self.anytls.as_ref().map(|node| node.listen_port))
+            .collect::<Vec<_>>();
+        for (index, port) in listener_ports.iter().enumerate() {
+            if !(MIN_PROTOCOL_PORT..=MAX_PROTOCOL_PORT).contains(port) {
+                return Err(ConfigError::InvalidValue(
+                    "Managed protocol ports must be in 10000-65535",
+                ));
+            }
+            if listener_ports[..index].contains(port) {
+                return Err(ConfigError::InvalidValue(
+                    "Managed protocol ports must be unique across TCP and UDP",
+                ));
+            }
+        }
+        for (index, protocol) in self.enabled_protocols.iter().enumerate() {
+            if self.enabled_protocols[..index].contains(protocol) {
+                return Err(ConfigError::InvalidValue(
+                    "enabled protocols must not contain duplicates",
+                ));
+            }
+        }
+        if self
+            .enabled_protocols
+            .contains(&ManagedProtocol::VlessReality)
+            && self.reality_decoy_sni.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ConfigError::InvalidValue(
+                "VLESS Reality requires a Reality decoy SNI",
+            ));
+        }
+        validate_enabled_credentials(
+            &self.enabled_protocols,
+            ManagedProtocol::VmessWebsocket,
+            self.vmess_websocket.is_some(),
+            "VMess WebSocket requires generated node credentials",
+        )?;
+        validate_enabled_credentials(
+            &self.enabled_protocols,
+            ManagedProtocol::Hysteria2,
+            self.hysteria2.is_some(),
+            "Hysteria2 requires generated node credentials",
+        )?;
+        validate_enabled_credentials(
+            &self.enabled_protocols,
+            ManagedProtocol::Tuic,
+            self.tuic.is_some(),
+            "TUIC requires generated node credentials",
+        )?;
+        validate_enabled_credentials(
+            &self.enabled_protocols,
+            ManagedProtocol::Anytls,
+            self.anytls.is_some(),
+            "AnyTLS requires generated node credentials",
+        )?;
+        if self
+            .enabled_protocols
+            .contains(&ManagedProtocol::VlessReality)
+            && self.vless_reality.is_none()
+        {
+            return Err(ConfigError::InvalidValue(
+                "VLESS Reality requires generated node credentials",
+            ));
+        }
+        if let Some(sni) = &self.reality_decoy_sni {
+            validate_hostname("Reality decoy SNI", sni)?;
+        }
+        if let Some(sni) = &self.protocol_sni {
+            validate_hostname("protocol SNI", sni)?;
+        }
+        Ok(())
+    }
+
+    fn validate_secret_and_accounting(&self) -> Result<(), ConfigError> {
+        if self.subscription_credential.len() < 43
+            || self
+                .subscription_credential
+                .bytes()
+                .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+        {
+            return Err(ConfigError::InvalidValue(
+                "subscription credential must be a URL-safe 256-bit secret",
+            ));
+        }
+        let mut live_names = std::collections::HashSet::new();
+        for entry in &self.subscription_credentials {
+            if entry.name.trim().is_empty() {
+                return Err(ConfigError::InvalidValue(
+                    "a named subscription credential needs a name",
+                ));
+            }
+            // A name may hold several records only while they retire: one live
+            // link per device, plus any number of previous secrets still inside
+            // their grace window. Two live records for one name would make
+            // `rotate --name` ambiguous.
+            if entry.revoked_at.is_none() && !live_names.insert(entry.name.as_str()) {
+                return Err(ConfigError::InvalidValue(
+                    "named subscription credentials must have one live record per name",
+                ));
+            }
+            // The same shape rule as the default credential: a named link is
+            // served by the same path secret comparator, so a short or
+            // non-URL-safe value would weaken every subscription at once.
+            if entry.credential.len() < 43
+                || entry
+                    .credential
+                    .bytes()
+                    .any(|byte| !(byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
+            {
+                return Err(ConfigError::InvalidValue(
+                    "every named subscription credential must be a URL-safe 256-bit secret \
+                     (sbctl credential list shows the names)",
+                ));
+            }
+        }
+        let accounting_timezone =
+            self.accounting_timezone
+                .parse::<chrono_tz::Tz>()
+                .map_err(|_| {
+                    ConfigError::InvalidValue("accounting timezone must be a named IANA timezone")
+                })?;
+        self.client_display_timezone
+            .parse::<chrono_tz::Tz>()
+            .map_err(|_| {
+                ConfigError::InvalidValue("client display timezone must be a named IANA timezone")
+            })?;
+        match self.accounting_policy {
+            AccountingPolicy::NaturalMonth if self.anchored_reset_at.is_some() => {
+                return Err(ConfigError::InvalidValue(
+                    "Natural-month reset must not configure an anchored reset time",
+                ));
+            }
+            AccountingPolicy::AnchoredMonth => {
+                let Some(reset_at) = &self.anchored_reset_at else {
+                    return Err(ConfigError::InvalidValue(
+                        "Anchored-month reset requires an anchored reset date and time",
+                    ));
+                };
+                let reset = chrono::NaiveDateTime::parse_from_str(reset_at, "%Y-%m-%dT%H:%M")
+                    .map_err(|_| {
+                        ConfigError::InvalidValue("anchored reset time must use YYYY-MM-DDTHH:MM")
+                    })?;
+                validate_anchored_reset_local_time(accounting_timezone, reset)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn validate_subscription_mode(&self) -> Result<(), ConfigError> {
+        match self.subscription_mode {
+            SubscriptionMode::IpFallback => {
+                if self.subscription_listen_port.is_some() {
+                    return Err(ConfigError::InvalidValue(
+                        "only external reverse-proxy subscription configures a listener port",
+                    ));
+                }
+                if self.subscription_host.parse::<IpAddr>().is_err() {
+                    return Err(ConfigError::InvalidValue(
+                        "IP fallback subscription requires an IP address as the subscription host",
+                    ));
+                }
+                let Some(port) = self.http_port else {
+                    return Err(ConfigError::InvalidValue(
+                        "IP fallback subscription requires an HTTP port",
+                    ));
+                };
+                if port <= 1024 {
+                    return Err(ConfigError::InvalidValue(
+                        "IP fallback HTTP port must be higher than 1024",
+                    ));
+                }
+                if self.protocol_listener_ports().contains(&port) {
+                    return Err(ConfigError::InvalidValue(
+                        "IP fallback HTTP port must not conflict with a Managed protocol port",
+                    ));
+                }
+                if self.enabled_protocols.iter().any(|protocol| {
+                    matches!(
+                        protocol,
+                        ManagedProtocol::VmessWebsocket
+                            | ManagedProtocol::Hysteria2
+                            | ManagedProtocol::Tuic
+                            | ManagedProtocol::Anytls
+                    )
+                }) && self.certificate_mode != CertificateMode::SelfSigned
+                {
+                    return Err(ConfigError::InvalidValue(
+                        "VMess WebSocket, Hysteria2, TUIC, and AnyTLS in IP fallback mode require self-signed certificates",
+                    ));
+                }
+            }
+            SubscriptionMode::Direct => {
+                if self.subscription_host.parse::<IpAddr>().is_ok() {
+                    return Err(ConfigError::InvalidValue(
+                        "domain subscription modes require a hostname",
+                    ));
+                }
+                if self.http_port.is_some() {
+                    return Err(ConfigError::InvalidValue(
+                        "only IP fallback subscription configures an HTTP port",
+                    ));
+                }
+                if self.subscription_listen_port.is_some() {
+                    return Err(ConfigError::InvalidValue(
+                        "only external reverse-proxy subscription configures a listener port",
+                    ));
+                }
+            }
+            SubscriptionMode::ExternalProxy => {
+                if self.subscription_host.parse::<IpAddr>().is_ok() {
+                    return Err(ConfigError::InvalidValue(
+                        "domain subscription modes require a hostname",
+                    ));
+                }
+                if self.http_port.is_some() {
+                    return Err(ConfigError::InvalidValue(
+                        "only IP fallback subscription configures an HTTP port",
+                    ));
+                }
+                let Some(port) = self.subscription_listen_port else {
+                    return Err(ConfigError::InvalidValue(
+                        "external reverse-proxy subscription requires a loopback listener port",
+                    ));
+                };
+                if port <= 1024 {
+                    return Err(ConfigError::InvalidValue(
+                        "external reverse-proxy listener port must be higher than 1024",
+                    ));
+                }
+                if self.protocol_listener_ports().contains(&port) {
+                    return Err(ConfigError::InvalidValue(
+                        "external reverse-proxy listener port must not conflict with a Managed protocol port",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub fn summary(&self) -> String {
+        let protocols = self
+            .enabled_protocols
+            .iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut lines = vec![
+            "sbctl status: configured".to_owned(),
+            format!("mode: {}", self.subscription_mode),
+            format!("subscription host: {}", self.subscription_host),
+            format!(
+                "proxy host: {}",
+                self.proxy_host
+                    .as_deref()
+                    .unwrap_or(&self.subscription_host)
+            ),
+            format!("interface: {}", self.interface),
+            format!(
+                "monthly traffic limit: {} bytes",
+                self.monthly_traffic_limit
+            ),
+            format!("accounting policy: {}", self.accounting_policy),
+            format!("VPS refresh timezone: {}", self.accounting_timezone),
+            format!("client display timezone: {}", self.client_display_timezone),
+            // Keep all supported client-generation knobs together so the
+            // wizard preview and `sbctl status` explain the effective output.
+            format!("client content template: {}", self.client_template),
+            format!("client DNS mode: {}", self.client_dns_mode),
+            format!("client rule profile: {}", self.client_rule_profile),
+            format!(
+                "client rule-set base URL: {}",
+                client_url_summary(&self.client_rule_set_base_url)
+            ),
+            format!(
+                "client latency probe URL: {}",
+                client_url_summary(&self.client_latency_probe_url)
+            ),
+            format!("enabled protocols: {protocols}"),
+            "subscription credential: [redacted]".to_owned(),
+        ];
+        if let Some(port) = self.http_port {
+            lines.push(format!("HTTP port: {port}"));
+        }
+        if let Some(port) = self.subscription_listen_port {
+            lines.push(format!("loopback subscription port: {port}"));
+        }
+        if let Some(sni) = &self.reality_decoy_sni {
+            lines.push(format!("Reality decoy SNI: {sni}"));
+        }
+        lines.push(format!("protocol SNI: {}", self.protocol_server_name()));
+        if let Some(reset_at) = &self.anchored_reset_at {
+            lines.push(format!("anchored reset: {reset_at}"));
+        }
+        lines.join("\n")
+    }
+
+    fn protocol_listener_ports(&self) -> Vec<u16> {
+        [
+            self.vless_reality.as_ref().map(|node| node.listen_port),
+            self.vmess_websocket.as_ref().map(|node| node.listen_port),
+            self.hysteria2.as_ref().map(|node| node.listen_port),
+            self.tuic.as_ref().map(|node| node.listen_port),
+            self.anytls.as_ref().map(|node| node.listen_port),
+        ]
+        .into_iter()
+        .flatten()
+        .collect()
+    }
+}
+
+fn validate_enabled_credentials(
+    enabled_protocols: &[ManagedProtocol],
+    protocol: ManagedProtocol,
+    has_credentials: bool,
+    message: &'static str,
+) -> Result<(), ConfigError> {
+    if enabled_protocols.contains(&protocol) && !has_credentials {
+        return Err(ConfigError::InvalidValue(message));
+    }
+    Ok(())
+}
+
+/// Rejects an anchored reset instant whose local time is skipped or repeated by
+/// a DST transition in the accounting timezone, so the schedule is unambiguous.
+fn validate_anchored_reset_local_time(
+    timezone: chrono_tz::Tz,
+    reset: chrono::NaiveDateTime,
+) -> Result<(), ConfigError> {
+    match timezone.with_ymd_and_hms(
+        reset.year(),
+        reset.month(),
+        reset.day(),
+        reset.hour(),
+        reset.minute(),
+        0,
+    ) {
+        LocalResult::Single(_) => Ok(()),
+        LocalResult::Ambiguous(_, _) => Err(ConfigError::InvalidValue(
+            "anchored reset time is ambiguous in the accounting timezone",
+        )),
+        LocalResult::None => Err(ConfigError::InvalidValue(
+            "anchored reset time does not exist in the accounting timezone",
+        )),
+    }
+}
+
+fn validate_requested_ports(
+    enabled_protocols: &[ManagedProtocol],
+    ports: &ProtocolPorts,
+) -> Result<(), ConfigError> {
+    let requested = [
+        (ManagedProtocol::VlessReality, ports.vless_reality),
+        (ManagedProtocol::VmessWebsocket, ports.vmess_websocket),
+        (ManagedProtocol::Hysteria2, ports.hysteria2),
+        (ManagedProtocol::Tuic, ports.tuic),
+        (ManagedProtocol::Anytls, ports.anytls),
+    ];
+    let mut values = Vec::new();
+    for (protocol, port) in requested {
+        if let Some(port) = port {
+            if !enabled_protocols.contains(&protocol) {
+                return Err(ConfigError::InvalidValue(
+                    "cannot specify a port for a disabled Managed protocol",
+                ));
+            }
+            if !(MIN_PROTOCOL_PORT..=MAX_PROTOCOL_PORT).contains(&port) {
+                return Err(ConfigError::InvalidValue(
+                    "Managed protocol ports must be in 10000-65535",
+                ));
+            }
+            if values.contains(&port) {
+                return Err(ConfigError::InvalidValue(
+                    "Managed protocol ports must be unique across TCP and UDP",
+                ));
+            }
+            values.push(port);
+        }
+    }
+    Ok(())
+}
+
+/// A fresh high-entropy Subscription credential. `credential rotate` and new
+/// deployments each call this so the URL-safe 256-bit secret is always generated
+/// by the same path.
+pub fn generate_subscription_credential() -> Result<String, ConfigError> {
+    let mut bytes = [0_u8; 32];
+    getrandom::fill(&mut bytes).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+/// Reuses an existing protocol credential when the protocol stays enabled,
+/// changing only its listener port when requested, or generates a fresh one.
+fn build_protocol_credentials<T, G>(
+    existing: Option<&T>,
+    enabled: bool,
+    requested_port: Option<u16>,
+    allocated_ports: &mut Vec<u16>,
+    mut generate: G,
+    get_port: impl Fn(&T) -> u16,
+    set_port: impl Fn(&mut T, u16),
+) -> Result<Option<T>, ConfigError>
+where
+    T: Clone,
+    G: FnMut(&mut Vec<u16>, Option<u16>) -> Result<T, ConfigError>,
+{
+    if !enabled {
+        return Ok(None);
+    }
+    if let Some(current) = existing {
+        let current_port = get_port(current);
+        let port = apply_existing_port(current_port, requested_port, allocated_ports)?;
+        let mut updated = current.clone();
+        set_port(&mut updated, port);
+        return Ok(Some(updated));
+    }
+    generate(allocated_ports, requested_port).map(Some)
+}
+
+fn apply_existing_port(
+    current_port: u16,
+    requested_port: Option<u16>,
+    allocated_ports: &mut Vec<u16>,
+) -> Result<u16, ConfigError> {
+    let port = match requested_port {
+        Some(requested) if requested != current_port => requested,
+        _ => current_port,
+    };
+    if allocated_ports.contains(&port) {
+        return Err(ConfigError::InvalidValue(
+            "Managed protocol ports must be unique across TCP and UDP",
+        ));
+    }
+    if port != current_port {
+        ensure_protocol_port_available(port)?;
+    }
+    allocated_ports.push(port);
+    Ok(port)
+}
+
+fn generate_vless_reality_credentials(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<VlessRealityCredentials, ConfigError> {
+    let mut private = [0_u8; 32];
+    let mut short_id = [0_u8; 8];
+    getrandom::fill(&mut private).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    getrandom::fill(&mut short_id).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    let public = x25519(private, X25519_BASEPOINT_BYTES);
+    let listen_port = allocate_port(allocated_ports, requested_port)?;
+    Ok(VlessRealityCredentials {
+        listen_port,
+        uuid: generate_uuid()?,
+        private_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(private),
+        public_key: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(public),
+        short_id: short_id.iter().map(|byte| format!("{byte:02x}")).collect(),
+    })
+}
+
+fn generate_vmess_websocket_credentials(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<VmessWebsocketCredentials, ConfigError> {
+    let mut path = [0_u8; 16];
+    getrandom::fill(&mut path).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(VmessWebsocketCredentials {
+        listen_port: allocate_port(allocated_ports, requested_port)?,
+        uuid: generate_uuid()?,
+        path: format!(
+            "/{}",
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(path)
+        ),
+    })
+}
+
+fn generate_hysteria2_credentials(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<Hysteria2Credentials, ConfigError> {
+    let mut password = [0_u8; 32];
+    getrandom::fill(&mut password).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(Hysteria2Credentials {
+        listen_port: allocate_port(allocated_ports, requested_port)?,
+        password: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password),
+    })
+}
+
+fn generate_tuic_credentials(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<TuicCredentials, ConfigError> {
+    let mut password = [0_u8; 32];
+    getrandom::fill(&mut password).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(TuicCredentials {
+        listen_port: allocate_port(allocated_ports, requested_port)?,
+        uuid: generate_uuid()?,
+        password: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password),
+    })
+}
+
+fn generate_anytls_credentials(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<AnytlsCredentials, ConfigError> {
+    let mut password = [0_u8; 32];
+    getrandom::fill(&mut password).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(AnytlsCredentials {
+        listen_port: allocate_port(allocated_ports, requested_port)?,
+        password: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(password),
+    })
+}
+
+fn generate_uuid() -> Result<String, ConfigError> {
+    let mut uuid = [0_u8; 16];
+    getrandom::fill(&mut uuid).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    Ok(format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        uuid[0],
+        uuid[1],
+        uuid[2],
+        uuid[3],
+        uuid[4],
+        uuid[5],
+        uuid[6],
+        uuid[7],
+        uuid[8],
+        uuid[9],
+        uuid[10],
+        uuid[11],
+        uuid[12],
+        uuid[13],
+        uuid[14],
+        uuid[15]
+    ))
+}
+
+fn allocate_port(
+    allocated_ports: &mut Vec<u16>,
+    requested_port: Option<u16>,
+) -> Result<u16, ConfigError> {
+    if let Some(port) = requested_port {
+        if allocated_ports.contains(&port) {
+            return Err(ConfigError::InvalidValue(
+                "Managed protocol ports must be unique",
+            ));
+        }
+        ensure_protocol_port_available(port)?;
+        allocated_ports.push(port);
+        return Ok(port);
+    }
+    // The candidate space spans 55536 ports; a bounded retry keeps a hostile
+    // environment (bind blocked by sandbox, genuinely full range) a fast
+    // error instead of an endless loop.
+    const MAX_RANDOM_PORT_ATTEMPTS: usize = 256;
+    for _ in 0..MAX_RANDOM_PORT_ATTEMPTS {
+        let port = random_protocol_port()?;
+        if !allocated_ports.contains(&port) && ensure_protocol_port_available(port).is_ok() {
+            allocated_ports.push(port);
+            return Ok(port);
+        }
+    }
+    Err(ConfigError::StateContent(format!(
+        "尝试了 {MAX_RANDOM_PORT_ATTEMPTS} 个随机端口（{MIN_PROTOCOL_PORT}-{MAX_PROTOCOL_PORT}）\
+         仍未找到 TCP/UDP 同时可用的端口；请检查系统端口占用（ss -tulpn）或改用 --*-port 手动指定"
+    )))
+}
+
+fn random_protocol_port() -> Result<u16, ConfigError> {
+    let mut bytes = [0_u8; 4];
+    getrandom::fill(&mut bytes).map_err(|error| ConfigError::Randomness(error.to_string()))?;
+    let span = u32::from(MAX_PROTOCOL_PORT - MIN_PROTOCOL_PORT) + 1;
+    Ok(MIN_PROTOCOL_PORT + (u32::from_le_bytes(bytes) % span) as u16)
+}
+
+/// Probes both TCP and UDP on IPv4 and, when the host has an IPv6 route, on
+/// IPv6 too, because the generated sing-box inbounds listen on `::`. The
+/// probe is inherently a snapshot (another process can still claim the port
+/// before sing-box starts), which the deployment checklist reminds the
+/// administrator to verify with `sbctl node`.
+fn ensure_protocol_port_available(port: u16) -> Result<(), ConfigError> {
+    let tcp_available = std::net::TcpListener::bind((std::net::Ipv4Addr::UNSPECIFIED, port));
+    if let Err(error) = tcp_available {
+        return Err(ConfigError::PortInUse(port, error.to_string()));
+    }
+    let udp_available = std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, port));
+    if let Err(error) = udp_available {
+        return Err(ConfigError::PortInUse(port, error.to_string()));
+    }
+    if host_has_ipv6_connectivity() {
+        let tcp6_available = std::net::TcpListener::bind((std::net::Ipv6Addr::UNSPECIFIED, port));
+        if let Err(error) = tcp6_available {
+            return Err(ConfigError::PortInUse(port, error.to_string()));
+        }
+    }
+    Ok(())
+}
+
+/// A cheap UDP route-lookup probe for an IPv6 default route; on hosts without
+/// one, IPv6 bind probing is skipped so a v6-less host is not rejected.
+fn host_has_ipv6_connectivity() -> bool {
+    let Ok(socket) = std::net::UdpSocket::bind("[::]:0") else {
+        return false;
+    };
+    socket.connect("[2001:4860:4860::8888]:443").is_ok()
+}
+
+#[derive(Debug, Error)]
+pub enum ConfigError {
+    #[error("invalid deployment configuration: {0}")]
+    InvalidValue(&'static str),
+    #[error("deployment configuration is not initialized")]
+    Missing,
+    #[error("deployment configuration already exists; refusing to overwrite it")]
+    AlreadyExists,
+    #[error("could not parse deployment configuration: {0}")]
+    Parse(#[from] toml::de::Error),
+    #[error("could not serialize deployment configuration: {0}")]
+    Serialize(#[from] toml::ser::Error),
+    #[error("could not obtain secure randomness: {0}")]
+    Randomness(String),
+    #[error(
+        "Managed protocol port {0} is already in use ({1}); \
+         free it or pick another port with --vless-port/--vmess-port/--hysteria2-port/--tuic-port/--anytls-port"
+    )]
+    PortInUse(u16, String),
+    #[error("configuration storage failed: {0}")]
+    Storage(#[from] io::Error),
+    #[error("could not update deployment state: {0}")]
+    StateContent(String),
+    #[error("VPS traffic state is corrupted: {0}")]
+    StateCorrupt(String),
+    #[error("VPS traffic state schema version {0} is not supported")]
+    StateSchemaMismatch(u32),
+}
+
+#[derive(Clone)]
+pub struct DeploymentStore {
+    root: PathBuf,
+}
+
+impl DeploymentStore {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+
+    pub fn initialize(&self, config: &DeploymentConfig) -> Result<(), ConfigError> {
+        self.initialize_with_artifacts(config, &[])
+    }
+
+    pub fn initialize_with_artifacts(
+        &self,
+        config: &DeploymentConfig,
+        artifacts: &[(String, &[u8])],
+    ) -> Result<(), ConfigError> {
+        config.validate()?;
+        let path = self.root.join(CONFIG_RELATIVE_PATH);
+        let _lock = self.operation_lock()?;
+        if path.exists() {
+            return Err(ConfigError::AlreadyExists);
+        }
+        for (name, contents) in artifacts {
+            self.write_artifact_unlocked(name, contents)?;
+        }
+        if config.subscription_mode == SubscriptionMode::Direct {
+            create_private_directory(
+                &self
+                    .root
+                    .join(ACME_WEBROOT_RELATIVE_PATH)
+                    .join(".well-known/acme-challenge"),
+            )?;
+        }
+        let contents = toml::to_string_pretty(config)?;
+        atomic_write(&path, contents.as_bytes())?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    pub fn load(&self) -> Result<DeploymentConfig, ConfigError> {
+        let path = self.root.join(CONFIG_RELATIVE_PATH);
+        let contents = fs::read_to_string(path).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => ConfigError::Missing,
+            _ => ConfigError::Storage(error),
+        })?;
+        let config = toml::from_str::<DeploymentConfig>(&contents)?;
+        config.validate()?;
+        Ok(config)
+    }
+
+    pub fn replace(&self, config: &DeploymentConfig) -> Result<(), ConfigError> {
+        config.validate()?;
+        let path = self.root.join(CONFIG_RELATIVE_PATH);
+        let _lock = self.operation_lock()?;
+        if !path.exists() {
+            return Err(ConfigError::Missing);
+        }
+        let contents = toml::to_string_pretty(config)?;
+        atomic_write(&path, contents.as_bytes())?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    /// Replaces the persisted configuration while an operation lock is already
+    /// held. Multi-file lifecycle transactions use this so the configuration,
+    /// artifacts, and active sing-box configuration commit together.
+    pub fn replace_locked(&self, config: &DeploymentConfig) -> Result<(), ConfigError> {
+        config.validate()?;
+        let path = self.root.join(CONFIG_RELATIVE_PATH);
+        if !path.exists() {
+            return Err(ConfigError::Missing);
+        }
+        let contents = toml::to_string_pretty(config)?;
+        atomic_write(&path, contents.as_bytes())?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    pub fn write_state(&self, contents: &[u8]) -> Result<(), ConfigError> {
+        self.atomic_write_managed(&self.root.join(STATE_RELATIVE_PATH), contents)
+    }
+
+    /// Read the complete accounting state without acquiring the operation lock.
+    /// Writers commit via temporary file and atomic rename, so a concurrent
+    /// reader observes either the previous or the next complete version.
+    pub fn read_state(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        self.read_state_unlocked()
+    }
+
+    pub fn update_state(
+        &self,
+        update: impl FnOnce(Option<Vec<u8>>) -> Result<Vec<u8>, ConfigError>,
+    ) -> Result<(), ConfigError> {
+        let _lock = self.operation_lock()?;
+        let prior = self.read_state_unlocked()?;
+        let contents = update(prior.clone())?;
+        if prior.as_deref() == Some(contents.as_slice()) {
+            return Ok(());
+        }
+        let path = self.root.join(STATE_RELATIVE_PATH);
+        atomic_write(&path, &contents)?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    fn read_state_unlocked(&self) -> Result<Option<Vec<u8>>, ConfigError> {
+        match fs::read(self.root.join(STATE_RELATIVE_PATH)) {
+            Ok(contents) => Ok(Some(contents)),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(ConfigError::Storage(error)),
+        }
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn acme_webroot(&self) -> PathBuf {
+        self.root.join(ACME_WEBROOT_RELATIVE_PATH)
+    }
+
+    /// The sbctl-owned directory holding the pinned certificate copy for a
+    /// subscription host. Both the sbctl daemon and the sing-box data plane
+    /// read the certificate from here; the deploy hook refreshes it after each
+    /// Certbot renewal.
+    pub fn certificate_directory(&self, host: &str) -> PathBuf {
+        self.root.join(CERTIFICATES_RELATIVE_PATH).join(host)
+    }
+
+    /// The live-host path of the pinned certificate copy for a subscription
+    /// host, used when generating the sing-box server configuration.
+    pub fn certificate_directory_absolute(host: &str) -> PathBuf {
+        PathBuf::from(CERTIFICATES_ABSOLUTE_PATH).join(host)
+    }
+
+    pub fn write_artifact(&self, name: &str, contents: &[u8]) -> Result<(), ConfigError> {
+        let _lock = self.operation_lock()?;
+        self.write_artifact_unlocked(name, contents)
+    }
+
+    /// Replaces a cached artifact while an operation lock is already held.
+    /// Callers use the locked write helpers only while the guard from
+    /// `acquire_operation_lock` lives.
+    pub fn write_artifact_locked(&self, name: &str, contents: &[u8]) -> Result<(), ConfigError> {
+        self.write_artifact_unlocked(name, contents)
+    }
+
+    /// Replaces the configuration consumed by the sing-box systemd unit.
+    /// Callers validate this exact content before invoking this operation.
+    pub fn write_active_sing_box_config(&self, contents: &[u8]) -> Result<(), ConfigError> {
+        self.atomic_write_managed(&self.root.join("etc/sing-box/config.json"), contents)
+    }
+
+    /// Serializes a multi-file lifecycle operation with configuration and state
+    /// writers. Callers use the locked write helpers only while this guard lives.
+    pub fn acquire_operation_lock(&self) -> Result<OperationLock, ConfigError> {
+        self.operation_lock()
+    }
+
+    pub fn write_relative_locked(
+        &self,
+        relative: &str,
+        contents: &[u8],
+    ) -> Result<(), ConfigError> {
+        let path = safe_managed_path(&self.root, relative)?;
+        atomic_write(&path, contents)?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    /// Writes a copy that stays root-only. Rollback points contain every
+    /// credential in the deployment — the subscription credential, the data
+    /// plane's node credentials and the TLS private key — so they must not be
+    /// delegated to the unprivileged service account that owns the live file
+    /// they were copied from; the two accounts are separate on purpose.
+    pub fn write_root_only_locked(
+        &self,
+        relative: &str,
+        contents: &[u8],
+    ) -> Result<(), ConfigError> {
+        let path = safe_managed_path(&self.root, relative)?;
+        atomic_write(&path, contents)?;
+        if self.root != Path::new("/") {
+            return Ok(());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let status = std::process::Command::new("chown")
+                .args(["root:root", &path.to_string_lossy()])
+                .status()
+                .map_err(ConfigError::Storage)?;
+            if !status.success() {
+                return Err(ConfigError::Storage(io::Error::other(format!(
+                    "chown root:root exited with {status}"
+                ))));
+            }
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
+                .map_err(ConfigError::Storage)?;
+        }
+        Ok(())
+    }
+
+    fn write_artifact_unlocked(&self, name: &str, contents: &[u8]) -> Result<(), ConfigError> {
+        if name.is_empty() || Path::new(name).components().count() != 1 {
+            return Err(ConfigError::InvalidValue(
+                "artifact name must be a single file name",
+            ));
+        }
+        let path = self.root.join(ARTIFACTS_RELATIVE_PATH).join(name);
+        atomic_write(&path, contents)?;
+        enforce_live_file_owner(&self.root, &path)
+    }
+
+    fn atomic_write_managed(&self, path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
+        let _lock = self.operation_lock()?;
+        atomic_write(path, contents)?;
+        enforce_live_file_owner(&self.root, path)
+    }
+
+    fn operation_lock(&self) -> Result<OperationLock, ConfigError> {
+        Ok(OperationLock::acquire(&self.root.join("var/lib/sbctl"))?)
+    }
+}
+
+pub struct OperationLock(File);
+
+impl OperationLock {
+    fn acquire(directory: &Path) -> io::Result<Self> {
+        create_private_directory(directory)?;
+        let lock = private_open(&directory.join(".operation.lock"), false)?;
+        lock.lock_exclusive()?;
+        Ok(Self(lock))
+    }
+}
+
+impl Drop for OperationLock {
+    fn drop(&mut self) {
+        let _ = self.0.unlock();
+    }
+}
+
+fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
+    let parent = path.parent().expect("managed path has parent");
+    create_private_directory(parent)?;
+    let temporary = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("artifact"),
+        std::process::id(),
+        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut file = private_open(&temporary, true)?;
+    let result = (|| {
+        file.write_all(contents)?;
+        file.sync_all()?;
+        fs::rename(&temporary, path)?;
+        // The rename is the linearization point: readers now see the complete new
+        // version. A failed directory sync can affect crash durability but cannot
+        // be reported as a failed commit without falsely claiming the old version
+        // remains active.
+        let _ = sync_directory(parent);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn safe_managed_path(root: &Path, relative: &str) -> Result<PathBuf, ConfigError> {
+    let path = Path::new(relative);
+    if path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(ConfigError::InvalidValue(
+            "managed path must be a relative path",
+        ));
+    }
+    Ok(root.join(path))
+}
+
+fn private_open(path: &Path, create_new: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.create(true);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options.open(path)
+}
+
+fn create_private_directory(directory: &Path) -> io::Result<()> {
+    // Directory permissions on the live host are established by the daemon
+    // storage preparation so the dedicated sbctl and sing-box service accounts
+    // can traverse them. Only a brand-new directory is created private; an
+    // existing directory must never have its mode clobbered back to 0700 by a
+    // later write or the operation lock, which would disconnect the service
+    // accounts from their configuration and certificates.
+    if directory.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+/// On the live host a root-run managed write must not leave a file owned only by
+/// root after the installation delegated it to a dedicated service account.
+/// Re-assert the service-account ownership and mode for the written file so the
+/// sbctl daemon and the sing-box data plane keep reading it after any config
+/// change. Fixture roots (a non-"/" configured root) keep the invoking user's
+/// ownership.
+fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    let relative = path
+        .strip_prefix(root)
+        .map_err(|_| {
+            ConfigError::Storage(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "managed path is outside root",
+            ))
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let (user, owner, mode) = match relative.as_str() {
+        "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
+        // The managed service binaries must stay root-owned and executable:
+        // sbctl.service and sing-box.service run under their own accounts and
+        // exec these paths, so treating them like state files (0600 sbctl:sbctl)
+        // would leave every updated binary unexecutable and break the services.
+        "usr/local/bin/sbctl" | "usr/local/bin/sing-box" => ("root", "root:root", 0o755u32),
+        _ => ("sbctl", "sbctl:sbctl", 0o600u32),
+    };
+    // The dedicated service account is created during the installation
+    // transaction, after the configuration is first written. Until it exists
+    // the write cannot be delegated; the daemon-storage preparation re-applies
+    // ownership at the end of the install. Skip so a pre-account write is not
+    // an error, and enforce from the first post-install mutation onward.
+    if !user_exists(root, user) {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let status = std::process::Command::new("chown")
+            .args([owner, &path.to_string_lossy()])
+            .status()
+            .map_err(ConfigError::Storage)?;
+        if !status.success() {
+            return Err(ConfigError::Storage(io::Error::other(format!(
+                "chown {owner} exited with {status}"
+            ))));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .map_err(ConfigError::Storage)?;
+    }
+    #[cfg(not(unix))]
+    let _ = (user, owner, mode);
+    Ok(())
+}
+
+/// Reports whether `user` has an entry in the host passwd database, so live
+/// ownership enforcement can skip writes that precede account creation.
+fn user_exists(root: &Path, user: &str) -> bool {
+    fs::read_to_string(root.join("etc/passwd"))
+        .unwrap_or_default()
+        .lines()
+        .any(|line| line.split(':').next() == Some(user))
+}
+
+fn sync_directory(_directory: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    File::open(_directory)?.sync_all()?;
+    Ok(())
+}
+
+fn validate_host(label: &'static str, value: &str) -> Result<(), ConfigError> {
+    if value.parse::<IpAddr>().is_ok() {
+        return Ok(());
+    }
+    validate_hostname(label, value)
+}
+
+/// Public host-format check used by the interactive wizard's per-item
+/// validation. Accepts a hostname or an IP address.
+pub fn host_is_valid(value: &str) -> bool {
+    validate_host("host", value).is_ok()
+}
+
+/// Public hostname-only check used for fields that cannot be an IP address,
+/// such as the Reality decoy SNI.
+pub fn hostname_is_valid(value: &str) -> bool {
+    validate_hostname("hostname", value).is_ok()
+}
+
+fn validate_hostname(label: &'static str, value: &str) -> Result<(), ConfigError> {
+    let valid = !value.is_empty()
+        && value.len() <= 253
+        && value.split('.').all(|label_part| {
+            !label_part.is_empty()
+                && label_part.len() <= 63
+                && !label_part.starts_with('-')
+                && !label_part.ends_with('-')
+                && label_part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        });
+    valid
+        .then_some(())
+        .ok_or(ConfigError::InvalidValue(match label {
+            "subscription host" => "subscription host must be a valid hostname or IP address",
+            "proxy host" => "proxy host must be a valid hostname or IP address",
+            "protocol SNI" => "protocol SNI must be a valid hostname",
+            _ => "Reality decoy SNI must be a valid hostname",
+        }))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+    use std::net::TcpListener;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+
+    use tempfile::TempDir;
+
+    use super::{
+        AccountingPolicy, CertificateMode, DeploymentConfig, DeploymentOptions, DeploymentStore,
+        ManagedProtocol, ProtocolPorts, SubscriptionMode,
+    };
+
+    #[test]
+    fn client_settings_summary_redacts_url_credentials_queries_and_fragments() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a base deployment is valid");
+        config.client_rule_set_base_url =
+            "https://alice:credential-secret@rules.example/base?token=query-secret#fragment-secret"
+                .into();
+
+        let summary = config.summary();
+
+        assert!(summary.contains("https://redacted:redacted@rules.example/base?redacted#redacted"));
+        for secret in [
+            "alice",
+            "credential-secret",
+            "query-secret",
+            "fragment-secret",
+        ] {
+            assert!(!summary.contains(secret), "summary exposed {secret}");
+        }
+    }
+
+    #[test]
+    fn read_state_returns_the_complete_version_or_none_without_writing() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+
+        assert_eq!(
+            store.read_state().expect("missing state reads as None"),
+            None
+        );
+        store
+            .write_state(b"complete state")
+            .expect("state is committed");
+        assert_eq!(
+            store
+                .read_state()
+                .expect("complete state reads as Some")
+                .as_deref(),
+            Some(b"complete state".as_slice())
+        );
+    }
+
+    #[test]
+    fn state_replacement_exposes_only_the_complete_new_artifact() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+
+        store
+            .write_state(b"first complete state")
+            .expect("first state is committed");
+        store
+            .write_state(b"second complete state")
+            .expect("second state atomically replaces the first");
+
+        assert_eq!(
+            fs::read(fixture.path().join("var/lib/sbctl/state.json"))
+                .expect("the complete state file is readable"),
+            b"second complete state"
+        );
+    }
+
+    #[test]
+    fn concurrent_reads_observe_only_complete_state_versions() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let root = fixture.path().to_path_buf();
+        let store = DeploymentStore::new(&root);
+        let first = vec![b'a'; 16 * 1024];
+        let second = vec![b'b'; 16 * 1024];
+        store
+            .write_state(&first)
+            .expect("initial state is committed");
+
+        let start = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start);
+        let writer_root = root.clone();
+        let writer_first = first.clone();
+        let writer_second = second.clone();
+        let writer = thread::spawn(move || {
+            let writer_store = DeploymentStore::new(writer_root);
+            writer_start.wait();
+            for index in 0..50 {
+                let contents = if index % 2 == 0 {
+                    &writer_first
+                } else {
+                    &writer_second
+                };
+                writer_store
+                    .write_state(contents)
+                    .expect("each complete state version is committed");
+            }
+        });
+
+        start.wait();
+        let state_path = root.join("var/lib/sbctl/state.json");
+        for _ in 0..200 {
+            let observed = fs::read(&state_path).expect("a complete state remains readable");
+            assert!(
+                observed == first || observed == second,
+                "reader observed a partial or unexpected state"
+            );
+        }
+        writer.join().expect("writer completes");
+    }
+
+    #[test]
+    fn concurrent_reads_observe_only_complete_artifact_versions() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let root = fixture.path().to_path_buf();
+        let store = DeploymentStore::new(&root);
+        let first = vec![b'j'; 16 * 1024];
+        let second = vec![b'k'; 16 * 1024];
+        store
+            .write_artifact("subscription.cache", &first)
+            .expect("initial artifact is committed");
+
+        let start = Arc::new(Barrier::new(2));
+        let writer_start = Arc::clone(&start);
+        let writer_root = root.clone();
+        let writer_first = first.clone();
+        let writer_second = second.clone();
+        let writer = thread::spawn(move || {
+            let writer_store = DeploymentStore::new(writer_root);
+            writer_start.wait();
+            for index in 0..50 {
+                let contents = if index % 2 == 0 {
+                    &writer_first
+                } else {
+                    &writer_second
+                };
+                writer_store
+                    .write_artifact("subscription.cache", contents)
+                    .expect("each complete artifact version is committed");
+            }
+        });
+
+        start.wait();
+        let artifact_path = root.join("var/lib/sbctl/artifacts/subscription.cache");
+        for _ in 0..200 {
+            let observed = fs::read(&artifact_path).expect("a complete artifact remains readable");
+            assert!(
+                observed == first || observed == second,
+                "reader observed a partial or unexpected artifact"
+            );
+        }
+        writer.join().expect("writer completes");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn persistent_files_are_owner_readable_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+        store
+            .write_state(b"restricted state")
+            .expect("state is committed");
+
+        let permissions = fs::metadata(fixture.path().join("var/lib/sbctl/state.json"))
+            .expect("state exists")
+            .permissions()
+            .mode();
+        assert_eq!(permissions & 0o777, 0o600);
+    }
+
+    #[test]
+    fn requested_protocol_ports_are_preserved_in_the_generated_credentials() {
+        let vless_port = free_port();
+        let vmess_port = free_port();
+        let hysteria2_port = free_port();
+        let tuic_port = free_port();
+        let anytls_port = free_port();
+        let config = DeploymentConfig::new_with_ports(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::VmessWebsocket,
+                ManagedProtocol::Hysteria2,
+                ManagedProtocol::Tuic,
+                ManagedProtocol::Anytls,
+            ],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts {
+                vless_reality: Some(vless_port),
+                vmess_websocket: Some(vmess_port),
+                hysteria2: Some(hysteria2_port),
+                tuic: Some(tuic_port),
+                anytls: Some(anytls_port),
+            },
+        )
+        .expect("explicit protocol ports are valid");
+
+        assert_eq!(config.vless_reality.unwrap().listen_port, vless_port);
+        assert_eq!(config.vmess_websocket.unwrap().listen_port, vmess_port);
+        assert_eq!(config.hysteria2.unwrap().listen_port, hysteria2_port);
+        assert_eq!(config.tuic.unwrap().listen_port, tuic_port);
+        assert_eq!(config.anytls.unwrap().listen_port, anytls_port);
+    }
+
+    #[test]
+    fn requested_protocol_ports_reject_duplicates_and_disabled_protocols() {
+        let duplicate = DeploymentConfig::new_with_ports(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality, ManagedProtocol::Hysteria2],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts {
+                vless_reality: Some(12001),
+                hysteria2: Some(12001),
+                ..ProtocolPorts::default()
+            },
+        );
+        assert!(duplicate.is_err());
+
+        let disabled = DeploymentConfig::new_with_ports(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts {
+                vmess_websocket: Some(12002),
+                ..ProtocolPorts::default()
+            },
+        );
+        assert!(disabled.is_err());
+    }
+
+    #[test]
+    fn requested_protocol_ports_reject_a_port_below_the_canonical_high_range() {
+        let result = DeploymentConfig::new_with_ports(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts {
+                vless_reality: Some(5000),
+                ..ProtocolPorts::default()
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::ConfigError::InvalidValue(
+                "Managed protocol ports must be in 10000-65535"
+            ))
+        ));
+    }
+
+    #[test]
+    fn a_hand_edited_config_rejects_an_out_of_range_or_duplicate_protocol_port() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality, ManagedProtocol::Hysteria2],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a base deployment is valid");
+
+        let mut low_port = config.clone();
+        low_port.vless_reality.as_mut().unwrap().listen_port = 5000;
+        assert!(matches!(
+            low_port.validate(),
+            Err(super::ConfigError::InvalidValue(
+                "Managed protocol ports must be in 10000-65535"
+            ))
+        ));
+
+        let mut duplicate = config.clone();
+        let hysteria_port = duplicate.hysteria2.as_ref().unwrap().listen_port;
+        duplicate.vless_reality.as_mut().unwrap().listen_port = hysteria_port;
+        assert!(matches!(
+            duplicate.validate(),
+            Err(super::ConfigError::InvalidValue(
+                "Managed protocol ports must be unique across TCP and UDP"
+            ))
+        ));
+    }
+
+    #[test]
+    fn automatically_allocated_protocol_ports_are_in_the_upstream_high_port_range() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("automatic port allocation succeeds");
+
+        let port = config.vless_reality.expect("VLESS node exists").listen_port;
+        assert!((10000..=65535).contains(&port));
+    }
+
+    #[test]
+    fn an_explicitly_requested_port_is_rejected_when_already_listening() {
+        let listener = TcpListener::bind("0.0.0.0:0").expect("test listener binds");
+        let port = listener
+            .local_addr()
+            .expect("test listener has an address")
+            .port();
+        if port < 10000 {
+            return;
+        }
+
+        let result = DeploymentConfig::new_with_ports(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts {
+                vless_reality: Some(port),
+                ..ProtocolPorts::default()
+            },
+        );
+
+        assert!(matches!(result, Err(super::ConfigError::PortInUse(..))));
+    }
+
+    /// Ports already handed out by this helper. The probe socket must be
+    /// released for the config under test to take the port, and Windows will
+    /// reissue a just-released ephemeral port to the next probe — which then
+    /// reads back as a duplicate protocol port and fails an otherwise valid
+    /// config.
+    fn free_port() -> u16 {
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static RESERVED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+        let reserved = RESERVED.get_or_init(|| Mutex::new(HashSet::new()));
+        loop {
+            let listener = TcpListener::bind("127.0.0.1:0").expect("test port binds");
+            let port = listener
+                .local_addr()
+                .expect("test port has an address")
+                .port();
+            if port < 10000 {
+                continue;
+            }
+            if reserved.lock().expect("reserved ports lock").insert(port) {
+                return port;
+            }
+        }
+    }
+
+    #[test]
+    fn new_deployments_default_to_the_selected_timezone_pair() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a default deployment is valid");
+
+        assert_eq!(config.accounting_timezone, "America/Los_Angeles");
+        assert_eq!(config.client_display_timezone, "Asia/Shanghai");
+    }
+
+    #[test]
+    fn anchored_reset_rejects_a_nonexistent_dst_local_time() {
+        let config = anchored_reset_config("America/New_York", "2024-03-10T02:30")
+            .expect("base anchored config is valid");
+
+        assert!(matches!(
+            config.validate(),
+            Err(super::ConfigError::InvalidValue(
+                "anchored reset time does not exist in the accounting timezone"
+            ))
+        ));
+    }
+
+    #[test]
+    fn anchored_reset_rejects_an_ambiguous_dst_local_time() {
+        let config = anchored_reset_config("America/New_York", "2024-11-03T01:30")
+            .expect("base anchored config is valid");
+
+        assert!(matches!(
+            config.validate(),
+            Err(super::ConfigError::InvalidValue(
+                "anchored reset time is ambiguous in the accounting timezone"
+            ))
+        ));
+    }
+
+    #[test]
+    fn anchored_reset_accepts_a_stable_dst_local_time() {
+        let config = anchored_reset_config("America/New_York", "2024-06-15T09:30")
+            .expect("a stable anchored reset is valid");
+
+        assert!(config.validate().is_ok());
+    }
+
+    fn anchored_reset_config(
+        timezone: &str,
+        reset_at: &str,
+    ) -> Result<DeploymentConfig, super::ConfigError> {
+        let mut config = DeploymentConfig::new_with_ports(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+            ProtocolPorts::default(),
+        )?;
+        config.accounting_policy = AccountingPolicy::AnchoredMonth;
+        config.accounting_timezone = timezone.to_owned();
+        config.anchored_reset_at = Some(reset_at.to_owned());
+        Ok(config)
+    }
+
+    #[test]
+    fn apply_options_with_unchanged_values_preserves_the_existing_configuration() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            Some("198.51.100.9".into()),
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("an existing deployment is valid");
+        let source = config.clone();
+
+        let rebuilt = DeploymentConfig::apply_options(
+            Some(&config),
+            &DeploymentOptions {
+                subscription_mode: source.subscription_mode,
+                subscription_host: source.subscription_host.clone(),
+                proxy_host: source.proxy_host.clone(),
+                certbot_email: source.certbot_email.clone(),
+                http_port: source.http_port,
+                subscription_listen_port: source.subscription_listen_port,
+                certificate_mode: source.certificate_mode.clone(),
+                interface: source.interface.clone(),
+                enabled_protocols: source.enabled_protocols.clone(),
+                reality_decoy_sni: source.reality_decoy_sni.clone(),
+                protocol_sni: source.protocol_sni.clone(),
+                monthly_traffic_limit: source.monthly_traffic_limit,
+                accounting_policy: source.accounting_policy,
+                accounting_timezone: source.accounting_timezone.clone(),
+                client_display_timezone: source.client_display_timezone.clone(),
+                anchored_reset_at: source.anchored_reset_at.clone(),
+                ports: ProtocolPorts {
+                    vless_reality: source.vless_reality.as_ref().map(|node| node.listen_port),
+                    ..ProtocolPorts::default()
+                },
+            },
+        )
+        .expect("rebuilding with unchanged values is valid");
+
+        assert_eq!(rebuilt, config);
+    }
+
+    #[test]
+    fn apply_options_preserves_proxy_credentials_when_changing_only_a_port() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("an existing deployment is valid");
+        let source = config.clone();
+        let current = config.vless_reality.clone().expect("VLESS node exists");
+        let new_port = free_port();
+        if new_port == current.listen_port {
+            return;
+        }
+
+        let rebuilt = DeploymentConfig::apply_options(
+            Some(&config),
+            &DeploymentOptions {
+                subscription_mode: source.subscription_mode,
+                subscription_host: source.subscription_host.clone(),
+                proxy_host: source.proxy_host.clone(),
+                certbot_email: source.certbot_email.clone(),
+                http_port: source.http_port,
+                subscription_listen_port: source.subscription_listen_port,
+                certificate_mode: source.certificate_mode.clone(),
+                interface: source.interface.clone(),
+                enabled_protocols: source.enabled_protocols.clone(),
+                reality_decoy_sni: source.reality_decoy_sni.clone(),
+                protocol_sni: source.protocol_sni.clone(),
+                monthly_traffic_limit: source.monthly_traffic_limit,
+                accounting_policy: source.accounting_policy,
+                accounting_timezone: source.accounting_timezone.clone(),
+                client_display_timezone: source.client_display_timezone.clone(),
+                anchored_reset_at: source.anchored_reset_at.clone(),
+                ports: ProtocolPorts {
+                    vless_reality: Some(new_port),
+                    ..ProtocolPorts::default()
+                },
+            },
+        )
+        .expect("a changed listener port is valid");
+
+        let updated = rebuilt.vless_reality.expect("VLESS node remains enabled");
+        assert_eq!(updated.listen_port, new_port);
+        assert_eq!(updated.uuid, current.uuid);
+        assert_eq!(updated.private_key, current.private_key);
+        assert_eq!(updated.public_key, current.public_key);
+        assert_eq!(updated.short_id, current.short_id);
+    }
+
+    #[test]
+    fn apply_options_for_a_new_deployment_generates_fresh_credentials() {
+        let rebuilt = DeploymentConfig::apply_options(
+            None,
+            &DeploymentOptions {
+                subscription_mode: SubscriptionMode::Direct,
+                subscription_host: "sub.example.test".into(),
+                proxy_host: None,
+                certbot_email: None,
+                http_port: None,
+                subscription_listen_port: None,
+                certificate_mode: CertificateMode::Domain,
+                interface: "ens3".into(),
+                enabled_protocols: vec![
+                    ManagedProtocol::VlessReality,
+                    ManagedProtocol::VmessWebsocket,
+                ],
+                reality_decoy_sni: Some("www.cloudflare.com".into()),
+                protocol_sni: None,
+                monthly_traffic_limit: 0,
+                accounting_policy: AccountingPolicy::NaturalMonth,
+                accounting_timezone: "America/Los_Angeles".into(),
+                client_display_timezone: "Asia/Shanghai".into(),
+                anchored_reset_at: None,
+                ports: ProtocolPorts::default(),
+            },
+        )
+        .expect("a fresh deployment from options is valid");
+
+        assert_eq!(rebuilt.subscription_credential.len(), 43);
+        assert!(rebuilt.vless_reality.is_some());
+        assert!(rebuilt.vmess_websocket.is_some());
+        assert!(rebuilt.hysteria2.is_none());
+    }
+
+    #[test]
+    fn apply_options_keeps_the_existing_subscription_credential() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("an existing deployment is valid");
+        let credential = config.subscription_credential.clone();
+        let source = config.clone();
+
+        let rebuilt = DeploymentConfig::apply_options(
+            Some(&config),
+            &DeploymentOptions {
+                subscription_mode: source.subscription_mode,
+                subscription_host: source.subscription_host.clone(),
+                proxy_host: source.proxy_host.clone(),
+                certbot_email: source.certbot_email.clone(),
+                http_port: source.http_port,
+                subscription_listen_port: source.subscription_listen_port,
+                certificate_mode: source.certificate_mode.clone(),
+                interface: source.interface.clone(),
+                enabled_protocols: source.enabled_protocols.clone(),
+                reality_decoy_sni: source.reality_decoy_sni.clone(),
+                protocol_sni: source.protocol_sni.clone(),
+                monthly_traffic_limit: source.monthly_traffic_limit,
+                accounting_policy: source.accounting_policy,
+                accounting_timezone: source.accounting_timezone.clone(),
+                client_display_timezone: source.client_display_timezone.clone(),
+                anchored_reset_at: source.anchored_reset_at.clone(),
+                ports: ProtocolPorts {
+                    vless_reality: source.vless_reality.as_ref().map(|node| node.listen_port),
+                    ..ProtocolPorts::default()
+                },
+            },
+        )
+        .expect("editing preserves the subscription credential");
+
+        assert_eq!(rebuilt.subscription_credential, credential);
+    }
+
+    #[test]
+    fn apply_options_rejects_mode_preconditions_before_returning_a_config() {
+        let result = DeploymentConfig::apply_options(
+            None,
+            &DeploymentOptions {
+                subscription_mode: SubscriptionMode::IpFallback,
+                subscription_host: "203.0.113.7".into(),
+                proxy_host: None,
+                certbot_email: None,
+                http_port: Some(2080),
+                subscription_listen_port: None,
+                certificate_mode: CertificateMode::Domain,
+                interface: "ens3".into(),
+                enabled_protocols: vec![
+                    ManagedProtocol::VlessReality,
+                    ManagedProtocol::VmessWebsocket,
+                ],
+                reality_decoy_sni: Some("www.cloudflare.com".into()),
+                protocol_sni: None,
+                monthly_traffic_limit: 0,
+                accounting_policy: AccountingPolicy::NaturalMonth,
+                accounting_timezone: "America/Los_Angeles".into(),
+                client_display_timezone: "Asia/Shanghai".into(),
+                anchored_reset_at: None,
+                ports: ProtocolPorts::default(),
+            },
+        );
+
+        assert!(matches!(
+            result,
+            Err(super::ConfigError::InvalidValue(
+                "VMess WebSocket, Hysteria2, TUIC, and AnyTLS in IP fallback mode require self-signed certificates"
+            ))
+        ));
+    }
+}

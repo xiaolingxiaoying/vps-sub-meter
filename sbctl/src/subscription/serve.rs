@@ -1,0 +1,2039 @@
+use std::collections::HashMap;
+use std::fs;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use bytes::Bytes;
+use http_body_util::Full;
+use hyper::body::Incoming;
+use hyper::service::service_fn;
+use hyper::{Method, Request, Response, StatusCode};
+use hyper_util::rt::TokioIo;
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
+use tokio_rustls::TlsAcceptor;
+
+use super::artifacts::{SubscriptionError, read_authorized, subscription_url};
+use super::profile::{
+    CLASH_LEGACY_VERSION, ClientVersion, SING_BOX_VERSION_PROFILES, SubscriptionFormat,
+    SubscriptionRoute,
+};
+use super::render::ensure_subscription_nodes;
+use crate::config::{DeploymentConfig, DeploymentStore, SubscriptionMode};
+
+pub async fn serve(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    bind: &str,
+    max_requests: Option<usize>,
+) -> Result<(), SubscriptionError> {
+    ensure_subscription_nodes(config)?;
+    let store = Arc::new(store.clone());
+    let config = Arc::new(config.clone());
+    if config.subscription_mode == SubscriptionMode::Direct {
+        return serve_direct_socket_activated(&store, &config, max_requests).await;
+    }
+    if config.subscription_mode == SubscriptionMode::ExternalProxy
+        && !bind
+            .parse::<SocketAddr>()
+            .ok()
+            .is_some_and(|address| address.ip().is_loopback())
+    {
+        return Err(SubscriptionError::ExternalProxyBind);
+    }
+    let listener = TcpListener::bind(bind).await.map_err(listener_io)?;
+    serve_http_listener(listener, &store, &config, &fresh_budget(), max_requests).await
+}
+
+/// Direct subscription mode never binds 80/443 itself. systemd owns those
+/// listeners through `sbctl-http.socket` and hands them to this process via
+/// `LISTEN_FDS`; the two sockets are routed by their local port so TCP 80
+/// serves the ACME challenge and TCP 443 serves the TLS subscription.
+async fn serve_direct_socket_activated(
+    store: &Arc<DeploymentStore>,
+    config: &Arc<DeploymentConfig>,
+    max_requests: Option<usize>,
+) -> Result<(), SubscriptionError> {
+    let listeners = crate::socket_activation::receive_listeners()
+        .map_err(|error| SubscriptionError::SocketActivation(error.to_string()))?;
+    let mut acme = None;
+    let mut tls = None;
+    for (port, listener) in listeners {
+        match crate::socket_activation::direct_listener_role(port) {
+            Some(crate::socket_activation::DirectListenerRole::Acme) => acme = Some(listener),
+            Some(crate::socket_activation::DirectListenerRole::Tls) => tls = Some(listener),
+            None => return Err(SubscriptionError::UnexpectedDirectListener(port)),
+        }
+    }
+    let acme = tokio_listener(acme.ok_or(SubscriptionError::MissingDirectListener(80))?)?;
+    let tls = tokio_listener(tls.ok_or(SubscriptionError::MissingDirectListener(443))?)?;
+    // Only the subscription listener gets a budget: the ACME path answers
+    // Let's Encrypt validators, and throttling it would fail a challenge and
+    // take the certificate — and with it HTTPS — offline.
+    tokio::try_join!(
+        serve_acme_listener(acme, Arc::clone(store), max_requests),
+        serve_tls_listener(
+            tls,
+            Arc::clone(store),
+            Arc::clone(config),
+            fresh_budget(),
+            max_requests
+        )
+    )?;
+    Ok(())
+}
+
+fn tokio_listener(listener: std::net::TcpListener) -> Result<TcpListener, SubscriptionError> {
+    listener
+        .set_nonblocking(true)
+        .map_err(|error| SubscriptionError::ListenerIo(error.to_string()))?;
+    TcpListener::from_std(listener)
+        .map_err(|error| SubscriptionError::ListenerIo(error.to_string()))
+}
+
+/// The shared Hyper HTTP/1 builder: a bounded header size, a slow-read
+/// timeout, and a Tokio timer so the timeout applies.
+fn http1_builder() -> hyper::server::conn::http1::Builder {
+    let mut builder = hyper::server::conn::http1::Builder::new();
+    builder.max_buf_size(MAX_REQUEST_HEADER_BYTES);
+    builder.timer(hyper_util::rt::TokioTimer::new());
+    builder.header_read_timeout(MAX_HEADER_READ_TIME);
+    builder
+}
+
+/// Bounds applied to every HTTP connection so an oversized request header, a
+/// slow reader, an idle client, or connection flooding cannot exhaust the
+/// process. Responses set `Connection: close`, so each request is its own
+/// connection and hyper never keeps an idle connection alive.
+const MAX_REQUEST_HEADER_BYTES: usize = 16 * 1024;
+const MAX_HEADER_READ_TIME: Duration = Duration::from_secs(5);
+const MAX_CONNECTION_TIME: Duration = Duration::from_secs(30);
+const MAX_TLS_HANDSHAKE_TIME: Duration = Duration::from_secs(10);
+const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
+const CERTIFICATE_RELOAD_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
+const TLS_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
+const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Requests a single source address may spend before it starts waiting, and how
+/// fast the allowance returns afterwards.
+///
+/// A client that imports the URL refreshes a handful of times a day, so sixty
+/// instant requests is already two orders of magnitude above honest use, while a
+/// prober enumerating credentials is capped at one guess per second per address.
+const REQUEST_BURST: u32 = 60;
+const REQUEST_REFILL: Duration = Duration::from_secs(1);
+/// Distinct addresses whose debt is remembered. Overflow clears the table: a
+/// peer able to complete that many real TCP handshakes and HTTP requests is
+/// beyond what a per-address budget defends against anyway, and the connection
+/// semaphore and header caps are the answer to that.
+const MAX_TRACKED_PEERS: usize = 4096;
+
+/// Per-source-address token bucket, shared by the subscription listeners.
+///
+/// The clock arrives as a parameter so a test can hand it any instant it likes;
+/// the production path passes `Instant::now`.
+pub(crate) struct IpBudget {
+    buckets: HashMap<IpAddr, Bucket>,
+}
+
+struct Bucket {
+    tokens: u32,
+    /// The instant this balance was last topped up.
+    at: std::time::Instant,
+}
+
+impl IpBudget {
+    fn new() -> Self {
+        Self {
+            buckets: HashMap::new(),
+        }
+    }
+
+    /// Spends one token on behalf of `peer`, or reports how long to wait for the
+    /// next one. A peer whose address cannot be read is not throttled at all:
+    /// failing closed would take the subscription offline for everyone the first
+    /// time the platform hid a peer address.
+    fn try_acquire(&mut self, peer: IpAddr, now: std::time::Instant) -> Result<(), Duration> {
+        let Some(bucket) = self.buckets.get_mut(&peer) else {
+            self.admit(now);
+            self.buckets.insert(
+                peer,
+                Bucket {
+                    tokens: REQUEST_BURST - 1,
+                    at: now,
+                },
+            );
+            return Ok(());
+        };
+
+        let elapsed = now.saturating_duration_since(bucket.at);
+        let refilled = (elapsed.as_nanos() / REQUEST_REFILL.as_nanos()) as u32;
+        if refilled > 0 {
+            bucket.tokens = bucket.tokens.saturating_add(refilled).min(REQUEST_BURST);
+            bucket.at = bucket
+                .at
+                .checked_add(REQUEST_REFILL.saturating_mul(refilled))
+                .unwrap_or(now);
+        }
+        if bucket.tokens == 0 {
+            let waited = now.saturating_duration_since(bucket.at);
+            // Always at least one second: a client told `Retry-After: 0` learns
+            // nothing and simply hammers again.
+            let remaining = REQUEST_REFILL
+                .saturating_sub(waited)
+                .max(Duration::from_secs(1));
+            return Err(remaining);
+        }
+        bucket.tokens -= 1;
+        Ok(())
+    }
+
+    fn admit(&mut self, now: std::time::Instant) {
+        self.buckets.retain(|_, bucket| {
+            let elapsed = now.saturating_duration_since(bucket.at);
+            let refilled = (elapsed.as_nanos() / REQUEST_REFILL.as_nanos()) as u32;
+            bucket.tokens.saturating_add(refilled) < REQUEST_BURST
+        });
+        if self.buckets.len() > MAX_TRACKED_PEERS {
+            self.buckets.clear();
+        }
+    }
+
+    #[cfg(test)]
+    fn tracked(&self) -> usize {
+        self.buckets.len()
+    }
+}
+
+type SharedBudget = Arc<Mutex<IpBudget>>;
+
+fn fresh_budget() -> SharedBudget {
+    Arc::new(Mutex::new(IpBudget::new()))
+}
+
+/// Spends a token for this request, returning how long the caller must wait when
+/// the address is out of budget.
+fn throttled(peer: Option<IpAddr>, budget: &SharedBudget) -> Option<Duration> {
+    let peer = peer?;
+    let mut budget = budget
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    budget.try_acquire(peer, std::time::Instant::now()).err()
+}
+
+fn throttled_http_response(retry_after: &Duration) -> Response<Full<Bytes>> {
+    // Second granularity, rounded up: a Retry-After the client cannot parse is
+    // worse than one that is slightly too generous.
+    let seconds = retry_after.as_secs().saturating_add(1).to_string();
+    Response::builder()
+        .status(StatusCode::TOO_MANY_REQUESTS)
+        .header("Retry-After", seconds)
+        .header("Content-Type", "text/plain; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::from_static(b"")))
+        .expect("valid throttled response")
+}
+
+/// Accepts the next connection, or returns `None` after a short poll when a
+/// test-configured `max_requests` limit may have been reached by a task that
+/// is already serving. Production operation (`max_requests == None`) blocks on
+/// the accept until a connection arrives.
+async fn accept_next(
+    listener: &TcpListener,
+    max_requests: Option<usize>,
+) -> Result<Option<tokio::net::TcpStream>, SubscriptionError> {
+    if max_requests.is_none() {
+        let (stream, _) = listener.accept().await.map_err(listener_io)?;
+        return Ok(Some(stream));
+    }
+    match tokio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
+        Ok(Ok((stream, _))) => Ok(Some(stream)),
+        Ok(Err(error)) => Err(listener_io(error)),
+        Err(_) => Ok(None),
+    }
+}
+
+fn listener_io(error: std::io::Error) -> SubscriptionError {
+    SubscriptionError::ListenerIo(error.to_string())
+}
+
+/// Accepts connections from one listener, bounding concurrency with a
+/// semaphore and each connection's lifetime with a timeout. Serves at most
+/// `max_requests` connections when a test supplies that limit.
+async fn serve_http_listener(
+    listener: TcpListener,
+    store: &Arc<DeploymentStore>,
+    config: &Arc<DeploymentConfig>,
+    budget: &SharedBudget,
+    max_requests: Option<usize>,
+) -> Result<(), SubscriptionError> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let counter = Arc::new(AtomicUsize::new(0));
+    loop {
+        if max_requests.is_some_and(|max| counter.load(Ordering::Acquire) >= max) {
+            break;
+        }
+        let Some(stream) = accept_next(&listener, max_requests).await? else {
+            continue;
+        };
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let peer = stream.peer_addr().ok().map(|address| address.ip());
+        let store = Arc::clone(store);
+        let config = Arc::clone(config);
+        let budget = Arc::clone(budget);
+        let counter = Arc::clone(&counter);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = tokio::time::timeout(
+                MAX_CONNECTION_TIME,
+                serve_http_connection(TokioIo::new(stream), store, config, peer, budget),
+            )
+            .await;
+            counter.fetch_add(1, Ordering::Release);
+        });
+    }
+    Ok(())
+}
+
+/// Serves ACME HTTP-01 challenge responses from the listener on TCP 80 with
+/// the same bounded connection handling as the subscription listener.
+async fn serve_acme_listener(
+    listener: TcpListener,
+    store: Arc<DeploymentStore>,
+    max_requests: Option<usize>,
+) -> Result<(), SubscriptionError> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let counter = Arc::new(AtomicUsize::new(0));
+    loop {
+        if max_requests.is_some_and(|max| counter.load(Ordering::Acquire) >= max) {
+            break;
+        }
+        let Some(stream) = accept_next(&listener, max_requests).await? else {
+            continue;
+        };
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            drop(stream);
+            continue;
+        };
+        let store = Arc::clone(&store);
+        let counter = Arc::clone(&counter);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let _ = tokio::time::timeout(
+                MAX_CONNECTION_TIME,
+                serve_acme_connection(TokioIo::new(stream), store),
+            )
+            .await;
+            counter.fetch_add(1, Ordering::Release);
+        });
+    }
+    Ok(())
+}
+
+/// Serves the TLS subscription listener on TCP 443. A background checker polls
+/// pinned certificate metadata once a second and reloads changed material away
+/// from the accept path, so renewal takes effect without blocking new sockets.
+async fn serve_tls_listener(
+    listener: TcpListener,
+    store: Arc<DeploymentStore>,
+    config: Arc<DeploymentConfig>,
+    budget: SharedBudget,
+    max_requests: Option<usize>,
+) -> Result<(), SubscriptionError> {
+    serve_tls_listener_with_timeouts(
+        listener,
+        store,
+        config,
+        budget,
+        max_requests,
+        MAX_TLS_HANDSHAKE_TIME,
+        MAX_CONNECTION_TIME,
+    )
+    .await
+}
+
+async fn serve_tls_listener_with_timeouts(
+    listener: TcpListener,
+    store: Arc<DeploymentStore>,
+    config: Arc<DeploymentConfig>,
+    budget: SharedBudget,
+    max_requests: Option<usize>,
+    handshake_timeout: Duration,
+    connection_timeout: Duration,
+) -> Result<(), SubscriptionError> {
+    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let counter = Arc::new(AtomicUsize::new(0));
+    let metrics = Arc::new(TlsConnectionMetrics::default());
+    let (tls_sender, tls_receiver) = tokio::sync::watch::channel(None);
+    let (initial_check_sender, initial_check_receiver) = tokio::sync::oneshot::channel();
+    let reload_task = tokio::spawn(reload_tls_material(
+        Arc::clone(&store),
+        Arc::clone(&config),
+        tls_sender,
+        initial_check_sender,
+    ));
+    let _reload_task = AbortOnDrop(reload_task);
+    // Do the first filesystem read and certificate parse off the runtime
+    // thread, then begin accepting. A missing/invalid initial certificate still
+    // leaves the socket open; the reload task will notice a later pin.
+    let _ = initial_check_receiver.await;
+    let _metrics_task = AbortOnDrop(tokio::spawn(log_tls_metrics(Arc::clone(&metrics))));
+    let mut connections = tokio::task::JoinSet::new();
+    loop {
+        if max_requests.is_some_and(|max| counter.load(Ordering::Acquire) >= max) {
+            break;
+        }
+        let accepted = tokio::select! {
+            accepted = accept_next(&listener, max_requests) => accepted?,
+            _ = connections.join_next(), if !connections.is_empty() => continue,
+        };
+        let Some(stream) = accepted else {
+            continue;
+        };
+        let accepted_at = tokio::time::Instant::now();
+        metrics.accepted.fetch_add(1, Ordering::Relaxed);
+        let tls =
+            tls_material_for_accept(tls_receiver.borrow().clone(), std::time::SystemTime::now());
+        let Some(tls) = tls else {
+            metrics
+                .certificate_unavailable
+                .fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        };
+        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+            metrics.capacity_rejected.fetch_add(1, Ordering::Relaxed);
+            drop(stream);
+            continue;
+        };
+        let store = Arc::clone(&store);
+        let config = Arc::clone(&config);
+        let budget = Arc::clone(&budget);
+        let counter = Arc::clone(&counter);
+        let metrics = Arc::clone(&metrics);
+        connections.spawn(async move {
+            let _permit = permit;
+            // The peer has to be read before the handshake, because the
+            // accepted TLS stream no longer exposes the TCP socket it came from.
+            let peer = stream.peer_addr().ok().map(|address| address.ip());
+            let outcome = serve_tls_connection(
+                stream,
+                tls,
+                TlsConnectionContext {
+                    store,
+                    config,
+                    peer,
+                    budget,
+                    accepted_at,
+                    handshake_timeout,
+                    connection_timeout,
+                    metrics: Arc::clone(&metrics),
+                },
+            )
+            .await;
+            metrics.record(outcome);
+            counter.fetch_add(1, Ordering::Release);
+        });
+    }
+    Ok(())
+}
+
+struct AbortOnDrop<T>(tokio::task::JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+#[derive(Clone)]
+struct TlsMaterial {
+    server_config: Arc<rustls::ServerConfig>,
+    not_after: i64,
+}
+
+impl TlsMaterial {
+    fn is_current(&self) -> bool {
+        self.is_current_at(std::time::SystemTime::now())
+    }
+
+    fn is_current_at(&self, now: std::time::SystemTime) -> bool {
+        now.duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+            .is_some_and(|timestamp| timestamp < self.not_after)
+    }
+}
+
+fn tls_material_for_accept(
+    material: Option<TlsMaterial>,
+    now: std::time::SystemTime,
+) -> Option<TlsMaterial> {
+    material.filter(|material| material.is_current_at(now))
+}
+
+#[derive(Default)]
+struct TlsConnectionMetrics {
+    accepted: AtomicUsize,
+    handshake_succeeded: AtomicUsize,
+    handshake_timed_out: AtomicUsize,
+    handshake_failed: AtomicUsize,
+    connection_succeeded: AtomicUsize,
+    connection_timed_out: AtomicUsize,
+    connection_failed: AtomicUsize,
+    capacity_rejected: AtomicUsize,
+    certificate_unavailable: AtomicUsize,
+}
+
+#[derive(Clone, Copy)]
+enum TlsConnectionOutcome {
+    ConnectionSucceeded,
+    HandshakeTimedOut,
+    HandshakeFailed,
+    ConnectionTimedOut,
+    ConnectionFailed,
+}
+
+impl TlsConnectionMetrics {
+    fn record(&self, outcome: TlsConnectionOutcome) {
+        let counter = match outcome {
+            TlsConnectionOutcome::ConnectionSucceeded => &self.connection_succeeded,
+            TlsConnectionOutcome::HandshakeTimedOut => &self.handshake_timed_out,
+            TlsConnectionOutcome::HandshakeFailed => &self.handshake_failed,
+            TlsConnectionOutcome::ConnectionTimedOut => &self.connection_timed_out,
+            TlsConnectionOutcome::ConnectionFailed => &self.connection_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+async fn serve_tls_connection(
+    stream: tokio::net::TcpStream,
+    tls: TlsMaterial,
+    context: TlsConnectionContext,
+) -> TlsConnectionOutcome {
+    let TlsConnectionContext {
+        store,
+        config,
+        peer,
+        budget,
+        accepted_at,
+        handshake_timeout,
+        connection_timeout,
+        metrics,
+    } = context;
+    let total_deadline = accepted_at + connection_timeout;
+    let handshake_deadline = (accepted_at + handshake_timeout).min(total_deadline);
+    let acceptor = TlsAcceptor::from(tls.server_config);
+    let stream = match tokio::time::timeout_at(handshake_deadline, acceptor.accept(stream)).await {
+        Err(_) => return TlsConnectionOutcome::HandshakeTimedOut,
+        Ok(Err(_)) => return TlsConnectionOutcome::HandshakeFailed,
+        Ok(Ok(stream)) => stream,
+    };
+    metrics.handshake_succeeded.fetch_add(1, Ordering::Relaxed);
+    let connection =
+        serve_http_connection(TokioIo::new(Box::pin(stream)), store, config, peer, budget);
+    match tokio::time::timeout_at(total_deadline, connection).await {
+        Err(_) => TlsConnectionOutcome::ConnectionTimedOut,
+        Ok(Err(_)) => TlsConnectionOutcome::ConnectionFailed,
+        Ok(Ok(())) => TlsConnectionOutcome::ConnectionSucceeded,
+    }
+}
+
+struct TlsConnectionContext {
+    store: Arc<DeploymentStore>,
+    config: Arc<DeploymentConfig>,
+    peer: Option<IpAddr>,
+    budget: SharedBudget,
+    accepted_at: tokio::time::Instant,
+    handshake_timeout: Duration,
+    connection_timeout: Duration,
+    metrics: Arc<TlsConnectionMetrics>,
+}
+
+async fn log_tls_metrics(metrics: Arc<TlsConnectionMetrics>) {
+    let mut interval = tokio::time::interval(TLS_METRICS_LOG_INTERVAL);
+    interval.tick().await;
+    loop {
+        interval.tick().await;
+        let accepted = metrics.accepted.swap(0, Ordering::Relaxed);
+        let succeeded = metrics.handshake_succeeded.swap(0, Ordering::Relaxed);
+        let connection_succeeded = metrics.connection_succeeded.swap(0, Ordering::Relaxed);
+        let handshake_timed_out = metrics.handshake_timed_out.swap(0, Ordering::Relaxed);
+        let handshake_failed = metrics.handshake_failed.swap(0, Ordering::Relaxed);
+        let connection_timed_out = metrics.connection_timed_out.swap(0, Ordering::Relaxed);
+        let connection_failed = metrics.connection_failed.swap(0, Ordering::Relaxed);
+        let capacity_rejected = metrics.capacity_rejected.swap(0, Ordering::Relaxed);
+        let certificate_unavailable = metrics.certificate_unavailable.swap(0, Ordering::Relaxed);
+        if accepted
+            + succeeded
+            + handshake_timed_out
+            + handshake_failed
+            + connection_succeeded
+            + connection_timed_out
+            + connection_failed
+            + capacity_rejected
+            + certificate_unavailable
+            > 0
+        {
+            eprintln!(
+                "Direct HTTPS last 60s: accepted={accepted}, handshake_ok={succeeded}, handshake_timeout={handshake_timed_out}, handshake_error={handshake_failed}, connection_ok={connection_succeeded}, connection_timeout={connection_timed_out}, connection_error={connection_failed}, capacity_rejected={capacity_rejected}, certificate_unavailable={certificate_unavailable}"
+            );
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct CertificateReloadBackoff {
+    failed: Option<(CertificateStamp, std::time::Instant)>,
+}
+
+type CertificateStamp = (Option<std::time::SystemTime>, Option<std::time::SystemTime>);
+
+impl CertificateReloadBackoff {
+    fn should_retry(&self, stamp: CertificateStamp, now: std::time::Instant) -> bool {
+        self.failed.is_none_or(|(failed_stamp, at)| {
+            failed_stamp != stamp
+                || now.saturating_duration_since(at) >= CERTIFICATE_RELOAD_FAILURE_BACKOFF
+        })
+    }
+
+    fn record_failure(&mut self, stamp: CertificateStamp, now: std::time::Instant) {
+        self.failed = Some((stamp, now));
+    }
+
+    fn clear(&mut self) {
+        self.failed = None;
+    }
+}
+
+enum CertificateCheck {
+    Unchanged,
+    Backoff,
+    ChangedDuringRead,
+    Loaded(CertificateStamp, TlsMaterial),
+    Failed(CertificateStamp, String),
+}
+
+async fn reload_tls_material(
+    store: Arc<DeploymentStore>,
+    config: Arc<DeploymentConfig>,
+    sender: tokio::sync::watch::Sender<Option<TlsMaterial>>,
+    initial_check_sender: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut active: Option<TlsMaterial> = None;
+    let mut active_stamp: Option<CertificateStamp> = None;
+    let mut backoff = CertificateReloadBackoff::default();
+    let mut initial_check_sender = Some(initial_check_sender);
+    let mut interval = tokio::time::interval(CERTIFICATE_CHECK_INTERVAL);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let store_for_check = Arc::clone(&store);
+        let config_for_check = Arc::clone(&config);
+        let previous_stamp = active_stamp;
+        let reload_backoff = backoff;
+        let check = tokio::task::spawn_blocking(move || {
+            let before =
+                crate::certificate::pinned_material_stamp(&store_for_check, &config_for_check);
+            if previous_stamp == Some(before) {
+                return CertificateCheck::Unchanged;
+            }
+            if !reload_backoff.should_retry(before, std::time::Instant::now()) {
+                return CertificateCheck::Backoff;
+            }
+            let loaded = load_tls_config(&store_for_check, &config_for_check);
+            let after =
+                crate::certificate::pinned_material_stamp(&store_for_check, &config_for_check);
+            if before != after {
+                return CertificateCheck::ChangedDuringRead;
+            }
+            match loaded {
+                Ok(material) => CertificateCheck::Loaded(before, material),
+                Err(error) => CertificateCheck::Failed(before, error.to_string()),
+            }
+        })
+        .await;
+
+        match check {
+            Ok(CertificateCheck::Loaded(stamp, material)) => {
+                active_stamp = Some(stamp);
+                active = Some(material);
+                backoff.clear();
+                sender.send_replace(active.clone());
+                eprintln!("Direct HTTPS certificate loaded or reloaded successfully");
+            }
+            Ok(CertificateCheck::Failed(stamp, error)) => {
+                backoff.record_failure(stamp, std::time::Instant::now());
+                let message = redact_secret(&error, &config.subscription_credential);
+                let expired = active
+                    .as_ref()
+                    .is_some_and(|material| !material.is_current());
+                if expired {
+                    active = None;
+                    active_stamp = None;
+                    sender.send_replace(None);
+                }
+                eprintln!(
+                    "Direct HTTPS certificate reload failed{}: {}",
+                    if active.is_some() {
+                        "; retaining the unexpired last valid certificate"
+                    } else {
+                        ""
+                    },
+                    message
+                );
+            }
+            Ok(
+                CertificateCheck::Unchanged
+                | CertificateCheck::Backoff
+                | CertificateCheck::ChangedDuringRead,
+            ) => {}
+            Err(error) => {
+                eprintln!("Direct HTTPS certificate checker failed: {error}");
+            }
+        }
+        if active
+            .as_ref()
+            .is_some_and(|material| !material.is_current())
+        {
+            active = None;
+            active_stamp = None;
+            sender.send_replace(None);
+            eprintln!("Direct HTTPS certificate expired; new TLS handshakes are disabled");
+        }
+        if let Some(initial) = initial_check_sender.take() {
+            let _ = initial.send(());
+        }
+    }
+}
+
+async fn serve_http_connection<S>(
+    io: TokioIo<S>,
+    store: Arc<DeploymentStore>,
+    config: Arc<DeploymentConfig>,
+    peer: Option<IpAddr>,
+    budget: SharedBudget,
+) -> Result<(), SubscriptionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request: Request<Incoming>| {
+        let response = subscription_http_response(request, &store, &config, peer, &budget);
+        async { Ok::<_, std::convert::Infallible>(response) }
+    });
+    http1_builder()
+        .serve_connection(io, service)
+        .await
+        .map_err(|error| SubscriptionError::Http(error.to_string()))
+}
+
+async fn serve_acme_connection<S>(
+    io: TokioIo<S>,
+    store: Arc<DeploymentStore>,
+) -> Result<(), SubscriptionError>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let service = service_fn(move |request: Request<Incoming>| {
+        let response = acme_http_response(request, &store);
+        async { Ok::<_, std::convert::Infallible>(response) }
+    });
+    http1_builder()
+        .serve_connection(io, service)
+        .await
+        .map_err(|error| SubscriptionError::Http(error.to_string()))
+}
+
+fn acme_http_response(
+    request: Request<Incoming>,
+    store: &DeploymentStore,
+) -> Response<Full<Bytes>> {
+    let body = request
+        .uri()
+        .path()
+        .strip_prefix("/.well-known/acme-challenge/")
+        .filter(|token| !token.is_empty() && !token.contains('/') && !token.contains('?'))
+        .and_then(|token| {
+            fs::read_to_string(
+                store
+                    .acme_webroot()
+                    .join(".well-known/acme-challenge")
+                    .join(token),
+            )
+            .ok()
+        });
+    match body {
+        Some(body) => Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "text/plain; charset=utf-8")
+            .header("Cache-Control", "no-store")
+            .header("Connection", "close")
+            .body(Full::new(Bytes::from(body)))
+            .expect("valid ACME response"),
+        None => not_found_http_response(),
+    }
+}
+
+fn subscription_http_response(
+    request: Request<Incoming>,
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    peer: Option<IpAddr>,
+    budget: &SharedBudget,
+) -> Response<Full<Bytes>> {
+    // Charged before the method and path are even considered, so a throttled
+    // address sees the same answer whatever it asks for: the throttle never
+    // reveals whether the credential in that URL is real, which is exactly what
+    // the uniform 404 exists to hide.
+    //
+    // Skipped in external-proxy mode on purpose. There, the peer address is
+    // always the local reverse proxy, so one shared bucket would let the whole
+    // user base collectively throttle each other - and the real per-client
+    // address is in a header this server deliberately does not trust, because a
+    // spoofed X-Forwarded-For turns the throttle into an oracle for hiding
+    // abuse or framing an address. Per-client limits belong in the front proxy.
+    if config.subscription_mode != SubscriptionMode::ExternalProxy
+        && let Some(retry_after) = throttled(peer, budget)
+    {
+        return throttled_http_response(&retry_after);
+    }
+    if request.method() != Method::GET {
+        // A probe with HEAD or POST is a client asking about the route, not an
+        // attacker: answering 404 tells it the subscription disappeared, while
+        // 405 tells it to retry with GET.
+        return method_not_allowed_http_response();
+    }
+    if request.uri().query().is_some() {
+        return not_found_http_response();
+    }
+    let Some((credential, route)) = parse_route(request.uri().path()) else {
+        return not_found_http_response();
+    };
+    if !super::credential_matches(config, credential, chrono::Utc::now().timestamp()) {
+        return not_found_http_response();
+    }
+    match route {
+        SubscriptionRoute::Qr(format) => qr_http_response(config, credential, format),
+        SubscriptionRoute::Index => index_http_response(store, config, credential),
+        SubscriptionRoute::Format(format) => {
+            let body = match read_authorized(store, config, credential, format) {
+                Ok(body) => body,
+                Err(error) => return unavailable_http_response(credential, &error.to_string()),
+            };
+            // The subscription-userinfo header is an addition to the artifact,
+            // not a precondition: a broken or mid-repair accounting state must
+            // not take the subscription itself offline. The failure is logged
+            // redacted and the artifact is served without traffic metadata.
+            let userinfo = match crate::traffic::report(store, config) {
+                Ok(traffic) => Some(subscription_userinfo(&traffic)),
+                Err(error) => {
+                    eprintln!(
+                        "subscription traffic metadata unavailable: {}",
+                        redact_secret(&error.to_string(), credential)
+                    );
+                    None
+                }
+            };
+            let mut builder = Response::builder()
+                .status(StatusCode::OK)
+                .header("Content-Type", format.content_type())
+                .header("Cache-Control", "no-store")
+                .header("X-Content-Type-Options", "nosniff")
+                .header("Connection", "close");
+            if let Some(value) = &userinfo {
+                builder = builder.header("subscription-userinfo", value);
+            }
+            builder
+                .body(Full::new(Bytes::from(body)))
+                .expect("valid subscription response")
+        }
+    }
+}
+
+/// How often a client app should re-download the subscription, in hours, as
+/// advertised by `profile-update-interval`.
+///
+/// This is a policy statement toward client apps, not a description of the
+/// server: the deployment regenerates artifacts when its configuration or
+/// nodes change, and a client that ignores the hint costs nothing. Twenty-four
+/// hours matches the cadence the generated profiles already use for their own
+/// remote resources, and going lower would make every client app poll the
+/// credential'd URL on a schedule the operator never asked for.
+const PROFILE_UPDATE_INTERVAL_HOURS: u32 = 24;
+
+/// The `subscription-userinfo` header value.
+///
+/// `upload` and `download` are the bytes used in the current period. `total`
+/// is only present when an actual monthly allowance is configured; omitting it
+/// avoids presenting current usage as a quota in client subscription cards.
+///
+/// The key order is the wire contract: client apps parse the four traffic keys
+/// by position-insensitive name but display them in this order, so a new key
+/// goes last and never between the existing ones.
+fn subscription_userinfo(traffic: &crate::traffic::TrafficReport) -> String {
+    let usage = format!(
+        "upload={}; download={}",
+        // The two counters are the VPS network interface's own rx/tx
+        // (`traffic.rs` reads `statistics/rx_bytes` and `tx_bytes`), while this
+        // header is read from the CLIENT's side: every consumer app labels
+        // `upload=` as "what I sent". Bytes arriving at the VPS are what the
+        // client sent, so `received` is the upload and `transmitted` is the
+        // download. Reporting them the other way round made a download-heavy
+        // day look like a massive upload in v2rayN, Clash Verge and
+        // Shadowrocket alike.
+        traffic.received,
+        traffic.transmitted,
+    );
+    if traffic.monthly_traffic_limit > 0 {
+        format!(
+            "{usage}; total={}; expire={}; profile-update-interval={}",
+            traffic.monthly_traffic_limit,
+            traffic.next_reset.timestamp(),
+            PROFILE_UPDATE_INTERVAL_HOURS
+        )
+    } else {
+        format!(
+            "{usage}; expire={}; profile-update-interval={}",
+            traffic.next_reset.timestamp(),
+            PROFILE_UPDATE_INTERVAL_HOURS
+        )
+    }
+}
+
+/// A scannable SVG QR code of the given format's subscription URL. The QR
+/// content is derived from the configuration only, so no artifact file is
+/// needed and the code always encodes the current URL.
+fn qr_http_response(
+    config: &DeploymentConfig,
+    credential: &str,
+    format: SubscriptionFormat,
+) -> Response<Full<Bytes>> {
+    let body = match subscription_url(config, format)
+        .map_err(|error| error.to_string())
+        .and_then(|url| crate::qr::render_svg(&url))
+    {
+        Ok(body) => body,
+        Err(error) => return unavailable_http_response(credential, &error),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "image/svg+xml")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::from(body)))
+        .expect("valid QR response")
+}
+
+/// The Chinese overview page: every subscription link with its label, the
+/// matching QR code, and per-client import instructions. Self-contained HTML
+/// with no external resources, so it renders offline and leaks nothing extra.
+fn index_http_response(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    credential: &str,
+) -> Response<Full<Bytes>> {
+    let body = match crate::index_page::render(store, config) {
+        Ok(body) => body,
+        Err(error) => return unavailable_http_response(credential, &error.to_string()),
+    };
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("Content-Type", "text/html; charset=utf-8")
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::from(body)))
+        .expect("valid index response")
+}
+
+/// Loads and validates the pinned certificate for Direct HTTPS. Every loading
+/// check — validity period, SAN coverage, private-key match — runs before the
+/// TLS acceptor is built, and the acceptor refuses connections whose SNI does
+/// not equal the subscription host. The daemon reloads before every handshake,
+/// so a Certbot renewal pinned by the deploy hook takes effect on the next
+/// connection without a service restart.
+fn load_tls_config(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Result<TlsMaterial, SubscriptionError> {
+    let validated = crate::certificate::load_pinned(store, config)
+        .map_err(|error| SubscriptionError::Tls(error.to_string()))?;
+    let not_after = validated.not_after;
+    let server_config = validated
+        .server_config()
+        .map_err(|error| SubscriptionError::Tls(error.to_string()))?;
+    Ok(TlsMaterial {
+        server_config,
+        not_after,
+    })
+}
+
+/// Replaces every occurrence of a Subscription credential in a diagnostic so
+/// logs and errors never expose the full secret. ADR-0013.
+pub fn redact_secret(text: &str, secret: &str) -> String {
+    if secret.is_empty() {
+        return text.to_owned();
+    }
+    text.replace(secret, "[redacted]")
+}
+
+/// A redacted 503 for state or artifact failures after a valid Subscription
+/// credential authenticated. The body carries no authorization or deployment
+/// details; the diagnostic log omits the credential.
+fn unavailable_http_response(credential: &str, message: &str) -> Response<Full<Bytes>> {
+    eprintln!(
+        "subscription request failed: {}",
+        redact_secret(message, credential)
+    );
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::new()))
+        .expect("valid unavailable response")
+}
+
+fn not_found_http_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::NOT_FOUND)
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::new()))
+        .expect("valid not-found response")
+}
+
+fn method_not_allowed_http_response() -> Response<Full<Bytes>> {
+    Response::builder()
+        .status(StatusCode::METHOD_NOT_ALLOWED)
+        .header("Allow", "GET")
+        .header("Cache-Control", "no-store")
+        .header("Connection", "close")
+        .body(Full::new(Bytes::new()))
+        .expect("valid method-not-allowed response")
+}
+
+fn parse_route(target: &str) -> Option<(&str, SubscriptionRoute)> {
+    if target.contains('?') {
+        return None;
+    }
+    let mut parts = target.strip_prefix("/sub/")?.split('/');
+    let credential = parts.next()?;
+    let route = match parts.next()? {
+        "index" => SubscriptionRoute::Index,
+        // The trailing check below rejects anything after the format segment.
+        "qr" => SubscriptionRoute::Qr(parse_format_path(parts.next()?)?),
+        segment => SubscriptionRoute::Format(parse_format_path(segment)?),
+    };
+    parts.next().is_none().then_some((credential, route))
+}
+
+/// Parses one subscription format path segment. Versioned segments are only
+/// accepted when the version exists in the profile registry, so unknown
+/// versions 404 instead of surfacing as a missing artifact.
+fn parse_format_path(segment: &str) -> Option<SubscriptionFormat> {
+    match segment {
+        "sing-box.json" => return Some(SubscriptionFormat::SingBox),
+        "sing-box-full.json" => return Some(SubscriptionFormat::SingBoxFull),
+        "clash.yaml" => return Some(SubscriptionFormat::Clash),
+        "uri" => return Some(SubscriptionFormat::Uri),
+        "uri.txt" => return Some(SubscriptionFormat::Base64Uri),
+        "shadowrocket.txt" => return Some(SubscriptionFormat::Shadowrocket),
+        _ => {}
+    }
+    if let Some(version) = segment
+        .strip_prefix("sing-box-")
+        .and_then(|rest| rest.strip_suffix(".json"))
+    {
+        let version = parse_client_version(version)?;
+        return SING_BOX_VERSION_PROFILES
+            .iter()
+            .any(|profile| profile.version == version)
+            .then_some(SubscriptionFormat::SingBoxVersion(version));
+    }
+    if let Some(version) = segment
+        .strip_prefix("clash-")
+        .and_then(|rest| rest.strip_suffix(".yaml"))
+    {
+        let version = parse_client_version(version)?;
+        return (version == CLASH_LEGACY_VERSION)
+            .then_some(SubscriptionFormat::ClashLegacy(version));
+    }
+    None
+}
+
+fn parse_client_version(text: &str) -> Option<ClientVersion> {
+    let (major, minor) = text.split_once('.')?;
+    Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?))
+}
+
+#[cfg(test)]
+mod tests {
+    use base64::Engine;
+    use std::fs;
+    use std::sync::Arc;
+
+    use tempfile::TempDir;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    use crate::config::{DeploymentConfig, DeploymentStore};
+    use crate::subscription::test_support::seed_direct_subscription;
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::time::Duration;
+
+    fn peer(last: u8) -> IpAddr {
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
+    }
+
+    /// The whole point of the bucket is that honest use is never punished and a
+    /// flood is. Both halves need a clock the test controls.
+    #[test]
+    fn a_budget_spends_its_burst_and_then_asks_the_same_address_to_wait() {
+        let mut budget = super::IpBudget::new();
+        let now = std::time::Instant::now();
+        for index in 0..super::REQUEST_BURST {
+            assert!(
+                budget.try_acquire(peer(1), now).is_ok(),
+                "request {index} is inside the burst and must not be throttled"
+            );
+        }
+        let wait = budget.try_acquire(peer(1), now).unwrap_err();
+        assert!(!wait.is_zero(), "a wait of zero teaches the client nothing");
+    }
+
+    #[test]
+    fn patience_returns_one_token_per_second_and_never_the_whole_burst_at_once() {
+        let mut budget = super::IpBudget::new();
+        let start = std::time::Instant::now();
+        for _ in 0..super::REQUEST_BURST {
+            assert!(budget.try_acquire(peer(2), start).is_ok());
+        }
+        let two_seconds_later = start + Duration::from_secs(2);
+        assert!(
+            budget.try_acquire(peer(2), two_seconds_later).is_ok(),
+            "two idle seconds buy two requests"
+        );
+        assert!(
+            budget.try_acquire(peer(2), two_seconds_later).is_ok(),
+            "the second of those two is still owed"
+        );
+        assert!(
+            budget.try_acquire(peer(2), two_seconds_later).is_err(),
+            "a long idle stretch must not hand back the entire burst at once"
+        );
+    }
+
+    #[test]
+    fn a_throttled_address_recovers_completely_after_waiting_the_burst_out() {
+        let mut budget = super::IpBudget::new();
+        let start = std::time::Instant::now();
+        for _ in 0..super::REQUEST_BURST {
+            assert!(budget.try_acquire(peer(3), start).is_ok());
+        }
+        let hour_later = start + Duration::from_secs(3600);
+        for index in 0..super::REQUEST_BURST {
+            assert!(
+                budget.try_acquire(peer(3), hour_later).is_ok(),
+                "after an hour the whole burst is available again, failed at {index}"
+            );
+        }
+        assert!(budget.try_acquire(peer(3), hour_later).is_err());
+    }
+
+    #[test]
+    fn one_address_burning_its_budget_does_not_silence_the_neighbour() {
+        let mut budget = super::IpBudget::new();
+        let now = std::time::Instant::now();
+        for _ in 0..super::REQUEST_BURST * 2 {
+            let _ = budget.try_acquire(peer(4), now);
+        }
+        assert!(
+            budget.try_acquire(peer(4), now).err().is_some_and(|_| true),
+            "the flooded address is throttled"
+        );
+        for index in 0..super::REQUEST_BURST {
+            assert!(
+                budget.try_acquire(peer(5), now).is_ok(),
+                "a different address keeps its own burst, failed at {index}"
+            );
+        }
+    }
+
+    /// The table must not grow with every address that ever connected: an
+    /// address with a full balance is indistinguishable from one never seen, so
+    /// remembering it is pure memory cost.
+    #[test]
+    fn addresses_that_owe_nothing_are_not_kept_in_the_table() {
+        let mut budget = super::IpBudget::new();
+        let start = std::time::Instant::now();
+        for last in 0..64 {
+            // One request each: every address is now below the burst, so every
+            // address is a debtor worth remembering.
+            assert!(budget.try_acquire(peer(last), start).is_ok());
+        }
+        assert_eq!(budget.tracked(), 64, "debtors stay remembered");
+
+        let later = start + Duration::from_secs(3600);
+        // A brand new address is what triggers the sweep; an established debtor
+        // is cheap to keep and is not scanned for on every request.
+        assert!(budget.try_acquire(peer(200), later).is_ok());
+        assert_eq!(
+            budget.tracked(),
+            1,
+            "after a full refill only the address just charged remains"
+        );
+    }
+
+    async fn http_get(port: u16, path: &str) -> String {
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("subscription service accepts connections");
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .await
+            .expect("request is sent");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("response is readable");
+        response
+    }
+
+    #[test]
+    fn parse_route_maps_every_matrix_route_and_rejects_malformed_paths() {
+        use super::{SubscriptionFormat, SubscriptionRoute, parse_route};
+        let credential = "cred";
+        let cases = [
+            (
+                "sing-box.json",
+                SubscriptionRoute::Format(SubscriptionFormat::SingBox),
+            ),
+            (
+                "sing-box-full.json",
+                SubscriptionRoute::Format(SubscriptionFormat::SingBoxFull),
+            ),
+            (
+                "clash.yaml",
+                SubscriptionRoute::Format(SubscriptionFormat::Clash),
+            ),
+            (
+                "clash-1.18.yaml",
+                SubscriptionRoute::Format(SubscriptionFormat::ClashLegacy(
+                    super::CLASH_LEGACY_VERSION,
+                )),
+            ),
+            ("uri", SubscriptionRoute::Format(SubscriptionFormat::Uri)),
+            (
+                "uri.txt",
+                SubscriptionRoute::Format(SubscriptionFormat::Base64Uri),
+            ),
+            (
+                "shadowrocket.txt",
+                SubscriptionRoute::Format(SubscriptionFormat::Shadowrocket),
+            ),
+            ("qr/uri", SubscriptionRoute::Qr(SubscriptionFormat::Uri)),
+            (
+                "qr/sing-box-full.json",
+                SubscriptionRoute::Qr(SubscriptionFormat::SingBoxFull),
+            ),
+            ("index", SubscriptionRoute::Index),
+        ];
+        for (path, route) in cases {
+            let target = format!("/sub/{credential}/{path}");
+            assert_eq!(
+                parse_route(&target),
+                Some((credential, route)),
+                "route {path} must parse"
+            );
+        }
+        for profile in super::SING_BOX_VERSION_PROFILES {
+            let target = format!("/sub/{credential}/sing-box-{}.json", profile.version);
+            assert_eq!(
+                parse_route(&target),
+                Some((
+                    credential,
+                    SubscriptionRoute::Format(SubscriptionFormat::SingBoxVersion(profile.version)),
+                )),
+                "version profile {} must parse",
+                profile.version
+            );
+        }
+    }
+
+    #[test]
+    fn parse_route_rejects_query_unknown_and_trailing_paths() {
+        use super::parse_route;
+        for target in [
+            "/sub/cred/uri?credential=cred",
+            "/sub/cred/bogus",
+            "/sub/cred/sing-box-1.09.json",
+            "/sub/cred/clash-1.17.yaml",
+            "/sub/cred/uri/extra",
+            "/sub/cred/qr",
+            "/sub/cred/qr/index",
+            "/sub/cred",
+            "/sub/",
+            "/other/cred/uri",
+        ] {
+            assert!(parse_route(target).is_none(), "must reject {target}");
+        }
+        // An empty credential parses but can never match the real one, so the
+        // handler still returns a uniform 404 before reading any artifact.
+        assert_eq!(
+            parse_route("/sub//uri"),
+            Some((
+                "",
+                super::SubscriptionRoute::Format(super::SubscriptionFormat::Uri)
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn acme_listener_serves_the_challenge_and_rejects_every_other_path() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+        let challenge = store.acme_webroot().join(".well-known/acme-challenge");
+        fs::create_dir_all(&challenge).expect("challenge directory is created");
+        fs::write(challenge.join("token-1"), "challenge-body").expect("challenge is written");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(store),
+            Some(1),
+        ));
+
+        let served = http_get(port, "/.well-known/acme-challenge/token-1").await;
+        assert!(served.starts_with("HTTP/1.1 200 OK"), "challenge is served");
+        assert!(served.contains("challenge-body"));
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn acme_listener_returns_404_for_a_foreign_or_malformed_challenge_path() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(store),
+            Some(3),
+        ));
+
+        let missing = http_get(port, "/.well-known/acme-challenge/unknown").await;
+        assert!(missing.starts_with("HTTP/1.1 404 Not Found"));
+        let traversal = http_get(port, "/.well-known/acme-challenge/../config.toml").await;
+        assert!(traversal.starts_with("HTTP/1.1 404 Not Found"));
+        let wrong_root = http_get(port, "/sub/anything/uri").await;
+        assert!(wrong_root.starts_with("HTTP/1.1 404 Not Found"));
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn acme_listener_rejects_oversized_request_headers() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(DeploymentStore::new(fixture.path())),
+            None,
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the service accepts the connection");
+        let request = format!(
+            "GET /.well-known/acme-challenge/missing HTTP/1.1\r\nHost: localhost\r\nX-Large: {}\r\n\r\n",
+            "x".repeat(20 * 1024)
+        );
+        stream
+            .write_all(request.as_bytes())
+            .await
+            .expect("the oversized request is sent");
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the bounded parser closes an oversized request promptly")
+            .expect("the response socket closes cleanly");
+        assert!(
+            response.starts_with(b"HTTP/1.1 431 "),
+            "oversized headers must be rejected with 431, got: {}",
+            String::from_utf8_lossy(&response)
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn acme_listener_closes_a_client_that_sends_headers_too_slowly() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(DeploymentStore::new(fixture.path())),
+            None,
+        ));
+
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the service accepts the connection");
+        stream
+            .write_all(
+                b"GET /.well-known/acme-challenge/missing HTTP/1.1\r\nHost: localhost\r\nX-Slow: ",
+            )
+            .await
+            .expect("the incomplete request header is sent");
+        tokio::time::sleep(Duration::from_secs(6)).await;
+
+        let mut response = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), stream.read_to_end(&mut response))
+            .await
+            .expect("the slow-header timeout closes the connection")
+            .expect("the response socket closes cleanly");
+        assert!(
+            !response.starts_with(b"HTTP/1.1 200 OK"),
+            "an incomplete request must never reach a successful route"
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn acme_listener_drops_connections_beyond_its_concurrency_limit() {
+        const MAX_EXPECTED_OPEN_CONNECTIONS: usize = 32;
+
+        let fixture = TempDir::new().expect("temporary root is created");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(DeploymentStore::new(fixture.path())),
+            None,
+        ));
+
+        let mut clients = Vec::new();
+        for _ in 0..=MAX_EXPECTED_OPEN_CONNECTIONS {
+            let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .expect("the service accepts a connection attempt");
+            stream
+                .write_all(
+                    b"GET /.well-known/acme-challenge/missing HTTP/1.1\r\nHost: localhost\r\nX-Hold: ",
+                )
+                .await
+                .expect("the incomplete request header is sent");
+            clients.push(stream);
+        }
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let (open, rejected) = loop {
+            let mut open = 0;
+            let mut rejected = 0;
+            for stream in &mut clients {
+                let mut byte = [0; 1];
+                match stream.try_read(&mut byte) {
+                    Ok(0) => rejected += 1,
+                    Ok(_) => open += 1,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => open += 1,
+                    Err(_) => rejected += 1,
+                }
+            }
+            if rejected > 0 || tokio::time::Instant::now() >= deadline {
+                break (open, rejected);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert!(
+            open > 0 && open <= MAX_EXPECTED_OPEN_CONNECTIONS,
+            "the listener should keep no more than 32 of 33 incomplete requests open (observed {open})"
+        );
+        assert!(
+            rejected > 0,
+            "the listener must close at least one of 33 simultaneous incomplete requests"
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn direct_tls_listener_serves_the_subscription_after_a_real_handshake() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            Some(1),
+        ));
+
+        let response = tls_get(port, &format!("/sub/{credential}/uri")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "TLS subscription is served"
+        );
+        assert!(response.contains("vless://"));
+        assert!(response.contains("subscription-userinfo:"));
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn failed_certificate_reload_keeps_the_valid_certificate_then_uses_a_new_pin() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, _) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store.clone()),
+            Arc::new(config.clone()),
+            super::fresh_budget(),
+            None,
+        ));
+
+        let original_fingerprint = tls_server_fingerprint(port).await;
+        let pinned = store.certificate_directory(&config.subscription_host);
+        fs::write(pinned.join("fullchain.pem"), b"not a certificate")
+            .expect("a failed certificate replacement is simulated");
+        tokio::time::sleep(Duration::from_millis(1_250)).await;
+        let retained_fingerprint = tls_server_fingerprint(port).await;
+        assert_eq!(
+            retained_fingerprint, original_fingerprint,
+            "a failed reload keeps serving the unexpired last valid certificate"
+        );
+
+        seed_direct_certificate(&fixture, &store, &config);
+        let replacement_fingerprint = crate::certificate::load_pinned(&store, &config)
+            .expect("the replacement certificate is valid")
+            .fingerprint;
+        assert_ne!(replacement_fingerprint, original_fingerprint);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if tls_server_fingerprint(port).await == replacement_fingerprint {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the next valid pin becomes active without restarting the listener"
+            );
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        handler.abort();
+    }
+
+    #[test]
+    fn expired_cached_tls_material_is_rejected_before_a_new_handshake() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, _) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let mut material =
+            super::load_tls_config(&store, &config).expect("the current certificate can be loaded");
+        material.not_after = 0;
+
+        assert!(
+            !material.is_current(),
+            "the cached material's expiry is checked even after initial validation"
+        );
+        assert!(
+            super::tls_material_for_accept(Some(material), std::time::SystemTime::now()).is_none(),
+            "an expired cached certificate is never selected for a new handshake"
+        );
+    }
+
+    #[tokio::test]
+    async fn incomplete_client_hellos_expire_and_release_all_tls_slots() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let handler = tokio::spawn(super::serve_tls_listener_with_timeouts(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            None,
+            Duration::from_millis(200),
+            Duration::from_secs(2),
+        ));
+
+        let mut stalled = Vec::new();
+        for _ in 0..super::MAX_CONCURRENT_CONNECTIONS {
+            stalled.push(
+                tokio::net::TcpStream::connect(("127.0.0.1", port))
+                    .await
+                    .expect("stalled TLS peer connects"),
+            );
+        }
+        // Let the listener accept the whole first batch while none of the
+        // clients sends a TLS ClientHello.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let mut overflow = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("the kernel accepts the overflow connection");
+        let mut byte = [0; 1];
+        let overflow_read = tokio::time::timeout(Duration::from_secs(1), overflow.read(&mut byte))
+            .await
+            .expect("capacity-rejected connection is closed promptly")
+            .expect("capacity-rejected stream is readable");
+        assert_eq!(overflow_read, 0, "the 33rd peer is dropped at the cap");
+
+        for stream in &mut stalled {
+            let closed = tokio::time::timeout(Duration::from_secs(1), stream.read(&mut byte))
+                .await
+                .expect("incomplete ClientHello is bounded by its TLS deadline")
+                .expect("stalled stream can observe closure");
+            assert_eq!(closed, 0, "timed-out TLS peer is closed");
+        }
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            tls_get(port, &format!("/sub/{credential}/uri")),
+        )
+        .await
+        .expect("a valid peer can use a slot released by TLS timeouts");
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        handler.abort();
+    }
+
+    #[test]
+    fn certificate_reload_failure_backs_off_for_the_same_material_stamp() {
+        let start = std::time::Instant::now();
+        let first_stamp = (
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(1)),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(2)),
+        );
+        let changed_stamp = (
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(3)),
+            Some(std::time::UNIX_EPOCH + Duration::from_secs(4)),
+        );
+        let mut backoff = super::CertificateReloadBackoff::default();
+        backoff.record_failure(first_stamp, start);
+
+        assert!(
+            !backoff.should_retry(first_stamp, start + Duration::from_secs(29)),
+            "an unchanged invalid pair is not reparsed during the 30-second backoff"
+        );
+        assert!(
+            backoff.should_retry(first_stamp, start + Duration::from_secs(30)),
+            "the same invalid pair is retried after the backoff"
+        );
+        assert!(
+            backoff.should_retry(changed_stamp, start + Duration::from_secs(1)),
+            "a new pin bypasses the failed-pair backoff"
+        );
+    }
+
+    /// A token bucket that only exists in unit tests protects nothing, so this
+    /// drives the real listener. The property that matters is the second one:
+    /// once an address is out of budget, a correct credential and a wrong one
+    /// get the *same* answer, so waiting cannot be traded for information about
+    /// whether a subscription exists.
+    #[tokio::test]
+    async fn an_over_budget_address_waits_without_learning_if_the_credential_is_real() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+        let budget = super::fresh_budget();
+        let store = Arc::new(store);
+        let config = Arc::new(config);
+        let handler = tokio::spawn(async move {
+            let _ = super::serve_http_listener(listener, &store, &config, &budget, None).await;
+        });
+
+        let first = http_get(port, &format!("/sub/{credential}/uri")).await;
+        assert!(
+            first.starts_with("HTTP/1.1 200 OK"),
+            "an honest first fetch is served: {first}"
+        );
+
+        let mut throttled_valid = false;
+        let mut indistinguishable = false;
+        for _ in 0..super::REQUEST_BURST * 4 {
+            let valid = http_get(port, &format!("/sub/{credential}/uri")).await;
+            let invalid = http_get(port, "/sub/not-the-credential/uri").await;
+            if valid.starts_with("HTTP/1.1 429") {
+                throttled_valid = true;
+                if valid == invalid {
+                    indistinguishable = true;
+                    break;
+                }
+            }
+        }
+        assert!(
+            throttled_valid,
+            "the budget never reached the response path"
+        );
+        assert!(
+            indistinguishable,
+            "a throttled probe could tell a real credential from a wrong one"
+        );
+        let last = http_get(port, &format!("/sub/{credential}/uri")).await;
+        assert!(
+            last.starts_with("HTTP/1.1 429"),
+            "the address is still out of budget: {last}"
+        );
+        assert!(
+            !last.contains(&credential),
+            "a throttled response must not repeat the credential it is guarding"
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn a_broken_accounting_state_degrades_the_userinfo_header_not_the_subscription() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        store
+            .write_state(b"not json")
+            .expect("the accounting state is corrupted");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let store = Arc::new(store.clone());
+        let config = Arc::new(config);
+        let handler = tokio::spawn(async move {
+            super::serve_http_listener(listener, &store, &config, &super::fresh_budget(), Some(1))
+                .await
+        });
+
+        let response = http_get(port, &format!("/sub/{credential}/uri")).await;
+        assert!(
+            response.starts_with("HTTP/1.1 200 OK"),
+            "the subscription must survive a broken accounting state: {response}"
+        );
+        assert!(
+            !response.contains("subscription-userinfo:"),
+            "the degraded response must not carry traffic metadata"
+        );
+        assert!(
+            response.contains("vless://"),
+            "the artifact body still serves"
+        );
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    /// The header is a wire contract parsed by third-party client apps, so its
+    /// names and order are the product: the four traffic keys stay as they were
+    /// and `profile-update-interval` is appended last rather than inserted.
+    #[test]
+    fn the_userinfo_header_locks_its_key_order_and_names() {
+        use chrono::TimeZone;
+        let report = crate::traffic::TrafficReport {
+            interface: "eth0".into(),
+            received: 36,
+            transmitted: 71,
+            total_adjustment: 0,
+            monthly_traffic_limit: 999,
+            accounting_period: "2026-09".into(),
+            next_reset: chrono::Utc
+                .timestamp_opt(1_767_225_600, 0)
+                .single()
+                .expect("the timestamp is unambiguous"),
+        };
+        assert_eq!(
+            super::subscription_userinfo(&report),
+            "upload=36; download=71; total=999; expire=1767225600; profile-update-interval=24",
+            "the interface's rx is the client's upload, its tx the client's download"
+        );
+        let unlimited = crate::traffic::TrafficReport {
+            monthly_traffic_limit: 0,
+            total_adjustment: 5,
+            ..report
+        };
+        assert_eq!(
+            super::subscription_userinfo(&unlimited),
+            "upload=36; download=71; expire=1767225600; profile-update-interval=24",
+            "without an allowance the header must not invent a quota from bytes used"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_tls_listener_serves_base64_uri_with_the_standard_traffic_headers() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store.clone()),
+            Arc::new(config),
+            super::fresh_budget(),
+            Some(1),
+        ));
+
+        let response = tls_get(port, &format!("/sub/{credential}/uri.txt")).await;
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        assert!(response.contains("content-type: text/plain; charset=utf-8"));
+        assert!(response.contains("subscription-userinfo:"));
+        let (_, body) = response
+            .split_once("\r\n\r\n")
+            .expect("the response separates headers and body");
+        assert_eq!(
+            base64::engine::general_purpose::STANDARD
+                .decode(body.trim())
+                .expect("the response body is standard Base64"),
+            fs::read(
+                store
+                    .root()
+                    .join("var/lib/sbctl/artifacts/subscription-uri.txt")
+            )
+            .expect("the canonical URI artifact is readable")
+        );
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn direct_tls_listener_rejects_a_handshake_whose_sni_is_not_the_subscription_host() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, _) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            Some(1),
+        ));
+
+        let handshake = tls_handshake_sni(port, "attacker.example.test").await;
+        assert!(
+            handshake.is_err(),
+            "an SNI mismatch is rejected before any HTTP request"
+        );
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn direct_tls_listener_rejects_a_handshake_without_an_sni() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (store, config, _) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("an ephemeral listener is available");
+        let port = listener.local_addr().expect("listener address").port();
+
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            Some(1),
+        ));
+
+        let handshake = tls_handshake_sni(port, "").await;
+        assert!(
+            handshake.is_err(),
+            "a missing SNI is rejected before any HTTP request"
+        );
+        handler.await.expect("handler completes").expect("no error");
+    }
+
+    /// Writes a valid certificate into the Certbot live directory and pins it
+    /// into the sbctl-owned copy that the daemon actually serves.
+    fn seed_direct_certificate(
+        fixture: &TempDir,
+        store: &DeploymentStore,
+        config: &DeploymentConfig,
+    ) {
+        let certificate_directory = fixture.path().join("etc/letsencrypt/live/sub.example.test");
+        fs::create_dir_all(&certificate_directory).expect("certificate directory is created");
+        let certificate = rcgen::generate_simple_self_signed(vec!["sub.example.test".into()])
+            .expect("a self-signed certificate is generated");
+        fs::write(
+            certificate_directory.join("fullchain.pem"),
+            certificate.cert.pem(),
+        )
+        .expect("fullchain is written");
+        fs::write(
+            certificate_directory.join("privkey.pem"),
+            certificate.signing_key.serialize_pem(),
+        )
+        .expect("private key is written");
+        let validated =
+            crate::certificate::load(store, config).expect("the fixture certificate is valid");
+        crate::certificate::pin(store, config, &validated)
+            .expect("the certificate is pinned for the daemon");
+    }
+
+    /// Opens a TLS connection that accepts any certificate and returns the
+    /// response to a single GET request. Certificates are verified separately
+    /// by the deploy hook and the certificate ticket; this test exercises the
+    /// listener's TLS termination path, not certificate trust.
+    async fn tls_get(port: u16, path: &str) -> String {
+        let mut stream = tls_connect(port, "sub.example.test")
+            .await
+            .expect("TLS handshake completes");
+        stream
+            .write_all(format!("GET {path} HTTP/1.1\r\nHost: sub.example.test\r\n\r\n").as_bytes())
+            .await
+            .expect("request is sent");
+        let mut response = String::new();
+        stream
+            .read_to_string(&mut response)
+            .await
+            .expect("response is readable");
+        response
+    }
+
+    /// Opens a TLS connection with a caller-supplied SNI and returns whether
+    /// the handshake completed. An empty `sni` connects without a DNS SNI (an
+    /// IP server name is used, which rustls omits from the ClientHello).
+    async fn tls_handshake_sni(port: u16, sni: &str) -> Result<(), std::io::Error> {
+        tls_connect(port, sni).await.map(|_| ())
+    }
+
+    async fn tls_server_fingerprint(port: u16) -> String {
+        use sha2::Digest;
+
+        let stream = tls_connect(port, "sub.example.test")
+            .await
+            .expect("TLS handshake completes");
+        let certificate = stream
+            .get_ref()
+            .1
+            .peer_certificates()
+            .and_then(|chain| chain.first())
+            .expect("server presents a certificate");
+        let digest = sha2::Sha256::digest(certificate.as_ref());
+        digest.iter().map(|byte| format!("{byte:02x}")).collect()
+    }
+
+    async fn tls_connect(
+        port: u16,
+        sni: &str,
+    ) -> Result<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, std::io::Error> {
+        use rustls::client::danger::{
+            HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier,
+        };
+        use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+        use rustls::{ClientConfig, DigitallySignedStruct, SignatureScheme};
+        use tokio_rustls::TlsConnector;
+
+        #[derive(Debug)]
+        struct AcceptsEverything;
+        impl ServerCertVerifier for AcceptsEverything {
+            fn verify_server_cert(
+                &self,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &ServerName<'_>,
+                _ocsp_response: &[u8],
+                _now: UnixTime,
+            ) -> Result<ServerCertVerified, rustls::Error> {
+                Ok(ServerCertVerified::assertion())
+            }
+            fn verify_tls12_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn verify_tls13_signature(
+                &self,
+                _message: &[u8],
+                _cert: &CertificateDer<'_>,
+                _dss: &DigitallySignedStruct,
+            ) -> Result<HandshakeSignatureValid, rustls::Error> {
+                Ok(HandshakeSignatureValid::assertion())
+            }
+            fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+                vec![
+                    SignatureScheme::ECDSA_NISTP256_SHA256,
+                    SignatureScheme::ECDSA_NISTP384_SHA384,
+                    SignatureScheme::ED25519,
+                    SignatureScheme::RSA_PSS_SHA256,
+                    SignatureScheme::RSA_PSS_SHA384,
+                    SignatureScheme::RSA_PSS_SHA512,
+                    SignatureScheme::RSA_PKCS1_SHA256,
+                    SignatureScheme::RSA_PKCS1_SHA384,
+                    SignatureScheme::RSA_PKCS1_SHA512,
+                ]
+            }
+        }
+
+        let config = ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptsEverything))
+            .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .expect("TLS listener accepts connections");
+        let server_name = if sni.is_empty() {
+            ServerName::try_from("203.0.113.7".to_owned()).expect("a valid IP server name")
+        } else {
+            ServerName::try_from(sni.to_owned()).expect("valid server name")
+        };
+        connector.connect(server_name, stream).await
+    }
+
+    #[test]
+    fn redact_secret_replaces_every_occurrence_of_the_credential() {
+        let secret = "deadbeef-credential";
+        let message = format!("subscription artifact failed: {secret}; retry with {secret}");
+        assert_eq!(
+            super::redact_secret(&message, secret),
+            "subscription artifact failed: [redacted]; retry with [redacted]"
+        );
+    }
+
+    #[test]
+    fn redact_secret_leaves_unrelated_text_untouched() {
+        assert_eq!(
+            super::redact_secret("subscription artifact failed: no such file", "secret"),
+            "subscription artifact failed: no such file"
+        );
+    }
+}
