@@ -12,9 +12,15 @@ concurrency:
   group: sbctl-release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  SING_BOX_REPOSITORY: SagerNet/sing-box
+
 jobs:
   validate:
     runs-on: ubuntu-24.04
+    outputs:
+      sing_box_tag: ${{ steps.sing_box.outputs.tag }}
+      sing_box_version: ${{ steps.sing_box.outputs.version }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -51,6 +57,20 @@ jobs:
         run: cargo test --manifest-path sbctl/Cargo.toml --locked --workspace --features sbctl/test-signing
       - name: Verify production release trust boundary
         run: cargo test --manifest-path sbctl/Cargo.toml --locked -p sbctl --no-default-features --test release_trust
+      - name: Resolve latest stable sing-box release
+        id: sing_box
+        run: |
+          set -euo pipefail
+          release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/${SING_BOX_REPOSITORY}/releases/latest")
+          case "$release_url" in
+            https://github.com/SagerNet/sing-box/releases/tag/v*) tag=${release_url##*/} ;;
+            *) echo "Could not resolve a stable sing-box release URL: $release_url" >&2; exit 1 ;;
+          esac
+          version=${tag#v}
+          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected sing-box version: $tag" >&2; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
   build:
     needs: validate
@@ -85,51 +105,42 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
-  publish:
-    needs: build
-    runs-on: ubuntu-24.04
+  package:
+    needs: [validate, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
     environment: release
     permissions:
-      contents: write
+      contents: read
     env:
       RELEASE_TAG: ${{ github.ref_name }}
       SBCTL_RELEASE_PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
-      SING_BOX_REPOSITORY: SagerNet/sing-box
+      SING_BOX_TAG: ${{ needs.validate.outputs.sing_box_tag }}
+      SING_BOX_VERSION: ${{ needs.validate.outputs.sing_box_version }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          pattern: sbctl-linux-*
+          name: sbctl-linux-${{ matrix.arch }}
           path: dist
-          merge-multiple: true
-      - name: Resolve latest stable sing-box release
-        id: sing-box
-        run: |
-          set -euo pipefail
-          release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
-            "https://github.com/${SING_BOX_REPOSITORY}/releases/latest")
-          case "$release_url" in
-            https://github.com/SagerNet/sing-box/releases/tag/v*) tag=${release_url##*/} ;;
-            *) echo "Could not resolve a stable sing-box release URL: $release_url" >&2; exit 1 ;;
-          esac
-          version=${tag#v}
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected sing-box version: $tag" >&2; exit 1; }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Download official sing-box runtime archives
+      - name: Download official sing-box runtime
         env:
-          SING_BOX_TAG: ${{ steps.sing-box.outputs.tag }}
-          SING_BOX_VERSION: ${{ steps.sing-box.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          for arch in amd64 arm64; do
-            archive="sing-box-${SING_BOX_VERSION}-linux-${arch}.tar.gz"
-            url="https://github.com/${SING_BOX_REPOSITORY}/releases/download/${SING_BOX_TAG}/${archive}"
-            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "$url"
-            mkdir -p "$RUNNER_TEMP/sing-box-$arch"
-            tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/sing-box-$arch" --strip-components=1
-            install -m 0755 "$RUNNER_TEMP/sing-box-$arch/sing-box" "dist/sing-box-linux-$arch"
-          done
+          archive="sing-box-${SING_BOX_VERSION}-linux-${ARCH}.tar.gz"
+          url="https://github.com/${SING_BOX_REPOSITORY}/releases/download/${SING_BOX_TAG}/${archive}"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "$url"
+          mkdir -p "$RUNNER_TEMP/sing-box"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/sing-box" --strip-components=1
+          install -m 0755 "$RUNNER_TEMP/sing-box/sing-box" "dist/sing-box-linux-$ARCH"
       - name: Write signing seed to a private temporary file
         env:
           SBCTL_SIGNING_SEED: ${{ secrets.SBCTL_SIGNING_SEED }}
@@ -142,18 +153,41 @@ jobs:
           chmod 600 "$key_file"
           echo "SBCTL_SIGNING_KEY=$key_file" >> "$GITHUB_ENV"
           unset SBCTL_SIGNING_SEED
-      - name: Sign and verify architecture manifests
+      - name: Sign and verify native architecture manifest
         env:
-          SING_BOX_VERSION: ${{ steps.sing-box.outputs.version }}
+          ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          chmod 0755 dist/sbctl-linux-amd64 dist/sbctl-linux-arm64
-          for arch in amd64 arm64; do
-            export SBCTL_SIGNER="$GITHUB_WORKSPACE/dist/sbctl-linux-$arch"
-            bash sbctl/scripts/generate-manifest.sh \
-              "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$SING_BOX_VERSION" "$arch" \
-              "dist/sbctl-linux-$arch" "dist/sing-box-linux-$arch" "dist/manifest-$arch.json"
-          done
+          chmod 0755 "dist/sbctl-linux-$ARCH"
+          export SBCTL_SIGNER="$GITHUB_WORKSPACE/dist/sbctl-linux-$ARCH"
+          bash sbctl/scripts/generate-manifest.sh \
+            "$GITHUB_REPOSITORY" "$RELEASE_TAG" "$SING_BOX_VERSION" "$ARCH" \
+            "dist/sbctl-linux-$ARCH" "dist/sing-box-linux-$ARCH" "dist/manifest-$ARCH.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbctl-release-${{ matrix.arch }}
+          path: |
+            dist/sbctl-linux-${{ matrix.arch }}
+            dist/sing-box-linux-${{ matrix.arch }}
+            dist/manifest-${{ matrix.arch }}.json
+          if-no-files-found: error
+          retention-days: 3
+
+  publish:
+    needs: package
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      SBCTL_RELEASE_PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: sbctl-release-*
+          path: dist
+          merge-multiple: true
       - name: Prepare production installer and checksums
         run: |
           set -euo pipefail
