@@ -11,8 +11,8 @@
 
 ```bash
 curl -fL -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/install.sh
-bash /tmp/sbctl-install.sh
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
+sudo bash /tmp/sbctl-install.sh
 ```
 
 取**发布工件**里的 `install.sh`，不要从 `raw.githubusercontent.com` 拿仓库中的那一份：
@@ -83,8 +83,8 @@ sbctl sing-box remove
 systemd 服务；失败时恢复 rollback 目录中的旧二进制。完整的 `sbctl update` 仍然
 保留同时升级控制面和数据面的能力。
 
-服务端发布的 sing-box 工件默认在发布时解析 SagerNet 官方最新稳定版；手动触发
-`release.yml` 时也可显式填写 `sing_box_version` 固定版本。签名 manifest 与归档均使用同一个已解析版本。
+服务端发布的 sing-box 工件默认在发布时解析 SagerNet 官方最新稳定版。GitHub Actions
+会构建 amd64/arm64 的 sbctl，生成签名 manifest，并把安装脚本和运行时一并上传到 Release。
 
 ## 证书状态与后续必做清单
 

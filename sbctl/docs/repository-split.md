@@ -58,12 +58,12 @@
 
 ## 拆分后必须知道的三件事
 
-1. **自更新与安装脚本仍指向 monorepo 的 Release。**
-   `src/update.rs:72`、`scripts/install.sh:64` 里的清单 URL 与 `src/cli/menu.rs:70`、
-   `scripts/install.sh:37` 的项目署名都写死为
-   `github.com/xiaolingxiaoying/singbox-sub-me`。签名公钥也钉在 `scripts/install.sh`
-   里（`docs/release-signing.md`）。在本仓库独立发 Release 之前，这套信任链是正确的；
-   要改成新仓库，得同时换清单地址与安装脚本里的构建期公钥，不能只改一处。
+1. **自更新和安装已接入本仓库 Release。**
+   `src/update.rs` 与 `scripts/install.sh` 从
+   `github.com/xiaolingxiaoying/vps-sub-meter/releases` 获取签名清单；GitHub Actions 将生产
+   公钥编入 amd64/arm64 二进制，并用 `release` Environment 中的私钥签名和回验清单。
+   仓库内的 `scripts/install.sh` 仍是未配置公钥的模板，部署应使用 Release 附带的
+   `install.sh`。复制到其他仓库时，必须同时调整 Release URL、生产公钥和签名密钥配置。
 2. **L3 验收套件有两条客户端腿。** `tests/acceptance/run.sh` 强制要求
    `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT`（`verify-client.sh` 证明孤儿回收与 TUN 接线，
    `verify-sbcli.sh` 证明共享后台协议）。本仓库没有这两个二进制，脚本保持原样未改；

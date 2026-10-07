@@ -28,7 +28,7 @@
 
 ```bash
 curl -fL --retry 3 -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/install.sh
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
 test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 ```
 
@@ -36,49 +36,7 @@ test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 
 > 该地址是**签名信任链的一部分**，不是笔误：`sbctl update` 与安装脚本的构建期公钥都钉在 monorepo 的 Release 上。要让本仓库独立发布 Release，必须同时更换清单地址和 `scripts/install.sh` 里的公钥，见 [`docs/release-signing.md`](docs/release-signing.md)。
 
-### 在 `vps-sub-meter` 分支测试当前源码
-
-下面的步骤从 `vps-sub-meter` 仓库的 `codex/vps-override-cli-fixes` 分支源码构建，不经过正式 Release 签名流程。请只在全新、可丢弃的 Debian 12 / Ubuntu 22.04+ 测试 VPS 上执行；`sbctl install --guided` 会安装 sing-box、写入 `/etc/sbctl` 配置并创建 systemd 服务。不要把这条测试流程用于承载业务的 VPS，也不要在测试期间执行 `sbctl update`（更新命令面向 monorepo 的正式签名 Release）。
-
-以有 `sudo` 权限的普通用户执行：
-
-```bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git build-essential cmake perl pkg-config
-
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-rustup toolchain install stable
-rustup default stable
-rustc --version  # Rust 1.85 或更新版本
-
-SBCTL_TEST_DIR="$(mktemp -d /tmp/sbctl-branch-test.XXXXXX)"
-git clone --depth 1 --branch codex/vps-override-cli-fixes \
-  https://github.com/xiaolingxiaoying/vps-sub-meter.git "$SBCTL_TEST_DIR/repo"
-cd "$SBCTL_TEST_DIR/repo/sbctl"
-cargo build --release --locked -p sbctl --no-default-features
-sudo install -o root -g root -m 0755 target/release/sbctl /usr/local/bin/sbctl
-sudo /usr/local/bin/sbctl install </dev/null && \
-  sudo /usr/local/bin/sbctl install --guided
-```
-
-`install </dev/null` 是只读预检；只有预检通过才会继续引导安装。正式 Release 安装方式仍见上方命令；仓库内 `scripts/install.sh` 是构建模板，不能直接下载执行。
-
-安装向导会询问订阅模式、域名或 IP、出口网卡、启用的协议与客户端模板。Direct 模式适用于域名已解析到 VPS 的情况；已有 Nginx/Caddy 时选择 External proxy；没有域名时可选择安全性较低的 IP fallback。
-
-非交互安装常用开关：
-
-```bash
-sbctl install --guided                 # 先问全部问题，再落地服务与状态
-sbctl install --mode direct --subscription-host sub.example.com
-sbctl install --manage-firewall        # 事务内执行 ufw allow（只加不删，默认关）
-sbctl install --ipv4-only              # 内核出站解析钉在 IPv4
-sbctl install --disable-protocol tuic  # 可重复，端口用 --vless-port 等指定
-```
-
-安装程序默认不会改动防火墙，也不会接管现有 sing-box 或反向代理；它会打印需要你自己执行的 `ufw allow` 命令。Direct + 域名模式还会在健康检查通过后尝试签发订阅证书，失败时降级为待办提示而不是回滚整个安装，`sbctl status` 会标注"证书未签发"。
-
-更多安装细节见 [`docs/installation.md`](docs/installation.md)。
+Release 提供已构建并签名的 `sbctl`、sing-box 运行时、按架构区分的签名清单和安装脚本。安装器会校验签名与文件摘要，然后启动引导配置；VPS 无需安装 Rust 或从源码构建。仓库中的 `scripts/install.sh` 是模板，不能直接运行。
 
 ## 常用命令
 
@@ -130,13 +88,9 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 
 `clear` 不带目标时清除 sing-box 与 Clash 客户端覆写（包括基础文件和 drop-in 层）；`clear server` 只清除服务端目标，`clear all` 清除全部目标。清理后会重新生成并校验工件，若生成失败会恢复被清理的文件。
 
-## 从源码构建
+## 开发验证
 
-```bash
-cargo build --release --locked -p sbctl --no-default-features
-```
-
-生成的程序为 `target/release/sbctl`。生产 Release 使用 GitHub Actions 构建和签名；不要直接运行仓库里的 `scripts/install.sh`，它没有生产公钥。开发和验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 与 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
+生产二进制由 GitHub Actions 构建和签名。开发构建、测试签名与验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 和 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
 
 ## 验证
 
@@ -148,7 +102,7 @@ cargo build --release --locked -p sbctl --no-default-features
 
 L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate，`scripts/dev/build-acceptance-artifacts.sh` 会明确打印它跳过了客户端那一腿。`verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言不受影响。
 
-集成分支的 CI ([../.github/workflows/sbctl-branch-ci.yml](../.github/workflows/sbctl-branch-ci.yml)) 从仓库根目录对本目录运行格式检查、安装脚本测试、clippy、Rust 测试和 release 构建。
+CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）只保留服务端四个任务：构建、测试、sing-box 版本带校验、mihomo 校验。
 
 ## 许可证
 

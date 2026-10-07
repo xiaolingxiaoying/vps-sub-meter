@@ -30,34 +30,20 @@ nexus
 bash <(curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/main/nexus-sub-meter.sh)
 ```
 
-## sbctl 服务端管理工具（Rust 试用分支）
+## sbctl 服务端管理工具
 
 本分支保留原有 VPS 流量统计脚本，并新增独立的 sbctl 服务端管理工具，位于 sbctl/。它支持 Debian 12 / Ubuntu 22.04+、systemd、amd64 和 arm64。功能、部署边界和完整安装说明见 [sbctl/README.md](sbctl/README.md)。
 
-### 在全新测试 VPS 上构建并安装当前分支
+### 安装 sbctl（GitHub Actions 预构建 Release）
 
-以下命令会在 VPS 上从源码构建 sbctl，安装到 /usr/local/bin，然后启动引导安装。请只在可丢弃的测试机执行：引导安装会下载并安装 sing-box、写入 /etc/sbctl、创建 systemd 服务并占用所选端口。安装器默认不改防火墙。该分支没有正式 Release 签名；测试时不要运行 sbctl update，它指向原项目的正式签名 Release。
+支持 Debian 12 / Ubuntu 22.04+、systemd、amd64 和 arm64。安装器会下载与 VPS 架构匹配的预构建 `sbctl` 和 sing-box，验证签名与摘要，然后启动完整配置向导；VPS 不需要安装 Rust、下载源码或自行构建。
 
-以有 sudo 权限的普通用户执行：
+以有 `sudo` 权限的普通用户执行：
 
-~~~bash
-sudo apt-get update
-sudo apt-get install -y ca-certificates curl git build-essential cmake perl pkg-config
+```bash
+curl -fL --retry 3 -o /tmp/sbctl-install.sh \
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
+test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
+```
 
-curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
-. "$HOME/.cargo/env"
-rustup toolchain install stable
-rustup default stable
-rustc --version  # 需要 Rust 1.85 或更新版本
-
-SBCTL_TEST_DIR="$(mktemp -d /tmp/sbctl-branch-test.XXXXXX)"
-git clone --depth 1 --branch codex/vps-override-cli-fixes \
-  https://github.com/xiaolingxiaoying/vps-sub-meter.git "$SBCTL_TEST_DIR/repo"
-cd "$SBCTL_TEST_DIR/repo/sbctl"
-cargo build --release --locked -p sbctl --no-default-features
-sudo install -o root -g root -m 0755 target/release/sbctl /usr/local/bin/sbctl
-sudo /usr/local/bin/sbctl install </dev/null && \
-  sudo /usr/local/bin/sbctl install --guided
-~~~
-
-该命令面向全新主机。若主机上已有 sing-box 部署，预检会停止安装，请勿在生产机选择接管现有服务。
+如果已经以 `root` 登录，将最后一行改为 `test -s /tmp/sbctl-install.sh && bash /tmp/sbctl-install.sh`。向导会写入 `/etc/sbctl` 配置并创建 systemd 服务；安装器默认不更改防火墙。首次安装前请确认主机上没有需要保留的 sing-box 部署。完整选项与安全边界见 [sbctl/README.md](sbctl/README.md)。

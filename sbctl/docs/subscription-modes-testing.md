@@ -36,7 +36,9 @@ curl -fsS -o /dev/null -w '%{http_code}\n' https://<域名>/sub/<凭据>/qr/uri 
 
 ```bash
 # 1. 安装（sbctl 监听 127.0.0.1:2080，不占用公网端口）
-bash <(wget -qO- https://raw.githubusercontent.com/xiaolingxiaoying/singbox-sub-me/master/scripts/install.sh)
+curl -fL --retry 3 -o /tmp/sbctl-install.sh \
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
+sudo bash /tmp/sbctl-install.sh
 # 向导中选择「外部反向代理」模式
 
 # 2. Caddy 反代示例（/etc/caddy/Caddyfile）

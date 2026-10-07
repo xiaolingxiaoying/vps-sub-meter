@@ -69,7 +69,7 @@ pub fn read_manifest(path: &Path) -> Result<ReleaseManifest, UpdateError> {
 /// versioned artifact URLs and is signature-verified before any URL is trusted.
 pub fn manifest_url_for_arch(arch: &str) -> String {
     format!(
-        "https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/manifest-{arch}.json"
+        "https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/manifest-{arch}.json"
     )
 }
 
@@ -1045,6 +1045,10 @@ mod tests {
         assert!(
             url.contains("releases/latest/download"),
             "unexpected url: {url}"
+        );
+        assert!(
+            url.contains("xiaolingxiaoying/vps-sub-meter/releases/"),
+            "unexpected release repository: {url}"
         );
     }
 

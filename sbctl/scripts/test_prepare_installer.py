@@ -18,6 +18,10 @@ class InstallerTrustTests(unittest.TestCase):
         key = "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a"
         script = render(key)
         self.assertNotIn("@SBCTL_RELEASE_PUBLIC_KEY_PEM@", script)
+        self.assertIn(
+            "https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/manifest-{arch}.json",
+            script,
+        )
         encoded = script.split("-----BEGIN PUBLIC KEY-----\n", 1)[1].splitlines()[0]
         self.assertEqual(base64.b64decode(encoded)[-32:], bytes.fromhex(key))
         self.assertNotIn("JH+I4WMkKYa3EH63BKmD4SGG0ml6OSe35rQuwrNkJys=", script)

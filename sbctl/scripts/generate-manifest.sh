@@ -41,7 +41,7 @@ trap 'rm -f "$unsigned"' EXIT
 
 jq -n \
   --argjson schema 1 \
-  --arg sbctl_version "${tag#v}" \
+  --arg sbctl_version "${tag#sbctl-v}" \
   --arg sbctl_url "$base/sbctl-linux-$arch" \
   --arg sbctl_sha "$sbctl_sha" \
   --arg sing_box_version "$sing_box_version" \

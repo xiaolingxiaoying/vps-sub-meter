@@ -11,7 +11,8 @@ fi
 
 # sbctl bootstrap installer.
 #
-# One-line usage:  bash <(wget -qO- https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/install.sh)
+# Download the release installer from:
+# https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
 #
 # The only trust decisions this script makes are the sbctl binary download,
 # which it protects by verifying the Ed25519 signature over the canonical JSON
@@ -34,7 +35,7 @@ fi
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 blue  "   sbctl  ·  私有 sing-box 订阅控制面"
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
-blue  " 项目  : github.com/xiaolingxiaoying/singbox-sub-me"
+blue  " 项目  : github.com/xiaolingxiaoying/vps-sub-meter"
 blue  "快捷方式: ly"
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 echo
@@ -61,7 +62,7 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-cer
 # src/release.rs. The signature in the manifest covers the canonical JSON of
 # every field except `signature`, produced exactly like `jq -S -c 'del(.signature)'`.
 
-default_manifest_url='https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/manifest-{arch}.json'
+default_manifest_url='https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/manifest-{arch}.json'
 manifest_url_template=${SBCTL_MANIFEST_URL:-$default_manifest_url}
 case "$(dpkg --print-architecture)" in
   amd64|arm64) arch=$(dpkg --print-architecture) ;;
