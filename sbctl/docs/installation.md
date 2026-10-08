@@ -24,8 +24,10 @@ sudo bash /tmp/sbctl-install.sh
 域名/IP、可选代理连接主机、网卡和 Reality 伪装 SNI；随后逐项确认需要启用的协议。协议端口
 默认自动分配。IP fallback 会自动只启用 VLESS Reality，并询问 HTTP 订阅端口。
 
-安装脚本下载并校验 sbctl 后，会在询问首次部署配置前做只读预检。如果发现已有部署，会给出选项：
-保留并退出，或输入确认词后先备份旧配置、状态、证书、二进制和相关 systemd 单元，再停止服务并继续全新安装。
+安装脚本先下载并校验 sbctl 到临时目录（**此时不改主机**），用这份候选二进制做只读预检，然后再决定是否落盘。
+如果发现已有部署，会先给出选项：保留并退出，或输入确认词后先备份旧配置、状态、证书、二进制和相关
+systemd 单元，再停止服务并继续全新安装。选择“保留并退出”时，`/usr/local/bin/sbctl` 一字节未变，
+脚本会提示用 `sbctl update` 升级已有部署。
 备份保存在 `/var/backups/sbctl/reinstall/`；如果新安装失败，安装器会尝试恢复旧部署和原服务状态。
 如果只想管理现有部署，请运行 `ly` 或 `sbctl menu`，查看状态可运行 `sbctl status`。
 对于不属于 sbctl 的 sing-box 服务，选择清理也会先将检测到的路径存入备份，之后才移除。
@@ -45,7 +47,7 @@ bootstrap 脚本只安装并校验 sbctl；它不会接管已有的 sing-box 部
 
 首次部署可在菜单中选择“引导式安装”，一次完成订阅模式、域名/IP、协议、端口和流量账期设置；安装前会显示脱敏摘要并要求确认，取消不会写入部署配置。命令行可用 `sbctl install --guided` 打开同一向导。菜单中的“快速安装”保留较短的默认配置路径。
 
-安装时可为五个协议分别指定监听端口；端口必须大于 1024，且五个协议之间不能重复：
+安装时可为五个协议分别指定监听端口；端口必须在 **10000–65535**，且五个协议之间不能重复：
 
 ```bash
 sbctl install \
@@ -83,8 +85,14 @@ sbctl sing-box remove
 systemd 服务；失败时恢复 rollback 目录中的旧二进制。完整的 `sbctl update` 仍然
 保留同时升级控制面和数据面的能力。
 
-服务端发布的 sing-box 工件默认在发布时解析 SagerNet 官方最新稳定版。GitHub Actions
-会构建 amd64/arm64 的 sbctl，生成签名 manifest，并把安装脚本和运行时一并上传到 Release。
+服务端发布的 sing-box 工件在发布时解析 SagerNet 官方最新稳定版，并把版本与逐架构 sha256 钉在
+[`scripts/release-runtime-pins.txt`](../scripts/release-runtime-pins.txt)；GitHub Actions 会构建
+amd64/arm64 的 sbctl，生成签名 manifest，并把安装脚本和运行时一并上传到 Release。
+
+`sbctl install` 不给 `--manifest` 时会直接从官方仓库下载最新稳定版内核，此时它要求 GitHub 在发布
+API 中提供该资产的 SHA-256 摘要：**摘要缺失一律中止下载**，错误信息会给出两条替代路径——
+`sbctl install --manifest <签名清单>` 或 `--sing-box-bin <已校验的本地内核>`。解压只取
+`sing-box-<版本>-linux-<架构>/sing-box` 这一个归档成员，不再以 root 展开整个归档。
 
 ## 证书状态与后续必做清单
 

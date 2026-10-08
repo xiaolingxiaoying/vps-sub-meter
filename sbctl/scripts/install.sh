@@ -20,6 +20,11 @@ fi
 # decision (sing-box download, digest, compatibility matrix, candidate checks)
 # is made by the installed sbctl binary with the same built-in public key, so
 # the script cannot bypass the Rust verification rules.
+#
+# Nothing on the host is written before the operator has answered the
+# "existing deployment" question: downloading, verifying and even running the
+# read-only preflight all happen inside the work directory, so choosing "keep
+# the existing deployment and exit" leaves the host byte-for-byte unchanged.
 
 red()   { echo -e "\033[31m\033[01m$*\033[0m"; }
 green() { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -81,6 +86,30 @@ run_installer() {
   exit "$status"
 }
 
+# Prompts read the terminal the operator actually typed on: stdin when it is a
+# terminal, otherwise /dev/tty. Both the replacement question and the guided
+# argument collection use it, so it is resolved once.
+installer_input=
+resolve_installer_input() {
+  if [[ -n "$installer_input" ]]; then
+    return
+  fi
+  if [[ -t 0 ]]; then
+    installer_input=/dev/stdin
+    return
+  fi
+  # `-r /dev/tty` only checks the device node's mode, and the node is readable
+  # even for a process with no controlling terminal. Probe by opening it:
+  # otherwise a piped install (`curl ... | bash`) on a host with an existing
+  # deployment blocks forever on a prompt nobody can answer.
+  if { : </dev/tty; } 2>/dev/null; then
+    installer_input=/dev/tty
+    return
+  fi
+  echo "检测到已有部署或需要交互输入；请在 VPS 交互终端运行安装脚本。" >&2
+  exit 2
+}
+
 curl --fail --globoff --location --silent --show-error "$manifest_url" >"$work_dir/manifest.json"
 
 # Verify the manifest signature BEFORE trusting any URL or digest in it. A
@@ -123,24 +152,19 @@ case "$artifact_url" in
     echo "release manifest 使用了不受支持的 latest/main 引用，已中止安装。" >&2
     exit 2 ;;
 esac
+
+# Download and digest-check the candidate into the work directory. The host is
+# still untouched: the management binary must not change before the operator
+# has decided what to do about an existing deployment.
 curl --fail --location --silent --show-error "$artifact_url" >"$work_dir/sbctl"
 printf '%s  %s\n' "$expected_sha" "$work_dir/sbctl" | sha256sum --check --status
-# Replace by rename, never in place: `install`/`cp` truncates the target, and a
-# running sbctl is exactly the case during a re-install or an upgrade - writing
-# over a live executable fails with ETXTBSY. A rename swaps the directory entry,
-# the old inode stays alive for the running process, and the new one is what
-# every later exec sees. `sbctl` itself does the same thing in Rust
-# (src/lifecycle.rs).
-install -m 0755 "$work_dir/sbctl" /usr/local/bin/.sbctl.new
-mv -f /usr/local/bin/.sbctl.new /usr/local/bin/sbctl
-ln -sf /usr/local/bin/sbctl /usr/local/bin/ly
-green "sbctl 已安装；快捷方式：ly"
+chmod 0755 "$work_dir/sbctl"
 
+# The read-only preflight runs the *candidate*, never an already installed
+# binary: `sbctl install` treats a non-terminal stdin as a preflight, so this
+# cannot start an installation or change deployment state.
 replace_existing=0
-# Fail before collecting configuration when this host already has a sing-box
-# deployment. `sbctl install` treats a non-terminal stdin as a read-only
-# preflight, so this cannot start an installation or change deployment state.
-if preflight_output=$(/usr/local/bin/sbctl install </dev/null 2>&1); then
+if preflight_output=$("$work_dir/sbctl" install </dev/null 2>&1); then
   :
 else
   printf '%s\n' "$preflight_output" >&2
@@ -148,57 +172,72 @@ else
     exit 2
   fi
 
-  if [[ -t 0 ]]; then
-    input=/dev/stdin
-  elif [[ -r /dev/tty ]]; then
-    input=/dev/tty
-  else
-    echo "检测到已有部署；请在 VPS 交互终端运行安装脚本，选择备份清理或退出。" >&2
-    exit 2
-  fi
-
+  resolve_installer_input
   echo ""
   echo "发现已有 sing-box/sbctl 部署。如何处理？"
   echo "1) 保留现有部署并退出（默认）"
   echo "2) 备份旧部署、停止相关服务、清理冲突路径，然后继续全新安装"
   while :; do
-    read -r -p "请选择 [1]: " replace_choice <"$input"
+    read -r -p "请选择 [1]: " replace_choice <"$installer_input"
     case "${replace_choice:-1}" in
       1)
-        echo "已取消；现有部署未更改。"
+        echo "已取消；现有部署未更改（含 /usr/local/bin/sbctl，本次没有替换它）。"
+        echo "如需升级已由 sbctl 管理的部署，请运行：sbctl update"
+        echo "如需管理现有部署，请运行：ly（或 sbctl menu）"
         exit 0 ;;
       2) break ;;
       *) echo "请输入 1 或 2。" >&2 ;;
     esac
   done
-  read -r -p "此操作会重建订阅和协议凭据；输入 REINSTALL 确认: " confirmation <"$input"
+  read -r -p "此操作会重建订阅和协议凭据；输入 REINSTALL 确认: " confirmation <"$installer_input"
   if [[ "$confirmation" != REINSTALL ]]; then
-    echo "确认文字不匹配，已取消；现有部署未更改。"
+    echo "确认文字不匹配，已取消；现有部署未更改（含 /usr/local/bin/sbctl）。"
     exit 0
   fi
   replace_existing=1
 fi
 
-if [[ "$#" -eq 0 ]]; then
-  if [[ -n "${input:-}" ]]; then
-    :
-  elif [[ -t 0 ]]; then
-    input=/dev/stdin
-  elif [[ -r /dev/tty ]]; then
-    input=/dev/tty
-  else
-    echo "未提供安装参数且无法打开终端。请在交互式终端运行，或传入 sbctl install 参数。" >&2
-    exit 2
-  fi
+# Collect the installation arguments without touching the host, so every answer
+# is in hand before the first write.
+install_args=()
+guided=0
+if [[ "$#" -gt 0 ]]; then
+  install_args=("$@")
+elif [[ "$replace_existing" -eq 0 ]]; then
+  # The full wizard is the single-pass path: unlike the flag subset below it
+  # also asks for certificate mode, the Certbot e-mail, traffic accounting and
+  # the client template, so a first install no longer leaves a second
+  # `sbctl config wizard` for the operator to discover.
+  resolve_installer_input
+  guided=1
+else
+  # A reinstall keeps the flag-driven path because --guided refuses to be
+  # combined with --replace-existing.
+  resolve_installer_input
+  echo ""
+  echo "sbctl 交互式安装"
+  echo "1) Direct：sbctl 使用公网 80/443 提供 HTTPS 订阅"
+  echo "2) External proxy：使用现有 Nginx/Caddy 反代本机 2080 端口"
+  echo "3) IP fallback：使用 IP + 高位 HTTP 端口（无域名，自签证书 + 协议伪装域名）"
+  while :; do
+    read -r -p "请选择订阅模式 [1]: " mode_choice <"$installer_input"
+    mode_choice=${mode_choice:-1}
+    case "$mode_choice" in
+      1) mode=direct; break ;;
+      2) mode=external-proxy; break ;;
+      3) mode=ip-fallback; break ;;
+      *) echo "请输入 1、2 或 3。" >&2 ;;
+    esac
+  done
 
   read_required() {
     local label=$1 default=${2-} value
     while :; do
       if [[ -n "$default" ]]; then
-        read -r -p "$label [$default]: " value <"$input"
+        read -r -p "$label [$default]: " value <"$installer_input"
         value=${value:-$default}
       else
-        read -r -p "$label: " value <"$input"
+        read -r -p "$label: " value <"$installer_input"
       fi
       if [[ -n "${value//[[:space:]]/}" ]]; then
         printf '%s' "$value"
@@ -208,64 +247,52 @@ if [[ "$#" -eq 0 ]]; then
     done
   }
 
-  if [[ "$replace_existing" -eq 0 ]]; then
-    # The full wizard is the single-pass path: unlike the flag subset below it
-    # also asks for certificate mode, the Certbot e-mail, traffic accounting and
-    # the client template, so a first install no longer leaves a second
-    # `sbctl config wizard` for the operator to discover.
-    echo ""
-    echo "sbctl 交互式安装（完整配置向导）"
-    run_installer /usr/local/bin/sbctl install --guided --manifest "$work_dir/manifest.json" <"$input"
+  if [[ "$mode" == ip-fallback ]]; then
+    subscription_host=$(read_required "VPS 公网 IP")
+    http_port=$(read_required "HTTP 订阅端口" "2080")
   else
-    # A reinstall keeps the flag-driven path because --guided refuses to be
-    # combined with --replace-existing.
-    echo ""
-    echo "sbctl 交互式安装"
-    echo "1) Direct：sbctl 使用公网 80/443 提供 HTTPS 订阅"
-    echo "2) External proxy：使用现有 Nginx/Caddy 反代本机 2080 端口"
-    echo "3) IP fallback：使用 IP + 高位 HTTP 端口（无域名，自签证书 + 协议伪装域名）"
-    while :; do
-      read -r -p "请选择订阅模式 [1]: " mode_choice <"$input"
-      mode_choice=${mode_choice:-1}
-      case "$mode_choice" in
-        1) mode=direct; break ;;
-        2) mode=external-proxy; break ;;
-        3) mode=ip-fallback; break ;;
-        *) echo "请输入 1、2 或 3。" >&2 ;;
-      esac
-    done
-
-    if [[ "$mode" == ip-fallback ]]; then
-      subscription_host=$(read_required "VPS 公网 IP")
-      http_port=$(read_required "HTTP 订阅端口" "2080")
-    else
-      subscription_host=$(read_required "订阅域名（请先解析到此 VPS）")
-    fi
-    proxy_host=$(read_required "代理连接主机（直接回车则使用订阅主机）" "$subscription_host")
-    interface=$(read_required "流量统计网卡（直接回车自动识别）" "auto")
-    reality_decoy_sni=$(read_required "Reality 伪装 SNI" "www.cloudflare.com")
-
-    install_args=(--mode "$mode" --subscription-host "$subscription_host" --proxy-host "$proxy_host" --reality-decoy-sni "$reality_decoy_sni")
-    if [[ "$replace_existing" -eq 1 ]]; then
-      install_args+=(--replace-existing)
-    fi
-    if [[ "$interface" != auto ]]; then
-      install_args+=(--interface "$interface")
-    fi
-    if [[ "$mode" == ip-fallback ]]; then
-      protocol_sni=$(read_required "协议 TLS 伪装域名（证书类协议使用）" "www.bing.com")
-      install_args+=(--http-port "$http_port" --protocol-sni "$protocol_sni")
-    fi
-
-    echo ""
-    echo "接下来可逐项选择要启用的协议；直接回车即启用。"
-    # sing-box 下载、摘要、兼容矩阵和配置检查全部由 sbctl 依据同一签名 manifest 完成。
-    run_installer /usr/local/bin/sbctl install --manifest "$work_dir/manifest.json" "${install_args[@]}" <"$input"
+    subscription_host=$(read_required "订阅域名（请先解析到此 VPS）")
   fi
+  proxy_host=$(read_required "代理连接主机（直接回车则使用订阅主机）" "$subscription_host")
+  interface=$(read_required "流量统计网卡（直接回车自动识别）" "auto")
+  reality_decoy_sni=$(read_required "Reality 伪装 SNI" "www.cloudflare.com")
+
+  install_args=(--mode "$mode" --subscription-host "$subscription_host" --proxy-host "$proxy_host" --reality-decoy-sni "$reality_decoy_sni")
+  if [[ "$interface" != auto ]]; then
+    install_args+=(--interface "$interface")
+  fi
+  if [[ "$mode" == ip-fallback ]]; then
+    protocol_sni=$(read_required "协议 TLS 伪装域名（证书类协议使用）" "www.bing.com")
+    install_args+=(--http-port "$http_port" --protocol-sni "$protocol_sni")
+  fi
+
+  echo ""
+  echo "接下来可逐项选择要启用的协议；直接回车即启用。"
 fi
 
-extra_install_args=()
 if [[ "$replace_existing" -eq 1 ]]; then
-  extra_install_args+=(--replace-existing)
+  install_args+=(--replace-existing)
 fi
-run_installer /usr/local/bin/sbctl install --manifest "$work_dir/manifest.json" "$@" "${extra_install_args[@]}"
+
+# Only now is the host changed. Replace by rename, never in place:
+# `install`/`cp` truncates the target, and a running sbctl is exactly the case
+# during a re-install or an upgrade - writing over a live executable fails with
+# ETXTBSY. A rename swaps the directory entry, the old inode stays alive for
+# the running process, and the new one is what every later exec sees. `sbctl`
+# itself does the same thing in Rust (src/lifecycle.rs).
+install -m 0755 "$work_dir/sbctl" /usr/local/bin/.sbctl.new
+mv -f /usr/local/bin/.sbctl.new /usr/local/bin/sbctl
+if [[ ! -x /usr/local/bin/sbctl ]]; then
+  echo "sbctl 二进制未正确安装到 /usr/local/bin/sbctl；现有部署未更改。" >&2
+  exit 2
+fi
+ln -sf /usr/local/bin/sbctl /usr/local/bin/ly
+green "sbctl 已安装；快捷方式：ly"
+
+# sing-box 下载、摘要、兼容矩阵和配置检查全部由 sbctl 依据同一签名 manifest 完成。
+if [[ "$guided" -eq 1 ]]; then
+  echo ""
+  echo "sbctl 交互式安装（完整配置向导）"
+  run_installer /usr/local/bin/sbctl install --guided --manifest "$work_dir/manifest.json" <"$installer_input"
+fi
+run_installer /usr/local/bin/sbctl install --manifest "$work_dir/manifest.json" "${install_args[@]}"

@@ -1872,15 +1872,7 @@ fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> 
         })?
         .to_string_lossy()
         .into_owned();
-    let (user, owner, mode) = match relative.as_str() {
-        "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
-        // The managed service binaries must stay root-owned and executable:
-        // sbctl.service and sing-box.service run under their own accounts and
-        // exec these paths, so treating them like state files (0600 sbctl:sbctl)
-        // would leave every updated binary unexecutable and break the services.
-        "usr/local/bin/sbctl" | "usr/local/bin/sing-box" => ("root", "root:root", 0o755u32),
-        _ => ("sbctl", "sbctl:sbctl", 0o600u32),
-    };
+    let (user, owner, mode) = managed_ownership(&relative);
     // The dedicated service account is created during the installation
     // transaction, after the configuration is first written. Until it exists
     // the write cannot be delegated; the daemon-storage preparation re-applies
@@ -1907,6 +1899,43 @@ fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> 
     #[cfg(not(unix))]
     let _ = (user, owner, mode);
     Ok(())
+}
+
+/// The owner, owner string and mode every managed path is restored to on the
+/// live host.
+///
+/// An update rollback rewrites every managed path through
+/// `write_relative_locked`, so this mapping decides what a restored file looks
+/// like. A single catch-all fallback used to hand `sbctl:sbctl 0600` to the
+/// systemd units, the Certbot deploy hook and the pinned TLS private key: the
+/// `sing-box` account could no longer read the certificate, and the hook lost
+/// the executable bit Certbot needs to keep re-pinning renewals. Each group gets
+/// its own policy instead.
+fn managed_ownership(relative: &str) -> (&'static str, &'static str, u32) {
+    match relative {
+        "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
+        // The managed service binaries must stay root-owned and executable:
+        // sbctl.service and sing-box.service run under their own accounts and
+        // exec these paths, so treating them like state files (0600 sbctl:sbctl)
+        // would leave every updated binary unexecutable and break the services.
+        "usr/local/bin/sbctl" | "usr/local/bin/sing-box" => ("root", "root:root", 0o755u32),
+        // systemd reads its units as root, so they are never delegated to a
+        // service account: a restricted daemon must not own its own unit file.
+        _ if relative.starts_with("etc/systemd/system/") => ("root", "root:root", 0o644u32),
+        // Certbot runs this hook as root and the hook invokes `sbctl certificate
+        // verify`; without the executable bit every renewal stops re-pinning the
+        // certificate and Direct mode silently serves an expiring one.
+        _ if relative.starts_with("etc/letsencrypt/renewal-hooks/") => {
+            ("root", "root:root", 0o755u32)
+        }
+        // The pinned TLS copy is read by the `sing-box` data plane through the
+        // shared certificate group, exactly like
+        // `certificate.rs::restrict_certificate_permissions` writes it.
+        _ if relative.starts_with("var/lib/sbctl/certificates/") => {
+            ("root", "root:sbctl-cert", 0o640u32)
+        }
+        _ => ("sbctl", "sbctl:sbctl", 0o600u32),
+    }
 }
 
 /// Reports whether `user` has an entry in the host passwd database, so live

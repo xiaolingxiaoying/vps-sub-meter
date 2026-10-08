@@ -5,12 +5,14 @@
 #   SBCTUI_ARTIFACT       release client binary    -> .scratch/acceptance-bin/sbtui-linux-amd64
 # The fixture build is never published (see docs/release-signing.md).
 #
-# `tests/acceptance/run.sh` still treats all three as mandatory: `verify-client.sh`
-# needs a real client to prove orphan reclamation and the TUN wiring. This
-# repository is the server only, so the client leg can be built here and run.sh
-# will refuse to start without SBCTUI_ARTIFACT/SBCLI_ARTIFACT - build those two in
-# the singbox-sub-me workspace and export their paths. The script says out loud
-# which branch it took, so a missing client binary never reads as a broken build.
+# `tests/acceptance/run.sh` treats the two client artifacts as optional: without
+# them it prints `branch: server-only workspace - skipping the client legs` and
+# runs the three server assertions (`verify-bootstrap.sh`, `verify.sh`,
+# `verify-real.sh`). Export SBCTUI_ARTIFACT/SBCLI_ARTIFACT from a singbox-sub-me
+# build to run the full suite, including `verify-client.sh` (orphan reclamation
+# and the TUN wiring) and `verify-sbcli.sh` (shared daemon protocol). The script
+# says out loud which branch it took, so a missing client binary never reads as
+# a broken build.
 #
 # Run inside WSL. The Windows tree is synced into the Linux filesystem first so
 # the compiler never touches /mnt/c, and the outputs are copied back only at the
@@ -59,8 +61,8 @@ if cargo metadata --no-deps --format-version 1 | grep -q '"sbtui"'; then
   cargo build --release --locked -p sbtui -p sbcli
 else
   echo "branch: server-only workspace - skipping the client leg"
-  echo "  run.sh needs SBCTUI_ARTIFACT and SBCLI_ARTIFACT; build them in the" >&2
-  echo "  singbox-sub-me workspace and export both paths before running it." >&2
+  echo "  run.sh still runs the three server assertions; export SBCTUI_ARTIFACT" >&2
+  echo "  and SBCLI_ARTIFACT from a singbox-sub-me build to add the client ones." >&2
 fi
 
 out="$SRC/.scratch/acceptance-bin"

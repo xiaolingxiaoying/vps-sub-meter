@@ -57,20 +57,23 @@ jobs:
         run: cargo test --manifest-path sbctl/Cargo.toml --locked --workspace --features sbctl/test-signing
       - name: Verify production release trust boundary
         run: cargo test --manifest-path sbctl/Cargo.toml --locked -p sbctl --no-default-features --test release_trust
-      - name: Resolve latest stable sing-box release
+      - name: Read the pinned sing-box runtime
         id: sing_box
         run: |
           set -euo pipefail
-          release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
-            "https://github.com/${SING_BOX_REPOSITORY}/releases/latest")
-          case "$release_url" in
-            https://github.com/SagerNet/sing-box/releases/tag/v*) tag=${release_url##*/} ;;
-            *) echo "Could not resolve a stable sing-box release URL: $release_url" >&2; exit 1 ;;
-          esac
-          version=${tag#v}
-          [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "Unexpected sing-box version: $tag" >&2; exit 1; }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
+          # The bundled runtime is pinned in one reviewed file, and
+          # `generate-manifest.sh` reads the same file: a release cannot declare
+          # a runtime it does not ship, and the archive is digest-verified
+          # before the manifest that names it is signed.
+          # shellcheck source=/dev/null
+          . sbctl/scripts/release-runtime-pins.txt
+          if [[ ! "$sing_box_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "release-runtime-pins.txt has a non-fixed sing_box_version: $sing_box_version" >&2
+            exit 1
+          fi
+          echo "tag=v$sing_box_version" >> "$GITHUB_OUTPUT"
+          echo "version=$sing_box_version" >> "$GITHUB_OUTPUT"
+          echo "pinned sing-box runtime: $sing_box_version"
 
   build:
     needs: validate
@@ -93,6 +96,9 @@ jobs:
         env:
           SBCTL_RELEASE_PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
         run: cargo build --release --locked -p sbctl --no-default-features
+      - name: Refuse to publish a binary that trusts the development key
+        working-directory: sbctl
+        run: bash scripts/dev/release-trust-anchor-check.sh target/release/sbctl
       - name: Stage architecture-specific binary
         working-directory: sbctl
         run: |
@@ -105,8 +111,62 @@ jobs:
           if-no-files-found: error
           retention-days: 3
 
+  runtime:
+    needs: validate
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [amd64, arm64]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download and verify the pinned sing-box runtime
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          . sbctl/scripts/release-runtime-pins.txt
+          case "$ARCH" in
+            amd64) expected=$sha256_amd64 ;;
+            arm64) expected=$sha256_arm64 ;;
+            *) echo "unsupported architecture $ARCH" >&2; exit 1 ;;
+          esac
+          archive="sing-box-${sing_box_version}-linux-${ARCH}.tar.gz"
+          url="https://github.com/${SING_BOX_REPOSITORY}/releases/download/v${sing_box_version}/${archive}"
+          curl -fsSL --retry 3 --proto '=https' -o "$RUNNER_TEMP/$archive" "$url"
+          printf '%s  %s\n' "$expected" "$RUNNER_TEMP/$archive" | sha256sum --check --status
+          # Cross-check the pin against the GitHub API's own digest so a stale
+          # pin cannot silently ship a different runtime.
+          api_digest=$(curl -fsSL --retry 3 \
+            -H 'Accept: application/vnd.github+json' -H 'User-Agent: sbctl' \
+            "https://api.github.com/repos/${SING_BOX_REPOSITORY}/releases/tags/v${sing_box_version}" \
+            | jq -r --arg name "$archive" '.assets[] | select(.name == $name) | .digest // empty' \
+            | sed -n 's/^sha256://p')
+          if [ -z "$api_digest" ]; then
+            echo "GitHub published no digest for $archive; refusing to sign an unverifiable runtime" >&2
+            exit 1
+          fi
+          if [ "$api_digest" != "$expected" ]; then
+            echo "pinned digest for $archive is stale: pinned $expected, GitHub reports $api_digest" >&2
+            exit 1
+          fi
+          mkdir -p dist
+          # Extract exactly the kernel member: `tar -xzf` of the whole archive
+          # as root is a traversal surface, and the other members are not part
+          # of the release.
+          member="sing-box-${sing_box_version}-linux-${ARCH}/sing-box"
+          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP" --no-same-owner --no-same-permissions -- "$member"
+          install -m 0755 "$RUNNER_TEMP/$member" "dist/sing-box-linux-$ARCH"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sing-box-linux-${{ matrix.arch }}
+          path: dist/sing-box-linux-${{ matrix.arch }}
+          if-no-files-found: error
+          retention-days: 3
+
   package:
-    needs: [validate, build]
+    needs: [validate, build, runtime]
     strategy:
       fail-fast: false
       matrix:
@@ -130,17 +190,10 @@ jobs:
         with:
           name: sbctl-linux-${{ matrix.arch }}
           path: dist
-      - name: Download official sing-box runtime
-        env:
-          ARCH: ${{ matrix.arch }}
-        run: |
-          set -euo pipefail
-          archive="sing-box-${SING_BOX_VERSION}-linux-${ARCH}.tar.gz"
-          url="https://github.com/${SING_BOX_REPOSITORY}/releases/download/${SING_BOX_TAG}/${archive}"
-          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "$url"
-          mkdir -p "$RUNNER_TEMP/sing-box"
-          tar -xzf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/sing-box" --strip-components=1
-          install -m 0755 "$RUNNER_TEMP/sing-box/sing-box" "dist/sing-box-linux-$ARCH"
+      - uses: actions/download-artifact@v4
+        with:
+          name: sing-box-linux-${{ matrix.arch }}
+          path: dist
       - name: Write signing seed to a private temporary file
         env:
           SBCTL_SIGNING_SEED: ${{ secrets.SBCTL_SIGNING_SEED }}
@@ -232,6 +285,7 @@ jobs:
     env:
       RELEASE_TAG: ${{ github.ref_name }}
     steps:
+      - uses: actions/checkout@v4
       - name: Download assets from the published release
         env:
           GH_TOKEN: ${{ github.token }}
@@ -246,6 +300,7 @@ jobs:
           chmod 0755 dist/sbctl-linux-amd64
           dist/sbctl-linux-amd64 release verify --manifest dist/manifest-amd64.json
           dist/sbctl-linux-amd64 release verify --manifest dist/manifest-arm64.json
+          bash sbctl/scripts/dev/release-trust-anchor-check.sh dist/sbctl-linux-amd64
           bash -n dist/install.sh
           if grep -q '@SBCTL_RELEASE_PUBLIC_KEY_PEM@' dist/install.sh; then
             echo "Published installer still contains the public-key placeholder." >&2

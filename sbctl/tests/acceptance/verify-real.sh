@@ -209,6 +209,47 @@ printf 'real-challenge-body' > "/var/lib/sbctl/acme-webroot/.well-known/acme-cha
 challenge=$(curl --silent --show-error --retry 5 --retry-connrefused --retry-delay 1 \
   "http://127.0.0.1:80/.well-known/acme-challenge/$direct_token")
 [ "$challenge" = 'real-challenge-body' ] || fail 'Direct HTTP-01 challenge did not serve through the systemd socket'
+
+# A failed update must restore the pinned certificate and the Certbot hook with
+# the ownership and mode the deployment depends on. The rollback used to rewrite
+# every managed path as `sbctl:sbctl 0600`, which left the `sing-box` account
+# unable to read the certificate its listeners present and left Certbot unable
+# to execute the hook that re-pins a renewal.
+pinned_key=/var/lib/sbctl/certificates/sub.example.test/privkey.pem
+deploy_hook=/etc/letsencrypt/renewal-hooks/deploy/sbctl-certificate-deploy-hook
+[ -f "$pinned_key" ] || fail 'the Direct install did not pin the subscription certificate'
+[ -x "$deploy_hook" ] || fail 'the Direct install did not install an executable deploy hook'
+key_before=$(stat -c '%a %U:%G' "$pinned_key")
+hook_before=$(stat -c '%a %U:%G' "$deploy_hook")
+
+rollback_digest=$(sha256sum "$fake_sing_box" | awk '{print $1}')
+printf '{"schema":1,"sbctl":{"version":"0.0.2","sha256":"%s"},"sing_box":{"version":"1.12.0","sha256":"%s"},"sing_box_compatibility":[{"min":"1.12.0","max":"1.12.0"}]}' \
+  "$rollback_digest" "$rollback_digest" > "$work/rollback.unsigned.json"
+"$sbctl" release sign \
+  --manifest "$work/rollback.unsigned.json" \
+  --private-key /usr/local/lib/sbctl-acceptance/dev-signing-key.hex \
+  --output "$work/rollback-manifest.json"
+# Masking the control-plane unit makes the post-update health check fail, which
+# is the rollback path under test. The mask is lifted as soon as the update
+# returns, even if the script is interrupted.
+systemctl mask sbctl.service >/dev/null
+trap 'systemctl unmask sbctl.service >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
+if "$sbctl" update --manifest "$work/rollback-manifest.json" \
+  --sbctl-artifact "$fake_sing_box" --sing-box-artifact "$fake_sing_box" \
+  >"$work/rollback-update.out" 2>&1; then
+  fail 'an update whose health check fails must not be accepted'
+fi
+systemctl unmask sbctl.service >/dev/null 2>&1 || true
+trap 'rm -rf "$work"' EXIT
+
+key_after=$(stat -c '%a %U:%G' "$pinned_key")
+hook_after=$(stat -c '%a %U:%G' "$deploy_hook")
+[ "$key_before" = "$key_after" ] \
+  || fail "the update rollback changed the pinned private key ($key_before -> $key_after)"
+[ "$hook_before" = "$hook_after" ] \
+  || fail "the update rollback changed the deploy hook ($hook_before -> $hook_after)"
+[ -x "$deploy_hook" ] || fail 'the update rollback removed the deploy hook executable bit'
+
 $sbctl uninstall --purge >/dev/null
 
 echo "real sbctl acceptance passed on $ID $VERSION_ID"

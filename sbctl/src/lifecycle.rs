@@ -287,6 +287,13 @@ fn wait_for_stable_activation(root: &Path, unit: &str) -> Result<(), String> {
 pub struct PreexistingState {
     pub config: bool,
     pub data_directory: bool,
+    /// Whether `/usr/local/bin/sbctl` already existed when the transaction
+    /// started. The release installer always places the management binary
+    /// before it invokes `sbctl install`, so a failed installation must not
+    /// delete it: doing so removes the administrator's only CLI (and the path
+    /// the Certbot deploy hook calls) even though the binary was never part of
+    /// this transaction.
+    pub management_binary: bool,
 }
 
 pub fn preexisting_state(root: &Path) -> PreexistingState {
@@ -298,6 +305,7 @@ pub fn preexisting_state(root: &Path) -> PreexistingState {
             || root.join(OWNERSHIP_MARKER).exists()
             || root.join("var/lib/sbctl/artifacts").is_dir()
             || root.join("var/lib/sbctl/certificates").is_dir(),
+        management_binary: root.join("usr/local/bin/sbctl").is_file(),
     }
 }
 
@@ -568,6 +576,10 @@ fn remove_conflict_path(path: &Path) -> Result<(), String> {
 fn predates_transaction(relative: &str, preexisting: PreexistingState) -> bool {
     (preexisting.config && relative == "etc/sbctl/config.toml")
         || (preexisting.data_directory && relative.starts_with("var/lib/sbctl"))
+        // The management binary is installed by the bootstrap installer before
+        // this transaction starts, so the rollback must never treat it as its
+        // own artifact. A `--purge` uninstall still removes it deliberately.
+        || (preexisting.management_binary && relative == "usr/local/bin/sbctl")
 }
 
 /// Removes only files created by a failed fresh installation. Preflight has
@@ -579,6 +591,12 @@ pub fn rollback_fresh_installation(root: &Path, preexisting: PreexistingState) {
         eprintln!(
             "warning: sbctl configuration or state predates this install, so the rollback left \
              it in place; run `sbctl uninstall --purge` first to start from a clean slate"
+        );
+    }
+    if preexisting.management_binary {
+        eprintln!(
+            "warning: /usr/local/bin/sbctl predates this install and was left in place; it is \
+             the management CLI, not an artifact of the failed transaction"
         );
     }
     let _ = systemctl(
@@ -1407,17 +1425,32 @@ fn grant_certificate_storage(root: &Path) -> Result<(), String> {
             "could not restrict certificate storage: chmod exited with {status}"
         ));
     }
+    grant_pinned_certificate_group(root)
+}
+
+/// Re-applies `sbctl-cert` group ownership to the pinned certificate copy.
+///
+/// Shared by the install-time storage preparation and by the update rollback:
+/// a restored pinned key is written by root, so without this the `sing-box`
+/// account loses read access to the certificate its listeners present.
+/// Fixture roots keep the writing user's ownership, exactly like
+/// `restrict_certificate_permissions`.
+pub(crate) fn grant_pinned_certificate_group(root: &Path) -> Result<(), String> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
     let certificates = root.join(crate::config::CERTIFICATES_RELATIVE_PATH);
-    if certificates.is_dir() {
-        let status = Command::new("chgrp")
-            .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
-            .status()
-            .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
-        if !status.success() {
-            return Err(format!(
-                "could not grant certificate copy access: chgrp exited with {status}"
-            ));
-        }
+    if !certificates.is_dir() {
+        return Ok(());
+    }
+    let status = Command::new("chgrp")
+        .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
+        .status()
+        .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant certificate copy access: chgrp exited with {status}"
+        ));
     }
     Ok(())
 }
@@ -1450,6 +1483,7 @@ mod tests {
             PreexistingState {
                 config: true,
                 data_directory: true,
+                management_binary: false,
             },
         );
 
@@ -1464,6 +1498,45 @@ mod tests {
         assert!(
             !unit.is_file(),
             "a rollback must still remove what the install created"
+        );
+    }
+
+    #[test]
+    fn a_rollback_keeps_a_management_binary_that_predates_the_transaction() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let binary = root.path().join("usr/local/bin/sbctl");
+        fs::create_dir_all(binary.parent().expect("binary has a parent"))
+            .expect("fixture binary directory");
+        fs::write(&binary, "installed by the bootstrap installer").expect("fixture binary");
+
+        rollback_fresh_installation(
+            root.path(),
+            PreexistingState {
+                config: false,
+                data_directory: false,
+                management_binary: true,
+            },
+        );
+
+        assert!(
+            binary.is_file(),
+            "a failed install must not remove the administrator's only CLI"
+        );
+    }
+
+    #[test]
+    fn a_rollback_removes_a_management_binary_this_transaction_created() {
+        let root = tempfile::tempdir().expect("fixture root");
+        let binary = root.path().join("usr/local/bin/sbctl");
+        fs::create_dir_all(binary.parent().expect("binary has a parent"))
+            .expect("fixture binary directory");
+        fs::write(&binary, "written by this transaction").expect("fixture binary");
+
+        rollback_fresh_installation(root.path(), PreexistingState::default());
+
+        assert!(
+            !binary.is_file(),
+            "a binary created inside the transaction is rolled back with it"
         );
     }
 

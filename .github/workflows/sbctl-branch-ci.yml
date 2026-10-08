@@ -37,3 +37,32 @@ jobs:
         run: cargo test --manifest-path sbctl/Cargo.toml --locked -p sbctl --no-default-features --test release_trust
       - name: Build release binary
         run: cargo build --manifest-path sbctl/Cargo.toml --locked -p sbctl --release --no-default-features
+
+  # The systemd acceptance suite drives real systemd inside disposable
+  # containers on three distributions. It is the only gate that can catch
+  # install-transaction, rollback and unit-permission regressions; the suite's
+  # two client legs need binaries that live in the singbox-sub-me workspace, so
+  # it detects their absence and skips exactly those two assertions.
+  server-acceptance:
+    needs: validate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+      - name: Build the release and test-signing binaries the suite consumes
+        working-directory: sbctl
+        run: |
+          set -euo pipefail
+          cargo build --release --locked -p sbctl --no-default-features
+          cargo build --release --locked -p sbctl --features test-signing --target-dir target-fixtures
+          mkdir -p .scratch/acceptance-bin
+          cp target/release/sbctl .scratch/acceptance-bin/sbctl-linux-amd64
+          cp target-fixtures/release/sbctl .scratch/acceptance-bin/sbctl-test-signing
+      - name: Run the server-only systemd acceptance suite
+        env:
+          SBCTL_ARTIFACT: ${{ github.workspace }}/sbctl/.scratch/acceptance-bin/sbctl-linux-amd64
+          SBCTL_TEST_ARTIFACT: ${{ github.workspace }}/sbctl/.scratch/acceptance-bin/sbctl-test-signing
+        run: sh sbctl/tests/acceptance/run.sh

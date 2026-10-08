@@ -8,14 +8,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
-    if options.subscription_host.is_none()
-        && options.interface.is_none()
-        && options.reality_decoy_sni.is_none()
-        && options.sing_box_bin.is_none()
-        && options.manifest.is_none()
-        && !options.guided
-        && !io::stdin().is_terminal()
-    {
+    // A bare `sbctl install` with no terminal is the read-only preflight the
+    // bootstrap installer relies on: it reports whether the host is ready and
+    // never writes anything. Any other invocation carries installation intent,
+    // so it must run the real transaction instead of silently succeeding.
+    if options.is_bare() && !io::stdin().is_terminal() {
         return match sbctl::preflight::preflight(root) {
             Ok(()) => {
                 println!("install preflight passed: host is ready for interactive installation");
@@ -151,6 +148,13 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         // previous deployment into its protected backup. A failed fresh install
         // is then rolled back before the old deployment is restored.
         state_before_install = sbctl::lifecycle::preexisting_state(root);
+        // The transaction owns the host from here on. Artifact generation has a
+        // side effect before anything is committed: a self-signed deployment
+        // writes its certificate into the managed data directory. Opening the
+        // transaction first means a failure after that point rolls the
+        // certificate away instead of leaving a directory that makes preflight
+        // refuse every later install.
+        installation_started = true;
         let sing_box_bin = match options.sing_box_bin {
             Some(path) => path,
             None => match options.manifest {
@@ -206,7 +210,6 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             .expect("generated server config");
         sbctl::subscription::check_sing_box_config(&sing_box_bin, server)
             .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-        installation_started = true;
         sbctl::lifecycle::install_checked_sing_box(root, &sing_box_bin)?;
         let references = artifacts
             .iter()

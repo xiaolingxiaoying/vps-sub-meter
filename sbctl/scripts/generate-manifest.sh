@@ -22,9 +22,33 @@ arch=$4
 sbctl_file=$5
 sing_box_file=$6
 output=$7
-compat=${8:-"${sing_box_version}:${sing_box_version}"}
+
+# The bundled runtime version and the compatibility band are recorded in one
+# reviewed file (`scripts/release-runtime-pins.txt`) so a release cannot declare
+# a runtime it does not ship, and cannot silently collapse the matrix to
+# "exactly this version" - the generated client profiles are validated against
+# every core in the band by the CI real-core matrix.
+pins_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/release-runtime-pins.txt
+pins_value() {
+  local key=$1
+  ( set -a; . "$pins_file"; printf '%s' "${!key}" )
+}
+pinned_version=$(pins_value sing_box_version)
+if [[ "$sing_box_version" != "$pinned_version" ]]; then
+  echo "generate-manifest.sh: sing-box $sing_box_version does not match the pinned runtime $pinned_version in scripts/release-runtime-pins.txt" >&2
+  exit 2
+fi
+if [[ "$#" -ge 8 ]]; then
+  compat=$8
+else
+  compat="$(pins_value sing_box_compat_min):$(pins_value sing_box_compat_max)"
+fi
 min_version=${compat%%:*}
 max_version=${compat##*:}
+if [[ -z "$min_version" || -z "$max_version" ]]; then
+  echo "generate-manifest.sh: the compatibility band must be MIN:MAX, got $compat" >&2
+  exit 2
+fi
 
 signing_key=${SBCTL_SIGNING_KEY:?set SBCTL_SIGNING_KEY to a private production key file}
 signer=${SBCTL_SIGNER:-$(command -v sbctl || true)}

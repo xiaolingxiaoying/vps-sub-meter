@@ -60,21 +60,26 @@
 
 1. **自更新和安装已接入本仓库 Release。**
    `src/update.rs` 与 `scripts/install.sh` 从
-   `github.com/xiaolingxiaoying/vps-sub-meter/releases` 获取签名清单；GitHub Actions 将生产
-   公钥编入 amd64/arm64 二进制，并用 `release` Environment 中的私钥签名和回验清单。
+   `github.com/xiaolingxiaoying/vps-sub-meter/releases` 获取签名清单；
+   [`../.github/workflows/sbctl-release.yml`](../.github/workflows/sbctl-release.yml) 将生产公钥编入
+   amd64/arm64 二进制，用 `release` Environment 中的私钥签名并用发布二进制回验清单，
+   随包 sing-box 的版本与逐架构 sha256 钉在 `scripts/release-runtime-pins.txt`。
    仓库内的 `scripts/install.sh` 仍是未配置公钥的模板，部署应使用 Release 附带的
    `install.sh`。复制到其他仓库时，必须同时调整 Release URL、生产公钥和签名密钥配置。
-2. **L3 验收套件有两条客户端腿。** `tests/acceptance/run.sh` 强制要求
-   `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT`（`verify-client.sh` 证明孤儿回收与 TUN 接线，
-   `verify-sbcli.sh` 证明共享后台协议）。本仓库没有这两个二进制，脚本保持原样未改；
-   `scripts/dev/build-acceptance-artifacts.sh` 会打印
-   `branch: server-only workspace - skipping the client leg` 并只产出两个 sbctl 产物，
-   随后 `run.sh` 会明确拒绝启动。要跑完整套件，请在 monorepo 里构建 sbtui/sbcli 并
-   导出路径；`verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 这三条服务端断言本身
-   不需要客户端。
+   发布链的四个阶段与失败模式见 `docs/release-signing.md`。
+2. **L3 验收套件的两条客户端腿是可选的了。** `tests/acceptance/run.sh` 不再强制要求
+   `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT`：未设置时打印
+   `branch: server-only workspace - skipping the client legs`，跳过 `verify-client.sh`
+   （孤儿回收与 TUN 接线）与 `verify-sbcli.sh`（共享后台协议），只跑
+   `verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言。要跑完整套件，
+   请在 monorepo 里构建 sbtui/sbcli 并导出两个路径。CI 的 `server-acceptance` job
+   按无客户端变量的方式跑三条服务端断言。
 3. **`vps-sub-meter` 这个名字在历史上是前身 Shell 项目。** `docs/implementation-plan.md`
    的总结里写着"吸收 `vps-sub-meter` Shell 脚本中的有效能力"——本仓库沿用了这个名字，
    但与那套 Shell 脚本没有代码继承关系，包名与二进制名仍是 `sbctl`。
+4. **审查结论见 [`project-review-round-3-2026-10-08.md`](project-review-round-3-2026-10-08.md)。**
+   七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已修复，
+   P1/P2 条目逐条附证据与建议，仍开放。
 
 4. **拆分时分层覆写的 CLI 仍是旧模型，生成逻辑与人工运维入口不对齐。** ADR-0029 和 `src/override_template.rs` 已支持客户端两种目标的基础文件与 `.d/` 层，以及 `sing-box-server.json` / `sing-box-server.d/` 服务端目标；当时 CLI 的 `show/edit/clear/validate` 有以下边界：
 

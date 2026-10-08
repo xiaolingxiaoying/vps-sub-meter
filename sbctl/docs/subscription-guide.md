@@ -118,7 +118,7 @@ sbctl config override clear all    # 清除所有覆写
   注意 `geoip/lan` 在该镜像上解析不到，因此 LAN 一直是内置列表而不是规则集 URL。
 - `client_latency_probe_url`：默认 `http://aliyun.com/generate_204`（选择组含 DIRECT，探测必须国内可达）
 
-修改后 `sbctl restart` 重新生成并生效。三档模板都已过 1.10–1.14 五个真实内核的
+修改后运行 `sbctl regenerate` 重新生成并生效（`sbctl restart` 只做 `sing-box check` 与重启服务，不重新生成工件）。三档模板都已过 1.10–1.14 五个真实内核的
 `sing-box check`（`cargo test --test version_profiles -- --ignored`，5 内核 × 3 模板 = 15 种组合）。
 
 ## 安全边界

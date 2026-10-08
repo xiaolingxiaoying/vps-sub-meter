@@ -4,6 +4,8 @@
 
 本仓库是 [`singbox-sub-me`](https://github.com/xiaolingxiaoying/singbox-sub-me) 工作区里**服务端部分的独立副本**（拆分溯源见 [`docs/repository-split.md`](docs/repository-split.md)）。终端与桌面客户端（`sbtui`、`sbcli`、`sbgui`、`client-core`）不在这里，它们仍住在 monorepo。
 
+> **目录布局**：本文件位于 `xiaolingxiaoying/vps-sub-meter` 仓库的 `sbctl/` 子目录。仓库级工作流在仓库根：`.github/workflows/sbctl-branch-ci.yml`（分支校验）与 `.github/workflows/sbctl-release.yml`（推 `sbctl-v*` 标签发布）。下文所有相对路径（`scripts/…`、`docs/…`、`cargo …`）都以本目录为基准；从仓库根构建时用 `--manifest-path sbctl/Cargo.toml`。
+
 ## 功能
 
 - 管理 VLESS Reality、VMess WebSocket、Hysteria 2、TUIC 和 AnyTLS 五种协议。
@@ -34,9 +36,11 @@ test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 
 如果已登录为 `root`，可将最后一行改成 `test -s /tmp/sbctl-install.sh && bash /tmp/sbctl-install.sh`。
 
-> 该地址是**签名信任链的一部分**，不是笔误：`sbctl update` 与安装脚本的构建期公钥都钉在 monorepo 的 Release 上。要让本仓库独立发布 Release，必须同时更换清单地址和 `scripts/install.sh` 里的公钥，见 [`docs/release-signing.md`](docs/release-signing.md)。
+> 该地址是本仓库的 Release，由 [`../.github/workflows/sbctl-release.yml`](../.github/workflows/sbctl-release.yml) 在本仓库构建、签名并发布；`sbctl update` 与安装脚本的构建期公钥都钉在它上面。发布需要仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX`（编译期与 `install.sh`）和 `release` Environment 的 `SBCTL_SIGNING_SEED`（签名私钥），发布约定见 [`docs/release-signing.md`](docs/release-signing.md)。
 
 Release 提供已构建并签名的 `sbctl`、sing-box 运行时、按架构区分的签名清单和安装脚本。安装器会校验签名与文件摘要，然后启动引导配置；VPS 无需安装 Rust 或从源码构建。仓库中的 `scripts/install.sh` 是模板，不能直接运行。
+
+> 在已有部署上重跑安装脚本时，安装器会先问是保留现有部署还是备份后全新安装，**在你回答之前不会替换 `/usr/local/bin/sbctl`**。升级已由 sbctl 管理的部署请直接用 `sbctl update`。
 
 ## 常用命令
 
@@ -90,7 +94,11 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 
 ## 开发验证
 
-生产二进制由 GitHub Actions 构建和签名。开发构建、测试签名与验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 和 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
+生产二进制由 [`../.github/workflows/sbctl-release.yml`](../.github/workflows/sbctl-release.yml) 构建和签名（推 `sbctl-v*` 标签触发）。开发构建、测试签名、发布密钥配置与验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 和 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
+
+## 已知缺口与审查结论
+
+[`docs/project-review-round-3-2026-10-08.md`](docs/project-review-round-3-2026-10-08.md) 记录了 2026-10-08 的全量审查结论：七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已在本轮修复，P1/P2 条目（`config switch-mode` 不可用、Direct 忽略 `--bind`、总览页流量口径、manifest 无序列/有效期、action 未 pin 等）仍开放，逐条附证据与建议。
 
 ## 验证
 
@@ -98,11 +106,11 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 |---|---|
 | L2 Linux（fmt / clippy / 全量测试） | `MSYS_NO_PATHCONV=1 wsl -d Ubuntu-22.04 -- bash scripts/dev/wsl-gate.sh` |
 | L2 真核矩阵（sing-box 1.10–1.14 + mihomo） | 先 `scripts/dev/fetch-sing-box-cores.sh`，再 `scripts/dev/wsl-real-cores.sh` |
-| L3 systemd 验收 | `SBCTL_ARTIFACT=… SBCTL_TEST_ARTIFACT=… SBCTUI_ARTIFACT=… SBCLI_ARTIFACT=… sh tests/acceptance/run.sh` |
+| L3 systemd 验收 | `SBCTL_ARTIFACT=… SBCTL_TEST_ARTIFACT=… sh tests/acceptance/run.sh` |
 
-L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate，`scripts/dev/build-acceptance-artifacts.sh` 会明确打印它跳过了客户端那一腿。`verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言不受影响。
+L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate。这两个变量现在是**可选**的：不设置时脚本打印 `branch: server-only workspace - skipping the client legs` 并只跑 `verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言；设置后跑完整套件。
 
-CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）只保留服务端四个任务：构建、测试、sing-box 版本带校验、mihomo 校验。
+CI（[`../.github/workflows/sbctl-branch-ci.yml`](../.github/workflows/sbctl-branch-ci.yml)）跑服务端五个任务：构建、测试、systemd 验收（三发行版）、sing-box 版本带校验、mihomo 校验。发布由 [`../.github/workflows/sbctl-release.yml`](../.github/workflows/sbctl-release.yml) 负责。
 
 ## 许可证
 
