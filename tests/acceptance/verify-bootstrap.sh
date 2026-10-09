@@ -99,16 +99,58 @@ after=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
 
 # Interactive: choosing "keep the existing deployment and exit" must also leave
 # the binary untouched.
-if command -v script >/dev/null 2>&1; then
-  printf '1\n' | timeout 60 script -qec \
-    "PATH=$work/bin:\$PATH SBCTL_MANIFEST_URL=file://$work/manifest-existing-{arch}.json $installer" \
-    /dev/null >"$work/keep-interactive.out" 2>&1 || true
-  after=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
-  [ "$before" = "$after" ] || fail 'choosing to keep the existing deployment still replaced the management binary'
-  grep -F -- 'sbctl update' "$work/keep-interactive.out" >/dev/null \
-    || fail 'the keep-and-exit path did not point at sbctl update'
-else
-  echo 'note: script(1) is unavailable; the interactive keep-and-exit path was not exercised'
-fi
+# Send the answer only after the prompt appears. Piping into script(1) closes
+# its input before startup completes and can lose the answer or terminate the
+# child before it reaches the prompt on a CI runner.
+PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
+  python3 - "$installer" "$work/keep-interactive.out" <<'PY'
+import errno
+import os
+from pathlib import Path
+import pty
+import select
+import signal
+import sys
+import time
+
+pid, terminal = pty.fork()
+if pid == 0:
+    os.execv(sys.argv[1], [sys.argv[1]])
+
+output = bytearray()
+answered = False
+deadline = time.monotonic() + 60
+try:
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            os.kill(pid, signal.SIGKILL)
+            raise RuntimeError("interactive keep-and-exit timed out")
+        if not select.select([terminal], [], [], remaining)[0]:
+            continue
+        try:
+            chunk = os.read(terminal, 65536)
+        except OSError as error:
+            if error.errno == errno.EIO:
+                break
+            raise
+        if not chunk:
+            break
+        output.extend(chunk)
+        if not answered and "请选择 [1]: ".encode() in output:
+            os.write(terminal, b"1\n")
+            answered = True
+finally:
+    os.close(terminal)
+    Path(sys.argv[2]).write_bytes(output)
+    _, status = os.waitpid(pid, 0)
+    if not answered or os.waitstatus_to_exitcode(status) != 0:
+        sys.stderr.buffer.write(output)
+        raise RuntimeError("interactive keep-and-exit did not finish successfully")
+PY
+after=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
+[ "$before" = "$after" ] || fail 'choosing to keep the existing deployment still replaced the management binary'
+grep -F -- 'sbctl update' "$work/keep-interactive.out" >/dev/null \
+  || fail 'the keep-and-exit path did not point at sbctl update'
 
 echo 'bootstrap acceptance passed'
