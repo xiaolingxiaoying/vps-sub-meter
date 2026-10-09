@@ -3,7 +3,7 @@
 //! the service restart with rollback that both the wizard and credential
 //! rotation rely on.
 
-use crate::cli::args::{CliOverrideTarget, ConfigCommand, OverrideCommand};
+use crate::cli::args::{CliOverrideClearTarget, CliOverrideTarget, ConfigCommand, OverrideCommand};
 use crate::cli::prompt::{ConsolePrompts, protocol_ports};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -34,31 +34,34 @@ pub(crate) fn restart(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
     }
 }
 
-/// Manages the server-side override templates (`sbctl config override ...`).
-/// Overrides merge into the generated client artifacts at regeneration time,
-/// so every edit finishes with a regenerate to keep the served files current.
+/// Manages client subscription overrides and the local server override
+/// (`sbctl config override ...`). Client files merge into generated artifacts;
+/// the server file merges into the sing-box configuration this host runs.
 fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
-    use sbctl::override_template::{CLASH_OVERRIDE_RELATIVE_PATH, SING_BOX_OVERRIDE_RELATIVE_PATH};
-    let overrides_dir = root.join("etc/sbctl/overrides");
+    let targets = [
+        override_target_spec(CliOverrideTarget::SingBox),
+        override_target_spec(CliOverrideTarget::Clash),
+        override_target_spec(CliOverrideTarget::Server),
+    ];
     match command {
         OverrideCommand::Show => {
-            for (target, relative) in [
-                ("sing-box", SING_BOX_OVERRIDE_RELATIVE_PATH),
-                ("clash", CLASH_OVERRIDE_RELATIVE_PATH),
-            ] {
-                let path = root.join(relative);
-                let status = if path.is_file() {
-                    "已启用"
-                } else {
-                    "未创建（不影响生成）"
-                };
-                println!("{target:9} {}  [{status}]", path.display());
+            for spec in targets {
+                if let Err(error) = show_override_target(root, spec) {
+                    eprintln!("override 列表读取失败：{error}");
+                    return ExitCode::from(2);
+                }
             }
             println!(
-                "\n合并语义：对象递归合并；数组整体替换；键名为 rules 的数组会前插到生成规则之前。"
+                "\n合并语义：对象递归合并；默认数组整体替换；rules 默认前插，也可在每个文件中用 rules_mode = prepend|append|replace 覆盖。"
             );
             println!(
-                "影响工件：sing-box-full.json、sing-box-<版本>.json、clash.yaml、clash-1.18.yaml。"
+                "客户端 sing-box 的 outbounds 按 tag 合并；Clash 的 proxies、proxy-groups、rule-providers 按 name 合并。"
+            );
+            println!(
+                "每个目标先应用基础文件，再按文件名字典序合并 drop-in 层；服务端覆写不得更改入站凭据字段。"
+            );
+            println!(
+                "影响工件：sing-box-server.json、sing-box-full.json、sing-box-<版本>.json、clash.yaml、clash-1.18.yaml。sing-box.json 与 URI 格式不受客户端覆写影响。"
             );
             ExitCode::SUCCESS
         }
@@ -68,9 +71,16 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
                 return ExitCode::from(2);
             }
             let store = sbctl::config::DeploymentStore::new(root);
-            let Ok(config) = store.load() else {
-                println!("override 模板结构有效（部署尚未初始化，跳过合并后真核 check）。");
-                return ExitCode::SUCCESS;
+            let config = match store.load() {
+                Ok(config) => config,
+                Err(sbctl::config::ConfigError::Missing) => {
+                    println!("override 模板结构有效（部署尚未初始化，跳过合并后真核 check）。");
+                    return ExitCode::SUCCESS;
+                }
+                Err(error) => {
+                    eprintln!("override 校验失败：无法读取部署配置：{error}");
+                    return ExitCode::from(2);
+                }
             };
             let artifacts = match sbctl::subscription::generated_artifacts(&config, root) {
                 Ok(artifacts) => artifacts,
@@ -81,59 +91,52 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
             };
             let Some(binary) = resolve_sing_box_bin(root, sing_box_bin) else {
                 println!(
-                    "override 模板结构有效；未找到 sing-box 内核（用 --sing-box-bin 指定），跳过合并后真核 check。"
+                    "override 模板和合并结果有效；未找到 sing-box 内核（用 --sing-box-bin 指定），跳过服务端与客户端真核 check。"
                 );
                 return ExitCode::SUCCESS;
             };
-            let name = sbctl::subscription::SubscriptionFormat::SingBoxFull
+            let full_name = sbctl::subscription::SubscriptionFormat::SingBoxFull
                 .artifact_name()
                 .into_owned();
-            let Some((_, merged)) = artifacts.iter().find(|(artifact, _)| *artifact == name) else {
-                eprintln!("override 校验失败：缺少 sing-box-full 工件");
-                return ExitCode::from(2);
-            };
-            match sbctl::subscription::check_sing_box_config(&binary, merged) {
-                Ok(()) => {
-                    println!(
-                        "override 模板有效；合并后 sing-box 配置已通过真核 check（{}）。",
-                        binary.display()
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(error) => {
+            for (name, label) in [
+                ("sing-box-server.json", "服务端配置"),
+                (full_name.as_str(), "客户端 sing-box-full 配置"),
+            ] {
+                let Some((_, merged)) = artifacts.iter().find(|(artifact, _)| artifact == name)
+                else {
+                    eprintln!("override 校验失败：缺少 {name} 工件");
+                    return ExitCode::from(2);
+                };
+                if let Err(error) = sbctl::subscription::check_sing_box_config(&binary, merged) {
                     eprintln!(
-                        "override 合并后 sing-box check 失败（内核 {}）：{error}\n\
-                         提示：合并后的 sing-box-full 工件面向最新稳定版内核；若上面报告未知字段，请先升级服务端内核（sbctl sing-box update）。",
+                        "{label}真核 check 失败（内核 {}）：{error}",
                         binary.display()
                     );
-                    ExitCode::from(2)
+                    return ExitCode::from(2);
                 }
             }
+            println!(
+                "override 模板有效；合并后的服务端和客户端 sing-box 配置均通过真核 check（{}）。",
+                binary.display()
+            );
+            ExitCode::SUCCESS
         }
         OverrideCommand::Edit {
             target,
+            layer,
             sing_box_bin,
         } => {
-            let (relative, sample) = match target {
-                CliOverrideTarget::SingBox => (
-                    SING_BOX_OVERRIDE_RELATIVE_PATH,
-                    "{\n  \"log\": {\"level\": \"warn\"},\n  \"route\": {\n    \"rules\": [\n      {\"domain_suffix\": [\"example.com\"], \"outbound\": \"节点选择\"}\n    ]\n  }\n}\n",
-                ),
-                CliOverrideTarget::Clash => (
-                    CLASH_OVERRIDE_RELATIVE_PATH,
-                    "# 键名为 rules 的数组会前插到生成规则之前。\nrules:\n  - DOMAIN-SUFFIX,example.com,节点选择\n",
-                ),
+            let spec = override_target_spec(target);
+            let (path, sample) = match override_edit_path(root, spec, layer.as_deref()) {
+                Ok(path) => path,
+                Err(error) => {
+                    eprintln!("override 编辑失败：{error}");
+                    return ExitCode::from(2);
+                }
             };
-            let path = root.join(relative);
-            if !path.is_file() {
-                if let Err(error) = fs::create_dir_all(&overrides_dir) {
-                    eprintln!("override 编辑失败：{error}");
-                    return ExitCode::from(2);
-                }
-                if let Err(error) = fs::write(&path, sample) {
-                    eprintln!("override 编辑失败：{error}");
-                    return ExitCode::from(2);
-                }
+            if let Err(error) = prepare_override_edit_path(&path, sample) {
+                eprintln!("override 编辑失败：{error}");
+                return ExitCode::from(2);
             }
             match crate::cli::editor::run_editor(&crate::cli::editor::editor_candidates(), &path) {
                 Ok(status) if status.success() => {}
@@ -153,23 +156,315 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
             println!("override 模板有效，正在重新生成订阅工件……");
             regenerate(root, sing_box_bin)
         }
-        OverrideCommand::Clear => {
-            for relative in [
-                SING_BOX_OVERRIDE_RELATIVE_PATH,
-                CLASH_OVERRIDE_RELATIVE_PATH,
-            ] {
-                let path = root.join(relative);
-                if path.is_file()
-                    && let Err(error) = fs::remove_file(&path)
-                {
-                    eprintln!("override 清理失败：{error}");
-                    return ExitCode::from(2);
+        OverrideCommand::Clear { target } => {
+            let selected = match target {
+                None => vec![CliOverrideTarget::SingBox, CliOverrideTarget::Clash],
+                Some(CliOverrideClearTarget::SingBox) => vec![CliOverrideTarget::SingBox],
+                Some(CliOverrideClearTarget::Clash) => vec![CliOverrideTarget::Clash],
+                Some(CliOverrideClearTarget::Server) => vec![CliOverrideTarget::Server],
+                Some(CliOverrideClearTarget::All) => {
+                    targets.iter().map(|spec| spec.target).collect()
                 }
-            }
-            println!("override 模板已删除，正在重新生成订阅工件……");
-            regenerate(root, None)
+            };
+            clear_override_targets(root, &selected)
         }
     }
+}
+
+#[derive(Clone, Copy)]
+struct OverrideTargetSpec {
+    target: CliOverrideTarget,
+    label: &'static str,
+    base_relative: &'static str,
+    directory_relative: &'static str,
+    extension: &'static str,
+    base_sample: &'static str,
+    layer_sample: &'static str,
+}
+
+fn override_target_spec(target: CliOverrideTarget) -> OverrideTargetSpec {
+    use sbctl::override_template::{
+        CLASH_OVERRIDE_DIRECTORY, CLASH_OVERRIDE_RELATIVE_PATH, SING_BOX_OVERRIDE_DIRECTORY,
+        SING_BOX_OVERRIDE_RELATIVE_PATH, SING_BOX_SERVER_OVERRIDE_DIRECTORY,
+        SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
+    };
+
+    match target {
+        CliOverrideTarget::SingBox => OverrideTargetSpec {
+            target,
+            label: "客户端 sing-box",
+            base_relative: SING_BOX_OVERRIDE_RELATIVE_PATH,
+            directory_relative: SING_BOX_OVERRIDE_DIRECTORY,
+            extension: ".json",
+            base_sample: "{\n  \"log\": {\"level\": \"warn\"},\n  \"route\": {\n    \"rules\": [\n      {\"domain_suffix\": [\"example.com\"], \"outbound\": \"节点选择\"}\n    ]\n  }\n}\n",
+            layer_sample: "{}\n",
+        },
+        CliOverrideTarget::Clash => OverrideTargetSpec {
+            target,
+            label: "客户端 Clash",
+            base_relative: CLASH_OVERRIDE_RELATIVE_PATH,
+            directory_relative: CLASH_OVERRIDE_DIRECTORY,
+            extension: ".yaml",
+            base_sample: "# 键名为 rules 的数组会前插到生成规则之前。\nrules:\n  - DOMAIN-SUFFIX,example.com,节点选择\n",
+            layer_sample: "{}\n",
+        },
+        CliOverrideTarget::Server => OverrideTargetSpec {
+            target,
+            label: "服务端 sing-box",
+            base_relative: SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
+            directory_relative: SING_BOX_SERVER_OVERRIDE_DIRECTORY,
+            extension: ".json",
+            base_sample: "{\n  \"log\": {\"level\": \"warn\"}\n}\n",
+            layer_sample: "{}\n",
+        },
+    }
+}
+
+fn override_layer_files(directory: &Path, extension: &str) -> std::io::Result<Vec<PathBuf>> {
+    let directory_metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error),
+    };
+    if directory_metadata.file_type().is_symlink() || !directory_metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "override layer path is not a regular directory: {}",
+                directory.display()
+            ),
+        ));
+    }
+
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name
+            .to_str()
+            .is_some_and(|name| !name.starts_with('.') && name.ends_with(extension))
+        {
+            let path = entry.path();
+            if path.is_file() {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn show_override_target(root: &Path, spec: OverrideTargetSpec) -> std::io::Result<()> {
+    let base = root.join(spec.base_relative);
+    let base_status = if base.is_file() {
+        "已启用"
+    } else {
+        "未创建"
+    };
+    println!("{}:", spec.label);
+    println!("  {}  [{base_status}]", base.display());
+
+    let directory = root.join(spec.directory_relative);
+    let layers = override_layer_files(&directory, spec.extension)?;
+    if layers.is_empty() {
+        println!(
+            "  {}  [没有生效的 {} drop-in 层]",
+            directory.display(),
+            spec.extension
+        );
+    } else {
+        for layer in layers {
+            println!("  {}  [已启用]", layer.display());
+        }
+    }
+    Ok(())
+}
+
+fn override_edit_path(
+    root: &Path,
+    spec: OverrideTargetSpec,
+    layer: Option<&str>,
+) -> Result<(PathBuf, &'static str), String> {
+    if let Some(layer) = layer {
+        let stem = layer
+            .strip_suffix(spec.extension)
+            .filter(|stem| !stem.is_empty());
+        if layer.starts_with('.')
+            || stem.is_none()
+            || !layer
+                .chars()
+                .all(|character| character.is_ascii_alphanumeric() || "._-".contains(character))
+        {
+            return Err(format!(
+                "层文件名必须是单一文件名，且以 {} 结尾",
+                spec.extension
+            ));
+        }
+        Ok((
+            root.join(spec.directory_relative).join(layer),
+            spec.layer_sample,
+        ))
+    } else {
+        Ok((root.join(spec.base_relative), spec.base_sample))
+    }
+}
+
+fn prepare_override_edit_path(path: &Path, sample: &str) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err(format!("拒绝编辑符号链接：{}", path.display()));
+        }
+        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(_) => return Err(format!("覆写路径不是常规文件：{}", path.display())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("读取 {} 失败：{error}", path.display())),
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("覆写路径没有父目录：{}", path.display()))?;
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("创建 {} 失败：{error}", parent.display()))?;
+    fs::write(path, sample).map_err(|error| format!("创建 {} 失败：{error}", path.display()))
+}
+
+fn clear_override_targets(root: &Path, targets: &[CliOverrideTarget]) -> ExitCode {
+    let overrides_dir = root.join("etc/sbctl/overrides");
+    let mut sources = Vec::new();
+    for target in targets {
+        let spec = override_target_spec(*target);
+        let base = root.join(spec.base_relative);
+        match fs::symlink_metadata(&base) {
+            Ok(metadata) if metadata.is_file() || metadata.file_type().is_symlink() => {
+                sources.push(base);
+            }
+            Ok(_) => {
+                eprintln!("override 清理失败：基础路径不是文件：{}", base.display());
+                return ExitCode::from(2);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                eprintln!("override 清理失败：读取 {} 失败：{error}", base.display());
+                return ExitCode::from(2);
+            }
+        }
+        match override_layer_sources_for_clear(&root.join(spec.directory_relative), spec.extension)
+        {
+            Ok(mut layers) => sources.append(&mut layers),
+            Err(error) => {
+                eprintln!(
+                    "override 清理失败：读取 {} 失败：{error}",
+                    spec.directory_relative
+                );
+                return ExitCode::from(2);
+            }
+        }
+    }
+    sources.sort();
+    sources.dedup();
+
+    let backup = if sources.is_empty() {
+        None
+    } else {
+        match tempfile::Builder::new()
+            .prefix(".override-clear-")
+            .tempdir_in(&overrides_dir)
+        {
+            Ok(backup) => Some(backup),
+            Err(error) => {
+                eprintln!("override 清理失败：无法创建回滚目录：{error}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+
+    let mut moved = Vec::new();
+    let mut move_error = None;
+    if let Some(backup) = &backup {
+        for source in sources {
+            let relative = match source.strip_prefix(&overrides_dir) {
+                Ok(relative) => relative,
+                Err(error) => {
+                    move_error = Some(format!("覆写路径超出根目录：{error}"));
+                    break;
+                }
+            };
+            let backup_path = backup.path().join(relative);
+            if let Some(parent) = backup_path.parent()
+                && let Err(error) = fs::create_dir_all(parent)
+            {
+                move_error = Some(format!("创建回滚路径失败：{error}"));
+                break;
+            }
+            if let Err(error) = fs::rename(&source, &backup_path) {
+                move_error = Some(format!("移走 {} 失败：{error}", source.display()));
+                break;
+            }
+            moved.push((source, backup_path));
+        }
+    }
+    if let Some(error) = move_error {
+        eprintln!("override 清理失败：{error}");
+        return restore_clear_backup(backup, &moved, ExitCode::from(2));
+    }
+
+    if !moved.is_empty() {
+        println!("已暂存 {} 个覆写文件，正在重新生成并验证……", moved.len());
+    } else {
+        println!("未发现已启用的覆写文件，正在检查并重新生成工件……");
+    }
+    restore_clear_backup(backup, &moved, regenerate(root, None))
+}
+
+fn override_layer_sources_for_clear(
+    directory: &Path,
+    extension: &str,
+) -> std::io::Result<Vec<PathBuf>> {
+    match fs::symlink_metadata(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error),
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            Ok(vec![directory.to_path_buf()])
+        }
+        Ok(_) => override_layer_files(directory, extension),
+    }
+}
+
+fn restore_clear_backup(
+    backup: Option<tempfile::TempDir>,
+    moved: &[(PathBuf, PathBuf)],
+    result: ExitCode,
+) -> ExitCode {
+    if result == ExitCode::SUCCESS || moved.is_empty() {
+        drop(backup);
+        return result;
+    }
+    let Some(backup) = backup else {
+        eprintln!("override 清理回滚失败：找不到暂存目录");
+        return ExitCode::from(2);
+    };
+    let mut restore_errors = Vec::new();
+    for (original, saved) in moved.iter().rev() {
+        if let Some(parent) = original.parent()
+            && let Err(error) = fs::create_dir_all(parent)
+        {
+            restore_errors.push(format!("创建 {} 失败：{error}", parent.display()));
+            continue;
+        }
+        if let Err(error) = fs::rename(saved, original) {
+            restore_errors.push(format!("恢复 {} 失败：{error}", original.display()));
+        }
+    }
+    if restore_errors.is_empty() {
+        drop(backup);
+        return result;
+    }
+    let backup_path = backup.keep();
+    eprintln!(
+        "override 清理回滚未完成；剩余备份保存在 {}：{}",
+        backup_path.display(),
+        restore_errors.join("；")
+    );
+    ExitCode::from(2)
 }
 
 /// Resolves the sing-box binary for an override validation: an explicit path,

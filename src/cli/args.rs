@@ -323,8 +323,7 @@ pub(crate) enum ConfigCommand {
         #[arg(long, value_name = "PATH")]
         sing_box_bin: Option<PathBuf>,
     },
-    /// Manage the server-side client override templates merged into
-    /// subscription artifacts (etc/sbctl/overrides/).
+    /// Manage client subscription overrides and local sing-box server overrides.
     Override {
         #[command(subcommand)]
         command: OverrideCommand,
@@ -333,34 +332,51 @@ pub(crate) enum ConfigCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum OverrideCommand {
-    /// Show the override files and which artifacts they affect.
+    /// Show every active base override and drop-in layer.
     Show,
-    /// Open $EDITOR on one override template; saving regenerates artifacts.
+    /// Open $EDITOR on an override base file or named drop-in layer.
     Edit {
-        /// Which template to edit: sing-box or clash.
+        /// Which target to edit: sing-box, clash, or the server configuration.
         #[arg(value_enum)]
         target: CliOverrideTarget,
-        /// sing-box binary used to validate the merged client profile.
+        /// Edit this named layer in the target's .d directory (ASCII filename with the matching extension).
+        #[arg(long, value_name = "FILE")]
+        layer: Option<String>,
+        /// sing-box binary used to validate the merged server and client configs.
         #[arg(long, value_name = "PATH")]
         sing_box_bin: Option<PathBuf>,
     },
-    /// Validate the override templates and run the merged sing-box profile
-    /// through a real `sing-box check` when a core is available.
+    /// Validate every override and check merged server and client configs with sing-box.
     Validate {
-        /// sing-box binary used to validate the merged client profile.
+        /// sing-box binary used to validate the merged server and client configs.
         #[arg(long, value_name = "PATH")]
         sing_box_bin: Option<PathBuf>,
     },
-    /// Delete both override templates and regenerate the artifacts.
-    Clear,
+    /// Clear client overrides by default; choose server or all explicitly. Failed regeneration restores files.
+    Clear {
+        /// Target to clear: sing-box, clash, server, or all. Without a target, clears both client targets.
+        #[arg(value_enum)]
+        target: Option<CliOverrideClearTarget>,
+    },
 }
 
-#[derive(Clone, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum CliOverrideTarget {
     #[value(name = "sing-box")]
     SingBox,
     #[value(name = "clash")]
     Clash,
+    Server,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliOverrideClearTarget {
+    #[value(name = "sing-box")]
+    SingBox,
+    #[value(name = "clash")]
+    Clash,
+    Server,
+    All,
 }
 
 #[derive(Debug, Subcommand)]

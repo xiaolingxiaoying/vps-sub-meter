@@ -90,8 +90,21 @@ pub struct Overrides {
 impl Overrides {
     /// Loads every override document from `<root>/etc/sbctl/overrides/`.
     /// A malformed file aborts generation so the transactional writer keeps
-    /// the previous known-good artifacts.
+    /// the previous known-good artifacts. Protected server inbound fields are
+    /// rejected here as well, including when no deployment has been initialized.
     pub fn load(root: &Path) -> Result<Self, OverrideError> {
+        let sing_box_server = load_json_layered(
+            root,
+            SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
+            SING_BOX_SERVER_OVERRIDE_DIRECTORY,
+            &json_merge::MergePolicy::default(),
+        )?;
+        if let Some(document) = sing_box_server.as_ref() {
+            reject_protected_server_inbounds(
+                document,
+                &root.join(SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH),
+            )?;
+        }
         Ok(Self {
             sing_box: load_json_layered(
                 root,
@@ -105,12 +118,7 @@ impl Overrides {
                 CLASH_OVERRIDE_DIRECTORY,
                 &clash_policy(),
             )?,
-            sing_box_server: load_json_layered(
-                root,
-                SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
-                SING_BOX_SERVER_OVERRIDE_DIRECTORY,
-                &json_merge::MergePolicy::default(),
-            )?,
+            sing_box_server,
         })
     }
 
@@ -132,22 +140,33 @@ pub fn server_merge_policy() -> json_merge::MergePolicy<'static> {
 /// The drop-in files of one override layer, sorted by name so the merge order
 /// is the operator's, not the filesystem's.
 fn layer_files(directory: &Path, extension: &str) -> Result<Vec<PathBuf>, OverrideError> {
-    let entries = match fs::read_dir(directory) {
-        Ok(entries) => entries,
+    let metadata = match fs::symlink_metadata(directory) {
+        Ok(metadata) => metadata,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(OverrideError::Io(error)),
     };
-    let mut files = entries
-        .filter_map(|entry| entry.ok())
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.is_file()
-                && path
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.ends_with(extension) && !name.starts_with('.'))
-        })
-        .collect::<Vec<_>>();
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(OverrideError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "override layer path is not a regular directory: {}",
+                directory.display()
+            ),
+        )));
+    }
+    let mut files = Vec::new();
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+        let name = entry.file_name();
+        if path.is_file()
+            && name
+                .to_str()
+                .is_some_and(|name| name.ends_with(extension) && !name.starts_with('.'))
+        {
+            files.push(path);
+        }
+    }
     files.sort();
     Ok(files)
 }

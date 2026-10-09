@@ -616,11 +616,6 @@ pub fn apply_server_override(root: &Path, generated: &str) -> Result<String, Sub
     let Some(document) = overrides.sing_box_server else {
         return Ok(generated.to_owned());
     };
-    crate::override_template::reject_protected_server_inbounds(
-        &document,
-        &root.join(crate::override_template::SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH),
-    )
-    .map_err(|error| SubscriptionError::Override(error.to_string()))?;
     let mut value: serde_json::Value = serde_json::from_str(generated)
         .map_err(|error| SubscriptionError::Override(error.to_string()))?;
     json_merge::deep_merge_with(
