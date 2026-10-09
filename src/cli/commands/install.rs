@@ -178,10 +178,14 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 }
                 None => {
                     // 默认：直接从官方 SagerNet 仓库安装最新稳定版 sing-box 内核。
-                    let version = sbctl::update::fetch_latest_official_sing_box_version().map_err(
-                        |error| sbctl::config::ConfigError::StateContent(error.to_string()),
-                    )?;
-                    println!("从官方仓库下载 sing-box 最新稳定版 {version} …");
+                    let version = options
+                        .kernel_version
+                        .map(Ok)
+                        .unwrap_or_else(sbctl::update::fetch_latest_official_sing_box_version)
+                        .map_err(|error| {
+                            sbctl::config::ConfigError::StateContent(error.to_string())
+                        })?;
+                    println!("从官方仓库下载 sing-box {version} …");
                     let download = tempfile::NamedTempFile::new().map_err(|error| {
                         sbctl::config::ConfigError::StateContent(error.to_string())
                     })?;
@@ -197,12 +201,39 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 }
             },
         };
-        let artifacts = sbctl::subscription::generated_artifacts_for_kernel(
+        let mut artifacts = sbctl::subscription::generated_artifacts_for_kernel(
             &config,
             root,
             Some(sing_box_bin.as_path()),
         )
         .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        let bootstrap_domain = !options.no_start
+            && config.subscription_mode == sbctl::config::SubscriptionMode::Direct
+            && config.certificate_mode == sbctl::config::CertificateMode::Domain
+            && !sbctl::config::DeploymentStore::new(root)
+                .certificate_directory(&config.subscription_host)
+                .join("fullchain.pem")
+                .is_file();
+        if bootstrap_domain {
+            // Keep client certificate verification strict; stage only the server
+            // with a private certificate until the HTTP ACME listener is up.
+            let mut temporary_config = config.clone();
+            temporary_config.certificate_mode = sbctl::config::CertificateMode::SelfSigned;
+            let temporary_artifacts = sbctl::subscription::generated_artifacts_for_kernel(
+                &temporary_config,
+                root,
+                Some(&sing_box_bin),
+            )
+            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+            let bootstrap = temporary_artifacts
+                .into_iter()
+                .find(|(name, _)| name == "sing-box-server.json")
+                .expect("server artifact");
+            *artifacts
+                .iter_mut()
+                .find(|(name, _)| name == "sing-box-server.json")
+                .expect("server artifact") = bootstrap;
+        }
         let server = artifacts
             .iter()
             .find(|(name, _)| *name == "sing-box-server.json")
@@ -235,6 +266,9 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 .map_err(sbctl::config::ConfigError::StateContent)?;
             sbctl::lifecycle::check_service_health(root, direct)
                 .map_err(sbctl::config::ConfigError::StateContent)?;
+            if options.manage_firewall {
+                open_firewall_ports(root, &config, direct);
+            }
             // Direct mode serves the subscription over the socket-activated
             // HTTPS listener, which silently drops every handshake until a
             // certificate is pinned — independently of `certificate_mode`,
@@ -244,10 +278,21 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             // usable.
             if direct {
                 certificate = obtain_install_certificate(&store, &config, root);
+                if bootstrap_domain {
+                    if certificate != SubscriptionCertificate::Obtained {
+                        return Err(sbctl::config::ConfigError::StateContent(
+                            "域名协议证书签发失败；请检查 DNS 和公网 80 端口后重试".into(),
+                        ));
+                    }
+                    sbctl::subscription::regenerate(&store, &config, Some(&sing_box_bin), true)
+                        .map_err(|error| {
+                            sbctl::config::ConfigError::StateContent(error.to_string())
+                        })?;
+                    sbctl::lifecycle::restart_services(root)
+                        .map_err(sbctl::config::ConfigError::StateContent)?;
+                }
             }
-            if options.manage_firewall {
-                open_firewall_ports(root, &config, direct);
-            }
+
             // The ownership marker is the commit point of the complete
             // transaction. A `--no-start` fixture install defers startup and
             // the health check, so it never claims ownership.

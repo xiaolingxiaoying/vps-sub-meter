@@ -87,7 +87,7 @@ before=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
 # answer, which is a failure, not a refusal.
 set +e
 PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
-  timeout 60 "$installer" </dev/null >"$work/keep.out" 2>&1
+  timeout 60 "$installer" --guided </dev/null >"$work/keep.out" 2>&1
 keep_status=$?
 set -e
 [ "$keep_status" -eq 2 ] \
@@ -115,7 +115,7 @@ import time
 
 pid, terminal = pty.fork()
 if pid == 0:
-    os.execv(sys.argv[1], [sys.argv[1]])
+    os.execv(sys.argv[1], [sys.argv[1], "--guided"])
 
 output = bytearray()
 answered = False
@@ -152,5 +152,24 @@ after=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
 [ "$before" = "$after" ] || fail 'choosing to keep the existing deployment still replaced the management binary'
 grep -F -- 'sbctl update' "$work/keep-interactive.out" >/dev/null \
   || fail 'the keep-and-exit path did not point at sbctl update'
+
+# Scenario 3: no-argument bootstrap installs management only, even with an
+# existing kernel. No deployment preflight, no kernel download/replacement.
+printf 'keep existing kernel\n' > /usr/local/bin/sing-box
+kernel_before=$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')
+rm -f /tmp/sbctl-bootstrap-arguments
+PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
+  timeout 60 "$installer" </dev/null >"$work/management-only.out" 2>&1
+cmp "$work/existing-sbctl" /usr/local/bin/sbctl >/dev/null \
+  || fail 'default bootstrap did not install the verified management binary'
+kernel_after=$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')
+[ "$kernel_before" = "$kernel_after" ] || fail 'default bootstrap changed the existing kernel'
+if [ -f /tmp/sbctl-bootstrap-arguments ]; then
+  ! grep -Fx -- 'install' /tmp/sbctl-bootstrap-arguments >/dev/null \
+    || fail 'default bootstrap attempted a deployment install'
+fi
+grep -F -- '选择内核下载源' "$work/management-only.out" >/dev/null \
+  || fail 'management bootstrap did not explain kernel selection'
+rm -f /usr/local/bin/sing-box
 
 echo 'bootstrap acceptance passed'

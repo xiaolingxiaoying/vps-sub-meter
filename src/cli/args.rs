@@ -161,6 +161,11 @@ pub(crate) enum Command {
         #[command(subcommand)]
         command: ConfigCommand,
     },
+    /// Configure SMTP and send status, traffic, subscription and reset reminders.
+    Email {
+        #[command(subcommand)]
+        command: EmailCommand,
+    },
     /// Run the periodic accounting reset task (managed by the systemd timer).
     #[command(name = "accounting-reset", hide = true)]
     AccountingReset,
@@ -226,6 +231,9 @@ pub(crate) struct InstallOptions {
     pub(crate) anytls_port: Option<u16>,
     #[arg(long, value_name = "PATH")]
     pub(crate) sing_box_bin: Option<PathBuf>,
+    /// Official version; omit for latest stable. Repository manifests pin their own version.
+    #[arg(long, conflicts_with_all = ["manifest", "sing_box_bin"])]
+    pub(crate) kernel_version: Option<String>,
     /// Signed release manifest used to download and verify the data plane.
     #[arg(long, value_name = "PATH")]
     pub(crate) manifest: Option<PathBuf>,
@@ -280,6 +288,7 @@ impl InstallOptions {
             tuic_port,
             anytls_port,
             sing_box_bin,
+            kernel_version,
             manifest,
             replace_existing,
             manage_firewall,
@@ -301,6 +310,7 @@ impl InstallOptions {
             && tuic_port.is_none()
             && anytls_port.is_none()
             && sing_box_bin.is_none()
+            && kernel_version.is_none()
             && manifest.is_none()
             && !replace_existing
             && !manage_firewall
@@ -312,6 +322,18 @@ impl InstallOptions {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
+    /// Print the complete generated configuration (contains proxy credentials).
+    Preview {
+        #[arg(long, default_value = "server")]
+        format: String,
+    },
+    /// Export a generated configuration to a new private file.
+    Export {
+        #[arg(long, default_value = "server")]
+        format: String,
+        #[arg(long)]
+        output: PathBuf,
+    },
     /// Create the initial deployment configuration without overwriting one.
     Init {
         #[arg(long, value_enum)]
@@ -755,6 +777,13 @@ pub(crate) enum SingBoxCommand {
         #[arg(long)]
         artifact: Option<PathBuf>,
     },
+    /// Install a repository pinned binary or a selected official version.
+    Fetch {
+        #[arg(long, value_enum, default_value = "official")]
+        source: KernelSource,
+        #[arg(long)]
+        version: Option<String>,
+    },
     /// Remove only the sbctl-owned sing-box binary and service.
     Remove,
     /// Print the installed kernel's full version and the latest official one.
@@ -820,4 +849,24 @@ impl From<CliAccountingPolicy> for sbctl::config::AccountingPolicy {
             CliAccountingPolicy::AnchoredMonth => Self::AnchoredMonth,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum KernelSource {
+    Repository,
+    Official,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum EmailCommand {
+    /// Edit the root-only SMTP configuration; validate before saving.
+    Configure,
+    /// Show settings without the SMTP password.
+    Status,
+    /// Send a report now to the configured recipient.
+    Send,
+    /// Check daily report and upcoming reset; used by the timer.
+    Check,
+    Enable,
+    Disable,
 }

@@ -385,10 +385,9 @@ fn default_client_rule_set_base_url() -> String {
     "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat".to_owned()
 }
 
-/// The selector group holds DIRECT, so the probe must succeed without a
-/// proxy; aliyun.com answers with a redirect, which mihomo counts as success.
+/// Use one URL across client groups so Android does not read mismatched delay histories.
 fn default_client_latency_probe_url() -> String {
-    "http://aliyun.com/generate_204".to_owned()
+    "https://www.gstatic.com/generate_204".to_owned()
 }
 
 /// Keeps endpoint locations useful in previews while ensuring credentials and
@@ -963,6 +962,16 @@ impl DeploymentConfig {
         }
         if let Some(sni) = &self.protocol_sni {
             validate_hostname("protocol SNI", sni)?;
+        }
+        if self.certificate_mode == CertificateMode::Domain
+            && self.subscription_mode != SubscriptionMode::IpFallback
+            && !self
+                .protocol_server_name()
+                .eq_ignore_ascii_case(&self.subscription_host)
+        {
+            return Err(ConfigError::InvalidValue(
+                "域名证书模式的协议 SNI 必须与订阅域名一致；伪装 SNI 请使用自签证书模式",
+            ));
         }
         Ok(())
     }

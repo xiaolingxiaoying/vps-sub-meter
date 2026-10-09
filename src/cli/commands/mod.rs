@@ -3,6 +3,7 @@
 
 pub(crate) mod certificate;
 pub(crate) mod config;
+pub(crate) mod email;
 pub(crate) mod install;
 pub(crate) mod rule;
 pub(crate) mod ruleset;

@@ -1,6 +1,7 @@
 pub mod canonical;
 pub mod certificate;
 pub mod config;
+pub mod email;
 pub mod index_page;
 pub mod lifecycle;
 pub mod observe;

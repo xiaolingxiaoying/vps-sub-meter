@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag on dev, e.g. sbctl-v0.0.6 (must match Cargo.toml)'
+        description: 'Release tag on dev, e.g. sbctl-v0.0.7 (must match Cargo.toml)'
         required: true
         type: string
 

@@ -17,6 +17,28 @@ const ACCOUNTING_RESET_TIMER: &str = "etc/systemd/system/sbctl-accounting-reset.
 /// `enable --now` fail because the unit does not exist.
 const CREDENTIAL_ROTATE_UNIT: &str = "etc/systemd/system/sbctl-credential-rotate.service";
 const CREDENTIAL_ROTATE_TIMER: &str = "etc/systemd/system/sbctl-credential-rotate.timer";
+const EMAIL_UNIT: &str = "etc/systemd/system/sbctl-email.service";
+const EMAIL_TIMER: &str = "etc/systemd/system/sbctl-email.timer";
+
+pub fn set_email_timer(root: &Path, enable: bool) -> Result<(), String> {
+    if enable {
+        write_unit(root, EMAIL_UNIT,
+            "# sbctl managed email\n[Unit]\nDescription=sbctl email reports\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nExecStart=/usr/local/bin/sbctl email check\nTimeoutStartSec=60\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/sbctl\nProtectHome=true\nUMask=0077\n").map_err(|e| e.to_string())?;
+        write_unit(root, EMAIL_TIMER,
+            "# sbctl managed email\n[Unit]\nDescription=sbctl email timer\n\n[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=60\nPersistent=true\nUnit=sbctl-email.service\n\n[Install]\nWantedBy=timers.target\n").map_err(|e| e.to_string())?;
+        systemctl(root, &["daemon-reload"])?;
+        systemctl(root, &["enable", "--now", "sbctl-email.timer"])
+    } else {
+        if root.join(EMAIL_TIMER).exists() {
+            systemctl(root, &["disable", "--now", "sbctl-email.timer"])?;
+            systemctl(root, &["stop", "sbctl-email.service"])?;
+            remove_file_if_present(&root.join(EMAIL_TIMER))?;
+            remove_file_if_present(&root.join(EMAIL_UNIT))?;
+            systemctl(root, &["daemon-reload"])?;
+        }
+        Ok(())
+    }
+}
 
 /// Installs or removes the scheduled credential rotation.
 ///
@@ -65,6 +87,8 @@ const CERTIFICATE_GROUP: &str = crate::certificate::CERTIFICATE_GROUP;
 
 const BACKED_UP_PATHS: &[&str] = &[
     "etc/sbctl/config.toml",
+    crate::email::CONFIG_PATH,
+    "var/lib/sbctl/email-state.json",
     OWNERSHIP_MARKER,
     "etc/sing-box/config.json",
     "var/lib/sbctl/state.json",
@@ -686,6 +710,7 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
     }
 
     let backup = (!purge).then(|| backup_persistent_data(root)).transpose()?;
+    set_email_timer(root, false)?;
     let sbctl_unit_owned = unit_has_marker(root, SBCTL_UNIT, SBCTL_UNIT_MARKER)?;
     let sing_box_unit_owned = unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)?;
     let reset_timer_owned = unit_has_marker(root, ACCOUNTING_RESET_TIMER, ACCOUNTING_RESET_MARKER)?;
@@ -737,6 +762,7 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
             remove_empty_directory_if_present(&root.join("etc/sing-box"))?;
         }
         remove_file_if_present(&root.join("etc/sbctl/config.toml"))?;
+        remove_file_if_present(&root.join(crate::email::CONFIG_PATH))?;
         remove_directory_if_present(&root.join("var/lib/sbctl"))?;
         // The uninstall menu double-confirmation promises that --purge deletes
         // the backups too, so the backup directory must not survive it.

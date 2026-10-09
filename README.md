@@ -37,13 +37,13 @@ test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 
 如果已登录为 `root`，上述命令去掉 `sudo` 即可（包括安装下载工具的两处 `sudo`）。
 
-固定安装本次 `dev` 发布的 `sbctl-v0.0.6`（安装器和清单都使用同一版本）：
+固定安装本次 `dev` 发布的 `sbctl-v0.0.7`（安装器和清单都使用同一版本）：
 
 ```bash
 curl -fL --retry 3 -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.6/install.sh
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.7/install.sh
 test -s /tmp/sbctl-install.sh && sudo env \
-  SBCTL_MANIFEST_URL='https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.6/manifest-{arch}.json' \
+  SBCTL_MANIFEST_URL='https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.7/manifest-{arch}.json' \
   bash /tmp/sbctl-install.sh
 ```
 
@@ -51,9 +51,9 @@ test -s /tmp/sbctl-install.sh && sudo env \
 
 > 该地址是本仓库的 Release，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在本仓库构建、签名并发布；`sbctl update` 与安装脚本的构建期公钥都钉在它上面。发布需要仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX`（编译期与 `install.sh`）和 `release` Environment 的 `SBCTL_SIGNING_SEED`（签名私钥），发布约定见 [`docs/release-signing.md`](docs/release-signing.md)。
 
-Release 提供已构建并签名的 `sbctl`、sing-box 运行时、按架构区分的签名清单和安装脚本。安装器会校验签名与文件摘要，然后启动引导配置；VPS 无需安装 Rust 或从源码构建。仓库中的 `scripts/install.sh` 是模板，不能直接运行。
+Release 提供已构建并签名的 `sbctl`、sing-box 运行时、按架构区分的签名清单和安装脚本。安装器会校验签名与文件摘要，先安装 sbctl 并打开菜单，由管理员选择内核来源、版本和部署配置；VPS 无需安装 Rust 或从源码构建。仓库中的 `scripts/install.sh` 是模板，不能直接运行。
 
-> 在已有部署上重跑安装脚本时，安装器会先问是保留现有部署还是备份后全新安装，**在你回答之前不会替换 `/usr/local/bin/sbctl`**。升级已由 sbctl 管理的部署请直接用 `sbctl update`。
+> 无参数安装脚本只安装 / 替换管理程序，保留已有内核、服务、配置和凭据。带部署参数重装时，仍会先询问保留或备份后全新安装。
 
 ## 常用命令
 
@@ -132,8 +132,8 @@ CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑服务端五个
 ```bash
 git switch dev
 git push origin dev
-git tag sbctl-v0.0.6
-git push origin sbctl-v0.0.6
+git tag sbctl-v0.0.7
+git push origin sbctl-v0.0.7
 ```
 
 标签推送会触发 GitHub Actions 的 `Release` 工作流。它校验标签版本和提交属于 `dev`，固定所有构建任务的源码提交，执行完整 CI（含 systemd 验收），然后构建 amd64/arm64、签名并发布 GitHub Release。任一门禁失败均不发布。已发布的版本不能覆盖，下次发布请使用新版本号。
@@ -141,9 +141,12 @@ git push origin sbctl-v0.0.6
 重跑已有标签也可手动触发，必须选择 `dev`：
 
 ```bash
-gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.6
+gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.7
 ```
 
 ## 许可证
 
 MIT OR Apache-2.0，详见 [`Cargo.toml`](Cargo.toml)。
+
+菜单新增「配置与路由规则」「邮件通知」。内核状态、连接和证书修复位于「服务与诊断」。
+详见 [菜单与邮件使用说明](docs/menu-and-email.md)。

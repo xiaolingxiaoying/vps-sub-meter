@@ -4,6 +4,7 @@ mod credentials;
 mod fixture;
 mod install;
 mod lifecycle;
+mod management;
 mod menu;
 mod observe;
 mod subscription_formats;

@@ -2,7 +2,10 @@
 //! the rendering and confirmation helpers they share. The console prompts used
 //! by the non-interactive install path live in `cli::prompt`, not here.
 
-use crate::cli::args::{CliSubscriptionMode, InstallOptions, SingBoxCommand};
+use crate::cli::args::{
+    ApiCommand, CertificateCommand, CliOverrideTarget, CliSubscriptionMode, ConfigCommand,
+    EmailCommand, InstallOptions, KernelSource, OverrideCommand, SingBoxCommand,
+};
 use crate::cli::commands::{
     config::{commit_config_change, regenerate, restart, run_config_wizard},
     install::install,
@@ -35,6 +38,8 @@ pub(crate) fn menu(root: &Path) -> ExitCode {
         println!("{}", sbctl::term::green(" 4. 流量与账期"));
         println!("{}", sbctl::term::green(" 5. 服务与诊断"));
         println!("{}", sbctl::term::green(" 6. 更新与卸载"));
+        println!("{}", sbctl::term::green(" 7. 配置与路由规则"));
+        println!("{}", sbctl::term::green(" 8. 邮件通知"));
         println!("{}", sbctl::term::green(" 0. 退出"));
         println!();
         match read_menu_choice("请选择 [0]: ") {
@@ -46,8 +51,10 @@ pub(crate) fn menu(root: &Path) -> ExitCode {
                 "4" => menu_traffic(root),
                 "5" => menu_services(root),
                 "6" => menu_updates(root),
+                "7" => menu_configuration(root),
+                "8" => menu_email(root),
                 _ => {
-                    eprintln!("无效选择，请输入 0 到 6。");
+                    eprintln!("无效选择，请输入 0 到 8。");
                     pause_menu();
                 }
             },
@@ -232,7 +239,7 @@ fn menu_protocols(root: &Path) {
                 pause_menu();
             }
             Some(_) => {
-                eprintln!("无效选择，请输入 0 到 3。");
+                eprintln!("无效选择，请按菜单中的编号输入。");
                 pause_menu();
             }
         }
@@ -447,6 +454,13 @@ fn menu_services(root: &Path) {
         println!("1. 查看完整部署状态");
         println!("2. 校验配置并重启服务");
         println!("3. 查看运行日志");
+        println!("4. 查看内核状态（版本、PID、内存、CPU、运行时长）");
+        println!("5. 查看当前连接");
+        println!("6. 启用连接观察 API（仅监听本机）");
+        println!("7. 关闭连接观察 API");
+        println!("8. 查看证书状态");
+        println!("9. 签发 / 修复 HTTPS 证书");
+        println!("10. 续期 HTTPS 证书");
         println!("0. 返回");
         match read_menu_choice("请选择 [0]: ").as_deref() {
             Some("0") | None => return,
@@ -464,8 +478,57 @@ fn menu_services(root: &Path) {
                 menu_logs(root);
                 pause_menu();
             }
+            Some("4") => {
+                sing_box(root, SingBoxCommand::Status);
+                pause_menu();
+            }
+            Some("5") => {
+                sing_box(root, SingBoxCommand::Connections);
+                pause_menu();
+            }
+            Some("6") => {
+                sing_box(
+                    root,
+                    SingBoxCommand::Api {
+                        command: ApiCommand::Enable { port: None },
+                    },
+                );
+                pause_menu();
+            }
+            Some("7") => {
+                sing_box(
+                    root,
+                    SingBoxCommand::Api {
+                        command: ApiCommand::Disable,
+                    },
+                );
+                pause_menu();
+            }
+            Some("8") => {
+                crate::cli::commands::certificate::run_certificate(
+                    root,
+                    CertificateCommand::Status,
+                );
+                pause_menu();
+            }
+            Some("9") => {
+                if let Some(email) = read_menu_choice("ACME 邮箱: ") {
+                    crate::cli::commands::certificate::run_certificate(
+                        root,
+                        CertificateCommand::Obtain {
+                            email: Some(email),
+                            no_email: false,
+                        },
+                    );
+                }
+                pause_menu();
+            }
+            Some("10") => {
+                crate::cli::commands::certificate::run_certificate(root, CertificateCommand::Renew);
+                pause_menu();
+            }
             Some(_) => {
-                eprintln!("无效选择，请输入 0 到 3。");
+                eprintln!("无效选择，请按菜单中的编号输入。");
                 pause_menu();
             }
         }
@@ -491,14 +554,10 @@ fn menu_updates(root: &Path) {
                 pause_menu();
             }
             Some("2") => {
-                if confirm_menu_action("确认更新 / 切换 sing-box 内核？") {
-                    sing_box(
-                        root,
-                        SingBoxCommand::Update {
-                            manifest: None,
-                            artifact: None,
-                        },
-                    );
+                if sbctl::config::DeploymentStore::new(root).load().is_err() {
+                    menu_install(root, true);
+                } else if let Some((source, version)) = select_kernel() {
+                    sing_box(root, SingBoxCommand::Fetch { source, version });
                 }
                 pause_menu();
             }
@@ -591,6 +650,27 @@ fn menu_direction_traffic_correction(root: &Path) {
 }
 
 fn menu_install(root: &Path, guided: bool) -> ExitCode {
+    let Some((source, kernel_version)) = select_kernel() else {
+        return ExitCode::SUCCESS;
+    };
+    let manifest_guard = if matches!(source, KernelSource::Repository) {
+        let result = (|| -> Result<tempfile::TempPath, Box<dyn std::error::Error>> {
+            let manifest = sbctl::update::fetch_latest_manifest()?;
+            println!("本仓库固定内核：{}", manifest.sing_box.version);
+            let path = tempfile::NamedTempFile::new()?.into_temp_path();
+            std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
+            Ok(path)
+        })();
+        match result {
+            Ok(path) => Some(path),
+            Err(error) => {
+                eprintln!("读取本仓库 Release 失败：{error}");
+                return ExitCode::from(2);
+            }
+        }
+    } else {
+        None
+    };
     match sbctl::config::DeploymentStore::new(root).load() {
         Ok(_) => {
             eprintln!("已安装。请返回上级菜单选择完整配置向导或重新生成配置工件。");
@@ -614,7 +694,8 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
                 tuic_port: None,
                 anytls_port: None,
                 sing_box_bin: None,
-                manifest: None,
+                kernel_version,
+                manifest: manifest_guard.as_ref().map(|path| path.to_path_buf()),
                 replace_existing: false,
                 manage_firewall: false,
                 ipv4_only: false,
@@ -642,4 +723,121 @@ pub(crate) fn confirm_menu_action(prompt: &str) -> bool {
     let mut answer = String::new();
     io::stdin().read_line(&mut answer).is_ok()
         && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn select_kernel() -> Option<(KernelSource, Option<String>)> {
+    println!(
+        "内核下载源：1. 本仓库 Release（原版二进制，固定版本）  2. 官方仓库（可选版本）  0. 取消"
+    );
+    match read_menu_choice("请选择 [2]: ")?.as_str() {
+        "1" => Some((KernelSource::Repository, None)),
+        "2" | "" => {
+            let version =
+                read_menu_choice("官方版本（例如 1.14.1；latest 表示最新稳定版）[latest]: ")?;
+            let version = if version.is_empty() || version == "latest" {
+                None
+            } else {
+                Some(version.trim_start_matches('v').to_owned())
+            };
+            if let Some(version) = &version
+                && let Err(error) = sbctl::update::official_sing_box_archive_url(version)
+            {
+                eprintln!("版本无效：{error}");
+                return None;
+            }
+            Some((KernelSource::Official, version))
+        }
+        _ => None,
+    }
+}
+
+fn menu_configuration(root: &Path) {
+    loop {
+        print_menu_section("配置与路由规则");
+        println!("1. 添加入站 / 出站 / 路由规则（服务端 JSON 覆写）");
+        println!("2. 编辑客户端 sing-box 出站与规则");
+        println!("3. 编辑 Clash 规则");
+        println!("4. 预览整体配置（含凭据）");
+        println!("5. 导出 / 下载整体配置（私有文件）");
+        println!("6. 查看覆写层");
+        println!("0. 返回");
+        let selection = read_menu_choice("请选择 [0]: ");
+        let command = match selection.as_deref() {
+            Some("0") | None => return,
+            Some("1") => {
+                println!(
+                    "自定义入站使用 custom- 开头的 tag；会保留现有入站。可在 JSON 中添加 inbounds、outbounds、route.rules。"
+                );
+                ConfigCommand::Override {
+                    command: OverrideCommand::Edit {
+                        target: CliOverrideTarget::Server,
+                        layer: None,
+                        sing_box_bin: None,
+                    },
+                }
+            }
+            Some("2") => ConfigCommand::Override {
+                command: OverrideCommand::Edit {
+                    target: CliOverrideTarget::SingBox,
+                    layer: None,
+                    sing_box_bin: None,
+                },
+            },
+            Some("3") => ConfigCommand::Override {
+                command: OverrideCommand::Edit {
+                    target: CliOverrideTarget::Clash,
+                    layer: None,
+                    sing_box_bin: None,
+                },
+            },
+            Some("4") | Some("5") => {
+                let export = selection.as_deref() == Some("5");
+                let format = read_menu_choice("格式 server / sing-box-full / clash [server]: ")
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or_else(|| "server".into());
+                if export {
+                    let Some(output) = read_menu_choice("导出到新文件路径（可使用 scp 下载）: ")
+                        .filter(|s| !s.is_empty())
+                    else {
+                        continue;
+                    };
+                    ConfigCommand::Export {
+                        format,
+                        output: output.into(),
+                    }
+                } else {
+                    ConfigCommand::Preview { format }
+                }
+            }
+            Some("6") => ConfigCommand::Override {
+                command: OverrideCommand::Show,
+            },
+            _ => continue,
+        };
+        crate::cli::commands::config::run_config(root, command);
+        pause_menu();
+    }
+}
+
+fn menu_email(root: &Path) {
+    loop {
+        print_menu_section("邮件通知");
+        println!("1. 配置 SMTP、收件人、日报和刷新提醒");
+        println!("2. 查看邮件配置（隐藏密码）");
+        println!("3. 立即发送状态 / 流量 / 订阅报告");
+        println!("4. 启用定时邮件");
+        println!("5. 关闭定时邮件");
+        println!("0. 返回");
+        let command = match read_menu_choice("请选择 [0]: ").as_deref() {
+            Some("0") | None => return,
+            Some("1") => EmailCommand::Configure,
+            Some("2") => EmailCommand::Status,
+            Some("3") => EmailCommand::Send,
+            Some("4") => EmailCommand::Enable,
+            Some("5") => EmailCommand::Disable,
+            _ => continue,
+        };
+        crate::cli::commands::email::run_email(root, command);
+        pause_menu();
+    }
 }

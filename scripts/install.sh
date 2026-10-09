@@ -21,10 +21,8 @@ fi
 # is made by the installed sbctl binary with the same built-in public key, so
 # the script cannot bypass the Rust verification rules.
 #
-# Nothing on the host is written before the operator has answered the
-# "existing deployment" question: downloading, verifying and even running the
-# read-only preflight all happen inside the work directory, so choosing "keep
-# the existing deployment and exit" leaves the host byte-for-byte unchanged.
+# Deployment writes wait for explicit installation intent. Default bootstrap
+# installs management only and leaves the data plane and its credentials intact.
 
 red()   { echo -e "\033[31m\033[01m$*\033[0m"; }
 green() { echo -e "\033[32m\033[01m$*\033[0m"; }
@@ -61,7 +59,7 @@ case "${ID}" in
 esac
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl jq openssl tar
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl jq openssl tar certbot
 
 # The first-release Ed25519 verification key, identical to the one embedded in
 # src/release.rs. The signature in the manifest covers the canonical JSON of
@@ -164,7 +162,7 @@ chmod 0755 "$work_dir/sbctl"
 # binary: `sbctl install` treats a non-terminal stdin as a preflight, so this
 # cannot start an installation or change deployment state.
 replace_existing=0
-if preflight_output=$("$work_dir/sbctl" install </dev/null 2>&1); then
+if [[ "$#" -eq 0 ]] || preflight_output=$("$work_dir/sbctl" install </dev/null 2>&1); then
   :
 else
   printf '%s\n' "$preflight_output" >&2
@@ -197,79 +195,8 @@ else
   replace_existing=1
 fi
 
-# Collect the installation arguments without touching the host, so every answer
-# is in hand before the first write.
-install_args=()
-guided=0
-if [[ "$#" -gt 0 ]]; then
-  install_args=("$@")
-elif [[ "$replace_existing" -eq 0 ]]; then
-  # The full wizard is the single-pass path: unlike the flag subset below it
-  # also asks for certificate mode, the Certbot e-mail, traffic accounting and
-  # the client template, so a first install no longer leaves a second
-  # `sbctl config wizard` for the operator to discover.
-  resolve_installer_input
-  guided=1
-else
-  # A reinstall keeps the flag-driven path because --guided refuses to be
-  # combined with --replace-existing.
-  resolve_installer_input
-  echo ""
-  echo "sbctl 交互式安装"
-  echo "1) Direct：sbctl 使用公网 80/443 提供 HTTPS 订阅"
-  echo "2) External proxy：使用现有 Nginx/Caddy 反代本机 2080 端口"
-  echo "3) IP fallback：使用 IP + 高位 HTTP 端口（无域名，自签证书 + 协议伪装域名）"
-  while :; do
-    read -r -p "请选择订阅模式 [1]: " mode_choice <"$installer_input"
-    mode_choice=${mode_choice:-1}
-    case "$mode_choice" in
-      1) mode=direct; break ;;
-      2) mode=external-proxy; break ;;
-      3) mode=ip-fallback; break ;;
-      *) echo "请输入 1、2 或 3。" >&2 ;;
-    esac
-  done
-
-  read_required() {
-    local label=$1 default=${2-} value
-    while :; do
-      if [[ -n "$default" ]]; then
-        read -r -p "$label [$default]: " value <"$installer_input"
-        value=${value:-$default}
-      else
-        read -r -p "$label: " value <"$installer_input"
-      fi
-      if [[ -n "${value//[[:space:]]/}" ]]; then
-        printf '%s' "$value"
-        return
-      fi
-      echo "此项不能为空。" >&2
-    done
-  }
-
-  if [[ "$mode" == ip-fallback ]]; then
-    subscription_host=$(read_required "VPS 公网 IP")
-    http_port=$(read_required "HTTP 订阅端口" "2080")
-  else
-    subscription_host=$(read_required "订阅域名（请先解析到此 VPS）")
-  fi
-  proxy_host=$(read_required "代理连接主机（直接回车则使用订阅主机）" "$subscription_host")
-  interface=$(read_required "流量统计网卡（直接回车自动识别）" "auto")
-  reality_decoy_sni=$(read_required "Reality 伪装 SNI" "www.cloudflare.com")
-
-  install_args=(--mode "$mode" --subscription-host "$subscription_host" --proxy-host "$proxy_host" --reality-decoy-sni "$reality_decoy_sni")
-  if [[ "$interface" != auto ]]; then
-    install_args+=(--interface "$interface")
-  fi
-  if [[ "$mode" == ip-fallback ]]; then
-    protocol_sni=$(read_required "协议 TLS 伪装域名（证书类协议使用）" "www.bing.com")
-    install_args+=(--http-port "$http_port" --protocol-sni "$protocol_sni")
-  fi
-
-  echo ""
-  echo "接下来可逐项选择要启用的协议；直接回车即启用。"
-fi
-
+# Default bootstrap installs management only; explicit flags deploy through sbctl.
+install_args=("$@")
 if [[ "$replace_existing" -eq 1 ]]; then
   install_args+=(--replace-existing)
 fi
@@ -289,10 +216,11 @@ fi
 ln -sf /usr/local/bin/sbctl /usr/local/bin/ly
 green "sbctl 已安装；快捷方式：ly"
 
-# sing-box 下载、摘要、兼容矩阵和配置检查全部由 sbctl 依据同一签名 manifest 完成。
-if [[ "$guided" -eq 1 ]]; then
-  echo ""
-  echo "sbctl 交互式安装（完整配置向导）"
-  run_installer /usr/local/bin/sbctl install --guided --manifest "$work_dir/manifest.json" <"$installer_input"
+if [[ "$#" -gt 0 ]]; then
+  run_installer /usr/local/bin/sbctl install "${install_args[@]}"
 fi
-run_installer /usr/local/bin/sbctl install --manifest "$work_dir/manifest.json" "${install_args[@]}"
+green "运行 ly，在安装与部署菜单中选择内核下载源、版本和部署配置。"
+if [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; then
+  resolve_installer_input
+  run_installer /usr/local/bin/sbctl menu <"$installer_input"
+fi

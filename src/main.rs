@@ -127,6 +127,7 @@ fn main() -> ExitCode {
         Command::Certificate { command } => run_certificate(root, command),
         Command::System { command } => run_system(root, command),
         Command::Config { command } => run_config(root, command),
+        Command::Email { command } => cli::commands::email::run_email(root, command),
         Command::AccountingReset => run_accounting_reset(root),
         Command::Regenerate { sing_box_bin } => regenerate(root, sing_box_bin),
     }

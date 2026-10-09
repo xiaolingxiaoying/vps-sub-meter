@@ -20,20 +20,13 @@ sudo bash /tmp/sbctl-install.sh
 由 `scripts/prepare-installer.py` 在打包时才替换成生产公钥。用模板安装会得到
 「此安装脚本尚未配置生产公钥」并退出 2 —— 这是有意的，签好名的脚本才是信任锚。
 
-首次无参数运行会进入中文引导菜单：选择 Direct、External proxy 或 IP fallback，再填写订阅
-域名/IP、可选代理连接主机、网卡和 Reality 伪装 SNI；随后逐项确认需要启用的协议。协议端口
-默认自动分配。IP fallback 会自动只启用 VLESS Reality，并询问 HTTP 订阅端口。
+首次无参数运行只安装 `sbctl` 和 `ly`，随后在可用交互终端打开菜单；不会下载内核或创建协议服务。
+进入「安装与部署」选择快速或引导式安装，先选内核来源：本仓库 Release 提供签名清单固定版本的原版二进制，
+不提供版本选择；官方仓库支持填写具体版本或 `latest`。下载后仍需摘要、配置与服务健康检查，失败会回滚。
+安装管理程序时保留现有协议服务；已有部署的配置和凭据不会由默认 bootstrap 重建。
 
-安装脚本先下载并校验 sbctl 到临时目录（**此时不改主机**），用这份候选二进制做只读预检，然后再决定是否落盘。
-如果发现已有部署，会先给出选项：保留并退出，或输入确认词后先备份旧配置、状态、证书、二进制和相关
-systemd 单元，再停止服务并继续全新安装。选择“保留并退出”时，`/usr/local/bin/sbctl` 一字节未变，
-脚本会提示用 `sbctl update` 升级已有部署。
-备份保存在 `/var/backups/sbctl/reinstall/`；如果新安装失败，安装器会尝试恢复旧部署和原服务状态。
-如果只想管理现有部署，请运行 `ly` 或 `sbctl menu`，查看状态可运行 `sbctl status`。
-对于不属于 sbctl 的 sing-box 服务，选择清理也会先将检测到的路径存入备份，之后才移除。
-
-脚本默认使用 GitHub Release 的 `latest/download/manifest-{arch}.json`。如需固定版本或使用
-镜像，请设置 `SBCTL_MANIFEST_URL`，例如：
+带部署参数运行脚本时仍执行安装事务：默认官方最新稳定内核，`--kernel-version` 指定官方版本；
+`--manifest` 则选择本仓库签名清单固定版本。明确重装已有部署时仍需要备份和确认。
 
 ```bash
 SBCTL_MANIFEST_URL=https://发布地址/manifest-{arch}.json \

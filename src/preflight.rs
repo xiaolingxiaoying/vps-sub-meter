@@ -180,6 +180,9 @@ pub fn existing_deployment_paths(root: &Path) -> Vec<String> {
         "etc/systemd/system/sbctl-http.socket",
         "etc/systemd/system/sbctl-accounting-reset.service",
         "etc/systemd/system/sbctl-accounting-reset.timer",
+        "etc/systemd/system/sbctl-email.service",
+        "etc/systemd/system/sbctl-email.timer",
+        "etc/systemd/system/timers.target.wants/sbctl-email.timer",
         "etc/systemd/system/multi-user.target.wants/sing-box.service",
         "etc/systemd/system/multi-user.target.wants/sbctl.service",
         "etc/systemd/system/sockets.target.wants/sbctl-http.socket",
@@ -193,6 +196,8 @@ pub fn existing_deployment_paths(root: &Path) -> Vec<String> {
         // itself is not on the list: a rolled-back install leaves only the
         // operation lock behind, and that is not a deployment.
         "etc/sbctl/config.toml",
+        "etc/sbctl/email.toml",
+        "var/lib/sbctl/email-state.json",
         "var/lib/sbctl/state.json",
         "var/lib/sbctl/ownership",
         "var/lib/sbctl/artifacts",

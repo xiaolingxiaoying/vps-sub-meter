@@ -41,6 +41,8 @@ fn clash_proxies(
     spec: &TemplateSpec,
 ) -> Result<String, SubscriptionError> {
     let skip = client_skip_cert_verify(config);
+    let probe_url =
+        serde_json::to_string(&config.client_latency_probe_url).expect("URL serializes");
     let mut proxies = String::from("proxies:\n");
     for node in nodes {
         let entry = match &node {
@@ -105,36 +107,19 @@ fn clash_proxies(
     {
         let tag = clash_tag(group.tag);
         match group.role {
-            GroupRole::Selector => {
-                // The selector holds DIRECT, so latency tests must use a URL
-                // that is reachable without a proxy; gstatic would time out
-                // from China. aliyun.com answers with a redirect, which mihomo
-                // counts as success.
+            GroupRole::Selector | GroupRole::Direct => {
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: select\n    url: http://aliyun.com/generate_204\n    interval: 300\n    proxies:\n"
+                    "  - name: {tag}\n    type: select\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    proxies:\n"
                 ));
             }
             GroupRole::UrlTest => {
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n    proxies:\n"
+                    "  - name: {tag}\n    type: url-test\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    tolerance: 50\n    proxies:\n"
                 ));
             }
             GroupRole::Fallback => {
-                // `url`/`interval` are the two probing fields this file already
-                // writes for a url-test group; a fallback group's remaining knobs
-                // (`timeout`, `max-failed`, `lazy`) have never been sent through
-                // the pinned core here, so they stay at its defaults rather than
-                // becoming an unverified claim.
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: fallback\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    proxies:\n"
-                ));
-            }
-            GroupRole::Direct => {
-                // No probe URL: this group exists so the client can see which
-                // verdict "direct" is, and the nodes are in it only so a user
-                // can promote one of them by hand.
-                proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: select\n    proxies:\n"
+                    "  - name: {tag}\n    type: fallback\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    proxies:\n"
                 ));
             }
         }

@@ -75,6 +75,8 @@ pub enum OverrideError {
          generated configuration (use the client overrides for your own nodes)"
     )]
     ProtectedField { path: PathBuf, field: String },
+    #[error("{path}: server inbounds must be objects with distinct, nonempty tags")]
+    InboundTags { path: PathBuf },
     #[error("override read failed: {0}")]
     Io(#[from] std::io::Error),
 }
@@ -97,7 +99,7 @@ impl Overrides {
             root,
             SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
             SING_BOX_SERVER_OVERRIDE_DIRECTORY,
-            &json_merge::MergePolicy::default(),
+            &server_merge_policy(),
         )?;
         if let Some(document) = sing_box_server.as_ref() {
             reject_protected_server_inbounds(
@@ -130,11 +132,12 @@ impl Overrides {
     }
 }
 
-/// Merge policy for the server override: `rules` only, no keyed arrays. The
-/// server has no outbounds to extend by tag, and a wholesale `inbounds`
-/// replace is exactly what the protected-field guard is there to catch.
+/// Extend listeners and outbounds by tag, preserving every generated listener.
 pub fn server_merge_policy() -> json_merge::MergePolicy<'static> {
-    json_merge::MergePolicy::default()
+    json_merge::MergePolicy {
+        keyed_arrays: &[("inbounds", "tag"), ("outbounds", "tag")],
+        ..json_merge::MergePolicy::default()
+    }
 }
 
 /// The drop-in files of one override layer, sorted by name so the merge order
@@ -188,6 +191,9 @@ fn load_json_layered(
     }
     let mut merged: Option<serde_json::Value> = None;
     for (path, document) in documents {
+        if base_relative == SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH {
+            reject_protected_server_inbounds(&document, &path)?;
+        }
         let (rules_mode, document) = take_rules_mode(document, &path)?;
         if let Some(existing) = merged.as_mut() {
             let scoped = json_merge::MergePolicy {
@@ -328,7 +334,31 @@ pub fn reject_protected_server_inbounds(
     };
     // Everything under the `inbounds` key is the credential surface, so the
     // traversal starts already inside it.
-    reject_protected_inbound_value(inbounds, path, true)
+    if let Some(entries) = inbounds.as_array() {
+        let mut tags = std::collections::HashSet::new();
+        for entry in entries {
+            let Some(tag) = entry
+                .get("tag")
+                .and_then(serde_json::Value::as_str)
+                .filter(|tag| !tag.is_empty() && tags.insert(*tag))
+            else {
+                reject_protected_inbound_value(entry, path, true)?;
+                return Err(OverrideError::InboundTags {
+                    path: path.to_owned(),
+                });
+            };
+            // An explicit custom namespace cannot collide with generated tags.
+            if tag.starts_with("custom-") && tag.len() > 7 {
+                continue;
+            }
+            reject_protected_inbound_value(entry, path, true)?;
+        }
+        Ok(())
+    } else {
+        Err(OverrideError::InboundTags {
+            path: path.to_owned(),
+        })
+    }
 }
 
 fn reject_protected_inbound_value(
@@ -552,6 +582,25 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn custom_inbounds_extend_generated_listeners_and_credentials_stay_protected() {
+        let path = Path::new("server.json");
+        let overlay = json!({"inbounds": [{"type": "mixed", "tag": "custom-local", "listen": "127.0.0.1", "listen_port": 1080, "users": [{"username": "u", "password": "p"}]}]});
+        reject_protected_server_inbounds(&overlay, path).unwrap();
+        let mut base = json!({"inbounds": [{"tag": "sbctl-tuic", "users": [{"uuid": "keep", "password": "keep"}]}]});
+        json_merge::deep_merge_with(&mut base, &overlay, &server_merge_policy());
+        assert_eq!(base["inbounds"][0]["users"][0]["password"], "keep");
+        assert_eq!(base["inbounds"].as_array().unwrap().len(), 2);
+        for invalid in [
+            json!({"inbounds": [{"tag": "sbctl-tuic", "users": []}]}),
+            json!({"inbounds": [{"listen_port": 1080}]}),
+            json!({"inbounds": [{"tag": "custom-a"}, {"tag": "custom-a"}]}),
+            json!({"inbounds": null}),
+        ] {
+            assert!(reject_protected_server_inbounds(&invalid, path).is_err());
+        }
     }
 
     #[test]

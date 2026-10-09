@@ -138,23 +138,51 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
                 eprintln!("override 编辑失败：{error}");
                 return ExitCode::from(2);
             }
-            match crate::cli::editor::run_editor(&crate::cli::editor::editor_candidates(), &path) {
-                Ok(status) if status.success() => {}
-                Ok(status) => {
-                    eprintln!("编辑器退出码 {status}；模板未验证。");
+            let prior = match fs::read(&path) {
+                Ok(prior) => prior,
+                Err(error) => {
+                    eprintln!("无法备份覆写文件：{error}");
                     return ExitCode::from(2);
                 }
-                Err(message) => {
-                    eprintln!("{message}");
+            };
+            let result = (|| {
+                match crate::cli::editor::run_editor(
+                    &crate::cli::editor::editor_candidates(),
+                    &path,
+                ) {
+                    Ok(status) if status.success() => {}
+                    Ok(status) => {
+                        eprintln!("编辑器退出码 {status}");
+                        return ExitCode::from(2);
+                    }
+                    Err(message) => {
+                        eprintln!("{message}");
+                        return ExitCode::from(2);
+                    }
+                }
+                if let Err(error) = sbctl::override_template::Overrides::load(root) {
+                    eprintln!("override 校验失败：{error}");
                     return ExitCode::from(2);
                 }
+                let store = sbctl::config::DeploymentStore::new(root);
+                if root == Path::new("/") || root.join("var/lib/sbctl/ownership").is_file() {
+                    match store.load() {
+                        Ok(config) => commit_config_change(root, &store, &config, sing_box_bin),
+                        Err(error) => {
+                            eprintln!("读取部署失败：{error}");
+                            ExitCode::from(2)
+                        }
+                    }
+                } else {
+                    regenerate(root, sing_box_bin)
+                }
+            })();
+            if result != ExitCode::SUCCESS
+                && let Err(error) = fs::write(&path, prior)
+            {
+                eprintln!("覆写文件恢复失败：{error}");
             }
-            if let Err(error) = sbctl::override_template::Overrides::load(root) {
-                eprintln!("override 校验失败：{error}");
-                return ExitCode::from(2);
-            }
-            println!("override 模板有效，正在重新生成订阅工件……");
-            regenerate(root, sing_box_bin)
+            result
         }
         OverrideCommand::Clear { target } => {
             let selected = match target {
@@ -314,7 +342,15 @@ fn prepare_override_edit_path(path: &Path, sample: &str) -> Result<(), String> {
         Ok(metadata) if metadata.file_type().is_symlink() => {
             return Err(format!("拒绝编辑符号链接：{}", path.display()));
         }
-        Ok(metadata) if metadata.is_file() => return Ok(()),
+        Ok(metadata) if metadata.is_file() => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                    .map_err(|e| e.to_string())?;
+            }
+            return Ok(());
+        }
         Ok(_) => return Err(format!("覆写路径不是常规文件：{}", path.display())),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(format!("读取 {} 失败：{error}", path.display())),
@@ -324,7 +360,18 @@ fn prepare_override_edit_path(path: &Path, sample: &str) -> Result<(), String> {
         .ok_or_else(|| format!("覆写路径没有父目录：{}", path.display()))?;
     fs::create_dir_all(parent)
         .map_err(|error| format!("创建 {} 失败：{error}", parent.display()))?;
-    fs::write(path, sample).map_err(|error| format!("创建 {} 失败：{error}", path.display()))
+    use std::io::Write;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    options
+        .open(path)
+        .and_then(|mut file| file.write_all(sample.as_bytes()))
+        .map_err(|error| format!("创建 {} 失败：{error}", path.display()))
 }
 
 fn clear_override_targets(root: &Path, targets: &[CliOverrideTarget]) -> ExitCode {
@@ -531,6 +578,8 @@ pub(crate) fn regenerate(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode
 pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
     let result = match command {
+        ConfigCommand::Preview { format } => return configuration_artifact(root, &format, None),
+        ConfigCommand::Export { format, output } => return configuration_artifact(root, &format, Some(&output)),
         ConfigCommand::Wizard { sing_box_bin } => return run_config_wizard(root, sing_box_bin),
         ConfigCommand::Override { command } => return run_config_override(root, command),
         ConfigCommand::Init {
@@ -841,4 +890,48 @@ pub(crate) fn restart_services_with_rollback(
         return Err(sbctl::config::ConfigError::StateContent(error));
     }
     Ok(())
+}
+
+fn configuration_artifact(root: &Path, format: &str, output: Option<&Path>) -> ExitCode {
+    let result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let name = if format == "server" {
+            "sing-box-server.json".into()
+        } else {
+            sbctl::subscription::subscription_matrix()
+                .into_iter()
+                .find(|row| row.format.path_name() == format)
+                .ok_or("未知配置格式")?
+                .format
+                .artifact_name()
+                .into_owned()
+        };
+        let contents = fs::read(root.join("var/lib/sbctl/artifacts").join(name))?;
+        if let Some(output) = output {
+            use std::io::Write;
+            let mut options = fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            let mut file = options.open(output)?;
+            file.write_all(&contents)?;
+            file.sync_all()?;
+            println!(
+                "已导出 {}（包含凭据，请使用 scp 下载并妥善保管）",
+                output.display()
+            );
+        } else {
+            println!("{}", String::from_utf8(contents)?);
+        }
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("配置读取 / 导出失败：{error}");
+            ExitCode::from(2)
+        }
+    }
 }

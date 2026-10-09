@@ -981,3 +981,90 @@ fn direct_install_reports_the_certificate_step_when_certbot_is_missing() {
         "a missing certificate must not roll back an otherwise healthy install"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn domain_install_bootstraps_acme_before_switching_protocols_to_validated_certificate() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = supported_systemd_host();
+    seed_service_accounts(&fixture);
+    seed_certificate_group(&fixture);
+    write_systemctl_fixture(&fixture, true);
+    write_traffic_fixture(&fixture, 100, 200, "boot-a");
+    seed_live_certificate(&fixture, &["sub.example.test"]);
+    let live = fixture.path().join("etc/letsencrypt/live/sub.example.test");
+    let ready = fixture.path().join(".acme-ready");
+    fs::rename(&live, &ready).unwrap();
+    let root = fixture.path().to_str().unwrap();
+    let certbot = fixture.path().join("usr/bin/certbot");
+    fs::write(
+        &certbot,
+        format!(
+            "#!/bin/sh\nmv '{root}/.acme-ready' '{root}/etc/letsencrypt/live/sub.example.test'\n"
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&certbot, fs::Permissions::from_mode(0o700)).unwrap();
+    let checker = fixture.path().join("checking-core");
+    fs::write(
+        &checker,
+        format!(
+            r#"#!/usr/bin/env python3
+import json, pathlib, sys
+root = pathlib.Path({root:?})
+if sys.argv[1] == 'version':
+    print('sing-box version 1.14.1')
+    sys.exit(0)
+config = json.loads(pathlib.Path(sys.argv[sys.argv.index('-c') + 1]).read_text())
+for inbound in config.get('inbounds', []):
+    tls = inbound.get('tls', {{}})
+    for key in ['certificate_path', 'key_path']:
+        if key in tls:
+            path = pathlib.Path(tls[key])
+            if not path.is_file():
+                path = root / tls[key].lstrip('/')
+            assert path.is_file(), 'TLS file missing before core check'
+            with (root / '.checked-tls').open('a') as log: log.write(path.name + '\n')
+"#
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o700)).unwrap();
+    let mut answers = vec![String::new(); 24];
+    answers[1] = "sub.example.test".into();
+    answers[3] = "admin@example.com".into();
+    answers[4] = "ens3".into();
+    answers[5] = "domain".into();
+    answers[16] = "www.cloudflare.com".into();
+    answers[22] = "n".into();
+    answers[23] = "y".into();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "install",
+            "--guided",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .write_stdin(answers.join("\n") + "\n")
+        .assert()
+        .success();
+    let checked = fs::read_to_string(fixture.path().join(".checked-tls")).unwrap();
+    assert!(checked.contains("cert.pem") && checked.contains("fullchain.pem"));
+    let active = fs::read_to_string(fixture.path().join("etc/sing-box/config.json")).unwrap();
+    assert!(active.contains("fullchain.pem") && !active.contains("cert.pem"));
+    let client: serde_json::Value = serde_json::from_str(
+        &fs::read_to_string(
+            fixture
+                .path()
+                .join("var/lib/sbctl/artifacts/subscription-sing-box.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    for outbound in client["outbounds"].as_array().unwrap() {
+        assert_ne!(outbound["tls"]["insecure"], serde_json::json!(true));
+    }
+}

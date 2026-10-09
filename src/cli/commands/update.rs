@@ -1,7 +1,7 @@
 //! The self-update and release tooling: `sbctl update`, `sbctl sing-box`,
 //! `sbctl release`, `sbctl logs` and `sbctl uninstall`.
 
-use crate::cli::args::{ApiCommand, LogUnit, ReleaseCommand, SingBoxCommand};
+use crate::cli::args::{ApiCommand, KernelSource, LogUnit, ReleaseCommand, SingBoxCommand};
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -64,7 +64,26 @@ pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
                         format!("sing-box updated; rollback point: {}", rollback.display())
                     })
             }
-            None => update_sing_box_official(root, artifact.as_deref()),
+            None => update_sing_box_official(root, artifact.as_deref(), None),
+        },
+        SingBoxCommand::Fetch { source, version } => match source {
+            KernelSource::Official => update_sing_box_official(root, None, version.as_deref()),
+            KernelSource::Repository => {
+                if version.is_some() {
+                    eprintln!("本仓库原版二进制由签名 manifest 固定版本，不支持选择版本");
+                    return ExitCode::from(2);
+                }
+                sbctl::update::fetch_latest_manifest().and_then(|manifest| {
+                    let temporary = tempfile::NamedTempFile::new()?.into_temp_path();
+                    sbctl::update::download_sing_box(&manifest, &temporary)?;
+                    sbctl::update::install_signed_sing_box(
+                        &sbctl::config::DeploymentStore::new(root),
+                        &manifest,
+                        &temporary,
+                    )
+                    .map(|path| format!("本仓库内核已安装；回滚点：{}", path.display()))
+                })
+            }
         },
         SingBoxCommand::Remove => sbctl::lifecycle::remove_managed_sing_box(root)
             .map(|_| "sing-box removed".to_owned())
@@ -89,6 +108,7 @@ pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
 fn update_sing_box_official(
     root: &Path,
     artifact: Option<&Path>,
+    requested_version: Option<&str>,
 ) -> Result<String, sbctl::update::UpdateError> {
     let store = sbctl::config::DeploymentStore::new(root);
     let temporary = tempfile::NamedTempFile::new().map_err(|error| {
@@ -102,13 +122,16 @@ fn update_sing_box_official(
     let (candidate, version_note) = match artifact {
         Some(path) => (path.to_path_buf(), "本地 sing-box 候选".to_owned()),
         None => {
-            let version = sbctl::update::fetch_latest_official_sing_box_version()?;
-            println!("官方最新稳定版：sing-box {version}，开始下载并校验…");
+            let version = requested_version
+                .map(str::to_owned)
+                .map(Ok)
+                .unwrap_or_else(sbctl::update::fetch_latest_official_sing_box_version)?;
+            println!("官方版本：sing-box {version}，开始下载并校验…");
             sbctl::update::download_sing_box_official(&version, temporary.path())?;
             let path = temporary.into_temp_path();
             let candidate = path.to_path_buf();
             candidate_guard = Some(path);
-            (candidate, format!("sing-box {version}（官方最新稳定版）"))
+            (candidate, format!("sing-box {version}（官方仓库）"))
         }
     };
     // The candidate is verified again here: it must run and pass a

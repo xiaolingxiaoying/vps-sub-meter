@@ -175,6 +175,31 @@ mod tests {
     /// `not find the sniffer[domain]`, and `dns-hijack` is already the default
     /// under a `tun:` block this project has no business writing for a client.
     #[test]
+    fn android_groups_share_the_configured_health_check_url() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        config.client_latency_probe_url = "https://probe.example.test/check?x=1&y=2".into();
+        let rendered = clash(&config, &crate::canonical::nodes(&config)).unwrap();
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&rendered).unwrap();
+        for group in parsed["proxy-groups"].as_sequence().unwrap() {
+            assert_eq!(
+                group["url"].as_str(),
+                Some(config.client_latency_probe_url.as_str())
+            );
+            assert_eq!(group["lazy"].as_bool(), Some(false));
+            assert!(group["interval"].as_u64().unwrap() > 0);
+        }
+    }
+
+    #[test]
     fn both_clash_artifacts_enable_the_sniffers_the_pinned_core_accepts() {
         let config = DeploymentConfig::new(
             SubscriptionMode::IpFallback,
@@ -250,15 +275,15 @@ mod tests {
         let uri = uri(&config, &nodes).expect("uri artifacts generate");
 
         assert!(
-            clash.contains("  - name: 节点选择\n    type: select\n    url: http://aliyun.com/generate_204\n    interval: 300\n    proxies:\n      - 自动选择\n      - DIRECT\n"),
+            clash.contains("  - name: 节点选择\n    type: select\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    proxies:\n      - 自动选择\n      - DIRECT\n"),
             "clash subscription exposes the manual selection group"
         );
         assert!(
-            clash.contains("  - name: 自动选择\n    type: url-test\n    url: http://www.gstatic.com/generate_204\n    interval: 300\n    tolerance: 50\n"),
+            clash.contains("  - name: 自动选择\n    type: url-test\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    tolerance: 50\n"),
             "clash subscription exposes the automatic selection group"
         );
         assert!(
-            clash.contains("  - name: 全球直连\n    type: select\n    proxies:\n      - DIRECT\n"),
+            clash.contains("  - name: 全球直连\n    type: select\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    proxies:\n      - DIRECT\n"),
             "clash subscription exposes the direct selection group"
         );
         for rule in [
