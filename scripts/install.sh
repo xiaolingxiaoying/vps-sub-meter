@@ -34,8 +34,8 @@ white() { echo -e "\033[37m\033[01m$*\033[0m"; }
 
 # GitHub Actions and piped installs may not provide a terminal or TERM.
 # Keep the banner useful in those environments without making clear(1) fatal.
-if [[ -t 1 && -n "${TERM:-}" ]]; then
-  clear
+if [[ -t 1 && -n "${TERM:-}" && "$TERM" != dumb ]]; then
+  clear || true
 fi
 white "~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~"
 blue  "   sbctl  ·  私有 sing-box 订阅控制面"

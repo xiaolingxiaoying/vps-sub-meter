@@ -35,7 +35,7 @@ curl -fL --retry 3 -o /tmp/sbctl-install.sh \
 test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 ```
 
-如果已登录为 `root`，可将最后一行改成 `test -s /tmp/sbctl-install.sh && bash /tmp/sbctl-install.sh`。
+如果已登录为 `root`，上述命令去掉 `sudo` 即可（包括安装下载工具的两处 `sudo`）。
 
 固定安装本次 `dev` 发布的 `sbctl-v0.0.6`（安装器和清单都使用同一版本）：
 
@@ -46,6 +46,8 @@ test -s /tmp/sbctl-install.sh && sudo env \
   SBCTL_MANIFEST_URL='https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.6/manifest-{arch}.json' \
   bash /tmp/sbctl-install.sh
 ```
+
+`root` 用户同样去掉固定版本命令中的 `sudo`，保留 `env SBCTL_MANIFEST_URL=…`。
 
 > 该地址是本仓库的 Release，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在本仓库构建、签名并发布；`sbctl update` 与安装脚本的构建期公钥都钉在它上面。发布需要仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX`（编译期与 `install.sh`）和 `release` Environment 的 `SBCTL_SIGNING_SEED`（签名私钥），发布约定见 [`docs/release-signing.md`](docs/release-signing.md)。
 
