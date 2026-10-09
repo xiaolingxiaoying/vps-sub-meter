@@ -24,7 +24,7 @@ const MANAGED_PATHS: &[&str] = &[
     "etc/systemd/system/sbctl-http.socket",
     "etc/systemd/system/sbctl-accounting-reset.service",
     "etc/systemd/system/sbctl-accounting-reset.timer",
-    "etc/letsencrypt/renewal-hooks/deploy/sbctl-certificate-deploy-hook",
+    CERTBOT_DEPLOY_HOOK,
 ];
 
 #[derive(Debug, Error)]
@@ -726,19 +726,38 @@ fn backup(
     Ok(entries)
 }
 
+/// The Certbot renewal hook restored by this transaction. It is executed by
+/// Certbot as root, so a rollback has to put the executable bit back.
+const CERTBOT_DEPLOY_HOOK: &str =
+    "etc/letsencrypt/renewal-hooks/deploy/sbctl-certificate-deploy-hook";
+
 fn restore(store: &DeploymentStore, backup: &[BackupEntry]) -> Result<(), ConfigError> {
+    let mut restored_certificate = false;
     for entry in backup {
         let path = store.root().join(&entry.relative);
         match &entry.contents {
             Some(contents) => {
                 store.write_relative_locked(&entry.relative, contents)?;
-                if entry.relative.starts_with("usr/local/bin/") {
+                if entry.relative.starts_with("usr/local/bin/")
+                    || entry.relative == CERTBOT_DEPLOY_HOOK
+                {
                     set_executable(&path)?;
+                }
+                if entry.relative.starts_with("var/lib/sbctl/certificates/") {
+                    restored_certificate = true;
                 }
             }
             None if path.exists() => fs::remove_file(path)?,
             None => {}
         }
+    }
+    // A restored pinned private key is written by root, so the shared group has
+    // to be re-applied or the `sing-box` account loses read access to the
+    // certificate its listeners present. Mirrors the install-time storage
+    // preparation; a no-op on fixture roots.
+    if restored_certificate {
+        crate::lifecycle::grant_pinned_certificate_group(store.root())
+            .map_err(|error| ConfigError::Storage(std::io::Error::other(error)))?;
     }
     Ok(())
 }
@@ -1032,6 +1051,38 @@ mod tests {
             mode & 0o777,
             0o755,
             "a restored binary must stay executable"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_restores_the_certbot_hook_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let fixture = tempfile::TempDir::new().expect("temporary root is created");
+        let store = crate::config::DeploymentStore::new(fixture.path());
+        let path = fixture.path().join(CERTBOT_DEPLOY_HOOK);
+        fs::create_dir_all(path.parent().expect("hook has a parent directory"))
+            .expect("hook directory is created");
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("hook fixture is written");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644))
+            .expect("hook fixture mode is set");
+
+        let backup = vec![BackupEntry {
+            relative: CERTBOT_DEPLOY_HOOK.to_owned(),
+            contents: Some(b"#!/bin/sh\nexit 0\n".to_vec()),
+        }];
+        restore(&store, &backup).expect("the rollback restore succeeds");
+
+        let mode = fs::metadata(&path)
+            .expect("hook metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o755,
+            "a restored deploy hook must stay executable or Certbot renewals silently \
+             stop re-pinning the certificate"
         );
     }
 

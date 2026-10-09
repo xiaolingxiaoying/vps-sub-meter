@@ -1425,17 +1425,32 @@ fn grant_certificate_storage(root: &Path) -> Result<(), String> {
             "could not restrict certificate storage: chmod exited with {status}"
         ));
     }
+    grant_pinned_certificate_group(root)
+}
+
+/// Re-applies `sbctl-cert` group ownership to the pinned certificate copy.
+///
+/// Shared by the install-time storage preparation and by the update rollback:
+/// a restored pinned key is written by root, so without this the `sing-box`
+/// account loses read access to the certificate its listeners present.
+/// Fixture roots keep the writing user's ownership, exactly like
+/// `restrict_certificate_permissions`.
+pub(crate) fn grant_pinned_certificate_group(root: &Path) -> Result<(), String> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
     let certificates = root.join(crate::config::CERTIFICATES_RELATIVE_PATH);
-    if certificates.is_dir() {
-        let status = Command::new("chgrp")
-            .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
-            .status()
-            .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
-        if !status.success() {
-            return Err(format!(
-                "could not grant certificate copy access: chgrp exited with {status}"
-            ));
-        }
+    if !certificates.is_dir() {
+        return Ok(());
+    }
+    let status = Command::new("chgrp")
+        .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
+        .status()
+        .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
+    if !status.success() {
+        return Err(format!(
+            "could not grant certificate copy access: chgrp exited with {status}"
+        ));
     }
     Ok(())
 }
