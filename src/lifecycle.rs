@@ -1428,7 +1428,7 @@ fn grant_certificate_storage(root: &Path) -> Result<(), String> {
     grant_pinned_certificate_group(root)
 }
 
-/// Re-applies `sbctl-cert` group ownership to the pinned certificate copy.
+/// Re-applies root ownership and the `sbctl-cert` group to the pinned copy.
 ///
 /// Shared by the install-time storage preparation and by the update rollback:
 /// a restored pinned key is written by root, so without this the `sing-box`
@@ -1443,13 +1443,17 @@ pub(crate) fn grant_pinned_certificate_group(root: &Path) -> Result<(), String> 
     if !certificates.is_dir() {
         return Ok(());
     }
-    let status = Command::new("chgrp")
-        .args(["-R", CERTIFICATE_GROUP, &certificates.to_string_lossy()])
+    // Installation first delegates the state directory to sbctl. Pinned keys
+    // must then use the same root-owned policy as config::managed_ownership,
+    // otherwise a rollback changes their owner even while restoring access.
+    let owner = format!("root:{CERTIFICATE_GROUP}");
+    let status = Command::new("chown")
+        .args(["-R", &owner, &certificates.to_string_lossy()])
         .status()
         .map_err(|error| format!("could not grant certificate copy access: {error}"))?;
     if !status.success() {
         return Err(format!(
-            "could not grant certificate copy access: chgrp exited with {status}"
+            "could not grant certificate copy access: chown exited with {status}"
         ));
     }
     Ok(())
