@@ -7,7 +7,7 @@
 1. 在可信维护设备上运行 `cargo run -p sbctl -- release keygen --output <仓库外的私有目录>`。命令输出公钥，私钥写入该目录；不要把私钥提交到 Git、聊天、日志或发布工件。已有密钥可以继续使用，但更换公钥会使旧二进制无法验证新 manifest。
 2. 在 GitHub 仓库 Actions Variables 中设置 `SBCTL_RELEASE_PUBLIC_KEY_HEX`，值为命令输出的 64 位十六进制公钥。
 3. 创建 GitHub Environment `release`，在其 Secrets 中设置 `SBCTL_SIGNING_SEED`，值为私钥文件中的 32 字节十六进制 seed。发布工作流只从此 Environment 读取 seed；不要将它设置为公开变量或写入仓库。
-4. 在 `dev` 上提交与 `Cargo.toml` / `Cargo.lock` 一致的版本，再从该提交推送 `sbctl-v*` 标签（本次版本为 `sbctl-v0.0.6`）。[`.github/workflows/release.yml`](../.github/workflows/release.yml) 要求标签提交属于 `dev`，全部任务使用经过校验的同一提交；amd64 和 arm64 在 Ubuntu 22.04 容器中原生构建普通 `sbctl`，兼容支持的 Debian/Ubuntu glibc。手动触发必须使用 `gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.6`。远程旧 `main` 不参与发布。公私钥不匹配、缺少密钥或仍使用公开开发密钥时，流程必须在上传发布工件前失败。
+4. 在 `dev` 上提交与 `Cargo.toml` / `Cargo.lock` 一致的版本，再从该提交推送 `sbctl-v*` 标签（本次版本为 `sbctl-v0.0.7`）。[`.github/workflows/release.yml`](../.github/workflows/release.yml) 要求标签提交属于 `dev`，全部任务使用经过校验的同一提交；amd64 和 arm64 在 Ubuntu 22.04 容器中原生构建普通 `sbctl`，兼容支持的 Debian/Ubuntu glibc。手动触发必须使用 `gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.7`。远程旧 `main` 不参与发布。公私钥不匹配、缺少密钥或仍使用公开开发密钥时，流程必须在上传发布工件前失败。
 
 ## 发布流水线的阶段
 
