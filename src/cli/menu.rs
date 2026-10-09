@@ -67,7 +67,7 @@ fn print_menu_header(root: &Path) {
     println!("{}", sbctl::term::blue("  快捷方式: ly"));
     println!(
         "{}",
-        sbctl::term::blue("  项目: github.com/xiaolingxiaoying/singbox-sub-me")
+        sbctl::term::blue("  项目: github.com/xiaolingxiaoying/vps-sub-meter")
     );
     println!("{bar}");
     println!(
