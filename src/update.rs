@@ -35,6 +35,14 @@ pub enum UpdateError {
     DigestMismatch(&'static str),
     #[error("official sing-box archive does not match GitHub's SHA-256 digest")]
     OfficialChecksumMismatch,
+    #[error(
+        "GitHub 未提供 sing-box {0} 资产的 SHA-256 摘要，无法校验归档完整性，已中止下载。\n\
+         请改用签名发布清单（sbctl install --manifest <清单> 或 sbctl sing-box update --manifest <清单>），\n\
+         或直接提供已校验的本地内核（--sing-box-bin <路径>）。"
+    )]
+    OfficialChecksumUnavailable(String),
+    #[error("official sing-box archive contains an unsafe member name: {0}")]
+    UnsafeArchiveMember(String),
     #[error("pinned release manifest has no download URL for {0}")]
     MissingDownloadUrl(&'static str),
     #[error("download of {0} failed: {1}")]
@@ -314,14 +322,89 @@ fn verify_official_archive_checksum(archive: &Path, expected: &str) -> Result<()
     }
 }
 
-/// Downloads the official sing-box release archive, checks GitHub's asset
-/// SHA-256 digest when supplied, extracts the kernel binary, confirms it runs
+/// The single archive member the official release publishes for `version` and
+/// this architecture.
+pub fn official_archive_member(version: &str) -> String {
+    format!(
+        "sing-box-{version}-linux-{}/sing-box",
+        official_release_arch()
+    )
+}
+
+/// Requires the upstream digest before any archive byte is trusted.
+///
+/// GitHub's `digest` field is the only integrity value the official download
+/// path has; continuing without it would let anyone able to suppress that field
+/// get an unverified binary executed as root by `confirm_sing_box_candidate`.
+/// The error names the two signed/verified alternatives.
+fn require_official_archive_digest(
+    version: &str,
+    digest: Option<String>,
+) -> Result<String, UpdateError> {
+    digest.ok_or_else(|| UpdateError::OfficialChecksumUnavailable(version.to_owned()))
+}
+
+/// Rejects a member name that must never be handed to `tar` as root: an empty
+/// name, an absolute path, a `..` component, a leading `-` (option injection),
+/// or an embedded NUL. Extra legitimate files (a license, a readme) are fine —
+/// they are never extracted — but a dangerous name means the archive is hostile
+/// and the whole download is refused.
+fn validate_archive_member(member: &str) -> Result<(), UpdateError> {
+    let unsafe_name = member.is_empty()
+        || member.contains('\0')
+        || member.starts_with('-')
+        || member.starts_with('/')
+        || member.starts_with('\\')
+        || member.split(['/', '\\']).any(|component| component == "..");
+    if unsafe_name {
+        return Err(UpdateError::UnsafeArchiveMember(member.to_owned()));
+    }
+    Ok(())
+}
+
+/// Lists the members of the downloaded archive so the expected kernel can be
+/// located and every other member can be screened before anything is
+/// extracted.
+fn official_archive_members(archive: &Path) -> Result<Vec<String>, UpdateError> {
+    let listing = Command::new("tar")
+        .args(["-tzf", &archive.to_string_lossy()])
+        .output()
+        .map_err(|error| {
+            UpdateError::DownloadFailed(
+                "sing-box",
+                format!("读取官方发布包目录失败（需要 tar 命令，Debian/Ubuntu 自带）：{error}"),
+            )
+        })?;
+    if !listing.status.success() {
+        return Err(UpdateError::DownloadFailed(
+            "sing-box",
+            format!(
+                "tar -tzf 读取发布包目录失败，退出码 {}；下载的发布包可能不完整",
+                listing.status
+            ),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&listing.stdout)
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_owned)
+        .collect())
+}
+
+/// Downloads the official sing-box release archive, requires GitHub's asset
+/// SHA-256 digest, extracts the single expected kernel member, confirms it runs
 /// and reports the requested version, and copies it to `output_bin`. The
 /// official digest is an integrity check from GitHub, not an independent
 /// publisher signature; signed manifests remain the stronger trust path.
+///
+/// A missing digest fails closed. Continuing without it meant a MITM (or a
+/// compromised release account) that could suppress the `digest` field could
+/// get an unverified binary executed as root by `confirm_sing_box_candidate`.
 pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<(), UpdateError> {
     let url = official_sing_box_archive_url(version)?;
-    let expected_digest = fetch_official_archive_digest(version)?;
+    let expected_digest =
+        require_official_archive_digest(version, fetch_official_archive_digest(version)?)?;
     let archive = tempfile::Builder::new()
         .suffix(".tar.gz")
         .tempfile()
@@ -355,22 +438,41 @@ pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<()
             curl_diagnostic("sing-box", &download),
         ));
     }
-    if let Some(expected_digest) = expected_digest {
-        verify_official_archive_checksum(archive.path(), &expected_digest)?;
-    } else {
-        eprintln!(
-            "warning: GitHub 未提供 sing-box {} 资产的 SHA-256 摘要；将继续通过 HTTPS 下载并检查候选内核版本，但归档完整性未校验。需要签名验证时请使用固定版本 release manifest。",
-            version
-        );
-    }
+    verify_official_archive_checksum(archive.path(), &expected_digest)?;
     let extracted = tempfile::tempdir().map_err(|error| {
         UpdateError::DownloadFailed("sing-box", format!("无法创建解压目录：{error}"))
     })?;
+    let member = official_archive_member(version);
+    let listing = official_archive_members(archive.path())?;
+    for listed in &listing {
+        // A release archive never legitimately contains absolute paths or `..`
+        // components; refusing the whole archive keeps a hostile one from
+        // relying on this extraction step.
+        validate_archive_member(listed)?;
+    }
+    if !listing.iter().any(|listed| listed == &member) {
+        return Err(UpdateError::DownloadFailed(
+            "sing-box",
+            format!(
+                "官方发布包中找不到预期的内核 {member}；归档成员：{}",
+                listing.join(", ")
+            ),
+        ));
+    }
+    // Extract exactly one member. `tar -xzf` of the whole archive as root is a
+    // traversal surface; naming the single expected file removes it, and the
+    // flags keep the archive from restoring its own ownership.
     let tar_status = Command::new("tar")
-        .arg("-xzf")
-        .arg(archive.path())
-        .arg("-C")
-        .arg(extracted.path())
+        .args([
+            "-xzf",
+            &archive.path().to_string_lossy(),
+            "-C",
+            &extracted.path().to_string_lossy(),
+            "--no-same-owner",
+            "--no-same-permissions",
+            "--",
+            &member,
+        ])
         .status()
         .map_err(|error| {
             UpdateError::DownloadFailed(
@@ -384,13 +486,7 @@ pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<()
             format!("tar 解压失败，退出码 {tar_status}；下载的发布包可能不完整"),
         ));
     }
-    let candidate = extracted
-        .path()
-        .join(format!(
-            "sing-box-{version}-linux-{}",
-            official_release_arch()
-        ))
-        .join("sing-box");
+    let candidate = extracted.path().join(&member);
     let candidate = candidate.as_path();
     confirm_sing_box_candidate(version, candidate)?;
     if let Some(parent) = output_bin.parent() {
@@ -952,6 +1048,60 @@ mod tests {
             &format!("{:x}", Sha256::digest(b"official archive")),
         )
         .expect("the expected official archive is accepted");
+    }
+
+    #[test]
+    fn official_archive_member_names_the_expected_kernel_path() {
+        let member = official_archive_member("1.14.1");
+        assert_eq!(
+            member,
+            format!("sing-box-1.14.1-linux-{}/sing-box", official_release_arch())
+        );
+        validate_archive_member(&member).expect("the expected member is safe to extract");
+    }
+
+    #[test]
+    fn archive_member_names_that_tar_must_never_extract_as_root_are_rejected() {
+        for member in [
+            "",
+            "/etc/sing-box/config.json",
+            "../escape",
+            "sing-box-1.14.1-linux-amd64/../../escape",
+            "-C",
+            "\\windows\\system32",
+        ] {
+            assert!(
+                validate_archive_member(member).is_err(),
+                "unsafe archive member must be refused: {member:?}"
+            );
+        }
+        // Extra legitimate files are not extracted, so they do not reject the
+        // archive; the danger is only in a name tar could follow out of the
+        // extraction directory.
+        for member in ["sing-box-1.14.1-linux-amd64/LICENSE", "README.md"] {
+            validate_archive_member(member)
+                .unwrap_or_else(|_| panic!("a plain member name is accepted: {member:?}"));
+        }
+    }
+
+    #[test]
+    fn a_missing_upstream_digest_fails_closed_before_any_download() {
+        let error = require_official_archive_digest("1.14.1", None)
+            .expect_err("an unavailable digest must stop the install");
+        assert!(
+            matches!(error, UpdateError::OfficialChecksumUnavailable(ref version) if version == "1.14.1"),
+            "unexpected error: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains("--manifest"), "{message}");
+        assert!(message.contains("--sing-box-bin"), "{message}");
+
+        let digest = format!("{:x}", Sha256::digest(b"official archive"));
+        assert_eq!(
+            require_official_archive_digest("1.14.1", Some(digest.clone()))
+                .expect("an available digest is used"),
+            digest
+        );
     }
 
     #[test]
