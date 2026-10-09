@@ -223,23 +223,36 @@ key_before=$(stat -c '%a %U:%G' "$pinned_key")
 hook_before=$(stat -c '%a %U:%G' "$deploy_hook")
 
 rollback_digest=$(sha256sum "$fake_sing_box" | awk '{print $1}')
+rollback_sbctl=${SBCTL_TEST_BIN:-/opt/sbctl-test/sbctl}
+test -x "$rollback_sbctl" || fail 'the rollback fixture needs a separate test-signing binary'
 printf '{"schema":1,"sbctl":{"version":"0.0.2","sha256":"%s"},"sing_box":{"version":"1.12.0","sha256":"%s"},"sing_box_compatibility":[{"min":"1.12.0","max":"1.12.0"}]}' \
   "$rollback_digest" "$rollback_digest" > "$work/rollback.unsigned.json"
-"$sbctl" release sign \
+"$rollback_sbctl" release sign \
   --manifest "$work/rollback.unsigned.json" \
   --private-key /usr/local/lib/sbctl-acceptance/dev-signing-key.hex \
   --output "$work/rollback-manifest.json"
-# Masking the control-plane unit makes the post-update health check fail, which
-# is the rollback path under test. The mask is lifted as soon as the update
-# returns, even if the script is interrupted.
-systemctl mask sbctl.service >/dev/null
-trap 'systemctl unmask sbctl.service >/dev/null 2>&1 || true; rm -rf "$work"' EXIT
-if "$sbctl" update --manifest "$work/rollback-manifest.json" \
+# A failing pre-start drop-in makes the health check fail without masking the
+# locally installed unit (systemctl refuses to mask a file under /etc). Use the
+# test-signing binary for this fixture: the production binary must reject the
+# public fixture signature before an update can reach its health check.
+failure_drop_in=/etc/systemd/system/sbctl.service.d/acceptance-failure.conf
+mkdir -p "$(dirname "$failure_drop_in")"
+printf '[Service]\nExecStartPre=/bin/false\n' > "$failure_drop_in"
+clear_failure() {
+  rm -f "$failure_drop_in"
+  rmdir "$(dirname "$failure_drop_in")" 2>/dev/null || true
+  systemctl daemon-reload
+}
+trap 'clear_failure; rm -rf "$work"' EXIT
+systemctl daemon-reload
+if "$rollback_sbctl" update --manifest "$work/rollback-manifest.json" \
   --sbctl-artifact "$fake_sing_box" --sing-box-artifact "$fake_sing_box" \
   >"$work/rollback-update.out" 2>&1; then
   fail 'an update whose health check fails must not be accepted'
 fi
-systemctl unmask sbctl.service >/dev/null 2>&1 || true
+grep -F 'update failed: service health check failed:' "$work/rollback-update.out" >/dev/null \
+  || fail "the update did not reach its health check: $(cat "$work/rollback-update.out")"
+clear_failure
 trap 'rm -rf "$work"' EXIT
 
 key_after=$(stat -c '%a %U:%G' "$pinned_key")
