@@ -8,14 +8,11 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
-    if options.subscription_host.is_none()
-        && options.interface.is_none()
-        && options.reality_decoy_sni.is_none()
-        && options.sing_box_bin.is_none()
-        && options.manifest.is_none()
-        && !options.guided
-        && !io::stdin().is_terminal()
-    {
+    // A bare `sbctl install` with no terminal is the read-only preflight the
+    // bootstrap installer relies on: it reports whether the host is ready and
+    // never writes anything. Any other invocation carries installation intent,
+    // so it must run the real transaction instead of silently succeeding.
+    if options.is_bare() && !io::stdin().is_terminal() {
         return match sbctl::preflight::preflight(root) {
             Ok(()) => {
                 println!("install preflight passed: host is ready for interactive installation");

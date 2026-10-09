@@ -267,6 +267,39 @@ fn install_reports_a_supported_systemd_fixture_as_ready() {
 }
 
 #[test]
+fn install_arguments_that_carry_intent_never_report_a_preflight_as_success() {
+    // `sbctl install </dev/null` is the bootstrap installer's read-only
+    // preflight. Every other flag shape is an installation request, and it used
+    // to print "install preflight passed" and exit 0 without doing anything -
+    // including `--replace-existing`.
+    for args in [
+        vec!["--disable-protocol", "vmess-websocket"],
+        vec!["--mode", "external-proxy"],
+        vec!["--http-port", "2080"],
+        vec!["--proxy-host", "proxy.example.test"],
+        vec!["--vless-port", "20001"],
+        vec!["--replace-existing"],
+        vec!["--no-start"],
+        vec!["--manage-firewall"],
+        vec!["--ipv4-only"],
+    ] {
+        let fixture = supported_systemd_host();
+        let mut command = Command::cargo_bin("sbctl").expect("sbctl binary is built");
+        command.args([
+            "--root",
+            fixture.path().to_str().expect("fixture path is UTF-8"),
+            "install",
+        ]);
+        command.args(&args);
+        command
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains("install preflight passed").not())
+            .stderr(predicate::str::contains("is required"));
+    }
+}
+
+#[test]
 fn a_failed_install_keeps_the_management_binary_and_rolls_back_the_certificate_directory() {
     let fixture = supported_systemd_host();
     // The release installer always places the management binary before it runs

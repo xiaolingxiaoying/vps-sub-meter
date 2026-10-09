@@ -252,6 +252,63 @@ pub(crate) struct InstallOptions {
     pub(crate) no_start: bool,
 }
 
+impl InstallOptions {
+    /// Whether this invocation carries no installation intent at all.
+    ///
+    /// The bootstrap installer uses a bare `sbctl install </dev/null` as a
+    /// read-only preflight, so this is the one shape that may answer with a
+    /// preflight alone. Every other flag has to run the real transaction:
+    /// `--disable-protocol vmess` or `--replace-existing` exiting 0 with
+    /// "install preflight passed" was a silent no-op.
+    ///
+    /// The destructuring pattern makes a new field a compile error until it is
+    /// considered here, so a future flag cannot fall out of this decision.
+    pub(crate) fn is_bare(&self) -> bool {
+        let Self {
+            mode,
+            guided,
+            subscription_host,
+            proxy_host,
+            http_port,
+            interface,
+            reality_decoy_sni,
+            protocol_sni,
+            disable_protocol,
+            vless_port,
+            vmess_port,
+            hysteria2_port,
+            tuic_port,
+            anytls_port,
+            sing_box_bin,
+            manifest,
+            replace_existing,
+            manage_firewall,
+            ipv4_only,
+            no_start,
+        } = self;
+        matches!(mode, CliSubscriptionMode::Direct)
+            && !guided
+            && subscription_host.is_none()
+            && proxy_host.is_none()
+            && http_port.is_none()
+            && interface.is_none()
+            && reality_decoy_sni.is_none()
+            && protocol_sni.is_none()
+            && disable_protocol.is_empty()
+            && vless_port.is_none()
+            && vmess_port.is_none()
+            && hysteria2_port.is_none()
+            && tuic_port.is_none()
+            && anytls_port.is_none()
+            && sing_box_bin.is_none()
+            && manifest.is_none()
+            && !replace_existing
+            && !manage_firewall
+            && !ipv4_only
+            && !no_start
+    }
+}
+
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
