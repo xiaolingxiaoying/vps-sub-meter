@@ -28,6 +28,11 @@ on:
         description: 'Release tag on dev, e.g. sbctl-v0.0.7 (must match Cargo.toml)'
         required: true
         type: string
+      update_existing:
+        description: 'Replace assets on the existing published release without creating a new release'
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -37,7 +42,7 @@ defaults:
     shell: bash
 
 concurrency:
-  group: release-${{ github.ref }}
+  group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
 
 env:
@@ -53,6 +58,7 @@ jobs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
+      original_tag_commit: ${{ steps.release.outputs.original_tag_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -62,6 +68,8 @@ jobs:
         env:
           INPUT_TAG: ${{ inputs.tag }}
           PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
+          UPDATE_EXISTING: ${{ inputs.update_existing || false }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           tag=${INPUT_TAG:-${GITHUB_REF_NAME}}
@@ -86,7 +94,10 @@ jobs:
             echo "tag '$tag' is not a commit on dev; refusing to publish" >&2
             exit 1
           fi
-          if [ "$tag_commit" != "$head_commit" ]; then
+          if [ "$UPDATE_EXISTING" = true ]; then
+            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { echo 'release replacement requires manual dispatch' >&2; exit 1; }
+            [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false ] || { echo 'replacement requires an existing published release' >&2; exit 1; }
+          elif [ "$tag_commit" != "$head_commit" ]; then
             echo "tag '$tag' points at $tag_commit but HEAD is $head_commit; refusing to publish a different commit" >&2
             exit 1
           fi
@@ -101,6 +112,7 @@ jobs:
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
+          echo "original_tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
           echo "releasing $tag ($version) from dev commit $head_commit"
 
   ci:
@@ -237,6 +249,9 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
           SIGNING_SEED: ${{ secrets.SBCTL_SIGNING_SEED }}
+          UPDATE_EXISTING: ${{ inputs.update_existing || false }}
+          ORIGINAL_TAG_COMMIT: ${{ needs.validate.outputs.original_tag_commit }}
+          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
         run: |
           set -euo pipefail
           [ -n "${SIGNING_SEED:-}" ] || { echo 'the release Environment has no SBCTL_SIGNING_SEED secret' >&2; exit 1; }
@@ -272,7 +287,14 @@ jobs:
           ( cd dist && sha256sum sbctl-linux-* sing-box-linux-* manifest-*.json install.sh > SHA256SUMS )
           cat dist/SHA256SUMS
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if [ "$UPDATE_EXISTING" = true ]; then
+            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] || { echo 'existing published release disappeared; refusing to create one' >&2; exit 1; }
+            git fetch origin "refs/tags/$TAG"
+            [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$ORIGINAL_TAG_COMMIT" ] || { echo 'release tag changed during the build; refusing to overwrite it' >&2; exit 1; }
+            gh api --method PATCH "repos/$RELEASE_REPOSITORY/git/refs/tags/$TAG" \
+              -f sha="$RELEASE_COMMIT" -F force=true
+            echo "updating the existing published release $TAG"
+          elif gh release view "$TAG" >/dev/null 2>&1; then
             if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
               echo "release $TAG is already published; refusing to overwrite published bytes" >&2
               exit 1
@@ -281,10 +303,12 @@ jobs:
           else
             gh release create "$TAG" --verify-tag --target dev --draft --title "$TAG" --generate-notes
           fi
-          # Upload into the draft (clobbering only draft assets), then publish.
+          # Replacement is opt-in and reaches here only after CI and signing.
           gh release upload "$TAG" dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
             dist/sing-box-linux-amd64 dist/sing-box-linux-arm64 \
             dist/manifest-amd64.json dist/manifest-arm64.json \
             dist/install.sh dist/SHA256SUMS --clobber
-          gh release edit "$TAG" --draft=false --latest
+          if [ "$UPDATE_EXISTING" != true ]; then
+            gh release edit "$TAG" --draft=false --latest
+          fi
           gh release view "$TAG" --json assets --jq '.assets[].name'

@@ -21,6 +21,12 @@
 
 `scripts/generate-manifest.sh` 从同一个 pin 文件读取版本与兼容区间：传入的 sing-box 版本必须等于 `sing_box_version`，否则拒绝签名，避免清单声明一个没有随包发布的运行时。
 
+### 更新现有 Release（不新增版本）
+
+管理员明确要求替换现有版本产物时，先把修复推送到 `dev`，再执行 `gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.7 -f update_existing=true`。该选项仅允许手动触发，并要求目标是已有的已发布 Release；版本仍必须与 Cargo.toml 一致。全部 CI、构建及签名验证通过后，工作流确认标签未在构建期间变化，再将原标签指向本次构建提交并覆盖原 Release 的全部资产，保留 Release 标题、说明和发布时间。缺失 Release 时直接失败，不创建新 Release。默认发布路径仍拒绝覆盖已发布产物。
+
+替换多个资产不是原子操作；替换期间下载的清单与二进制可能暂时不一致，此时校验会失败，应在工作流成功后重试下载。已经安装相同版本号的部署应通过菜单重新安装管理程序，或手动替换二进制；仅比较版本号的更新检查可能不会提示更新。
+
 `scripts/prepare-installer.py` 将同一个生产公钥写入发布工件 `install.sh`。仓库里的 `scripts/install.sh` 是未配置的模板，直接执行会失败。README 的安装入口指向 `https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh`。发布会附上 `sbctl-linux-amd64`、`sbctl-linux-arm64`、两个 sing-box 运行时、两个签名 manifest、`install.sh` 与 `SHA256SUMS`。
 
 > 兼容区间写在该 pin 文件里（当前 `1.10.0:1.14.99`），与 CI `sing-box-profiles` job 覆盖的版本带一致；升级随包内核时同时更新版本、逐架构摘要与区间。
