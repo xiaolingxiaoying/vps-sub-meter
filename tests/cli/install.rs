@@ -267,6 +267,115 @@ fn install_reports_a_supported_systemd_fixture_as_ready() {
 }
 
 #[test]
+fn a_failed_install_keeps_the_management_binary_and_rolls_back_the_certificate_directory() {
+    let fixture = supported_systemd_host();
+    // The release installer always places the management binary before it runs
+    // `sbctl install`, so a failed transaction must not delete it.
+    let management_binary = fixture.path().join("usr/local/bin/sbctl");
+    fs::create_dir_all(management_binary.parent().expect("binary has a parent"))
+        .expect("fixture binary directory");
+    fs::write(&management_binary, "installed by the bootstrap installer")
+        .expect("fixture management binary");
+    // A kernel whose `check` rejects the generated configuration fails the
+    // install after the self-signed certificate has already been written.
+    let rejecting_checker = sing_box_check_fixture(&fixture, false, &[]);
+
+    Command::cargo_bin("sbctl")
+        .expect("sbctl binary is built")
+        .args([
+            "--root",
+            fixture.path().to_str().expect("fixture path is UTF-8"),
+            "install",
+            "--subscription-host",
+            "sub.example.test",
+            "--interface",
+            "ens3",
+            "--reality-decoy-sni",
+            "www.cloudflare.com",
+            "--sing-box-bin",
+            rejecting_checker.to_str().expect("checker path is UTF-8"),
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("installation failed"));
+
+    assert_eq!(
+        fs::read_to_string(&management_binary).expect("the management binary survives"),
+        "installed by the bootstrap installer",
+        "a failed install must not remove the administrator's only CLI"
+    );
+    assert!(
+        !fixture.path().join("var/lib/sbctl/certificates").exists(),
+        "the certificate written before the failure belongs to the rolled-back transaction"
+    );
+    assert!(
+        !fixture.path().join("etc/sbctl/config.toml").exists(),
+        "a failed install must not leave a configuration behind"
+    );
+}
+
+#[test]
+fn a_failed_install_can_be_retried_without_manual_cleanup() {
+    let fixture = supported_systemd_host();
+    write_traffic_fixture(&fixture, 100, 200, "boot-a");
+    let management_binary = fixture.path().join("usr/local/bin/sbctl");
+    fs::create_dir_all(management_binary.parent().expect("binary has a parent"))
+        .expect("fixture binary directory");
+    fs::write(&management_binary, "installed by the bootstrap installer")
+        .expect("fixture management binary");
+    let rejecting_checker = sing_box_check_fixture(&fixture, false, &[]);
+    let install_args = [
+        "install",
+        "--mode",
+        "external-proxy",
+        "--subscription-host",
+        "sub.example.test",
+        "--interface",
+        "ens3",
+        "--reality-decoy-sni",
+        "www.cloudflare.com",
+        "--no-start",
+    ];
+
+    let mut failing = Command::cargo_bin("sbctl").expect("sbctl binary is built");
+    failing.args([
+        "--root",
+        fixture.path().to_str().expect("fixture path is UTF-8"),
+    ]);
+    failing.args(install_args);
+    failing
+        .args([
+            "--sing-box-bin",
+            rejecting_checker.to_str().expect("checker path is UTF-8"),
+        ])
+        .assert()
+        .code(2);
+
+    // Preflight lists `var/lib/sbctl/certificates` as an existing deployment,
+    // so a leftover certificate directory would refuse this retry.
+    let accepting_checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    let mut retry = Command::cargo_bin("sbctl").expect("sbctl binary is built");
+    retry.args([
+        "--root",
+        fixture.path().to_str().expect("fixture path is UTF-8"),
+    ]);
+    retry.args(install_args);
+    retry
+        .args([
+            "--sing-box-bin",
+            accepting_checker.to_str().expect("checker path is UTF-8"),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("install preflight passed").not());
+
+    assert!(
+        fixture.path().join("etc/sbctl/config.toml").is_file(),
+        "the retried install commits its configuration"
+    );
+}
+
+#[test]
 fn install_defaults_to_all_managed_protocols_writes_services_and_only_lists_firewall_ports() {
     let fixture = supported_systemd_host();
     write_traffic_fixture(&fixture, 100, 200, "boot-a");
