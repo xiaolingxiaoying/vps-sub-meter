@@ -37,7 +37,7 @@
   `project-review-2026-09-24.md`、`project-review-round-3-2026-10-02.md`（后两篇主体是客户端，
   服务端与发布治理结论在已复制的 round-2 里）、`qml-prototype-rewrite-acceptance.md`、
   `qml-ui-layout-acceptance.md`、`sbgui-qml-gui-and-kernel-interface.md`；
-  `docs/research/` 少 10 篇（gpui 系列 8 篇 + `ratatui-study-for-sbtui.md` + 两篇客户端综述）；
+  `docs/research/` 少 10 篇（GPUI 相关 7 篇 + `ratatui-study-for-sbtui.md` + 两篇客户端综述；源提交共 14 篇、副本保留 4 篇）；
   根目录的 `DESIGN.md`（QML 视觉系统）与 `PRODUCT.md`（含客户端的产品定位）不复制。
 - `.scratch/`（本地工单目录）、`target/`、`dist/`。注意 `AGENTS.md` 与
   `docs/agents/issue-tracker.md` 约定工单落在 `.scratch/` 下，本仓库首次建工单需要自己建目录。
@@ -58,23 +58,43 @@
 
 ## 拆分后必须知道的三件事
 
-1. **自更新与安装脚本仍指向 monorepo 的 Release。**
-   `src/update.rs:72`、`scripts/install.sh:64` 里的清单 URL 与 `src/cli/menu.rs:70`、
-   `scripts/install.sh:37` 的项目署名都写死为
-   `github.com/xiaolingxiaoying/singbox-sub-me`。签名公钥也钉在 `scripts/install.sh`
-   里（`docs/release-signing.md`）。在本仓库独立发 Release 之前，这套信任链是正确的；
-   要改成新仓库，得同时换清单地址与安装脚本里的构建期公钥，不能只改一处。
-2. **L3 验收套件有两条客户端腿。** `tests/acceptance/run.sh` 强制要求
-   `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT`（`verify-client.sh` 证明孤儿回收与 TUN 接线，
-   `verify-sbcli.sh` 证明共享后台协议）。本仓库没有这两个二进制，脚本保持原样未改；
-   `scripts/dev/build-acceptance-artifacts.sh` 会打印
-   `branch: server-only workspace - skipping the client leg` 并只产出两个 sbctl 产物，
-   随后 `run.sh` 会明确拒绝启动。要跑完整套件，请在 monorepo 里构建 sbtui/sbcli 并
-   导出路径；`verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 这三条服务端断言本身
-   不需要客户端。
+1. **自更新和安装已接入本仓库 Release。**
+   `src/update.rs` 与 `scripts/install.sh` 从
+   `github.com/xiaolingxiaoying/vps-sub-meter/releases` 获取签名清单；
+   [`.github/workflows/release.yml`](../.github/workflows/release.yml) 将生产公钥编入
+   amd64/arm64 二进制，用 `release` Environment 中的私钥签名并用发布二进制回验清单，
+   随包 sing-box 的版本与逐架构 sha256 钉在 `scripts/release-runtime-pins.txt`。
+   仓库内的 `scripts/install.sh` 仍是未配置公钥的模板，部署应使用 Release 附带的
+   `install.sh`。复制到其他仓库时，必须同时调整 Release URL、生产公钥和签名密钥配置。
+   发布链的四个阶段与失败模式见 `docs/release-signing.md`。
+2. **L3 验收套件的两条客户端腿是可选的了。** `tests/acceptance/run.sh` 不再强制要求
+   `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT`：未设置时打印
+   `branch: server-only workspace - skipping the client legs`，跳过 `verify-client.sh`
+   （孤儿回收与 TUN 接线）与 `verify-sbcli.sh`（共享后台协议），只跑
+   `verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言。要跑完整套件，
+   请在 monorepo 里构建 sbtui/sbcli 并导出两个路径。CI 的 `server-acceptance` job
+   按无客户端变量的方式跑三条服务端断言。
 3. **`vps-sub-meter` 这个名字在历史上是前身 Shell 项目。** `docs/implementation-plan.md`
    的总结里写着"吸收 `vps-sub-meter` Shell 脚本中的有效能力"——本仓库沿用了这个名字，
    但与那套 Shell 脚本没有代码继承关系，包名与二进制名仍是 `sbctl`。
+4. **审查结论见 [`project-review-round-3-2026-10-08.md`](project-review-round-3-2026-10-08.md)。**
+   七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已修复，
+   P1/P2 条目逐条附证据与建议，仍开放。
+
+4. **拆分时分层覆写的 CLI 仍是旧模型，生成逻辑与人工运维入口不对齐。** ADR-0029 和 `src/override_template.rs` 已支持客户端两种目标的基础文件与 `.d/` 层，以及 `sing-box-server.json` / `sing-box-server.d/` 服务端目标；当时 CLI 的 `show/edit/clear/validate` 有以下边界：
+
+   | 命令 | 抽取时实现 | 抽取时缺口 |
+   |---|---|---|
+   | `config override show` | 只列 `sing-box-override.json` 与 `clash-override.yaml` 两个客户端基础文件 | 不展示客户端 `.d/` 层或服务端目标；输出的合并说明也没写 `rules_mode` 与按 `tag` / `name` 合并的数组规则。README 的“已知缺口”已记录前两类展示问题及 `rules_mode`。 |
+   | `config override edit` | `CliOverrideTarget` 只有 `sing-box` 和 `clash` | 没有 `edit server`，也没有按文件名编辑某个 drop-in 层；服务端扩展只能由管理员手工创建/编辑文件。 |
+   | `config override validate` | `Overrides::load` 会解析三种目标；有内核时命令只对 `subscription-sing-box-full.json` 执行 `sing-box check` | 不会对合并后的 `sing-box-server.json` 执行真核检查。正常 `regenerate_current` 路径会检查服务端工件，并在存在覆写时检查合并后的客户端 full profile；两条 CLI 路径的验证覆盖不同。 |
+   | `config override clear` | 只删除两个客户端基础文件，然后重新生成工件 | 客户端 `.d/` 目录和服务端基础文件/层会保留，所以这个命令不是清空全部覆写。 |
+
+   `tests/cli/config_topics.rs` 中唯一直接调用 `config override` 的专项 CLI 测试是 Unix 下的编辑器回退测试；它覆盖编辑器探测和客户端样例文件创建，没有覆盖 `show`、`validate`、`clear` 或服务端目标。拆分仓库排除了 `.scratch/`，因此原报告中的“W5”编号在此没有可回查的工单来源；本节按当前代码行为记录。
+
+   这意味着在拆分报告生成时，README 只写到了 `show` 展示和 `edit server` 缺失，还没有说明 `validate` 的服务端真核检查空档、`clear` 的保留范围和 CLI 测试覆盖空白。
+
+   **2026-10-08 修复状态：** `show` 现在列出三个目标和有效分层文件；`edit` 支持 `server` 与 `--layer <文件名>`；`validate` 区分未初始化与配置损坏，并对服务端和客户端配置都执行真核检查；`clear` 默认清除两种客户端覆写，`clear server` / `clear all` 显式清理服务端目标或全部目标，验证失败会回滚文件。
 
 ## 验证状态（2026-10-07 实测）
 
@@ -99,4 +119,14 @@
 
 **未**在本仓库跑过的：Docker systemd L3 验收（这台宿主机 Docker 守护进程没起，且缺 sbtui/sbcli 二进制）、
 生产签名 Release 链（`release.yml` 未复制）。
+
+## 二次复核补充（2026-10-07）
+
+- **文档计数已校正**：`2b2a411` 的 `docs/research/` 有 14 篇，副本有 4 篇，差集为 10 篇。GPUI 相关文件是 7 篇，不是 8 篇；再加 1 篇 `ratatui-study-for-sbtui.md` 和 2 篇客户端综述，合计 10 篇。
+- **源分支指针复核**：源仓库的 `fix-ui` 分支仍指向 `2b2a411`；本次只读复核时，源仓库当前 checkout 是 `main`（`a4298f1`），工作树干净。正文中“源仓库 fix-ui 状态”描述的是拆分报告生成时的快照，不代表源仓库当前 checkout 分支。
+- 本节是对报告和代码的静态复核；没有重跑构建、测试或 L3 验收，也没有修改源仓库。
+
+## 覆写 CLI 修复（2026-10-08）
+
+本轮修复落在当前 `vps-sub-meter` 工作树：补全三目标与分层文件的 `show/edit/clear`，让 `validate` 检查服务端与客户端工件，并让覆写目录符号链接、配置解析错误和清理失败走显式错误/回滚路径。源仓库 `singbox-sub-me` 未修改。`cargo fmt --all -- --check`、`cargo check --locked -p sbctl --no-default-features` 和 `cargo clippy --locked -p sbctl --all-targets --all-features -- -D warnings` 均通过；本轮没有新增或运行测试。
 

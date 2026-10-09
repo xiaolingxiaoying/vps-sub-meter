@@ -28,29 +28,17 @@
 
 ```bash
 curl -fL --retry 3 -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/singbox-sub-me/releases/latest/download/install.sh
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
 test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 ```
 
 如果已登录为 `root`，可将最后一行改成 `test -s /tmp/sbctl-install.sh && bash /tmp/sbctl-install.sh`。
 
-> 该地址是**签名信任链的一部分**，不是笔误：`sbctl update` 与安装脚本的构建期公钥都钉在 monorepo 的 Release 上。要让本仓库独立发布 Release，必须同时更换清单地址和 `scripts/install.sh` 里的公钥，见 [`docs/release-signing.md`](docs/release-signing.md)。
+> 该地址是本仓库的 Release，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在本仓库构建、签名并发布；`sbctl update` 与安装脚本的构建期公钥都钉在它上面。发布需要仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX`（编译期与 `install.sh`）和 `release` Environment 的 `SBCTL_SIGNING_SEED`（签名私钥），发布约定见 [`docs/release-signing.md`](docs/release-signing.md)。
 
-安装向导会询问订阅模式、域名或 IP、出口网卡、启用的协议与客户端模板。Direct 模式适用于域名已解析到 VPS 的情况；已有 Nginx/Caddy 时选择 External proxy；没有域名时可选择安全性较低的 IP fallback。
+Release 提供已构建并签名的 `sbctl`、sing-box 运行时、按架构区分的签名清单和安装脚本。安装器会校验签名与文件摘要，然后启动引导配置；VPS 无需安装 Rust 或从源码构建。仓库中的 `scripts/install.sh` 是模板，不能直接运行。
 
-非交互安装常用开关：
-
-```bash
-sbctl install --guided                 # 先问全部问题，再落地服务与状态
-sbctl install --mode direct --subscription-host sub.example.com
-sbctl install --manage-firewall        # 事务内执行 ufw allow（只加不删，默认关）
-sbctl install --ipv4-only              # 内核出站解析钉在 IPv4
-sbctl install --disable-protocol tuic  # 可重复，端口用 --vless-port 等指定
-```
-
-安装程序默认不会改动防火墙，也不会接管现有 sing-box 或反向代理；它会打印需要你自己执行的 `ufw allow` 命令。Direct + 域名模式还会在健康检查通过后尝试签发订阅证书，失败时降级为待办提示而不是回滚整个安装，`sbctl status` 会标注"证书未签发"。
-
-更多安装细节见 [`docs/installation.md`](docs/installation.md)。
+> 在已有部署上重跑安装脚本时，安装器会先问是保留现有部署还是备份后全新安装，**在你回答之前不会替换 `/usr/local/bin/sbctl`**。升级已由 sbctl 管理的部署请直接用 `sbctl update`。
 
 ## 常用命令
 
@@ -77,7 +65,7 @@ sbctl rule-set import-list --url https://…/direct.list --into direct
 sbctl rule-set interval 12h   # 订阅端重新下载远程规则集的间隔
 sbctl config show                # 部署摘要（不含凭据）
 sbctl config wizard              # 交互式改配置
-sbctl config override edit sing-box|clash
+sbctl config override edit <sing-box|clash|server> [--layer <file>]
 sbctl traffic show            # 账期流量
 sbctl update [--check]        # 校验并应用签名发布清单
 sbctl uninstall [--purge]     # 卸载并保留备份
@@ -90,25 +78,25 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 - **分层覆写**：`overrides/sing-box.d/*.json`、`clash.d/*.yaml` 按文件名顺序叠在单文件之后；`sing-box-server.json` + `sing-box-server.d/` 是**本台 VPS 实际运行的配置**的扩展缝。覆写文件顶层可写 `rules_mode = "append" | "prepend" | "replace"`（合并前剥离）。服务端覆写碰到入站凭据字段会被拒绝，合并结果一律过真核 `sing-box check` 再进原子事务。
 - **自定义规则列表**：`rules/{direct,proxy,reject,fakeip-filter}.list`，行格式 `DOMAIN-SUFFIX,example.com` / `IP-CIDR,10.0.0.0/8`，`#` 注释，与 qichiyuhub/rule 的 `.list` 一致。
 - **远程规则集注册表**：`config.toml` 的 `[[client_extra_rule_sets]]`，只接受 https 的 `.srs`/`.mrs`（由订阅端自己下载）；纯文本列表走 `sbctl rule-set import-list`。
-- **编辑器**：`sbctl config override edit <sing-box|clash>` 按 `$VISUAL → $EDITOR → vim → nano → vi` 探测，没有 vim 时自动降到 nano（Windows 落到 notepad）。
+- **编辑器**：`sbctl config override edit <sing-box|clash|server>` 按 `$VISUAL → $EDITOR → vim → nano → vi` 探测，没有 vim 时自动降到 nano（Windows 落到 notepad）；`--layer <文件名>` 可直接编辑 `.d/` 中的分层文件。
 
 策略组名已去掉前置图标（`节点选择`、`自动选择`、`流媒体`、`Telegram` 等），对客户端透明。详见 [`docs/subscription-guide.md`](docs/subscription-guide.md) 与 ADR-0029／0030／0031（[`docs/adr/`](docs/adr/)）。
 
-### 已知缺口
+### 覆写 CLI
 
-分层覆写的**生成逻辑已完整生效**（服务端目标、`.d` 目录、`rules_mode`、凭据黑名单、合并后真核 check），但 CLI 的展示面还停在旧的两文件模型：
+`sbctl config override show` 会列出三个目标的基础文件和有效 drop-in 层。`edit` 支持 `sing-box`、`clash`、`server`；使用 `--layer 10-dns.json` 或 `--layer 20-routing.yaml` 可编辑对应 `.d/` 文件，文件名仅可含 ASCII 字母数字、点、下划线和连字符，且扩展名必须匹配目标格式。
 
-- `sbctl config override show` 只列 `sing-box-override.json` 与 `clash-override.yaml`，不列 `sing-box.d/`、`clash.d/`、`sing-box-server.json`、`sing-box-server.d/`（`src/cli/commands/config.rs` 的 `OverrideCommand::Show`）。
-- `CliOverrideTarget` 只有 `sing-box`/`clash` 两个取值，所以服务端覆写文件需要手工创建，没有 `edit server`。
-- `show` 输出的合并语义说明尚未提到 `rules_mode`。
+`validate` 会解析全部覆写；部署已初始化且能找到 sing-box 内核时，同时检查合并后的服务端配置和客户端 full profile。未初始化部署时只做覆写结构检查；缺失配置与损坏配置会分别处理，损坏配置返回失败。
 
-## 从源码构建
+`clear` 不带目标时清除 sing-box 与 Clash 客户端覆写（包括基础文件和 drop-in 层）；`clear server` 只清除服务端目标，`clear all` 清除全部目标。清理后会重新生成并校验工件，若生成失败会恢复被清理的文件。
 
-```bash
-cargo build --release --locked -p sbctl --no-default-features
-```
+## 开发验证
 
-生成的程序为 `target/release/sbctl`。生产 Release 使用 GitHub Actions 构建和签名；不要直接运行仓库里的 `scripts/install.sh`，它没有生产公钥。开发和验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 与 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
+生产二进制由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 构建和签名（推 `sbctl-v*` 标签触发）。开发构建、测试签名、发布密钥配置与验收说明见 [`docs/release-signing.md`](docs/release-signing.md) 和 [`tests/acceptance/README.md`](tests/acceptance/README.md)。
+
+## 已知缺口与审查结论
+
+[`docs/project-review-round-3-2026-10-08.md`](docs/project-review-round-3-2026-10-08.md) 记录了 2026-10-08 的全量审查结论：七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已在本轮修复，P1/P2 条目（`config switch-mode` 不可用、Direct 忽略 `--bind`、总览页流量口径、manifest 无序列/有效期、action 未 pin 等）仍开放，逐条附证据与建议。
 
 ## 验证
 
@@ -116,11 +104,11 @@ cargo build --release --locked -p sbctl --no-default-features
 |---|---|
 | L2 Linux（fmt / clippy / 全量测试） | `MSYS_NO_PATHCONV=1 wsl -d Ubuntu-22.04 -- bash scripts/dev/wsl-gate.sh` |
 | L2 真核矩阵（sing-box 1.10–1.14 + mihomo） | 先 `scripts/dev/fetch-sing-box-cores.sh`，再 `scripts/dev/wsl-real-cores.sh` |
-| L3 systemd 验收 | `SBCTL_ARTIFACT=… SBCTL_TEST_ARTIFACT=… SBCTUI_ARTIFACT=… SBCLI_ARTIFACT=… sh tests/acceptance/run.sh` |
+| L3 systemd 验收 | `SBCTL_ARTIFACT=… SBCTL_TEST_ARTIFACT=… sh tests/acceptance/run.sh` |
 
-L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate，`scripts/dev/build-acceptance-artifacts.sh` 会明确打印它跳过了客户端那一腿。`verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言不受影响。
+L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate。这两个变量现在是**可选**的：不设置时脚本打印 `branch: server-only workspace - skipping the client legs` 并只跑 `verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言；设置后跑完整套件。
 
-CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）只保留服务端四个任务：构建、测试、sing-box 版本带校验、mihomo 校验。
+CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑服务端五个任务：构建、测试、systemd 验收（三发行版）、sing-box 版本带校验、mihomo 校验。发布由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 负责。
 
 ## 许可证
 

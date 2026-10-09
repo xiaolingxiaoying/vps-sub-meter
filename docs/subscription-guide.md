@@ -83,11 +83,14 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 ```bash
 sbctl config override show      # 查看路径与合并语义
 sbctl config override edit clash     # $EDITOR 编辑（默认给出示例）
-sbctl config override validate  # 校验
-sbctl config override clear     # 删除并重新生成
+sbctl config override edit server --layer 10-dns.json # 编辑服务端分层覆写
+sbctl config override validate  # 校验服务端与客户端 sing-box 配置
+sbctl config override clear     # 清除客户端覆写（基础文件与 .d 层）
+sbctl config override clear server # 仅清除服务端覆写
+sbctl config override clear all    # 清除所有覆写
 ```
 
-合并语义（ADR-0021）：对象递归合并；数组整体替换；**键名为 `rules` 的数组前插**到生成规则之前。影响工件：sing-box-full + 各版本文件、clash.yaml、clash-1.18.yaml；`sing-box.json` 与 URI 格式不受影响。
+合并语义（ADR-0021/0029）：对象递归合并；默认数组整体替换；**键名为 `rules` 的数组前插**到生成规则之前，每个文件可用 `rules_mode` 选择 `prepend`、`append` 或 `replace`。sing-box 的 `outbounds` 按 `tag` 合并，Clash 的代理、策略组和规则提供者按 `name` 合并。客户端目标影响 sing-box-full 与各版本文件、clash.yaml、clash-1.18.yaml；服务端目标修改本机运行的 `sing-box-server.json`。客户端覆写不改变 `sing-box.json` 与 URI 格式。
 
 ## 客户端模板配置
 
@@ -115,7 +118,7 @@ sbctl config override clear     # 删除并重新生成
   注意 `geoip/lan` 在该镜像上解析不到，因此 LAN 一直是内置列表而不是规则集 URL。
 - `client_latency_probe_url`：默认 `http://aliyun.com/generate_204`（选择组含 DIRECT，探测必须国内可达）
 
-修改后 `sbctl restart` 重新生成并生效。三档模板都已过 1.10–1.14 五个真实内核的
+修改后运行 `sbctl regenerate` 重新生成并生效（`sbctl restart` 只做 `sing-box check` 与重启服务，不重新生成工件）。三档模板都已过 1.10–1.14 五个真实内核的
 `sing-box check`（`cargo test --test version_profiles -- --ignored`，5 内核 × 3 模板 = 15 种组合）。
 
 ## 安全边界
