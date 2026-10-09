@@ -25,7 +25,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag, e.g. sbctl-v0.0.4 (must match Cargo.toml)'
+        description: 'Release tag on dev, e.g. sbctl-v0.0.6 (must match Cargo.toml)'
         required: true
         type: string
 
@@ -48,6 +48,7 @@ jobs:
     outputs:
       tag: ${{ steps.release.outputs.tag }}
       version: ${{ steps.release.outputs.version }}
+      commit: ${{ steps.release.outputs.commit }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -72,6 +73,15 @@ jobs:
           fi
           tag_commit=$(git rev-parse "$tag^{commit}")
           head_commit=$(git rev-parse HEAD)
+          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/dev ]; then
+            echo 'manual releases must run with --ref dev' >&2
+            exit 1
+          fi
+          git fetch origin dev
+          if ! git merge-base --is-ancestor "$tag_commit" origin/dev; then
+            echo "tag '$tag' is not a commit on dev; refusing to publish" >&2
+            exit 1
+          fi
           if [ "$tag_commit" != "$head_commit" ]; then
             echo "tag '$tag' points at $tag_commit but HEAD is $head_commit; refusing to publish a different commit" >&2
             exit 1
@@ -86,7 +96,12 @@ jobs:
           fi
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "releasing $tag ($version) from $head_commit"
+          echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
+          echo "releasing $tag ($version) from dev commit $head_commit"
+
+  ci:
+    needs: validate
+    uses: ./.github/workflows/ci.yml
 
   build:
     needs: validate
@@ -99,8 +114,17 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
+    # Both native architectures target glibc 2.35 (Ubuntu 22.04 / Debian 12).
+    # The arm64 runner host is newer than the supported production systems.
+    container: ubuntu:22.04
     steps:
+      - name: Install native build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -121,7 +145,7 @@ jobs:
           install -m 0755 target/release/sbctl "dist/sbctl-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: sbctl-linux-${{ matrix.arch }}
+          name: release-sbctl-linux-${{ matrix.arch }}
           path: dist/sbctl-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
@@ -135,6 +159,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.validate.outputs.commit }}
       - name: Download and verify the pinned sing-box runtime
         run: |
           set -euo pipefail
@@ -176,13 +202,13 @@ jobs:
           rm -rf "dist/sing-box-$sing_box_version-linux-$arch"
       - uses: actions/upload-artifact@v4
         with:
-          name: sing-box-linux-${{ matrix.arch }}
+          name: release-sing-box-linux-${{ matrix.arch }}
           path: dist/sing-box-linux-${{ matrix.arch }}
           if-no-files-found: error
           retention-days: 7
 
   package:
-    needs: [validate, build, runtime]
+    needs: [validate, ci, build, runtime]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -191,6 +217,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ needs.validate.outputs.commit }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
@@ -198,12 +225,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: release-*
           merge-multiple: true
       - name: Sign the manifests, render install.sh and publish a draft release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
-          VERSION: ${{ needs.validate.outputs.version }}
           PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
           SIGNING_SEED: ${{ secrets.SBCTL_SIGNING_SEED }}
         run: |
@@ -223,9 +250,11 @@ jobs:
           printf '%s' "$SIGNING_SEED" > "$seed_file"
           export SBCTL_SIGNING_KEY="$seed_file"
 
+          . scripts/release-runtime-pins.txt
+
           for arch in amd64 arm64; do
             bash scripts/generate-manifest.sh \
-              "$RELEASE_REPOSITORY" "$TAG" "$VERSION" "$arch" \
+              "$RELEASE_REPOSITORY" "$TAG" "$sing_box_version" "$arch" \
               "dist/sbctl-linux-$arch" "dist/sing-box-linux-$arch" "dist/manifest-$arch.json"
           done
 
@@ -246,12 +275,12 @@ jobs:
             fi
             echo "reusing the existing draft release $TAG"
           else
-            gh release create "$TAG" --draft --title "$TAG" --generate-notes
+            gh release create "$TAG" --verify-tag --target dev --draft --title "$TAG" --generate-notes
           fi
           # Upload into the draft (clobbering only draft assets), then publish.
           gh release upload "$TAG" dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
             dist/sing-box-linux-amd64 dist/sing-box-linux-arm64 \
             dist/manifest-amd64.json dist/manifest-arm64.json \
             dist/install.sh dist/SHA256SUMS --clobber
-          gh release edit "$TAG" --draft=false
+          gh release edit "$TAG" --draft=false --latest
           gh release view "$TAG" --json assets --jq '.assets[].name'

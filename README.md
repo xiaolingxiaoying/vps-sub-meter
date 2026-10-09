@@ -4,6 +4,8 @@
 
 本仓库是 [`singbox-sub-me`](https://github.com/xiaolingxiaoying/singbox-sub-me) 工作区里**服务端部分的独立副本**（拆分溯源见 [`docs/repository-split.md`](docs/repository-split.md)）。终端与桌面客户端（`sbtui`、`sbcli`、`sbgui`、`client-core`）不在这里，它们仍住在 monorepo。
 
+当前开发和发布分支为 **`dev`**，从本地最新 `main` 创建。远程 `main` 保留旧项目；`dev` 独立维护，后续提交与 Release 不依赖远程 `main`。
+
 ## 功能
 
 - 管理 VLESS Reality、VMess WebSocket、Hysteria 2、TUIC 和 AnyTLS 五种协议。
@@ -24,15 +26,26 @@
 
 ## 安装
 
-在 VPS 上下载经过签名校验的安装脚本并运行：
+在 VPS 上安装下载工具，再下载 Release 附带的安装脚本并运行；脚本会验证清单签名和二进制摘要：
 
 ```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl
 curl -fL --retry 3 -o /tmp/sbctl-install.sh \
   https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
 test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 ```
 
 如果已登录为 `root`，可将最后一行改成 `test -s /tmp/sbctl-install.sh && bash /tmp/sbctl-install.sh`。
+
+固定安装本次 `dev` 发布的 `sbctl-v0.0.6`（安装器和清单都使用同一版本）：
+
+```bash
+curl -fL --retry 3 -o /tmp/sbctl-install.sh \
+  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.6/install.sh
+test -s /tmp/sbctl-install.sh && sudo env \
+  SBCTL_MANIFEST_URL='https://github.com/xiaolingxiaoying/vps-sub-meter/releases/download/sbctl-v0.0.6/manifest-{arch}.json' \
+  bash /tmp/sbctl-install.sh
+```
 
 > 该地址是本仓库的 Release，由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 在本仓库构建、签名并发布；`sbctl update` 与安装脚本的构建期公钥都钉在它上面。发布需要仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX`（编译期与 `install.sh`）和 `release` Environment 的 `SBCTL_SIGNING_SEED`（签名私钥），发布约定见 [`docs/release-signing.md`](docs/release-signing.md)。
 
@@ -109,6 +122,25 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 L3 的两条客户端断言（`verify-client.sh`、`verify-sbcli.sh`）需要 monorepo 构建的 `sbtui`/`sbcli` 二进制——本仓库没有这两个 crate。这两个变量现在是**可选**的：不设置时脚本打印 `branch: server-only workspace - skipping the client legs` 并只跑 `verify-bootstrap.sh`/`verify.sh`/`verify-real.sh` 三条服务端断言；设置后跑完整套件。
 
 CI（[`.github/workflows/ci.yml`](.github/workflows/ci.yml)）跑服务端五个任务：构建、测试、systemd 验收（三发行版）、sing-box 版本带校验、mihomo 校验。发布由 [`.github/workflows/release.yml`](.github/workflows/release.yml) 负责。
+
+## 从 dev 发布
+
+发布前更新 `Cargo.toml` 和 `Cargo.lock` 的 sbctl 版本并提交到 `dev`，再从该提交创建对应标签：
+
+```bash
+git switch dev
+git push origin dev
+git tag sbctl-v0.0.6
+git push origin sbctl-v0.0.6
+```
+
+标签推送会触发 GitHub Actions 的 `Release` 工作流。它校验标签版本和提交属于 `dev`，固定所有构建任务的源码提交，执行完整 CI（含 systemd 验收），然后构建 amd64/arm64、签名并发布 GitHub Release。任一门禁失败均不发布。已发布的版本不能覆盖，下次发布请使用新版本号。
+
+重跑已有标签也可手动触发，必须选择 `dev`：
+
+```bash
+gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.6
+```
 
 ## 许可证
 

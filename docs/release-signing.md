@@ -7,13 +7,14 @@
 1. 在可信维护设备上运行 `cargo run -p sbctl -- release keygen --output <仓库外的私有目录>`。命令输出公钥，私钥写入该目录；不要把私钥提交到 Git、聊天、日志或发布工件。已有密钥可以继续使用，但更换公钥会使旧二进制无法验证新 manifest。
 2. 在 GitHub 仓库 Actions Variables 中设置 `SBCTL_RELEASE_PUBLIC_KEY_HEX`，值为命令输出的 64 位十六进制公钥。
 3. 创建 GitHub Environment `release`，在其 Secrets 中设置 `SBCTL_SIGNING_SEED`，值为私钥文件中的 32 字节十六进制 seed。发布工作流只从此 Environment 读取 seed；不要将它设置为公开变量或写入仓库。
-4. 推送与 `Cargo.toml` 版本匹配的 `sbctl-v*` 标签（当前版本为 `sbctl-v0.0.4`）。[`.github/workflows/release.yml`](../.github/workflows/release.yml) 在 amd64 和 arm64 runner 构建普通 `sbctl`，再由 package job 用 Environment 私钥签名并由对应二进制验签。公私钥不匹配、缺少密钥或仍使用公开开发密钥时，流程必须在上传发布工件前失败。
+4. 在 `dev` 上提交与 `Cargo.toml` / `Cargo.lock` 一致的版本，再从该提交推送 `sbctl-v*` 标签（本次版本为 `sbctl-v0.0.6`）。[`.github/workflows/release.yml`](../.github/workflows/release.yml) 要求标签提交属于 `dev`，全部任务使用经过校验的同一提交；amd64 和 arm64 在 Ubuntu 22.04 容器中原生构建普通 `sbctl`，兼容支持的 Debian/Ubuntu glibc。手动触发必须使用 `gh workflow run release.yml --ref dev -f tag=sbctl-v0.0.6`。远程旧 `main` 不参与发布。公私钥不匹配、缺少密钥或仍使用公开开发密钥时，流程必须在上传发布工件前失败。
 
-## 发布流水线的四个阶段
+## 发布流水线的阶段
 
 | Job | 做什么 | 失败模式 |
 |---|---|---|
-| `validate` | 标签必须等于 `sbctl-v<Cargo.toml 版本>` 且指向 `HEAD`；仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX` 必须存在且不是公开开发密钥 | 标签/版本/锚点任一不符即中止，不构建 |
+| `validate` | 标签必须等于 `sbctl-v<Cargo.toml 版本>`、指向 `HEAD` 且属于 `dev`；输出固定源码提交；仓库变量 `SBCTL_RELEASE_PUBLIC_KEY_HEX` 必须存在且不是公开开发密钥 | 标签/分支/版本/锚点任一不符即中止，不构建 |
+| `ci` | 调用本次提交的 `ci.yml`，运行测试、clippy、systemd 验收和真实内核矩阵 | 任一检查失败，`package` 不执行 |
 | `build` | 带锚点编译，跑 `scripts/dev/release-trust-anchor-check.sh` 与 `--test release_trust` | 二进制信任开发密钥、或没配锚点，拒绝上传 |
 | `runtime` | 按 [`scripts/release-runtime-pins.txt`](../scripts/release-runtime-pins.txt) 下载随包 sing-box，校验钉住的 sha256，再与 GitHub API 的 `digest` 交叉核对；只解出 `sing-box-<版本>-linux-<arch>/sing-box` 一个成员 | 摘要缺失/不符、pin 过期、成员名危险，拒绝签名 |
 | `package` | 渲染 `install.sh`，逐架构 `generate-manifest.sh` 签名并用发布二进制回验，生成 `SHA256SUMS`，以**草稿**发布、上传全部资产、再 `--draft=false` | 半途失败只留下可删除重跑的草稿；已发布的 tag 拒绝覆盖 |
