@@ -1,0 +1,31 @@
+# Pinned sing-box runtime bundled into every sbctl release.
+#
+# `version` is the sing-box release whose linux binary ships as
+# `sing-box-linux-<arch>` and whose version is declared in the signed
+# manifests. It must stay inside the compatibility band published in those
+# manifests and inside the client version-profile registry
+# (src/subscription/profile.rs).
+#
+# The digests are the SHA-256 of the upstream release archives, recorded here so
+# the release build verifies the bytes it downloads instead of signing whatever
+# the network returned. `scripts/generate-manifest.sh` used to compute the
+# digest after downloading, which made the signature vouch for the received
+# bytes rather than for a reviewed upstream artifact.
+#
+# Bump procedure: pick the upstream version, download both archives, verify the
+# digests against the GitHub release API's `digest` field, update this file, and
+# keep `min`/`max` in step with the version profiles the CI real-core matrix
+# covers (currently sing-box 1.10.7 - 1.14.1).
+sing_box_version=1.14.2
+
+# Compatibility band declared in every signed manifest for this release. The
+# generated client profiles are validated against every core in the band by the
+# CI `sing-box-profiles` job.
+sing_box_compat_min=1.10.0
+sing_box_compat_max=1.14.99
+
+# Verified 2026-10-08: the amd64 digest was reproduced by downloading the
+# archive and hashing it locally; the arm64 digest comes from the GitHub release
+# API and is enforced (and therefore verified) by the release build itself.
+sha256_amd64=a684484d7477d1437282ee411f4d131d0340aaad60a7868841ebd5d87dd8a0c6
+sha256_arm64=b43a1fb1bda131c6653576741ce527eb2bdeab7c9308ca90ee8b972abb7e4a7f
