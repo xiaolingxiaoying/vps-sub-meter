@@ -111,6 +111,11 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 
 ## 已知缺口与审查结论
 
+2026-10-13 的 8 项 sbctl 修复已实施，命名凭据隔离、邮件权限和模式切换等行为及
+升级说明见 [`docs/sbctl-review-fixes-2026-10-13.md`](docs/sbctl-review-fixes-2026-10-13.md)。
+库／CLI 回归和 Linux 权限检查已通过；完整三发行版 systemd 验收仍待容器引擎恢复后执行，
+相关条目尚未标记为完成全部发布验收。
+
 [`docs/project-review-round-3-2026-10-08.md`](docs/project-review-round-3-2026-10-08.md) 记录了 2026-10-08 的全量审查结论：七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已在本轮修复，P1/P2 条目（`config switch-mode` 不可用、Direct 忽略 `--bind`、总览页流量口径、manifest 无序列/有效期、action 未 pin 等）仍开放，逐条附证据与建议。
 
 ## 验证

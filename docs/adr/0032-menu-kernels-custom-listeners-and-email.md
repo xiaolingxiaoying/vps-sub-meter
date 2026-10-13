@@ -38,6 +38,10 @@ advance window; state is saved only after SMTP success under the operation lock.
 Missed pre-reset reminders are not retroactively sent after a period changes.
 Uninstall removes the email timer; normal data backup preserves email settings.
 
+ADR-0033 makes the root-only boundary persistent across regeneration and updates:
+mail files remain root-owned, and daemon-writable state directories use a root-owned
+sticky parent so the service cannot unlink or substitute the root-only delivery state.
+
 Sources for the CMFA behavior:
 - https://github.com/MetaCubeX/ClashMetaForAndroid/blob/main/core/src/main/golang/native/tunnel/connectivity.go
 - https://github.com/MetaCubeX/ClashMetaForAndroid/blob/main/core/src/main/golang/native/tunnel/proxies.go

@@ -607,7 +607,12 @@ fn certificate_tls_config(
     let (certificate_path, key_path) = match config.certificate_mode {
         CertificateMode::SelfSigned => ensure_self_signed_certificate(config, root)?,
         CertificateMode::Domain => {
-            if config.subscription_mode == SubscriptionMode::Direct {
+            let pinned = root
+                .join(crate::config::CERTIFICATES_RELATIVE_PATH)
+                .join(&config.subscription_host);
+            if config.subscription_mode == SubscriptionMode::Direct
+                || (pinned.join("fullchain.pem").is_file() && pinned.join("privkey.pem").is_file())
+            {
                 let directory = crate::config::DeploymentStore::certificate_directory_absolute(
                     &config.subscription_host,
                 );

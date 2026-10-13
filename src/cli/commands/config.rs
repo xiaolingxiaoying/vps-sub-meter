@@ -689,20 +689,14 @@ pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
             })
         }
         .map(|_| "deployment configuration initialized".to_owned()),
-        ConfigCommand::SwitchMode { mode, listen_port } => store.load().and_then(|mut config| {
-            config.subscription_mode = mode.into();
-            config.subscription_listen_port = listen_port;
-            if config.subscription_mode != sbctl::config::SubscriptionMode::IpFallback {
-                config.http_port = None;
-            }
-            config.validate()?;
-            if let Some(port) = config.subscription_listen_port {
-                sbctl::subscription::ensure_external_proxy_listener_available(port)
-                    .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-            }
-            store.replace(&config)
-        })
-        .map(|_| "subscription mode changed".to_owned()),
+        ConfigCommand::SwitchMode {
+            mode, listen_port, subscription_host, http_port, certificate_mode,
+            protocol_sni, certbot_email, sing_box_bin,
+        } => return super::mode::switch_mode(root, super::mode::ModeOptions {
+            mode: mode.into(), listen_port, subscription_host, http_port,
+            certificate_mode: certificate_mode.map(Into::into), protocol_sni,
+            certbot_email, sing_box_bin,
+        }),
         ConfigCommand::Show => store.load().map(|config| config.summary()),
         ConfigCommand::Validate => store
             .load()

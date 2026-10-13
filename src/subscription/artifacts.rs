@@ -127,10 +127,10 @@ fn regenerate_locked(
     }
     let prior_artifacts = artifacts
         .iter()
-        .map(|(name, _)| (name.clone(), read_artifact(store, name)))
-        .collect::<Vec<_>>();
+        .map(|(name, _)| read_artifact(store, name).map(|bytes| (name.clone(), bytes)))
+        .collect::<Result<Vec<_>, _>>()?;
     let prior_active = if update_active_config {
-        fs::read(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH)).ok()
+        read_optional_file(&store.root().join(ACTIVE_CONFIG_RELATIVE_PATH))?
     } else {
         None
     };
@@ -172,8 +172,19 @@ fn server_artifact(artifacts: &[(String, String)]) -> Result<&str, SubscriptionE
         })
 }
 
-fn read_artifact(store: &DeploymentStore, name: &str) -> Option<Vec<u8>> {
-    fs::read(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name)).ok()
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, SubscriptionError> {
+    match crate::config::read_managed_file_no_follow(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(SubscriptionError::Artifact(error)),
+    }
+}
+
+fn read_artifact(
+    store: &DeploymentStore,
+    name: &str,
+) -> Result<Option<Vec<u8>>, SubscriptionError> {
+    read_optional_file(&store.root().join(ARTIFACTS_RELATIVE_DIR).join(name))
 }
 
 /// Best-effort rollback of already-replaced artifacts and the active
@@ -217,15 +228,42 @@ pub fn apply_config_transaction(
     sing_box_bin: Option<&Path>,
 ) -> Result<DeploymentSnapshot, SubscriptionError> {
     let _lock = store.acquire_operation_lock()?;
+    apply_config_transaction_locked(store, config, sing_box_bin)
+}
+
+/// Caller holds the operation lock across publication and service recovery.
+pub fn apply_config_transaction_locked(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    sing_box_bin: Option<&Path>,
+) -> Result<DeploymentSnapshot, SubscriptionError> {
+    apply_config_transaction_with_server_locked(store, config, sing_box_bin, None)
+}
+
+/// Stage only the server during ACME bootstrap. Client artifacts always use
+/// the final certificate policy, never the temporary server's insecure policy.
+pub fn apply_config_transaction_with_server_locked(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    sing_box_bin: Option<&Path>,
+    staged_server: Option<&str>,
+) -> Result<DeploymentSnapshot, SubscriptionError> {
     config.validate()?;
-    let artifacts = generated_artifacts_for_kernel(config, store.root(), sing_box_bin)?;
+    let mut artifacts = generated_artifacts_for_kernel(config, store.root(), sing_box_bin)?;
+    if let Some(server) = staged_server {
+        let (_, contents) = artifacts
+            .iter_mut()
+            .find(|(name, _)| name == SING_BOX_SERVER_ARTIFACT)
+            .ok_or(SubscriptionError::MissingNodes)?;
+        *contents = server.to_owned();
+    }
     let server = server_artifact(&artifacts)?;
     let prior_artifacts = artifacts
         .iter()
-        .map(|(name, _)| (name.clone(), read_artifact(store, name)))
-        .collect::<Vec<_>>();
-    let prior_active = fs::read(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH)).ok();
-    let prior_config = fs::read(store.root().join(crate::config::CONFIG_RELATIVE_PATH)).ok();
+        .map(|(name, _)| read_artifact(store, name).map(|bytes| (name.clone(), bytes)))
+        .collect::<Result<Vec<_>, _>>()?;
+    let prior_active = read_optional_file(&store.root().join(ACTIVE_CONFIG_RELATIVE_PATH))?;
+    let prior_config = read_optional_file(&store.root().join(crate::config::CONFIG_RELATIVE_PATH))?;
 
     let artifacts_changed = prior_artifacts.iter().any(|(name, prior)| {
         artifacts
@@ -311,6 +349,14 @@ pub fn restore_config_transaction(
     snapshot: &DeploymentSnapshot,
 ) -> Result<(), SubscriptionError> {
     let _lock = store.acquire_operation_lock()?;
+    restore_config_transaction_locked(store, snapshot)
+}
+
+/// Restore without reacquiring a lock held by a lifecycle transaction.
+pub fn restore_config_transaction_locked(
+    store: &DeploymentStore,
+    snapshot: &DeploymentSnapshot,
+) -> Result<(), SubscriptionError> {
     for (name, prior) in snapshot.artifacts.iter().rev() {
         match prior {
             Some(prior) => store.write_artifact_locked(name, prior)?,

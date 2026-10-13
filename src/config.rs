@@ -1,6 +1,6 @@
 use std::fmt;
 use std::fs::{self, File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -1721,21 +1721,8 @@ impl DeploymentStore {
         if self.root != Path::new("/") {
             return Ok(());
         }
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let status = std::process::Command::new("chown")
-                .args(["root:root", &path.to_string_lossy()])
-                .status()
-                .map_err(ConfigError::Storage)?;
-            if !status.success() {
-                return Err(ConfigError::Storage(io::Error::other(format!(
-                    "chown root:root exited with {status}"
-                ))));
-            }
-            fs::set_permissions(&path, fs::Permissions::from_mode(0o600))
-                .map_err(ConfigError::Storage)?;
-        }
+        set_owner_mode_no_follow(&self.root, &path, "root:root", 0o600)
+            .map_err(ConfigError::Storage)?;
         Ok(())
     }
 
@@ -1867,7 +1854,7 @@ fn create_private_directory(directory: &Path) -> io::Result<()> {
 /// sbctl daemon and the sing-box data plane keep reading it after any config
 /// change. Fixture roots (a non-"/" configured root) keep the invoking user's
 /// ownership.
-fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> {
+pub(crate) fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> {
     if root != Path::new("/") {
         return Ok(());
     }
@@ -1890,23 +1877,114 @@ fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> 
     if !user_exists(root, user) {
         return Ok(());
     }
+    set_owner_mode_no_follow(root, path, owner, mode).map_err(ConfigError::Storage)?;
+    Ok(())
+}
+
+/// Open through pinned directory descriptors. Reject symlinks in every path
+/// component so a service cannot redirect a root ownership change through a
+/// renamed writable parent directory.
+pub fn open_managed_path_no_follow(path: &Path) -> io::Result<File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let status = std::process::Command::new("chown")
-            .args([owner, &path.to_string_lossy()])
-            .status()
-            .map_err(ConfigError::Storage)?;
-        if !status.success() {
-            return Err(ConfigError::Storage(io::Error::other(format!(
-                "chown {owner} exited with {status}"
-            ))));
+        use std::os::unix::{
+            ffi::OsStrExt,
+            io::{AsRawFd, FromRawFd},
+        };
+        let mut current = File::open(if path.is_absolute() { "/" } else { "." })?;
+        let components = path
+            .components()
+            .filter(|part| {
+                !matches!(
+                    part,
+                    std::path::Component::RootDir | std::path::Component::CurDir
+                )
+            })
+            .collect::<Vec<_>>();
+        for (index, component) in components.iter().enumerate() {
+            let std::path::Component::Normal(name) = component else {
+                return Err(io::Error::other(
+                    "managed path must not contain parent components",
+                ));
+            };
+            let name = std::ffi::CString::new(name.as_bytes())
+                .map_err(|_| io::Error::other("invalid managed path"))?;
+            let mut flags = libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK;
+            if index + 1 < components.len() {
+                flags |= libc::O_DIRECTORY;
+            }
+            let descriptor = unsafe { libc::openat(current.as_raw_fd(), name.as_ptr(), flags) };
+            if descriptor < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            current = unsafe { File::from_raw_fd(descriptor) };
         }
-        fs::set_permissions(path, fs::Permissions::from_mode(mode))
-            .map_err(ConfigError::Storage)?;
+        let metadata = current.metadata()?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(io::Error::other(
+                "managed path must be a regular file or directory",
+            ));
+        }
+        Ok(current)
     }
     #[cfg(not(unix))]
-    let _ = (user, owner, mode);
+    {
+        if fs::symlink_metadata(path)?.file_type().is_symlink() {
+            return Err(io::Error::other("managed path must not be a symlink"));
+        }
+        File::open(path)
+    }
+}
+
+/// Read a managed snapshot from the same inode opened without symlinks.
+pub fn read_managed_file_no_follow(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = open_managed_path_no_follow(path)?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
+/// Ownership and mode changes target one opened inode. Never run a root
+/// pathname-based chown/chmod in a directory writable by the service account.
+pub(crate) fn set_owner_mode_no_follow(
+    root: &Path,
+    path: &Path,
+    owner: &str,
+    mode: u32,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
+        let (user, group) = owner
+            .split_once(':')
+            .ok_or_else(|| io::Error::other("invalid managed owner"))?;
+        let lookup = |relative: &str, name: &str, field: usize| -> io::Result<u32> {
+            fs::read_to_string(root.join(relative))?
+                .lines()
+                .find_map(|line| {
+                    let fields: Vec<&str> = line.split(':').collect();
+                    (fields.first().copied() == Some(name))
+                        .then(|| fields.get(field).and_then(|value| value.parse().ok()))
+                        .flatten()
+                })
+                .ok_or_else(|| io::Error::other(format!("missing managed identity {name}")))
+        };
+        let uid = lookup("etc/passwd", user, 2)?;
+        let gid = lookup("etc/group", group, 2)?;
+        let file = open_managed_path_no_follow(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() && !metadata.is_dir() {
+            return Err(io::Error::other(
+                "managed path must be a regular file or directory",
+            ));
+        }
+        if unsafe { libc::fchown(file.as_raw_fd(), uid, gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        file.set_permissions(fs::Permissions::from_mode(mode))?;
+    }
+    #[cfg(not(unix))]
+    let _ = (root, path, owner, mode);
     Ok(())
 }
 
@@ -1922,6 +2000,9 @@ fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> 
 /// its own policy instead.
 fn managed_ownership(relative: &str) -> (&'static str, &'static str, u32) {
     match relative {
+        "etc/sbctl/email.toml" | "var/lib/sbctl/email-state.json" => {
+            ("root", "root:root", 0o600u32)
+        }
         "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
         // The managed service binaries must stay root-owned and executable:
         // sbctl.service and sing-box.service run under their own accounts and
@@ -2016,6 +2097,50 @@ mod tests {
         AccountingPolicy, CertificateMode, DeploymentConfig, DeploymentOptions, DeploymentStore,
         ManagedProtocol, ProtocolPorts, SubscriptionMode,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_ownership_rejects_symlink_without_changing_private_target() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        fs::create_dir_all(root.join("etc")).unwrap();
+        let uid = unsafe { libc::geteuid() };
+        let gid = unsafe { libc::getegid() };
+        fs::write(
+            root.join("etc/passwd"),
+            format!("sbctl:x:{uid}:{gid}:service:/:/bin/false\n"),
+        )
+        .unwrap();
+        fs::write(root.join("etc/group"), format!("sbctl:x:{gid}:\n")).unwrap();
+        let private = root.join("email.toml");
+        fs::write(&private, "SMTP secret").unwrap();
+        fs::set_permissions(&private, fs::Permissions::from_mode(0o600)).unwrap();
+        let link = root.join("subscription-uri.txt");
+        symlink(&private, &link).unwrap();
+        assert!(super::set_owner_mode_no_follow(root, &link, "sbctl:sbctl", 0o644).is_err());
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert_eq!(fs::read_to_string(&private).unwrap(), "SMTP secret");
+        assert!(fs::symlink_metadata(link).unwrap().file_type().is_symlink());
+        let parent_link = root.join("artifacts");
+        symlink(root, &parent_link).unwrap();
+        assert!(
+            super::set_owner_mode_no_follow(
+                root,
+                &parent_link.join("email.toml"),
+                "sbctl:sbctl",
+                0o644
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::metadata(&private).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
 
     #[test]
     fn client_settings_summary_redacts_url_credentials_queries_and_fragments() {

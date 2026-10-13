@@ -277,3 +277,208 @@ fn a_malformed_grace_duration_is_refused_before_anything_changes() {
         "a refused command must not revoke anything"
     );
 }
+
+#[test]
+fn credential_failures_restore_the_complete_config_and_do_not_print_links() {
+    let fixture = TempDir::new().unwrap();
+    initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+    let root = fixture.path().to_str().unwrap();
+    write_systemctl_fixture(&fixture, true);
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "credential", "add", "--name", "phone"])
+        .assert()
+        .success();
+    // Include a historical same-name record before the live record: restoration
+    // must preserve order and every expiry instead of finding the first name.
+    let store = sbctl::config::DeploymentStore::new(fixture.path());
+    let mut config = store.load().unwrap();
+    config.subscription_credentials.insert(
+        0,
+        sbctl::config::NamedCredential {
+            name: "phone".into(),
+            credential: sbctl::config::generate_subscription_credential().unwrap(),
+            revoked_at: Some(1),
+        },
+    );
+    store.replace(&config).unwrap();
+    let path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&path).unwrap();
+    write_systemctl_fixture(&fixture, false);
+    for command in [
+        vec!["add", "--name", "tablet"],
+        vec!["revoke", "phone"],
+        vec!["rotate", "--name", "phone", "--grace", "30m"],
+        vec!["rotate"],
+    ] {
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root, "credential"])
+            .args(command)
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains("/sub/").not());
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+}
+
+#[test]
+fn malformed_and_overflowing_grace_never_change_config_or_panic() {
+    let fixture = TempDir::new().unwrap();
+    initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+    write_systemctl_fixture(&fixture, true);
+    let root = fixture.path().to_str().unwrap();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "credential", "add", "--name", "phone"])
+        .assert()
+        .success();
+    let path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&path).unwrap();
+    for value in [
+        "",
+        " ",
+        "30分",
+        "-1h",
+        "9223372036854775807s",
+        "9223372036854775807d",
+        "not-a-duration",
+    ] {
+        for action in ["rotate", "revoke"] {
+            let mut command = Command::cargo_bin("sbctl").unwrap();
+            command.args(["--root", root, "credential", action]);
+            if action == "rotate" {
+                command.args(["--name", "phone"]);
+            } else {
+                command.arg("phone");
+            }
+            command
+                .args(["--grace", value])
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains("panicked").not());
+            assert_eq!(fs::read(&path).unwrap(), before);
+        }
+    }
+}
+
+#[test]
+fn named_and_retiring_routes_never_advertise_the_default_secret() {
+    let fixture = TempDir::new().unwrap();
+    let port = free_high_tcp_port();
+    let default = initialize_ip_fallback_subscription(&fixture, port);
+    let store = sbctl::config::DeploymentStore::new(fixture.path());
+    let mut config = store.load().unwrap();
+    let named = sbctl::config::generate_subscription_credential().unwrap();
+    let retiring = sbctl::config::generate_subscription_credential().unwrap();
+    for (credential, revoked_at) in [
+        (named.clone(), None),
+        (
+            retiring.clone(),
+            Some(chrono::Utc::now().timestamp() + 1800),
+        ),
+    ] {
+        config
+            .subscription_credentials
+            .push(sbctl::config::NamedCredential {
+                name: "phone".into(),
+                credential,
+                revoked_at,
+            });
+    }
+    store.replace(&config).unwrap();
+    let mut server = spawn_sbctl_serve(&fixture, port, 6, &fixture.path().join("routes.stderr"));
+    for credential in [&default, &named, &retiring] {
+        let index = http_get(port, &format!("/sub/{credential}/index"));
+        assert!(index.starts_with("HTTP/1.1 200"));
+        assert!(index.contains(&format!("/sub/{credential}/")));
+        for other in [&default, &named, &retiring] {
+            if credential != other {
+                assert!(!index.contains(other));
+            }
+        }
+        let response = http_get(port, &format!("/sub/{credential}/qr/uri"));
+        assert!(response.starts_with("HTTP/1.1 200"));
+        let url = sbctl::subscription::route_url_with_credential(
+            &config,
+            credential,
+            sbctl::subscription::SubscriptionRoute::Format(
+                sbctl::subscription::SubscriptionFormat::Uri,
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            response.split_once("\r\n\r\n").unwrap().1,
+            sbctl::qr::render_svg(&url).unwrap()
+        );
+    }
+    assert!(server.wait().unwrap().success());
+}
+
+#[cfg(unix)]
+#[test]
+fn first_restart_or_health_failure_recovers_previous_config() {
+    use std::os::unix::fs::PermissionsExt;
+    for fail_at in ["restart", "is-active"] {
+        let fixture = TempDir::new().unwrap();
+        initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+        let path = fixture.path().join("etc/sbctl/config.toml");
+        let before = fs::read(&path).unwrap();
+        let systemctl = fixture.path().join("usr/bin/systemctl");
+        fs::create_dir_all(systemctl.parent().unwrap()).unwrap();
+        fs::write(&systemctl, format!("#!/bin/sh\nroot=$(CDPATH= cd -- \"$(dirname -- \"$0\")/../..\" && pwd)\nif [ \"$1\" = \"{fail_at}\" ] && [ ! -f \"$root/failed-once\" ]; then touch \"$root/failed-once\"; exit 1; fi\nexit 0\n")).unwrap();
+        fs::set_permissions(&systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args([
+                "--root",
+                fixture.path().to_str().unwrap(),
+                "credential",
+                "add",
+                "--name",
+                "phone",
+            ])
+            .assert()
+            .code(2)
+            .stdout(predicate::str::contains("/sub/").not())
+            .stderr(predicate::str::contains("恢复重启失败").not());
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+#[test]
+fn concurrent_credential_adds_keep_both_records() {
+    let fixture = TempDir::new().unwrap();
+    initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+    write_systemctl_fixture(&fixture, true);
+    let root = fixture.path().to_str().unwrap();
+    let mut children = Vec::new();
+    for name in ["phone", "tablet"] {
+        children.push(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("sbctl"))
+                .args(["--root", root, "credential", "add", "--name", name])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+    let config = sbctl::config::DeploymentStore::new(fixture.path())
+        .load()
+        .unwrap();
+    assert_eq!(config.subscription_credentials.len(), 2);
+    assert!(
+        config
+            .subscription_credentials
+            .iter()
+            .any(|entry| entry.name == "phone")
+    );
+    assert!(
+        config
+            .subscription_credentials
+            .iter()
+            .any(|entry| entry.name == "tablet")
+    );
+}

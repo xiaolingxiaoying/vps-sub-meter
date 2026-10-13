@@ -20,55 +20,93 @@ const CREDENTIAL_ROTATE_TIMER: &str = "etc/systemd/system/sbctl-credential-rotat
 const EMAIL_UNIT: &str = "etc/systemd/system/sbctl-email.service";
 const EMAIL_TIMER: &str = "etc/systemd/system/sbctl-email.timer";
 
-pub fn set_email_timer(root: &Path, enable: bool) -> Result<(), String> {
-    if enable {
-        write_unit(root, EMAIL_UNIT,
-            "# sbctl managed email\n[Unit]\nDescription=sbctl email reports\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nExecStart=/usr/local/bin/sbctl email check\nTimeoutStartSec=60\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/sbctl\nProtectHome=true\nUMask=0077\n").map_err(|e| e.to_string())?;
-        write_unit(root, EMAIL_TIMER,
-            "# sbctl managed email\n[Unit]\nDescription=sbctl email timer\n\n[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=60\nPersistent=true\nUnit=sbctl-email.service\n\n[Install]\nWantedBy=timers.target\n").map_err(|e| e.to_string())?;
-        systemctl(root, &["daemon-reload"])?;
-        systemctl(root, &["enable", "--now", "sbctl-email.timer"])
-    } else {
-        if root.join(EMAIL_TIMER).exists() {
-            systemctl(root, &["disable", "--now", "sbctl-email.timer"])?;
-            systemctl(root, &["stop", "sbctl-email.service"])?;
-            remove_file_if_present(&root.join(EMAIL_TIMER))?;
-            remove_file_if_present(&root.join(EMAIL_UNIT))?;
-            systemctl(root, &["daemon-reload"])?;
+const EMAIL_MARKER: &str = "Description=sbctl email";
+const ROTATE_MARKER: &str = "Description=sbctl scheduled subscription credential rotation";
+const ROTATE_SERVICE_CONTENTS: &str = "[Unit]\nDescription=sbctl scheduled subscription credential rotation\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nGroup=root\nExecStart=/usr/local/bin/sbctl credential rotate\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\nReadWritePaths=/etc/sbctl /var/lib/sbctl /etc/systemd/system -/etc/letsencrypt/renewal-hooks/deploy\nUMask=0077\n";
+
+fn check_optional_units(root: &Path, paths: &[&str], marker: &str) -> Result<(), String> {
+    for path in paths {
+        if root.join(path).exists() && !unit_has_marker(root, path, marker)? {
+            return Err(format!(
+                "{path} is not sbctl-managed; refusing to change it"
+            ));
         }
-        Ok(())
     }
+    Ok(())
 }
 
-/// Installs or removes the scheduled credential rotation.
-///
-/// Opt-in only: an unattended rotation invalidates every printed QR code and
-/// saved link at once, which is exactly what some operators want on a shared
-/// VPS and exactly what others would not expect from an update.
-pub fn set_credential_rotate_timer(root: &Path, enable: bool) -> Result<(), String> {
-    if enable {
-        write_unit(
-            root,
-            CREDENTIAL_ROTATE_UNIT,
-            "[Unit]\nDescription=sbctl scheduled subscription credential rotation\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=sbctl\nGroup=sbctl\nExecStart=/usr/local/bin/sbctl credential rotate\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/etc/sbctl /var/lib/sbctl\n",
-        )
-        .map_err(|error| error.to_string())?;
-        write_unit(
-            root,
-            CREDENTIAL_ROTATE_TIMER,
-            "[Unit]\nDescription=sbctl scheduled subscription credential rotation timer\n\n[Timer]\nOnCalendar=monthly\nPersistent=true\nUnit=sbctl-credential-rotate.service\n\n[Install]\nWantedBy=timers.target\n",
-        )
-        .map_err(|error| error.to_string())?;
-        systemctl(root, &["daemon-reload"])?;
-        systemctl(root, &["enable", "--now", "sbctl-credential-rotate.timer"])?;
+fn remove_optional_timer(
+    root: &Path,
+    service: &str,
+    timer: &str,
+    marker: &str,
+) -> Result<(), String> {
+    check_optional_units(root, &[service, timer], marker)?;
+    if !root.join(service).exists() && !root.join(timer).exists() {
         return Ok(());
     }
-    // Disabling is tolerant of the unit never having existed: `--remove-timer`
-    // on a deployment without one is a no-op, not an error.
-    let _ = systemctl(root, &["disable", "--now", "sbctl-credential-rotate.timer"]);
-    remove_file_if_present(&root.join(CREDENTIAL_ROTATE_TIMER))?;
-    remove_file_if_present(&root.join(CREDENTIAL_ROTATE_UNIT))?;
+    let timer_name = Path::new(timer).file_name().unwrap().to_str().unwrap();
+    let service_name = Path::new(service).file_name().unwrap().to_str().unwrap();
+    if root.join(timer).exists() {
+        systemctl(root, &["disable", "--now", timer_name])?;
+    }
+    if root.join(service).exists() {
+        systemctl(root, &["stop", service_name])?;
+    }
+    remove_file_if_present(&root.join(timer))?;
+    remove_file_if_present(&root.join(service))?;
+    systemctl(root, &["daemon-reload"])
+}
+
+pub fn set_email_timer(root: &Path, enable: bool) -> Result<(), String> {
+    check_optional_units(root, &[EMAIL_UNIT, EMAIL_TIMER], EMAIL_MARKER)?;
+    if !enable {
+        return remove_optional_timer(root, EMAIL_UNIT, EMAIL_TIMER, EMAIL_MARKER);
+    }
+    write_unit(root, EMAIL_UNIT,
+        "# sbctl managed email\n[Unit]\nDescription=sbctl email reports\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=oneshot\nUser=root\nExecStart=/usr/local/bin/sbctl email check\nTimeoutStartSec=60\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nReadWritePaths=/var/lib/sbctl\nProtectHome=true\nUMask=0077\n").map_err(|e| e.to_string())?;
+    write_unit(root, EMAIL_TIMER,
+        "# sbctl managed email\n[Unit]\nDescription=sbctl email timer\n\n[Timer]\nOnCalendar=hourly\nRandomizedDelaySec=60\nPersistent=true\nUnit=sbctl-email.service\n\n[Install]\nWantedBy=timers.target\n").map_err(|e| e.to_string())?;
     systemctl(root, &["daemon-reload"])?;
+    systemctl(root, &["enable", "--now", "sbctl-email.timer"])
+}
+
+pub fn set_credential_rotate_timer(root: &Path, enable: bool) -> Result<(), String> {
+    check_optional_units(
+        root,
+        &[CREDENTIAL_ROTATE_UNIT, CREDENTIAL_ROTATE_TIMER],
+        ROTATE_MARKER,
+    )?;
+    if !enable {
+        return remove_optional_timer(
+            root,
+            CREDENTIAL_ROTATE_UNIT,
+            CREDENTIAL_ROTATE_TIMER,
+            ROTATE_MARKER,
+        );
+    }
+    write_unit(root, CREDENTIAL_ROTATE_UNIT, ROTATE_SERVICE_CONTENTS).map_err(|e| e.to_string())?;
+    write_unit(root, CREDENTIAL_ROTATE_TIMER,
+        "[Unit]\nDescription=sbctl scheduled subscription credential rotation timer\n\n[Timer]\nOnCalendar=monthly\nPersistent=true\nUnit=sbctl-credential-rotate.service\n\n[Install]\nWantedBy=timers.target\n").map_err(|e| e.to_string())?;
+    systemctl(root, &["daemon-reload"])?;
+    systemctl(root, &["enable", "--now", "sbctl-credential-rotate.timer"])
+}
+
+/// Upgrade only an existing managed service; never enable an opt-in timer.
+pub fn migrate_credential_rotate_service(root: &Path) -> Result<(), String> {
+    check_optional_units(
+        root,
+        &[CREDENTIAL_ROTATE_UNIT, CREDENTIAL_ROTATE_TIMER],
+        ROTATE_MARKER,
+    )?;
+    if root.join(CREDENTIAL_ROTATE_UNIT).is_file()
+        && fs::read_to_string(root.join(CREDENTIAL_ROTATE_UNIT)).map_err(|e| e.to_string())?
+            != ROTATE_SERVICE_CONTENTS
+    {
+        write_unit(root, CREDENTIAL_ROTATE_UNIT, ROTATE_SERVICE_CONTENTS)
+            .map_err(|e| e.to_string())?;
+        systemctl(root, &["daemon-reload"])?;
+    }
     Ok(())
 }
 
@@ -710,7 +748,14 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
     }
 
     let backup = (!purge).then(|| backup_persistent_data(root)).transpose()?;
+    check_optional_units(root, &[EMAIL_UNIT, EMAIL_TIMER], EMAIL_MARKER)?;
+    check_optional_units(
+        root,
+        &[CREDENTIAL_ROTATE_UNIT, CREDENTIAL_ROTATE_TIMER],
+        ROTATE_MARKER,
+    )?;
     set_email_timer(root, false)?;
+    set_credential_rotate_timer(root, false)?;
     let sbctl_unit_owned = unit_has_marker(root, SBCTL_UNIT, SBCTL_UNIT_MARKER)?;
     let sing_box_unit_owned = unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)?;
     let reset_timer_owned = unit_has_marker(root, ACCOUNTING_RESET_TIMER, ACCOUNTING_RESET_MARKER)?;
@@ -832,6 +877,7 @@ fn unit_has_marker(root: &Path, relative: &str, marker: &str) -> Result<bool, St
 }
 
 pub fn restart_services(root: &Path) -> Result<(), String> {
+    migrate_credential_rotate_service(root)?;
     // Isolated deployment roots used by CLI tests and image builders do not
     // control the host's systemd units or sockets. Keep their historical
     // service-command behavior; socket reconciliation is for the live host.
@@ -882,7 +928,7 @@ pub fn restart_services(root: &Path) -> Result<(), String> {
 /// subscription mode. A configuration edit can change modes without running
 /// the installer, so relying on the install-time unit files leaves Direct mode
 /// without socket activation (and makes `sbctl serve` exit immediately).
-fn reconcile_subscription_units(root: &Path, direct: bool) -> Result<(), String> {
+pub fn reconcile_subscription_units(root: &Path, direct: bool) -> Result<(), String> {
     let service_path = root.join(SBCTL_UNIT);
     let existing_service = fs::read_to_string(&service_path)
         .map_err(|error| format!("could not read {}: {error}", service_path.display()))?;
@@ -1298,20 +1344,55 @@ fn run_account_command(root: &Path, program: &str, args: &[&str]) -> Result<(), 
         .ok_or_else(|| format!("{program} {} exited with {status}", args.join(" ")))
 }
 
+fn set_path_owner_mode(path: &Path, owner: &str, mode: u32) -> Result<(), String> {
+    crate::config::set_owner_mode_no_follow(Path::new("/"), path, owner, mode)
+        .map_err(|e| e.to_string())
+}
+
 pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
     // Fixture roots intentionally do not have real passwd entries or ownership
     // metadata. Only change ownership when operating on the live host root.
     if root != Path::new("/") {
         return Ok(());
     }
-    let status = Command::new("chown")
-        .args(["-R", "sbctl:sbctl", "/etc/sbctl", "/var/lib/sbctl"])
-        .status()
-        .map_err(|error| format!("could not prepare sbctl service storage: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "could not prepare sbctl service storage: chown exited with {status}"
-        ));
+    for (relative, owner, mode) in [
+        ("etc/sbctl", "root:sbctl", 0o750),
+        ("var/lib/sbctl", "root:sbctl", 0o1771),
+        ("var/lib/sbctl/artifacts", "sbctl:sbctl", 0o700),
+        ("var/lib/sbctl/acme-webroot", "sbctl:sbctl", 0o755),
+    ] {
+        let path = root.join(relative);
+        if path.exists() {
+            set_path_owner_mode(&path, owner, mode)?;
+        }
+    }
+    for relative in [
+        "etc/sbctl/config.toml",
+        "etc/sbctl/email.toml",
+        "var/lib/sbctl/state.json",
+        "var/lib/sbctl/ownership",
+        "var/lib/sbctl/.operation.lock",
+        "var/lib/sbctl/email-state.json",
+    ] {
+        let path = root.join(relative);
+        if path.exists() {
+            crate::config::enforce_live_file_owner(root, &path).map_err(|e| e.to_string())?;
+        }
+    }
+    let artifacts = root.join("var/lib/sbctl/artifacts");
+    if artifacts.is_dir() {
+        for entry in fs::read_dir(&artifacts).map_err(|e| e.to_string())? {
+            let entry = entry.map_err(|e| e.to_string())?;
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == "sing-box-server.json"
+                || crate::subscription::subscription_matrix()
+                    .iter()
+                    .any(|row| row.format.artifact_name() == name)
+            {
+                crate::config::enforce_live_file_owner(root, &entry.path())
+                    .map_err(|e| e.to_string())?;
+            }
+        }
     }
     // The /etc/sing-box directory is created private (0700 root:root). The
     // sing-box data plane runs as its own account, so grant that group
@@ -1367,15 +1448,6 @@ pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
 /// account traversal of the storage root and read access to the pinned
 /// certificate copy, keeping the private key group-readable only.
 fn grant_self_signed_certificate_access(root: &Path) -> Result<(), String> {
-    let status = Command::new("chmod")
-        .args(["0755", "/var/lib/sbctl"])
-        .status()
-        .map_err(|error| format!("could not grant certificate traversal: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "could not grant certificate traversal: chmod exited with {status}"
-        ));
-    }
     let certificates = root.join("var/lib/sbctl/certificates");
     if certificates.is_dir() {
         let status = Command::new("chown")
@@ -1428,29 +1500,11 @@ fn grant_self_signed_certificate_access(root: &Path) -> Result<(), String> {
 }
 
 /// Both service accounts read the pinned certificate copy under
-/// /var/lib/sbctl/certificates in Direct subscription mode. Grant the shared
-/// certificate group traversal of the storage root while every sbctl-owned
-/// state file stays 0600, so sing-box gains access to the certificate and
-/// nothing else. External proxy mode never touches certificate storage.
+/// /var/lib/sbctl/certificates in Direct subscription mode. The root-owned
+/// sticky state directory permits sbctl to update its own state without
+/// unlinking root-only email state. Certificate readers traverse that parent;
+/// the shared group receives access only to certificate material.
 fn grant_certificate_storage(root: &Path) -> Result<(), String> {
-    let status = Command::new("chgrp")
-        .args([CERTIFICATE_GROUP, "/var/lib/sbctl"])
-        .status()
-        .map_err(|error| format!("could not grant certificate storage access: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "could not grant certificate storage access: chgrp exited with {status}"
-        ));
-    }
-    let status = Command::new("chmod")
-        .args(["0750", "/var/lib/sbctl"])
-        .status()
-        .map_err(|error| format!("could not restrict certificate storage: {error}"))?;
-    if !status.success() {
-        return Err(format!(
-            "could not restrict certificate storage: chmod exited with {status}"
-        ));
-    }
     grant_pinned_certificate_group(root)
 }
 

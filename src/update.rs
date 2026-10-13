@@ -24,6 +24,8 @@ const MANAGED_PATHS: &[&str] = &[
     "etc/systemd/system/sbctl-http.socket",
     "etc/systemd/system/sbctl-accounting-reset.service",
     "etc/systemd/system/sbctl-accounting-reset.timer",
+    "etc/systemd/system/sbctl-credential-rotate.service",
+    "etc/systemd/system/sbctl-credential-rotate.timer",
     CERTBOT_DEPLOY_HOOK,
 ];
 
@@ -753,7 +755,12 @@ pub fn apply(
         return Err(error);
     }
 
-    if let Err(error) = crate::lifecycle::restart_services(store.root()) {
+    if let Err(error) = crate::lifecycle::prepare_daemon_storage(
+        store.root(),
+        config.subscription_mode == crate::config::SubscriptionMode::Direct,
+    )
+    .and_then(|()| crate::lifecycle::restart_services(store.root()))
+    {
         restore(store, &backup)
             .map_err(|rollback_error| UpdateError::Rollback(rollback_error.to_string()))?;
         if let Err(rollback_error) = crate::lifecycle::restart_services(store.root()) {
@@ -803,7 +810,7 @@ fn backup(
     let mut entries = Vec::new();
     for relative in rollback_paths(config) {
         let source = store.root().join(&relative);
-        let contents = match fs::read(&source) {
+        let contents = match crate::config::read_managed_file_no_follow(&source) {
             Ok(contents) => {
                 let backup_path = rollback.join(&relative);
                 let backup_relative = backup_path

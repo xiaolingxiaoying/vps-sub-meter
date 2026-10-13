@@ -388,9 +388,25 @@ pub(crate) enum ConfigCommand {
     SwitchMode {
         #[arg(long, value_enum)]
         mode: CliSubscriptionMode,
-        /// Required when switching to external-proxy mode.
+        /// Loopback port required when entering external-proxy mode.
         #[arg(long)]
         listen_port: Option<u16>,
+        /// New subscription hostname or IP; omitted retains the current host.
+        #[arg(long)]
+        subscription_host: Option<String>,
+        /// Public HTTP high port required for IP fallback.
+        #[arg(long)]
+        http_port: Option<u16>,
+        /// Protocol TLS certificate policy; a downgrade must be explicit.
+        #[arg(long, value_enum)]
+        certificate_mode: Option<CliCertificateMode>,
+        #[arg(long)]
+        protocol_sni: Option<String>,
+        /// ACME email used when Direct needs a new certificate.
+        #[arg(long)]
+        certbot_email: Option<String>,
+        #[arg(long)]
+        sing_box_bin: Option<PathBuf>,
     },
     /// Display the persisted deployment summary without exposing credentials.
     Show,
@@ -692,6 +708,21 @@ pub(crate) enum CliSubscriptionMode {
     Direct,
     ExternalProxy,
     IpFallback,
+}
+
+#[derive(Clone, Debug, ValueEnum)]
+pub(crate) enum CliCertificateMode {
+    SelfSigned,
+    Domain,
+}
+
+impl From<CliCertificateMode> for sbctl::config::CertificateMode {
+    fn from(mode: CliCertificateMode) -> Self {
+        match mode {
+            CliCertificateMode::SelfSigned => Self::SelfSigned,
+            CliCertificateMode::Domain => Self::Domain,
+        }
+    }
 }
 
 #[derive(Clone, Debug, ValueEnum)]

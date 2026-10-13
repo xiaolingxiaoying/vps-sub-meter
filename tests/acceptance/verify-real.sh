@@ -61,6 +61,57 @@ for format in sing-box.json clash.yaml uri; do
   contains "$response" 'subscription-userinfo:'
 done
 
+# SMTP files stay root-only across regeneration and configuration transactions.
+cat >/etc/sbctl/email.toml <<'EOF'
+smtp_host = "smtp.example.test"
+smtp_port = 465
+implicit_tls = true
+username = "admin@example.test"
+password = "acceptance-only-secret"
+from = "admin@example.test"
+to = "admin@example.test"
+daily_report = true
+include_subscription = false
+reset_reminder_hours = 24
+EOF
+printf '{"daily":null,"reminder":null}\n' >/var/lib/sbctl/email-state.json
+chown sbctl:sbctl /etc/sbctl/email.toml /var/lib/sbctl/email-state.json
+chmod 0600 /etc/sbctl/email.toml /var/lib/sbctl/email-state.json
+# A root-only administrator override is deliberately preserved, not delegated.
+mkdir -p /etc/sbctl/overrides
+printf '{}\n' >/etc/sbctl/overrides/sing-box-server.json
+chown root:root /etc/sbctl/overrides/sing-box-server.json
+chmod 0600 /etc/sbctl/overrides/sing-box-server.json
+check_mail_permissions() {
+  for file in /etc/sbctl/email.toml /var/lib/sbctl/email-state.json; do
+    [ "$(stat -c '%a %U:%G' "$file")" = '600 root:root' ] || fail "mail permissions changed: $file"
+    if runuser -u sbctl -- test -r "$file"; then fail "sbctl can read root-only mail file: $file"; fi
+    if runuser -u sbctl -- rm "$file" 2>/dev/null; then fail "sbctl can delete root-only mail file: $file"; fi
+  done
+  [ "$(stat -c '%a %U:%G' /etc/sbctl/overrides/sing-box-server.json)" = '600 root:root' ] || fail 'administrator override ownership changed'
+}
+$sbctl regenerate >/dev/null
+check_mail_permissions
+$sbctl config switch-mode --mode external-proxy --listen-port 2082 >/dev/null
+check_mail_permissions
+$sbctl config switch-mode --mode external-proxy --listen-port 2080 >/dev/null
+
+# Migrate an already-enabled legacy timer without changing its enabled state.
+$sbctl credential rotate --install-timer >/dev/null
+sed -i 's/User=root/User=sbctl/;s/Group=root/Group=sbctl/' /etc/systemd/system/sbctl-credential-rotate.service
+systemctl daemon-reload
+$sbctl restart >/dev/null
+[ "$(systemctl show -p User --value sbctl-credential-rotate.service)" = root ] || fail 'legacy rotate service was not migrated'
+systemctl is-enabled --quiet sbctl-credential-rotate.timer || fail 'migration disabled rotation timer'
+systemctl start sbctl-credential-rotate.service
+new_credential=$(sed -n 's/^subscription_credential = "\([^"]*\)"/\1/p' /etc/sbctl/config.toml)
+[ "$new_credential" != "$credential" ] || fail 'scheduled rotation did not replace credential'
+old_status=$(curl --silent --output /dev/null --write-out '%{http_code}' "http://127.0.0.1:2080/sub/$credential/uri")
+[ "$old_status" = 404 ] || fail 'scheduled rotation kept old link alive'
+credential=$new_credential
+response=$(curl --silent --show-error --include "http://127.0.0.1:2080/sub/$credential/uri")
+contains "$response" 'HTTP/1.1 200 OK'
+
 status=$($sbctl status)
 contains "$status" 'sbctl.service: active'
 contains "$status" 'sing-box.service: active'
@@ -107,6 +158,9 @@ test -f /etc/ufw/user.rules || {
 }
 printf 'proxy\n' >/etc/nginx.conf
 $sbctl uninstall >/dev/null
+for unit in sbctl-credential-rotate.service sbctl-credential-rotate.timer; do
+  test ! -e "/etc/systemd/system/$unit" || fail "uninstall left $unit"
+done
 test -f /etc/sbctl/config.toml || fail 'default uninstall removed persistent data'
 test -d /var/backups/sbctl || fail 'default uninstall did not preserve a backup'
 test "$(cat /etc/ufw/user.rules)" = firewall || fail 'uninstall changed firewall data'
@@ -209,6 +263,35 @@ printf 'real-challenge-body' > "/var/lib/sbctl/acme-webroot/.well-known/acme-cha
 challenge=$(curl --silent --show-error --retry 5 --retry-connrefused --retry-delay 1 \
   "http://127.0.0.1:80/.well-known/acme-challenge/$direct_token")
 [ "$challenge" = 'real-challenge-body' ] || fail 'Direct HTTP-01 challenge did not serve through the systemd socket'
+
+# Every cross-mode direction runs against actual systemd listeners. Host and
+# protocol credentials persist; only delivery, host and explicit TLS choices change.
+stop_reset_timer=$(systemctl is-active sbctl-accounting-reset.timer)
+systemctl stop sbctl-accounting-reset.timer
+state_before=$(sha256sum /var/lib/sbctl/state.json | awk '{print $1}')
+$sbctl config switch-mode --mode external-proxy --listen-port 2082 --certificate-mode domain --protocol-sni sub.example.test >/dev/null
+systemctl is-active --quiet sbctl-http.socket && fail 'Direct socket survived external-proxy switch'
+response=$(curl --silent --show-error --include "http://127.0.0.1:2082/sub/$credential/uri")
+contains "$response" 'HTTP/1.1 200 OK'
+check_mail_permissions() {
+  # This deployment was reinstalled without mail; absence must stay absence.
+  test ! -e /etc/sbctl/email.toml || fail 'switch created unrequested mail config'
+}
+check_mail_permissions
+$sbctl config switch-mode --mode ip-fallback --subscription-host 127.0.0.1 --http-port 2083 --certificate-mode self-signed --protocol-sni www.bing.com >/dev/null
+response=$(curl --silent --show-error --include "http://127.0.0.1:2083/sub/$credential/uri")
+contains "$response" 'HTTP/1.1 200 OK'
+$sbctl config switch-mode --mode direct --subscription-host sub.example.test >/dev/null
+systemctl is-active --quiet sbctl-http.socket || fail 'IP to Direct did not activate sockets'
+$sbctl config switch-mode --mode ip-fallback --subscription-host 127.0.0.1 --http-port 2083 --certificate-mode self-signed >/dev/null
+$sbctl config switch-mode --mode external-proxy --subscription-host sub.example.test --listen-port 2082 >/dev/null
+$sbctl config switch-mode --mode direct --certificate-mode domain --protocol-sni sub.example.test >/dev/null
+systemctl is-active --quiet sbctl-http.socket || fail 'External to Direct did not activate sockets'
+response=$(curl --silent --show-error --insecure --include --resolve sub.example.test:443:127.0.0.1 "https://sub.example.test/sub/$credential/uri")
+contains "$response" 'HTTP/1.1 200 OK'
+[ "$(sed -n 's/^subscription_credential = "\([^"]*\)"/\1/p' /etc/sbctl/config.toml)" = "$credential" ] || fail 'mode switch rotated credential'
+[ "$(sha256sum /var/lib/sbctl/state.json | awk '{print $1}')" = "$state_before" ] || fail 'mode switch reset accounting'
+[ "$stop_reset_timer" != active ] || systemctl start sbctl-accounting-reset.timer
 
 # A failed update must restore the pinned certificate and the Certbot hook with
 # the ownership and mode the deployment depends on. The rollback used to rewrite

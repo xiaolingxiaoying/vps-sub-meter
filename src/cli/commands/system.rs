@@ -3,7 +3,6 @@
 //! facts the menu header prints.
 
 use crate::cli::args::{CredentialCommand, SystemCommand};
-use crate::cli::commands::config::restart_services_with_rollback;
 use std::fs;
 use std::path::Path;
 use std::process::ExitCode;
@@ -115,20 +114,30 @@ fn set_rotation_timer(root: &Path, enable: bool) -> ExitCode {
 
 /// Parses a grace window such as `30m`, `2h` or `1d`.
 fn parse_grace(text: &str) -> Result<i64, String> {
-    let (digits, unit) = text.trim().split_at(text.trim().len() - 1);
+    let text = text.trim();
+    let unit = text
+        .as_bytes()
+        .last()
+        .copied()
+        .filter(u8::is_ascii_alphabetic)
+        .ok_or_else(|| "时长需为非负数字加 s/m/h/d 单位".to_owned())?;
+    let digits = &text[..text.len() - 1];
     let amount = digits
         .parse::<i64>()
-        .map_err(|_| format!("无法解析时长 {text:?}"))?;
+        .map_err(|_| "时长数字无效或过大".to_owned())?;
     if amount < 0 {
         return Err("宽限期不能为负".to_owned());
     }
-    Ok(match unit.to_ascii_lowercase().as_str() {
-        "s" => amount,
-        "m" => amount * 60,
-        "h" => amount * 3_600,
-        "d" => amount * 86_400,
-        _ => return Err(format!("时长单位需为 s/m/h/d，收到 {text:?}")),
-    })
+    let multiplier = match unit.to_ascii_lowercase() {
+        b's' => 1,
+        b'm' => 60,
+        b'h' => 3_600,
+        b'd' => 86_400,
+        _ => return Err("时长单位需为 s/m/h/d".to_owned()),
+    };
+    amount
+        .checked_mul(multiplier)
+        .ok_or_else(|| "宽限期过大".to_owned())
 }
 
 /// Keeps only the credential's first six characters visible. The full value is
@@ -170,36 +179,89 @@ fn list_credentials(root: &Path) -> ExitCode {
     }
 }
 
-fn add_credential(root: &Path, name: &str) -> ExitCode {
+/// Keep the lock through restart and recovery, so a failed command cannot
+/// overwrite a concurrent credential change with its old snapshot.
+fn credential_transaction<T>(
+    root: &Path,
+    change: impl FnOnce(&mut sbctl::config::DeploymentConfig) -> Result<T, sbctl::config::ConfigError>,
+) -> Result<T, sbctl::config::ConfigError> {
+    sbctl::preflight::require_install_privileges(root)
+        .map_err(|error| credential_error(error.to_string()))?;
     let store = sbctl::config::DeploymentStore::new(root);
-    let result = (|| -> Result<(), sbctl::config::ConfigError> {
-        let mut config = store.load()?;
+    let _lock = store.acquire_operation_lock()?;
+    let mut config = store.load()?;
+    let prior = fs::read(root.join(sbctl::config::CONFIG_RELATIVE_PATH))
+        .map_err(sbctl::config::ConfigError::Storage)?;
+    let output = change(&mut config)?;
+    config.validate()?;
+    let commit = store.replace_locked(&config).and_then(|()| {
+        sbctl::lifecycle::restart_services(root).map_err(sbctl::config::ConfigError::StateContent)
+    });
+    if let Err(error) = commit {
+        if let Err(recovery) =
+            store.write_relative_locked(sbctl::config::CONFIG_RELATIVE_PATH, &prior)
+        {
+            return Err(sbctl::config::ConfigError::StateContent(format!(
+                "{error}; 配置恢复失败：{recovery}；请检查服务与配置"
+            )));
+        }
+        if let Err(recovery) = sbctl::lifecycle::restart_services(root) {
+            return Err(sbctl::config::ConfigError::StateContent(format!(
+                "{error}; 旧配置已恢复，但恢复重启失败：{recovery}"
+            )));
+        }
+        return Err(error);
+    }
+    Ok(output)
+}
+
+fn credential_error(message: impl Into<String>) -> sbctl::config::ConfigError {
+    sbctl::config::ConfigError::StateContent(message.into())
+}
+
+fn grace_seconds(grace: Option<&str>) -> Result<i64, sbctl::config::ConfigError> {
+    grace
+        .map(parse_grace)
+        .transpose()
+        .map(|value| value.unwrap_or(0))
+        .map_err(credential_error)
+}
+
+fn expiry(now: i64, seconds: i64) -> Result<i64, sbctl::config::ConfigError> {
+    now.checked_add(seconds)
+        .ok_or_else(|| credential_error("宽限期到期时间溢出"))
+}
+
+fn named_url(
+    config: &sbctl::config::DeploymentConfig,
+    credential: &str,
+) -> Result<String, sbctl::config::ConfigError> {
+    sbctl::subscription::route_url_with_credential(
+        config,
+        credential,
+        sbctl::subscription::SubscriptionRoute::Format(
+            sbctl::subscription::SubscriptionFormat::SingBoxFull,
+        ),
+    )
+    .map_err(|error| credential_error(error.to_string()))
+}
+
+fn add_credential(root: &Path, name: &str) -> ExitCode {
+    let result = credential_transaction(root, |config| {
         let now = chrono::Utc::now().timestamp();
         if config
             .subscription_credentials
             .iter()
             .any(|entry| entry.name == name && entry.is_active(now))
         {
-            return Err(sbctl::config::ConfigError::StateContent(format!(
-                "已存在生效中的凭据 {name:?}"
-            )));
+            return Err(credential_error(format!("已存在生效中的凭据 {name:?}")));
         }
         let entry = sbctl::config::NamedCredential {
             name: name.to_owned(),
             credential: sbctl::config::generate_subscription_credential()?,
             revoked_at: None,
         };
-        println!(
-            "凭据 {name} 链接: {}",
-            sbctl::subscription::route_url_with_credential(
-                &config,
-                &entry.credential,
-                sbctl::subscription::SubscriptionRoute::Format(
-                    sbctl::subscription::SubscriptionFormat::SingBoxFull,
-                ),
-            )
-            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?
-        );
+        let url = named_url(config, &entry.credential)?;
         match config
             .subscription_credentials
             .iter_mut()
@@ -208,28 +270,13 @@ fn add_credential(root: &Path, name: &str) -> ExitCode {
             Some(existing) => *existing = entry,
             None => config.subscription_credentials.push(entry),
         }
-        config.validate()?;
-        let previous = config.subscription_credentials.clone();
-        store.replace(&config)?;
-        // The credential is a URL path secret, not artifact content: nothing is
-        // regenerated, the daemon just has to reload the accepted set, which it
-        // reads once at startup.
-        restart_services_with_rollback(root, || {
-            let mut rollback = config.clone();
-            rollback.subscription_credentials = previous;
-            if let Err(error) = store.replace(&rollback) {
-                eprintln!(
-                    "warning: restoring the previous credential list failed ({error}); \
-                     the new link may already be active"
-                );
-            }
-        })?;
-        Ok(())
-    })();
+        Ok(url)
+    });
     match result {
-        Ok(()) => {
-            println!("已新增命名凭据 {name}，sbctl 服务已重载（订阅工件内容未变）");
-            println!("run 'sbctl sub' to display the default subscription URLs");
+        Ok(url) => {
+            println!(
+                "已新增命名凭据 {name}，sbctl 服务已重载（订阅工件内容未变）\n凭据 {name} 链接: {url}"
+            );
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -240,51 +287,31 @@ fn add_credential(root: &Path, name: &str) -> ExitCode {
 }
 
 fn revoke_credential(root: &Path, name: &str, grace: Option<&str>) -> ExitCode {
-    let store = sbctl::config::DeploymentStore::new(root);
-    let result = (|| -> Result<(), sbctl::config::ConfigError> {
-        let mut config = store.load()?;
-        if name == "default" {
-            return Err(sbctl::config::ConfigError::StateContent(
-                "默认凭据不能吊销；用 sbctl credential rotate 轮换它".to_owned(),
-            ));
-        }
-        let window = grace
-            .map(parse_grace)
-            .transpose()
-            .map_err(sbctl::config::ConfigError::StateContent)?
-            .unwrap_or(0);
-        let now = chrono::Utc::now().timestamp();
-        let Some(entry) = config
-            .subscription_credentials
-            .iter_mut()
-            .find(|entry| entry.name == name && entry.is_active(now))
-        else {
-            return Err(sbctl::config::ConfigError::StateContent(format!(
-                "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
-            )));
-        };
-        // An immediate revoke is an expiry in the past-by-construction, not a
-        // missing field: `revoked_at = None` means "never expires", so writing
-        // None here would have kept serving the link the operator just retired.
-        entry.revoked_at = Some(if window > 0 { now + window } else { now });
-        config.validate()?;
-        let previous = config.subscription_credentials.clone();
-        store.replace(&config)?;
-        restart_services_with_rollback(root, || {
-            let mut rollback = config.clone();
-            rollback.subscription_credentials = previous;
-            if let Err(error) = store.replace(&rollback) {
-                eprintln!(
-                    "warning: restoring the previous credential list failed ({error}); \
-                     the revocation may already be in effect"
-                );
+    let result = grace_seconds(grace).and_then(|window| {
+        credential_transaction(root, |config| {
+            if name == "default" {
+                return Err(credential_error(
+                    "默认凭据不能吊销；用 sbctl credential rotate 轮换它",
+                ));
             }
-        })?;
-        Ok(())
-    })();
+            let now = chrono::Utc::now().timestamp();
+            let until = expiry(now, window)?;
+            let entry = config
+                .subscription_credentials
+                .iter_mut()
+                .find(|entry| entry.name == name && entry.is_active(now))
+                .ok_or_else(|| {
+                    credential_error(format!(
+                        "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
+                    ))
+                })?;
+            entry.revoked_at = Some(until);
+            Ok(window)
+        })
+    });
     match result {
-        Ok(()) => {
-            if window_of(grace) > 0 {
+        Ok(window) => {
+            if window > 0 {
                 println!("凭据 {name} 将在宽限期结束后失效");
             } else {
                 println!("凭据 {name} 已立即失效（其他链接不受影响）");
@@ -298,87 +325,52 @@ fn revoke_credential(root: &Path, name: &str, grace: Option<&str>) -> ExitCode {
     }
 }
 
-/// The grace window in seconds, for the message that reports it.
-fn window_of(grace: Option<&str>) -> i64 {
-    grace.and_then(|text| parse_grace(text).ok()).unwrap_or(0)
-}
-
-/// `sbctl credential rotate [OPTIONS]`: the default link when no `--name` is
-/// given (the historical one-shot behaviour), or one named link, whose previous
-/// secret optionally survives until the grace window expires.
 fn rotate_credential(root: &Path, name: Option<&str>, grace: Option<&str>) -> ExitCode {
-    let Some(name) = name else {
-        return rotate_subscription_credential(root);
-    };
-    let window = match grace.map(parse_grace).transpose() {
-        Ok(window) => window.unwrap_or(0),
-        Err(message) => {
-            eprintln!("credential rotate failed: {message}");
+    let window = match grace_seconds(grace) {
+        Ok(window) => window,
+        Err(error) => {
+            eprintln!("credential rotate failed: {error}");
             return ExitCode::from(2);
         }
     };
-    let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|mut config| {
+    let Some(name) = name else {
+        if window > 0 {
+            eprintln!("credential rotate failed: 默认凭据不支持宽限期；使用 --name 轮换设备凭据");
+            return ExitCode::from(2);
+        }
+        return rotate_subscription_credential(root);
+    };
+    let result = credential_transaction(root, |config| {
         let now = chrono::Utc::now().timestamp();
-        let Some(index) = config
+        let until = expiry(now, window)?;
+        let index = config
             .subscription_credentials
             .iter()
             .position(|entry| entry.name == name && entry.is_active(now))
-        else {
-            return Err(sbctl::config::ConfigError::StateContent(format!(
-                "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
-            )));
-        };
-        let previous = config.subscription_credentials[index].credential.clone();
-        // A grace window is kept by *remembering the retiring secret*: the live
-        // record takes the fresh value, and the old one stays as a second
-        // record that expires on its own. Dropping the old secret here would
-        // make `--grace` a promise nothing holds.
+            .ok_or_else(|| {
+                credential_error(format!(
+                    "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
+                ))
+            })?;
         if window > 0 {
-            config
-                .subscription_credentials
-                .push(sbctl::config::NamedCredential {
-                    name: name.to_owned(),
-                    credential: previous.clone(),
-                    revoked_at: Some(now + window),
-                });
+            let mut retired = config.subscription_credentials[index].clone();
+            retired.revoked_at = Some(until);
+            config.subscription_credentials.push(retired);
         }
-        let entry = &mut config.subscription_credentials[index];
-        entry.credential = sbctl::config::generate_subscription_credential()?;
-        entry.revoked_at = None;
-        config.validate()?;
-        store.replace(&config)?;
-        restart_services_with_rollback(root, || {
-            let mut rollback = config.clone();
-            // Undo both halves: drop the retired record and put the old secret
-            // back on the live one.
-            rollback
-                .subscription_credentials
-                .retain(|entry| !(entry.name == name && entry.credential == previous));
-            if let Some(entry) = rollback
-                .subscription_credentials
-                .iter_mut()
-                .find(|entry| entry.name == name)
-            {
-                entry.credential = previous.clone();
-            }
-            if let Err(error) = store.replace(&rollback) {
-                eprintln!(
-                    "warning: restoring the previous credential failed ({error}); \
-                     the rotated link may already be active"
-                );
-            }
-        })?;
-        Ok(())
+        let fresh = sbctl::config::generate_subscription_credential()?;
+        let url = named_url(config, &fresh)?;
+        config.subscription_credentials[index].credential = fresh;
+        config.subscription_credentials[index].revoked_at = None;
+        Ok(url)
     });
     match result {
-        Ok(()) => {
+        Ok(url) => {
             if window > 0 {
                 println!("凭据 {name} 已轮换；旧链接在 {window} 秒内仍然有效，之后失效");
             } else {
                 println!("凭据 {name} 已轮换；该设备的旧链接立即失效（其他凭据不受影响）");
             }
-            println!("run 'sbctl sub' to display the subscription URLs");
+            println!("凭据 {name} 链接: {url}");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -389,24 +381,12 @@ fn rotate_credential(root: &Path, name: Option<&str>, grace: Option<&str>) -> Ex
 }
 
 pub(crate) fn rotate_subscription_credential(root: &Path) -> ExitCode {
-    let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|mut config| {
-        let previous = config.subscription_credential.clone();
+    let result = credential_transaction(root, |config| {
         config.subscription_credential = sbctl::config::generate_subscription_credential()?;
-        store.replace(&config)?;
-        restart_services_with_rollback(root, || {
-            config.subscription_credential = previous;
-            if let Err(error) = store.replace(&config) {
-                eprintln!(
-                    "warning: restoring the previous subscription credential failed ({error}); \
-                     the rotated credential may still be active"
-                );
-            }
-        })?;
-        Ok(config)
+        Ok(())
     });
     match result {
-        Ok(_) => {
+        Ok(()) => {
             println!(
                 "subscription credential rotated; all previous subscription URLs are now invalid"
             );
@@ -417,5 +397,28 @@ pub(crate) fn rotate_subscription_credential(root: &Path) -> ExitCode {
             eprintln!("credential rotation failed: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn grace_validation_handles_empty_unicode_and_overflow() {
+        for text in [
+            "",
+            " ",
+            "30分",
+            "-1h",
+            "9223372036854775807d",
+            "999999999999999999999s",
+            "30x",
+        ] {
+            assert!(parse_grace(text).is_err(), "{text:?}");
+        }
+        for (text, seconds) in [("0s", 0), ("30M", 1800), (" 2h ", 7200), ("1D", 86400)] {
+            assert_eq!(parse_grace(text).unwrap(), seconds);
+        }
+        assert!(expiry(i64::MAX, 1).is_err());
     }
 }

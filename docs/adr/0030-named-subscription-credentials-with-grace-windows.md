@@ -28,8 +28,9 @@ one link without touching the rest.
   would skip the comparison for an expired entry and hand back a timing signal
   for "this name exists". The uniform 404 for unknown, expired and valid-but-
   wrong links is only meaningful if the check behind it is uniform too.
-- `credential list` masks every secret to its first six characters; `sbctl sub`
-  remains the only command that prints a full path secret, to this terminal.
+- `credential list` masks every secret to its first six characters. `sbctl sub`
+  prints default links; successful `credential add` and named `rotate` print
+  the newly committed named link to the administrator's terminal.
 - Nothing here changes artifact content, so add/revoke/rotate restart the daemon
   (which reads the accepted set at startup) instead of regenerating artifacts.
 
@@ -38,9 +39,10 @@ one link without touching the rest.
 - ADR-0021 refused per-request *content* rewriting; this is multiplicity at the
   authentication layer — every accepted credential still receives the identical
   artifact bytes.
-- Rotating the **default** credential remains all-or-nothing by design: it is
-  what `sbctl sub`, the index page and the QR routes advertise, so a grace window
-  on it would mean advertising a link that is already being retired.
+- Rotating the **default** credential remains all-or-nothing by design.
+  `sbctl sub` advertises it; authenticated index and QR routes advertise only
+  the credential that authorized their request (ADR-0033), so a named device
+  cannot obtain the default secret and bypass its own retirement.
 - Expired records are harmless but accumulate; `credential add` reuses an
   expired same-name record instead of appending a third, and the list view shows
   each record's state so an operator can see what to clean up.

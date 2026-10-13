@@ -13,13 +13,22 @@ use chrono_tz::Tz;
 
 use crate::config::{DeploymentConfig, DeploymentStore};
 use crate::subscription::{
-    ClientVersion, SubscriptionRoute, client_subscription_matrix, route_url, subscription_matrix,
+    ClientVersion, SubscriptionRoute, client_subscription_matrix, subscription_matrix,
 };
 
 /// Renders the overview page. Fails only when a QR code or a route URL cannot
 /// be produced; the caller turns any failure into a redacted 503. Traffic
 /// reporting failures degrade to a "暂不可用" badge instead.
 pub fn render(store: &DeploymentStore, config: &DeploymentConfig) -> Result<String, String> {
+    render_with_credential(store, config, &config.subscription_credential)
+}
+
+/// Render links using the credential that authorized this request.
+pub fn render_with_credential(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    credential: &str,
+) -> Result<String, String> {
     let traffic = match crate::traffic::report(store, config) {
         Ok(traffic) => Some(traffic),
         Err(error) => {
@@ -41,8 +50,12 @@ pub fn render(store: &DeploymentStore, config: &DeploymentConfig) -> Result<Stri
         client_rows.push_str(&esc(row.client));
         client_rows.push_str("</th><td><ul>");
         for (index, recommended) in row.formats.iter().enumerate() {
-            let url = route_url(config, SubscriptionRoute::Format(recommended.format))
-                .map_err(|error| error.to_string())?;
+            let url = crate::subscription::route_url_with_credential(
+                config,
+                credential,
+                SubscriptionRoute::Format(recommended.format),
+            )
+            .map_err(|error| error.to_string())?;
             let primary = index == 0;
             client_rows.push_str(&format!(
                 "<li><a href=\"{url_attr}\" rel=\"noreferrer\">{url}</a>\
@@ -69,8 +82,12 @@ pub fn render(store: &DeploymentStore, config: &DeploymentConfig) -> Result<Stri
     }
     let mut rows = String::new();
     for info in subscription_matrix() {
-        let url = route_url(config, SubscriptionRoute::Format(info.format))
-            .map_err(|error| error.to_string())?;
+        let url = crate::subscription::route_url_with_credential(
+            config,
+            credential,
+            SubscriptionRoute::Format(info.format),
+        )
+        .map_err(|error| error.to_string())?;
         let qr = crate::qr::render_svg(&url)?;
         rows.push_str(&format!(
             "<details open><summary><span class=\"label\">{label}</span>\
@@ -168,7 +185,7 @@ fn traffic_badges(
         "<span class=\"badge\">已用流量：{used}</span>\
 <span class=\"badge\">总量：{quota}</span>\
 <span class=\"badge\">下次重置：{reset}（{tz}）</span>",
-        used = format_gib(traffic.received + traffic.transmitted),
+        used = format_gib(traffic.total()),
         quota = if traffic.monthly_traffic_limit > 0 {
             format_gib(traffic.monthly_traffic_limit)
         } else {
@@ -205,4 +222,51 @@ fn esc_attr(text: &str) -> String {
 /// Re-exported for tests and callers that want to label version rows.
 pub fn version_label(version: ClientVersion) -> String {
     format!("sing-box {version}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn badges_follow_total_adjustments_without_changing_directions() {
+        let config = DeploymentConfig::new(
+            crate::config::SubscriptionMode::IpFallback,
+            "127.0.0.1".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![crate::config::ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        let gib = 1024 * 1024 * 1024;
+        let mut traffic = crate::traffic::TrafficReport {
+            interface: "ens3".into(),
+            received: 2 * gib,
+            transmitted: 3 * gib,
+            total_adjustment: 0,
+            monthly_traffic_limit: 10 * gib,
+            accounting_period: "test".into(),
+            next_reset: chrono::Utc::now(),
+        };
+        for (adjustment, expected) in [
+            (0, "5.00"),
+            (i128::from(gib), "6.00"),
+            (-i128::from(gib), "4.00"),
+            (-5 * i128::from(gib), "0.00"),
+        ] {
+            traffic.total_adjustment = adjustment;
+            assert!(
+                traffic_badges(&config, Some(&traffic))
+                    .unwrap()
+                    .contains(&format!("已用流量：{expected} GiB"))
+            );
+        }
+        traffic.received += gib;
+        assert!(
+            traffic_badges(&config, Some(&traffic))
+                .unwrap()
+                .contains("已用流量：1.00 GiB")
+        );
+    }
 }

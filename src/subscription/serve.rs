@@ -16,7 +16,7 @@ use tokio::net::TcpListener;
 use tokio::sync::Semaphore;
 use tokio_rustls::TlsAcceptor;
 
-use super::artifacts::{SubscriptionError, read_authorized, subscription_url};
+use super::artifacts::{SubscriptionError, read_authorized};
 use super::profile::{
     CLASH_LEGACY_VERSION, ClientVersion, SING_BOX_VERSION_PROFILES, SubscriptionFormat,
     SubscriptionRoute,
@@ -918,9 +918,13 @@ fn qr_http_response(
     credential: &str,
     format: SubscriptionFormat,
 ) -> Response<Full<Bytes>> {
-    let body = match subscription_url(config, format)
-        .map_err(|error| error.to_string())
-        .and_then(|url| crate::qr::render_svg(&url))
+    let body = match super::route_url_with_credential(
+        config,
+        credential,
+        SubscriptionRoute::Format(format),
+    )
+    .map_err(|error| error.to_string())
+    .and_then(|url| crate::qr::render_svg(&url))
     {
         Ok(body) => body,
         Err(error) => return unavailable_http_response(credential, &error),
@@ -943,7 +947,7 @@ fn index_http_response(
     config: &DeploymentConfig,
     credential: &str,
 ) -> Response<Full<Bytes>> {
-    let body = match crate::index_page::render(store, config) {
+    let body = match crate::index_page::render_with_credential(store, config, credential) {
         Ok(body) => body,
         Err(error) => return unavailable_http_response(credential, &error.to_string()),
     };
