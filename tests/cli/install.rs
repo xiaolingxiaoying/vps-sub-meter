@@ -167,6 +167,80 @@ fn guided_install_refuses_an_existing_deployment_before_prompting() {
 }
 
 #[cfg(unix)]
+#[test]
+fn guided_replacement_installs_over_residual_units_and_recovers_on_failure() {
+    use std::os::unix::fs::symlink;
+    for accepts_config in [true, false] {
+        let fixture = supported_systemd_host();
+        write_managed_file(
+            &fixture,
+            "proc/net/route",
+            b"Iface\tDestination\tGateway\tFlags\nens3\t00000000\t00000000\t0003\n",
+        );
+        fs::create_dir_all(fixture.path().join("sys/class/net/ens3")).unwrap();
+        write_systemctl_fixture(&fixture, true);
+        let old_unit = "[Service]\nExecStart=/missing/sing-box\n";
+        write_managed_file(
+            &fixture,
+            "etc/systemd/system/sing-box.service",
+            old_unit.as_bytes(),
+        );
+        let link = fixture
+            .path()
+            .join("etc/systemd/system/multi-user.target.wants/sing-box.service");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink("/missing/sing-box.service", &link).unwrap();
+        let checker = sing_box_check_fixture(&fixture, accepts_config, &[]);
+        let mut answers = vec![String::new(); 25];
+        answers[1] = "sub.example.test".into();
+        answers[4] = "y".into();
+        answers[17] = "www.cloudflare.com".into();
+        answers[23] = "n".into();
+        answers[24] = "y".into();
+        let mut command = Command::cargo_bin("sbctl").unwrap();
+        command
+            .args([
+                "--root",
+                fixture.path().to_str().unwrap(),
+                "install",
+                "--guided",
+                "--replace-existing",
+                "--sing-box-bin",
+                checker.to_str().unwrap(),
+                "--no-start",
+            ])
+            .write_stdin(answers.join("\n") + "\n");
+        let assertion = command.assert();
+        if accepts_config {
+            assertion
+                .success()
+                .stdout(predicate::str::contains("冲突服务已停止并禁用"));
+            assert!(fixture.path().join("etc/sbctl/config.toml").is_file());
+            assert!(
+                fs::read_to_string(fixture.path().join("etc/systemd/system/sing-box.service"))
+                    .unwrap()
+                    .contains("managed by sbctl")
+            );
+            assert!(fs::symlink_metadata(&link).is_err());
+        } else {
+            assertion
+                .code(2)
+                .stderr(predicate::str::contains("installation failed"));
+            assert!(!fixture.path().join("etc/sbctl/config.toml").exists());
+            assert_eq!(
+                fs::read_to_string(fixture.path().join("etc/systemd/system/sing-box.service"))
+                    .unwrap(),
+                old_unit
+            );
+            assert_eq!(
+                fs::read_link(&link).unwrap(),
+                std::path::PathBuf::from("/missing/sing-box.service")
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
 use crate::fixture::write_manifest_spec;
 
 // The install flow ends by executing the downloaded kernel, and the fixture

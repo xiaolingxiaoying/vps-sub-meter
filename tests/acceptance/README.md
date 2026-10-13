@@ -18,6 +18,9 @@ simulated CLI checks; it is not evidence for the Production host release gate.
 `verify.sh`（fixture root 的事务、更新回滚点、卸载）与 `verify-real.sh`（真实 systemd 安装、
 非 root 服务、socket activation、更新回滚后的权限与可执行位）。
 
+最后执行 `verify-replacement.sh`：真实旧 sing-box 服务和占用 80 端口的 Nginx 的停止/禁用、
+内核检查失败时恢复运行及启用状态、成功安装后保留 Nginx 配置。该脚本只用于可丢弃的 systemd 容器。
+
 `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT` 是**可选**的：本仓库只有服务端 crate，未设置时脚本打印
 `branch: server-only workspace - skipping the client legs` 并跳过 `verify-client.sh` 与
 `verify-sbcli.sh`；设置后跑完整套件。CI 的 `server-acceptance` job 以无客户端变量的方式运行。

@@ -91,6 +91,8 @@ for image in debian:12-slim ubuntu:22.04 ubuntu:24.04; do
     MSYS_NO_PATHCONV=1 docker exec "$container" env SBCLI_BIN=/opt/sbtui-client/sbcli \
       /usr/local/lib/sbctl-acceptance/verify-sbcli.sh
   fi
+  MSYS_NO_PATHCONV=1 docker exec "$container" env SBCTL_BIN=/opt/sbctl/sbctl \
+    /usr/local/lib/sbctl-acceptance/verify-replacement.sh
   cleanup
   trap - EXIT INT TERM
 done

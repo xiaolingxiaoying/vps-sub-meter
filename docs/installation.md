@@ -53,7 +53,13 @@ sbctl install \
   --anytls-port 12005
 ```
 
-Direct 模式安装前会只读检查 TCP 80/443；若被 Nginx、Caddy 或其他程序占用，安装会停止并报告 `ss` 检测到的监听信息。请自行释放端口或改用 External proxy，sbctl 不会停止或改写已有服务。`sbctl install` 需要 root 权限，建议通过 `sudo` 执行。首次执行 `sbctl certificate obtain` 前也会检查 Certbot；Debian/Ubuntu 可用 `sudo apt-get update && sudo apt-get install certbot` 安装。
+Direct 模式普通安装前会只读检查 TCP 80/443；若被 Nginx、Caddy 或其他程序占用，安装会停止并报告监听信息。菜单支持选择备份并替换旧部署；命令行可运行 `sudo sbctl install --guided --replace-existing`。这会备份旧文件、停止并禁用旧服务及占用本次订阅/协议端口的系统级 systemd 服务，清理旧部署路径后继续安装。相关 socket/timer 会先停止，防止重新激活服务。端口冲突的其他服务保留其配置文件；安装成功后保持禁用，失败则恢复原部署及服务状态。备份位于 `/var/backups/sbctl/reinstall/`，其中 `services.json` 记录原来的运行和启用状态。非 systemd 管理的占用进程仍需自行停止。External proxy 模式保留外部代理的 TCP 80/443 服务。
+
+发布安装脚本也接受 `--guided --replace-existing`，显式指定替换后直接进入向导，无需重复选择旧部署处理方式。普通卸载保留的数据及残留服务文件也可以通过替换安装处理；新安装会重建订阅和协议凭据。
+
+菜单入口：「安装与部署」→「3. 备份旧部署并重新安装（停止并禁用冲突服务）」，即使旧配置仍然存在也可使用。
+
+`sbctl install` 需要 root 权限，建议通过 `sudo` 执行。首次执行 `sbctl certificate obtain` 前也会检查 Certbot；Debian/Ubuntu 可用 `sudo apt-get update && sudo apt-get install certbot` 安装。
 
 `sbctl config init` 使用同样的五个参数。未指定的协议端口仍会自动分配高端口；指定了未启用协议的端口会直接报错。请同时在 VPS 安全组/防火墙中放行对应的 TCP 或 UDP 端口。
 

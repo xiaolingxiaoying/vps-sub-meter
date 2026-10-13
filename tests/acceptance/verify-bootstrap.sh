@@ -153,6 +153,18 @@ after=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
 grep -F -- 'sbctl update' "$work/keep-interactive.out" >/dev/null \
   || fail 'the keep-and-exit path did not point at sbctl update'
 
+# Explicit replacement is already authorized and must be forwarded together
+# with --guided without requiring a second terminal-only replacement prompt.
+rm -f /tmp/sbctl-bootstrap-arguments
+PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
+  timeout 60 "$installer" --guided --replace-existing </dev/null >"$work/replace.out" 2>&1
+grep -Fx -- '--guided' /tmp/sbctl-bootstrap-arguments >/dev/null \
+  || fail 'explicit replacement lost --guided'
+grep -Fx -- '--replace-existing' /tmp/sbctl-bootstrap-arguments >/dev/null \
+  || fail 'explicit replacement was not forwarded'
+cmp "$work/existing-sbctl" /usr/local/bin/sbctl >/dev/null \
+  || fail 'explicit replacement did not install the candidate management binary'
+
 # Scenario 3: no-argument bootstrap installs management only, even with an
 # existing kernel. No deployment preflight, no kernel download/replacement.
 printf 'keep existing kernel\n' > /usr/local/bin/sing-box

@@ -237,8 +237,8 @@ pub(crate) struct InstallOptions {
     /// Signed release manifest used to download and verify the data plane.
     #[arg(long, value_name = "PATH")]
     pub(crate) manifest: Option<PathBuf>,
-    /// Back up and remove the detected deployment before installing a fresh one.
-    #[arg(long, conflicts_with = "guided")]
+    /// Back up the old deployment and stop/disable services occupying install ports.
+    #[arg(long)]
     pub(crate) replace_existing: bool,
     /// Open the required ports in UFW as part of the install transaction.
     ///

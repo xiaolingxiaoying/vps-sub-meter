@@ -190,6 +190,7 @@ fn menu_deployment(root: &Path) {
             println!("1. 快速安装（默认配置）");
             println!("2. 引导式安装（完整配置向导）");
         }
+        println!("3. 备份旧部署并重新安装（停止并禁用冲突服务）");
         println!("0. 返回");
         match read_menu_choice("请选择 [0]: ").as_deref() {
             Some("0") | None => return,
@@ -205,7 +206,10 @@ fn menu_deployment(root: &Path) {
             Some("2") => {
                 run_config_wizard(root, None);
             }
-            Some(_) => eprintln!("无效选择，请输入 0 到 2。"),
+            Some("3") => {
+                menu_install(root, true);
+            }
+            Some(_) => eprintln!("无效选择，请输入 0 到 3。"),
         }
         pause_menu();
     }
@@ -650,6 +654,18 @@ fn menu_direction_traffic_correction(root: &Path) {
 }
 
 fn menu_install(root: &Path, guided: bool) -> ExitCode {
+    let conflicts = sbctl::preflight::existing_deployment_paths(root);
+    let replace_existing = if conflicts.is_empty() {
+        confirm_menu_action("安装时若有服务占用所需端口，是否停止并禁用这些服务？")
+    } else {
+        println!("发现旧部署或残留文件：\n  {}", conflicts.join("\n  "));
+        if !confirm_menu_action(
+            "备份旧部署，停止并禁用冲突服务，然后重新安装？订阅和协议凭据将重建",
+        ) {
+            return ExitCode::SUCCESS;
+        }
+        true
+    };
     let Some((source, kernel_version)) = select_kernel() else {
         return ExitCode::SUCCESS;
     };
@@ -671,12 +687,18 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
     } else {
         None
     };
-    match sbctl::config::DeploymentStore::new(root).load() {
-        Ok(_) => {
+    let existing_config = if replace_existing {
+        // Replacement must work even when an old configuration is unreadable.
+        Err(sbctl::config::ConfigError::Missing)
+    } else {
+        sbctl::config::DeploymentStore::new(root).load()
+    };
+    match existing_config {
+        Ok(_) if !replace_existing => {
             eprintln!("已安装。请返回上级菜单选择完整配置向导或重新生成配置工件。");
             ExitCode::from(2)
         }
-        Err(sbctl::config::ConfigError::Missing) => install(
+        Ok(_) | Err(sbctl::config::ConfigError::Missing) => install(
             root,
             InstallOptions {
                 mode: CliSubscriptionMode::Direct,
@@ -696,7 +718,7 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
                 sing_box_bin: None,
                 kernel_version,
                 manifest: manifest_guard.as_ref().map(|path| path.to_path_buf()),
-                replace_existing: false,
+                replace_existing,
                 manage_firewall: false,
                 ipv4_only: false,
                 no_start: false,

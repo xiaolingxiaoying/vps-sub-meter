@@ -1,3 +1,5 @@
 # Refuse automatic takeover of existing sing-box deployments
 
 When installation discovers an existing sing-box binary, service, or configuration, sbctl reports it and exits without changing it. A future explicit import workflow may migrate compatible deployments, but first-release installation only creates and owns a fresh sbctl deployment; this avoids destructive assumptions about `sing-box-yg` or manually maintained services.
+
+Explicit replacement is supported through `sbctl install --replace-existing`, including `--guided`, and the installation menu's replacement choice. It backs up detected deployment paths, stops/disables their systemd units and system services occupying the new deployment's listener ports, then installs a fresh deployment. Unrelated port-owning services retain their files. Sockets/timers are stopped first to prevent reactivation. Failed installation restores the old files and service states; successful installation keeps conflicting services disabled. The protected backup includes `services.json` for later manual recovery. Processes outside system-level systemd services require manual shutdown.

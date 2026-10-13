@@ -383,7 +383,7 @@ impl ReinstallBackup {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 struct PreviousServiceState {
     unit: String,
     was_active: bool,
@@ -395,15 +395,70 @@ struct PreviousServiceState {
 /// permissions, directories, and symlinks so an unsuccessful new install can
 /// restore the old deployment.
 pub fn prepare_reinstall(root: &Path, conflicts: &[String]) -> Result<ReinstallBackup, String> {
+    prepare_reinstall_with_services(root, conflicts, &[])
+}
+
+/// Releases install ports without deleting unrelated services' configuration.
+/// The old runtime state participates in the replacement recovery transaction.
+pub fn prepare_install_replacement(
+    root: &Path,
+    conflicts: &[String],
+    config: &DeploymentConfig,
+) -> Result<Option<ReinstallBackup>, String> {
+    let mut services = conflicting_port_units(root, config)?;
+    // Include activation sources even when an old service is currently stopped
+    // and consequently absent from the port probe.
+    if root == Path::new("/") || root.join("usr/bin/systemctl").is_file() {
+        for service in previous_service_states(root, conflicts) {
+            let triggers = match systemctl_output(
+                root,
+                &["show", &service.unit, "--property=TriggeredBy", "--value"],
+            ) {
+                Ok(triggers) => triggers,
+                // Dangling enablement links and unloadable leftover units have
+                // no active service to stop; still back up and remove them.
+                Err(_) if !service.was_active => continue,
+                Err(error) => return Err(error),
+            };
+            services.extend(
+                triggers
+                    .split_whitespace()
+                    .filter(|unit| unit.ends_with(".socket") || unit.ends_with(".timer"))
+                    .map(str::to_owned),
+            );
+        }
+    }
+    if conflicts.is_empty() && services.is_empty() {
+        return Ok(None);
+    }
+    prepare_reinstall_with_services(root, conflicts, &services).map(Some)
+}
+
+fn prepare_reinstall_with_services(
+    root: &Path,
+    conflicts: &[String],
+    additional_units: &[String],
+) -> Result<ReinstallBackup, String> {
     let conflicts = validate_conflict_paths(conflicts)?;
-    if conflicts.is_empty() {
+    if conflicts.is_empty() && additional_units.is_empty() {
         return Err("no existing deployment paths were supplied for replacement".into());
     }
 
     let _operation_lock = DeploymentStore::new(root)
         .acquire_operation_lock()
         .map_err(|error| format!("could not lock sbctl state for replacement: {error}"))?;
-    let services = previous_service_states(root, &conflicts);
+    let mut services = previous_service_states(root, &conflicts);
+    for unit in additional_units {
+        if !services.iter().any(|service| service.unit == *unit) {
+            services.push(PreviousServiceState {
+                unit: unit.clone(),
+                was_active: systemctl_probe(root, &["is-active", "--quiet", unit]),
+                was_enabled: systemctl_probe(root, &["is-enabled", "--quiet", unit]),
+            });
+        }
+    }
+    // Stop activation sources before services so they cannot restart them.
+    services.sort_by_key(|service| service.unit.ends_with(".service"));
     let backup_directory = new_reinstall_backup_directory(root)?;
     let archive = backup_directory.join("existing-deployment.tar");
     let partial_archive = backup_directory.join("existing-deployment.tar.part");
@@ -414,6 +469,11 @@ pub fn prepare_reinstall(root: &Path, conflicts: &[String]) -> Result<ReinstallB
         fs::rename(&partial_archive, &archive).map_err(|error| {
             format!("could not finalize the existing-deployment backup: {error}")
         })?;
+        fs::write(
+            backup_directory.join("services.json"),
+            serde_json::to_vec_pretty(&services).map_err(|e| e.to_string())?,
+        )
+        .map_err(|e| format!("could not save previous service states: {e}"))?;
         stop_previous_services(root, &services)?;
 
         for relative in &conflicts {
@@ -472,6 +532,146 @@ fn validate_conflict_paths(paths: &[String]) -> Result<Vec<String>, String> {
     Ok(validated.into_iter().collect())
 }
 
+fn install_ports(config: &DeploymentConfig) -> std::collections::BTreeSet<u16> {
+    let mut ports = config
+        .enabled_protocols
+        .iter()
+        .filter_map(|protocol| config.protocol_listener_port(protocol))
+        .collect::<std::collections::BTreeSet<_>>();
+    if config.subscription_mode == crate::config::SubscriptionMode::Direct {
+        ports.extend([80, 443]);
+    } else if let Some(port) = config.subscription_listen_port {
+        ports.insert(port);
+    }
+    ports
+}
+
+fn listener_port(line: &str) -> Option<u16> {
+    line.split_whitespace()
+        .nth(4)?
+        .rsplit(':')
+        .next()?
+        .parse()
+        .ok()
+}
+
+fn listener_pids(line: &str) -> Vec<u32> {
+    line.split("pid=")
+        .skip(1)
+        .filter_map(|part| {
+            part.split(|c: char| !c.is_ascii_digit())
+                .next()?
+                .parse()
+                .ok()
+        })
+        .collect()
+}
+
+fn system_service_from_cgroup(contents: &str) -> Option<String> {
+    contents
+        .lines()
+        .filter_map(|line| line.splitn(3, ':').nth(2))
+        .filter(|path| path.starts_with("/system.slice/"))
+        .flat_map(|path| path.split('/'))
+        .find(|component| component.ends_with(".service"))
+        .map(str::to_owned)
+}
+
+fn systemctl_output(root: &Path, args: &[&str]) -> Result<String, String> {
+    let local = root.join("usr/bin/systemctl");
+    let program = if local.is_file() {
+        local
+    } else {
+        "systemctl".into()
+    };
+    let output = Command::new(program)
+        .args(args)
+        .output()
+        .map_err(|e| e.to_string())?;
+    if !output.status.success() {
+        return Err(format!(
+            "systemctl {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn conflicting_port_units(root: &Path, config: &DeploymentConfig) -> Result<Vec<String>, String> {
+    // Fixture roots must never inspect or stop services on the development host.
+    let local = root.join("usr/bin/ss");
+    if root != Path::new("/") && !local.is_file() {
+        return Ok(Vec::new());
+    }
+    let program = if local.is_file() { local } else { "ss".into() };
+    let output = Command::new(program)
+        .args(["-H", "-lntup"])
+        .output()
+        .map_err(|e| format!("could not inspect installation ports with ss: {e}"))?;
+    if !output.status.success() {
+        return Err("could not inspect installation ports; install iproute2 and retry".into());
+    }
+    let ports = install_ports(config);
+    let mut units = std::collections::BTreeSet::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some(port) = listener_port(line).filter(|port| ports.contains(port)) else {
+            continue;
+        };
+        let pids = listener_pids(line);
+        if pids.is_empty() {
+            return Err(format!(
+                "端口 {port} 已被占用，无法识别所属 systemd 服务；请先停止该进程"
+            ));
+        }
+        for pid in pids {
+            if pid == 1 {
+                let sockets = systemctl_output(
+                    root,
+                    &["list-sockets", "--all", "--no-legend", "--no-pager"],
+                )?;
+                let matching = sockets
+                    .lines()
+                    .filter(|line| {
+                        line.split_whitespace()
+                            .next()
+                            .and_then(|address| address.rsplit(':').next()?.parse::<u16>().ok())
+                            == Some(port)
+                    })
+                    .flat_map(|line| {
+                        line.split_whitespace()
+                            .filter(|word| word.ends_with(".socket") || word.ends_with(".service"))
+                    })
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if matching.is_empty() {
+                    return Err(format!("无法识别占用端口 {port} 的 systemd socket"));
+                }
+                units.extend(matching);
+            } else {
+                let cgroup = fs::read_to_string(root.join(format!("proc/{pid}/cgroup")))
+                    .map_err(|e| format!("could not identify process {pid} on port {port}: {e}"))?;
+                let unit = system_service_from_cgroup(&cgroup).ok_or_else(|| {
+                    format!("端口 {port} 的进程 {pid} 不属于系统级 systemd 服务；请先停止该进程")
+                })?;
+                units.insert(unit);
+            }
+        }
+    }
+    // Include sockets and timers that can activate a port-owning service again.
+    for unit in units.clone() {
+        let triggers =
+            systemctl_output(root, &["show", &unit, "--property=TriggeredBy", "--value"])?;
+        units.extend(
+            triggers
+                .split_whitespace()
+                .filter(|unit| unit.ends_with(".socket") || unit.ends_with(".timer"))
+                .map(str::to_owned),
+        );
+    }
+    Ok(units.into_iter().collect())
+}
+
 fn previous_service_states(root: &Path, paths: &[String]) -> Vec<PreviousServiceState> {
     let mut units = std::collections::BTreeSet::new();
     for path in paths {
@@ -521,6 +721,7 @@ fn is_systemd_path(path: &str) -> bool {
 
 fn stop_previous_services(root: &Path, services: &[PreviousServiceState]) -> Result<(), String> {
     for service in services {
+        println!("停止并禁用冲突单元：{}", service.unit);
         if service.was_active {
             systemctl(root, &["stop", &service.unit])?;
         }
@@ -532,7 +733,7 @@ fn stop_previous_services(root: &Path, services: &[PreviousServiceState]) -> Res
 }
 
 fn restore_previous_services(root: &Path, services: &[PreviousServiceState]) -> Result<(), String> {
-    for service in services {
+    for service in services.iter().rev() {
         if service.was_enabled {
             systemctl(root, &["enable", &service.unit])?;
         }
@@ -580,14 +781,20 @@ fn create_conflict_archive(root: &Path, paths: &[String], archive: &Path) -> Res
     } else {
         "tar".into()
     };
-    let status = Command::new(program)
+    let mut command = Command::new(program);
+    command
         .arg("-cpf")
         .arg(archive)
         .arg("--numeric-owner")
         .arg("-C")
-        .arg(root)
-        .arg("--")
-        .args(paths)
+        .arg(root);
+    if paths.is_empty() {
+        command
+            .args(["--files-from", "-"])
+            .stdin(std::process::Stdio::null());
+    }
+    command.arg("--").args(paths);
+    let status = command
         .status()
         .map_err(|error| format!("could not create the existing-deployment backup: {error}"))?;
     status
@@ -1552,6 +1759,119 @@ pub(crate) fn grant_pinned_certificate_group(root: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn port_owner_parsing_handles_ipv6_workers_and_system_cgroups() {
+        let line = "tcp LISTEN 0 511 [::]:443 [::]:* users:((\"nginx\",pid=321,fd=7),(\"nginx\",pid=322,fd=7))";
+        assert_eq!(listener_port(line), Some(443));
+        assert_eq!(listener_pids(line), vec![321, 322]);
+        assert_eq!(
+            system_service_from_cgroup("0::/system.slice/nginx.service\n"),
+            Some("nginx.service".into())
+        );
+        assert_eq!(
+            system_service_from_cgroup("0::/user.slice/user-1000.slice/session-2.scope\n"),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    fn replacement_fixture() -> (tempfile::TempDir, DeploymentConfig) {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        fs::create_dir_all(root.path().join("usr/bin")).unwrap();
+        let systemctl = root.path().join("usr/bin/systemctl");
+        fs::write(&systemctl, format!("#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}/commands'\nif [ \"$1\" = show ]; then\n  [ \"$2\" != nginx.service ] || echo nginx.socket\nfi\nexit 0\n", root.path().display())).unwrap();
+        fs::set_permissions(systemctl, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = DeploymentConfig::new(
+            crate::config::SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        (root, config)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_removes_foreign_unit_and_dangling_link_and_restores_them() {
+        use std::os::unix::fs::symlink;
+        let (root, config) = replacement_fixture();
+        let unit = root.path().join(SING_BOX_UNIT);
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, "[Service]\nExecStart=/missing/sing-box\n").unwrap();
+        let link = root
+            .path()
+            .join("etc/systemd/system/multi-user.target.wants/sing-box.service");
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        symlink("/missing/sing-box.service", &link).unwrap();
+        let conflicts = crate::preflight::existing_deployment_paths(root.path());
+        let backup = prepare_install_replacement(root.path(), &conflicts, &config)
+            .unwrap()
+            .unwrap();
+        assert!(!unit.exists());
+        assert!(fs::symlink_metadata(&link).is_err());
+        assert!(crate::preflight::existing_deployment_paths(root.path()).is_empty());
+        restore_replaced_deployment(root.path(), &backup).unwrap();
+        assert!(
+            fs::read_to_string(unit)
+                .unwrap()
+                .contains("/missing/sing-box")
+        );
+        assert_eq!(
+            fs::read_link(link).unwrap(),
+            PathBuf::from("/missing/sing-box.service")
+        );
+        let log = fs::read_to_string(root.path().join("commands")).unwrap();
+        assert!(log.contains("stop sing-box.service"));
+        assert!(log.contains("disable sing-box.service"));
+        assert!(log.contains("enable sing-box.service"));
+        assert!(log.contains("start sing-box.service"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn port_only_replacement_stops_activation_first_and_preserves_foreign_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let (root, config) = replacement_fixture();
+        let ss = root.path().join("usr/bin/ss");
+        fs::write(&ss, "#!/bin/sh\necho 'tcp LISTEN 0 511 0.0.0.0:443 0.0.0.0:* users:((\"nginx\",pid=321,fd=7))'\necho 'tcp LISTEN 0 511 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=555,fd=7))'\n").unwrap();
+        fs::set_permissions(ss, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::create_dir_all(root.path().join("proc/321")).unwrap();
+        fs::write(
+            root.path().join("proc/321/cgroup"),
+            "0::/system.slice/nginx.service\n",
+        )
+        .unwrap();
+        let foreign = root.path().join("etc/nginx/nginx.conf");
+        fs::create_dir_all(foreign.parent().unwrap()).unwrap();
+        fs::write(&foreign, "keep nginx configuration").unwrap();
+        let backup = prepare_install_replacement(root.path(), &[], &config)
+            .unwrap()
+            .unwrap();
+        let log = fs::read_to_string(root.path().join("commands")).unwrap();
+        assert!(log.find("stop nginx.socket").unwrap() < log.find("stop nginx.service").unwrap());
+        assert!(log.contains("disable nginx.service"));
+        assert!(!log.contains("sshd"));
+        assert_eq!(
+            fs::read_to_string(&foreign).unwrap(),
+            "keep nginx configuration"
+        );
+        assert!(
+            backup
+                .archive_path()
+                .with_file_name("services.json")
+                .is_file()
+        );
+        restore_replaced_deployment(root.path(), &backup).unwrap();
+        let log = fs::read_to_string(root.path().join("commands")).unwrap();
+        assert!(log.contains("enable nginx.socket"));
+        assert!(log.contains("start nginx.service"));
+    }
 
     #[test]
     fn a_rollback_only_deletes_what_the_failed_install_created() {

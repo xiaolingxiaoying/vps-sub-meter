@@ -36,7 +36,8 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         return ExitCode::from(2);
     }
     if options.guided
-        && let Err(error) = sbctl::preflight::preflight(root)
+        && let Err(error) =
+            sbctl::preflight::preflight_install(root, false, options.replace_existing)
     {
         eprintln!("install preflight failed: {error}");
         return ExitCode::from(2);
@@ -131,10 +132,13 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         }
         if options.replace_existing {
             let conflicts = sbctl::preflight::existing_deployment_paths(root);
-            if !conflicts.is_empty() {
-                replacement_backup = Some(
-                    sbctl::lifecycle::prepare_reinstall(root, &conflicts)
-                        .map_err(sbctl::config::ConfigError::StateContent)?,
+            replacement_backup =
+                sbctl::lifecycle::prepare_install_replacement(root, &conflicts, &config)
+                    .map_err(sbctl::config::ConfigError::StateContent)?;
+            if let Some(backup) = &replacement_backup {
+                println!(
+                    "旧部署已备份，冲突服务已停止并禁用；备份：{}",
+                    backup.archive_path().display()
                 );
             }
             sbctl::preflight::preflight_install(

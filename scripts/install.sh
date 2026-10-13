@@ -162,7 +162,13 @@ chmod 0755 "$work_dir/sbctl"
 # binary: `sbctl install` treats a non-terminal stdin as a preflight, so this
 # cannot start an installation or change deployment state.
 replace_existing=0
-if [[ "$#" -eq 0 ]] || preflight_output=$("$work_dir/sbctl" install </dev/null 2>&1); then
+explicit_replacement=0
+for arg in "$@"; do
+  if [[ "$arg" == --replace-existing ]]; then
+    explicit_replacement=1
+  fi
+done
+if [[ "$#" -eq 0 || "$explicit_replacement" -eq 1 ]] || preflight_output=$("$work_dir/sbctl" install </dev/null 2>&1); then
   :
 else
   printf '%s\n' "$preflight_output" >&2
@@ -174,7 +180,7 @@ else
   echo ""
   echo "发现已有 sing-box/sbctl 部署。如何处理？"
   echo "1) 保留现有部署并退出（默认）"
-  echo "2) 备份旧部署、停止相关服务、清理冲突路径，然后继续全新安装"
+  echo "2) 备份旧部署、停止并禁用相关及端口冲突服务、清理冲突路径，然后继续全新安装"
   while :; do
     read -r -p "请选择 [1]: " replace_choice <"$installer_input"
     case "${replace_choice:-1}" in

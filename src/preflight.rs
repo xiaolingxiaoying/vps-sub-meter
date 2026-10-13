@@ -57,7 +57,7 @@ pub enum PreflightError {
     #[error("sbctl install requires root; rerun as root (for example: sudo sbctl install)")]
     RequiresRoot,
     #[error(
-        "Direct mode requires TCP ports 80 and 443, but these are occupied: {0}. Stop the listed service or choose External proxy mode; sbctl will not change existing services."
+        "Direct mode requires TCP ports 80 and 443, but these are occupied: {0}. Stop the listed service, choose External proxy mode, or use --replace-existing to stop and disable conflicting systemd services before installing."
     )]
     DirectPortsOccupied(String),
     #[error(
@@ -182,7 +182,10 @@ pub fn existing_deployment_paths(root: &Path) -> Vec<String> {
         "etc/systemd/system/sbctl-accounting-reset.timer",
         "etc/systemd/system/sbctl-email.service",
         "etc/systemd/system/sbctl-email.timer",
+        "etc/systemd/system/sbctl-credential-rotate.service",
+        "etc/systemd/system/sbctl-credential-rotate.timer",
         "etc/systemd/system/timers.target.wants/sbctl-email.timer",
+        "etc/systemd/system/timers.target.wants/sbctl-credential-rotate.timer",
         "etc/systemd/system/multi-user.target.wants/sing-box.service",
         "etc/systemd/system/multi-user.target.wants/sbctl.service",
         "etc/systemd/system/sockets.target.wants/sbctl-http.socket",
