@@ -115,6 +115,8 @@ sbctl uninstall [--purge]     # 卸载并保留备份
 升级说明见 [`docs/sbctl-review-fixes-2026-10-13.md`](docs/sbctl-review-fixes-2026-10-13.md)。
 库／CLI 回归、Linux 权限检查及 Debian 12、Ubuntu 22.04、Ubuntu 24.04 的完整
 Docker/systemd 验收已通过，验证范围和复跑记录见上述说明。
+补充的真实 Certbot／本地 ACME CA／sing-box 验收也在三发行版通过，
+包括受信任 HTTPS、续期热更新和 AnyTLS 数据传输；公网签发仍需专用测试主机验证。
 
 [`docs/project-review-round-3-2026-10-08.md`](docs/project-review-round-3-2026-10-08.md) 记录了 2026-10-08 的全量审查结论：七条 P0（安装事务边界、更新回滚权限、官方内核降级通道、发布链缺失等）已在本轮修复，P1/P2 条目（`config switch-mode` 不可用、Direct 忽略 `--bind`、总览页流量口径、manifest 无序列/有效期、action 未 pin 等）仍开放，逐条附证据与建议。
 

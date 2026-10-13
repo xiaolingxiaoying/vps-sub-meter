@@ -70,9 +70,20 @@ External proxy 的域名协议证书必须已存在于该域名的 Certbot live 
 - 复跑中修复了两个 Linux 回归：`fs.protected_regular=2` 下 root 重新打开
   服务账号拥有的锁文件时避免 `O_CREAT`；逐路径授予 ACME 的 `.well-known`
   和 `acme-challenge` 目录访问权限。测试脚本也改为使用重新安装后的当前凭据。
-- 容器验收使用本地证书和模拟 sing-box 进程；公网 ACME 签发及生产网络未验证。
+- 既有 `run.sh` 容器验收使用本地证书和模拟 sing-box 进程。
   服务端仓库未提供 sbcli/sbtui 工件，其可选客户端验收分支按脚本约定跳过。
   本地完整日志：`.scratch/acceptance-bin/docker-acceptance-final.log`。
+- 继续验证：新增 `run-acme.sh`，使用真实 sing-box 1.14.1、Pebble 2.10.1 测试 CA
+  和发行版 Certbot（Debian 12：2.1.0，Ubuntu 22.04：1.21.0，Ubuntu 24.04：2.9.0）。
+  三发行版均通过完整补充验收，固定脚本复跑退出码为 0。
+  覆盖实际 HTTP-01 失败后的配置／工件恢复、成功签发及受信任 HTTPS、AnyTLS
+  客户端到真实服务端的数据传输、强制续期部署钩子、HTTPS 证书热更新且进程不重启、
+  跨模式证书复用、首次 Direct 安装和卸载保留签发历史。本轮未发现新的产品代码问题。
+- 补充验收仅修改测试基础设施：使用测试 CA、关闭容器内续期随机等待、有限次重试
+  等待首次安装的证书异步加载。未关闭 TLS 校验或 ACME 挑战验证。
+  日志：`.scratch/acceptance-bin/docker-acme-debian-final.log`、
+  `.scratch/acceptance-bin/docker-acme-ubuntu-final.log`。
+  公网 DNS、防火墙、Let's Encrypt 公网签发及生产网络仍未验证。
 
 ```sh
 cargo fmt --all -- --check
@@ -87,6 +98,11 @@ sudo bash scripts/dev/check-storage-permissions.sh /absolute/path/to/linux/sbctl
 SBCTL_ARTIFACT=/absolute/path/to/production-sbctl \
 SBCTL_TEST_ARTIFACT=/absolute/path/to/test-signing-sbctl \
 sh tests/acceptance/run.sh
+
+# 真实 Certbot、测试 ACME CA、sing-box 及代理数据传输的三发行版补充验收
+SBCTL_ARTIFACT=/absolute/path/to/production-sbctl \
+SING_BOX_ARTIFACT=/absolute/path/to/sing-box \
+bash tests/acceptance/run-acme.sh
 ```
 
 本次不发布版本，也不部署生产主机。

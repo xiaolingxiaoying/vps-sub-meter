@@ -21,3 +21,31 @@ simulated CLI checks; it is not evidence for the Production host release gate.
 `SBCTUI_ARTIFACT`/`SBCLI_ARTIFACT` 是**可选**的：本仓库只有服务端 crate，未设置时脚本打印
 `branch: server-only workspace - skipping the client legs` 并跳过 `verify-client.sh` 与
 `verify-sbcli.sh`；设置后跑完整套件。CI 的 `server-acceptance` job 以无客户端变量的方式运行。
+
+## 真实 Certbot／ACME 和代理数据传输
+
+`run-acme.sh` 是独立的补充验收，使用 Debian／Ubuntu 仓库中的真实 Certbot、
+真实 sing-box 工件和固定镜像摘要的 [Pebble](https://github.com/letsencrypt/pebble)。
+每个发行版创建独立 Docker 网络、测试 CA 和 systemd 容器，并在结束后清理。
+需要可运行 privileged/systemd 容器的 Docker 引擎；不会占用宿主公网 80/443。
+
+```sh
+SBCTL_ARTIFACT=/absolute/path/to/production-sbctl \
+SING_BOX_ARTIFACT=/absolute/path/to/sing-box \
+bash tests/acceptance/run-acme.sh
+```
+
+默认依次测试 Debian 12、Ubuntu 22.04、Ubuntu 24.04。
+可使用 `ACME_BASE_IMAGES='debian:12-slim'` 单独复跑一种发行版。
+生产 sbctl 工件不需要测试签名功能；sing-box 版本必须支持生成的五协议配置。
+
+验收包括实际 HTTP-01 失败后的模式回滚、成功签发与受信任 HTTPS、AnyTLS
+客户端到服务端的真实数据传输、强制续期与部署钩子、无进程重启的 HTTPS
+证书更新、跨模式证书复用、首次 Direct 安装，以及卸载保留 Certbot 历史。
+TLS 校验显式使用该测试 CA，未使用 `--insecure` 或关闭 ACME 挑战验证。
+测试 CA 仅通过容器内 `REQUESTS_CA_BUNDLE` 和客户端 `--cacert`／`certificate_path`
+使用，不加入宿主信任库。容器内关闭 Certbot 的续期随机等待，使验收时间可控。
+首次安装后 HTTPS 监听器异步加载证书，探测使用有限次重试等待其就绪。
+
+这些结果验证本地真实组件交互；公网 DNS、NAT／防火墙和 Let's Encrypt
+生产服务仍需专用域名及公网测试主机另行验收。
