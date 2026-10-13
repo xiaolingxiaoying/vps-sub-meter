@@ -571,7 +571,13 @@ fn system_service_from_cgroup(contents: &str) -> Option<String> {
     contents
         .lines()
         .filter_map(|line| line.splitn(3, ':').nth(2))
-        .filter(|path| path.starts_with("/system.slice/"))
+        // Host cgroup namespaces expose the container/machine prefix too.
+        // Match the system slice within that path, never a user's service tree.
+        .filter(|path| !path.split('/').any(|component| component == "user.slice"))
+        .filter_map(|path| {
+            path.rsplit_once("/system.slice/")
+                .map(|(_, service)| service)
+        })
         .flat_map(|path| path.split('/'))
         .find(|component| component.ends_with(".service"))
         .map(str::to_owned)
@@ -1767,6 +1773,10 @@ mod tests {
         assert_eq!(listener_pids(line), vec![321, 322]);
         assert_eq!(
             system_service_from_cgroup("0::/system.slice/nginx.service\n"),
+            Some("nginx.service".into())
+        );
+        assert_eq!(
+            system_service_from_cgroup("0::/docker/container-id/system.slice/nginx.service\n"),
             Some("nginx.service".into())
         );
         assert_eq!(
