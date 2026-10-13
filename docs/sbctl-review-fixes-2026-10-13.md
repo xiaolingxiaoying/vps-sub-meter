@@ -4,8 +4,8 @@
 完整模式切换、轮换任务权限、卸载任务清理、总量修正显示及宽限期输入错误。
 配置文件格式保持兼容，升级不轮换凭据、不重置流量账期。
 
-当前状态：代码和回归测试已实施；真实三发行版 systemd 发布验收尚未通过，
-因此这些问题尚未标记为完成全部发布验收。详见 ADR-0033。
+当前状态：代码和回归测试已实施，既有 Debian 12、Ubuntu 22.04、Ubuntu 24.04
+Docker/systemd 验收均已通过。详见 ADR-0033 和下方验证记录。
 
 ## 使用变化
 
@@ -62,10 +62,17 @@ External proxy 的域名协议证书必须已存在于该域名的 Certbot live 
 - 真核矩阵：sing-box 1.10.7／1.11.15／1.12.25／1.13.21／1.14.1
   的客户端配置，以及 1.14.1 服务端配置和本机 Mihomo 加载检查已通过。
 - 真实 Linux UID/GID：隔离挂载命名空间与 chroot 中验证了邮件不可读／不可删除、
-  daemon 可写自己的状态、sing-box 可读配置和协议证书。
-- 尚未验证：Debian 12、Ubuntu 22.04、Ubuntu 24.04 的完整 systemd 容器验收。
-  本机 Docker Desktop 初始化 inference manager 失败，无法连接容器引擎。
-  已扩展 `tests/acceptance/verify-real.sh` 覆盖真实轮换、迁移、权限和六方向切换。
+  daemon 可写自己的状态、sing-box 可读配置和协议证书，以及 ACME 挑战目录可读。
+- 2026-10-13 Docker 复跑：Debian 12、Ubuntu 22.04、Ubuntu 24.04 的安装器、
+  模拟事务和真实 systemd 验收全部通过，完整脚本退出码为 0。
+  覆盖真实轮换、旧单元迁移、邮件权限、六方向切换、HTTP/HTTPS 监听、
+  HTTP-01 挑战响应、流量状态保留、失败恢复和两种卸载。
+- 复跑中修复了两个 Linux 回归：`fs.protected_regular=2` 下 root 重新打开
+  服务账号拥有的锁文件时避免 `O_CREAT`；逐路径授予 ACME 的 `.well-known`
+  和 `acme-challenge` 目录访问权限。测试脚本也改为使用重新安装后的当前凭据。
+- 容器验收使用本地证书和模拟 sing-box 进程；公网 ACME 签发及生产网络未验证。
+  服务端仓库未提供 sbcli/sbtui 工件，其可选客户端验收分支按脚本约定跳过。
+  本地完整日志：`.scratch/acceptance-bin/docker-acceptance-final.log`。
 
 ```sh
 cargo fmt --all -- --check
@@ -76,7 +83,7 @@ cargo test -p sbctl --no-default-features --test release_trust
 # 仅用于隔离权限测试；不修改宿主账号或宿主 /etc
 sudo bash scripts/dev/check-storage-permissions.sh /absolute/path/to/linux/sbctl
 
-# 引擎恢复后使用独立的生产和测试签名 Linux 构建运行既有三发行版验收
+# 使用独立的生产和测试签名 Linux 构建运行既有三发行版验收
 SBCTL_ARTIFACT=/absolute/path/to/production-sbctl \
 SBCTL_TEST_ARTIFACT=/absolute/path/to/test-signing-sbctl \
 sh tests/acceptance/run.sh

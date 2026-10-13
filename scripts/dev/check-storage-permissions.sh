@@ -47,6 +47,12 @@ chmod 0600 "$work/etc/sbctl/overrides/sing-box-server.json"
 # Simulate the ownership left behind by the old recursive preparation.
 chown 65000:65000 "$work/etc/sbctl/email.toml" "$work/var/lib/sbctl/email-state.json"
 chmod 0600 "$work/etc/sbctl/email.toml" "$work/var/lib/sbctl/email-state.json"
+mkdir -p "$work/var/lib/sbctl/acme-webroot/.well-known/acme-challenge"
+chmod 0700 "$work/var/lib/sbctl/acme-webroot" "$work/var/lib/sbctl/acme-webroot/.well-known" "$work/var/lib/sbctl/acme-webroot/.well-known/acme-challenge"
+printf 'challenge-body\n' >"$work/var/lib/sbctl/acme-webroot/.well-known/acme-challenge/permission-token"
+chroot "$work" /usr/local/bin/sbctl regenerate >/dev/null
+# Reopen the delegated lock as root after preparation. With
+# fs.protected_regular=2, O_CREAT on that existing lock must not be used.
 chroot "$work" /usr/local/bin/sbctl regenerate >/dev/null
 for relative in etc/sbctl/email.toml var/lib/sbctl/email-state.json; do
   [ "$(stat -c '%u:%g:%a' "$work/$relative")" = 0:0:600 ]
@@ -62,6 +68,8 @@ chroot "$work" /usr/bin/setpriv --reuid=65000 --regid=65000 --clear-groups \
   /usr/bin/test -r /var/lib/sbctl/artifacts/subscription-uri.txt
 chroot "$work" /usr/bin/setpriv --reuid=65000 --regid=65000 --clear-groups \
   /usr/bin/touch /var/lib/sbctl/daemon-can-write
+chroot "$work" /usr/bin/setpriv --reuid=65000 --regid=65000 --clear-groups \
+  /usr/bin/test -r /var/lib/sbctl/acme-webroot/.well-known/acme-challenge/permission-token
 chroot "$work" /usr/bin/setpriv --reuid=65001 --regid=65001 --clear-groups \
   /usr/bin/test -r /etc/sing-box/config.json
 chroot "$work" /usr/bin/setpriv --reuid=65001 --regid=65001 --clear-groups \

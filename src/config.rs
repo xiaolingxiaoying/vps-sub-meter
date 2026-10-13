@@ -1818,15 +1818,35 @@ fn private_open(path: &Path, create_new: bool) -> io::Result<File> {
     options.read(true).write(true);
     if create_new {
         options.create_new(true);
-    } else {
-        options.create(true);
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
-    options.open(path)
+    loop {
+        match options.open(path) {
+            Ok(file) => {
+                if !file.metadata()?.is_file() {
+                    return Err(io::Error::other("private storage must be a regular file"));
+                }
+                return Ok(file);
+            }
+            Err(error) if !create_new && error.kind() == io::ErrorKind::NotFound => {
+                // O_CREAT on an existing service-owned lock is rejected by
+                // fs.protected_regular=2 in our root-owned sticky directory.
+                // Open existing locks without it; create missing locks once.
+                match private_open(path, true) {
+                    Ok(file) => return Ok(file),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 fn create_private_directory(directory: &Path) -> io::Result<()> {

@@ -246,6 +246,7 @@ printf '%s' "$verify_output" | grep -q 'Unknown key name' \
   && fail "systemd reported an unknown unit key: $verify_output"
 
 direct_credential=$(sed -n 's/^subscription_credential = "\([^"]*\)"/\1/p' /etc/sbctl/config.toml)
+credential=$direct_credential
 direct_response=$(mktemp)
 if ! curl --silent --show-error --retry 5 --retry-connrefused --retry-delay 1 --insecure \
   --resolve sub.example.test:443:127.0.0.1 \

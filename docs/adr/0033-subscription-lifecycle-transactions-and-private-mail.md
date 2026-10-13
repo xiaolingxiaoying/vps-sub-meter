@@ -56,5 +56,8 @@ additive; successful mode changes now require a kernel check and a healthy runni
 deployment. Certbot's accounts and issuance history are not deleted during recovery.
 
 Unit/CLI regressions and a real Linux UID/GID chroot check accompany the changes.
-Production release acceptance still requires the existing real-systemd suite on
+Production release acceptance requires the existing real-systemd suite on
 Debian 12, Ubuntu 22.04 and Ubuntu 24.04; WSL checks alone do not satisfy that gate.
+The Docker suites passed on all three distributions on 2026-10-13. Their scope
+and the Linux permission fixes found during that run are recorded in
+`docs/sbctl-review-fixes-2026-10-13.md`.

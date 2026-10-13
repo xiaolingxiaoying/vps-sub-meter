@@ -1360,6 +1360,16 @@ pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
         ("var/lib/sbctl", "root:sbctl", 0o1771),
         ("var/lib/sbctl/artifacts", "sbctl:sbctl", 0o700),
         ("var/lib/sbctl/acme-webroot", "sbctl:sbctl", 0o755),
+        (
+            "var/lib/sbctl/acme-webroot/.well-known",
+            "sbctl:sbctl",
+            0o755,
+        ),
+        (
+            "var/lib/sbctl/acme-webroot/.well-known/acme-challenge",
+            "sbctl:sbctl",
+            0o755,
+        ),
     ] {
         let path = root.join(relative);
         if path.exists() {
