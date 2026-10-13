@@ -13,6 +13,9 @@ also saved configuration without changing the running service.
 - Credential operations hold the operation lock through reading, writing, restart,
   health checks and recovery. Recovery restores the complete original configuration;
   successful links are printed only after the running deployment commits.
+- Revoking a name applies to every still-active credential for that name,
+  including historical links retained by rotation. A revocation grace window
+  never extends an earlier expiry; already-expired records stay unchanged.
 - Storage preparation applies ownership only to known managed paths. SMTP config
   and delivery state remain `root:root 0600`. `/etc/sbctl` is `root:sbctl 0750`;
   `/var/lib/sbctl` is `root:sbctl 1771`. The sticky directory allows the daemon to

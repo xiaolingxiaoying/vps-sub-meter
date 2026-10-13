@@ -296,16 +296,21 @@ fn revoke_credential(root: &Path, name: &str, grace: Option<&str>) -> ExitCode {
             }
             let now = chrono::Utc::now().timestamp();
             let until = expiry(now, window)?;
-            let entry = config
+            let entries: Vec<_> = config
                 .subscription_credentials
                 .iter_mut()
-                .find(|entry| entry.name == name && entry.is_active(now))
-                .ok_or_else(|| {
-                    credential_error(format!(
-                        "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
-                    ))
-                })?;
-            entry.revoked_at = Some(until);
+                .filter(|entry| entry.name == name && entry.is_active(now))
+                .collect();
+            if entries.is_empty() {
+                return Err(credential_error(format!(
+                    "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
+                )));
+            }
+            for entry in entries {
+                // Rotation may leave multiple still-authorized historical URLs.
+                // Revoke the whole name without extending an earlier expiry.
+                entry.revoked_at = Some(entry.revoked_at.map_or(until, |old| old.min(until)));
+            }
             Ok(window)
         })
     });

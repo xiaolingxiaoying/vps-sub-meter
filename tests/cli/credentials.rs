@@ -115,6 +115,76 @@ fn named_credentials_serve_side_by_side_and_revoke_touches_only_one_link() {
 }
 
 #[test]
+fn revoke_applies_to_every_active_same_name_without_extending_old_expiries() {
+    for grace in [None, Some("10m")] {
+        let fixture = TempDir::new().unwrap();
+        let port = free_high_tcp_port();
+        let root = fixture.path().to_str().unwrap();
+        write_systemctl_fixture(&fixture, true);
+        let default = initialize_ip_fallback_subscription(&fixture, port);
+        let store = sbctl::config::DeploymentStore::new(fixture.path());
+        let mut config = store.load().unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let old_expiry = now + 300;
+        let mut credentials = Vec::new();
+        for (name, revoked_at) in [
+            ("phone", Some(old_expiry)),
+            ("phone", None),
+            ("phone", Some(1)),
+            ("tablet", None),
+        ] {
+            credentials.push(sbctl::config::NamedCredential {
+                name: name.into(),
+                credential: sbctl::config::generate_subscription_credential().unwrap(),
+                revoked_at,
+            });
+        }
+        config.subscription_credentials = credentials.clone();
+        store.replace(&config).unwrap();
+        let mut command = Command::cargo_bin("sbctl").unwrap();
+        command.args(["--root", root, "credential", "revoke", "phone"]);
+        if let Some(grace) = grace {
+            command.args(["--grace", grace]);
+        }
+        command.assert().success();
+        let after = store.load().unwrap();
+        assert_eq!(after.subscription_credential, default);
+        assert_eq!(after.subscription_credentials[2], credentials[2]);
+        assert_eq!(after.subscription_credentials[3], credentials[3]);
+        if grace.is_some() {
+            assert_eq!(
+                after.subscription_credentials[0].revoked_at,
+                Some(old_expiry)
+            );
+            assert!(after.subscription_credentials[1].revoked_at.is_some());
+        } else {
+            assert!(
+                after
+                    .subscription_credentials
+                    .iter()
+                    .filter(|entry| entry.name == "phone")
+                    .all(|entry| !entry.is_active(chrono::Utc::now().timestamp()))
+            );
+            let mut server =
+                spawn_sbctl_serve(&fixture, port, 4, &fixture.path().join("revoke-all.stderr"));
+            for entry in &credentials[..2] {
+                assert!(
+                    http_get(port, &format!("/sub/{}/index", entry.credential))
+                        .starts_with("HTTP/1.1 404")
+                );
+            }
+            for credential in [&default, &credentials[3].credential] {
+                assert!(
+                    http_get(port, &format!("/sub/{credential}/uri")).starts_with("HTTP/1.1 200")
+                );
+            }
+            let _ = server.kill();
+            let _ = server.wait();
+        }
+    }
+}
+
+#[test]
 fn a_grace_window_keeps_the_old_link_until_it_expires_and_rotate_spares_the_default() {
     let fixture = TempDir::new().expect("temporary root is created");
     let port = free_high_tcp_port();

@@ -15,6 +15,8 @@ Docker/systemd 验收均已通过。详见 ADR-0033 和下方验证记录。
   服务账号无法读取或删除邮件文件。管理员 override 的内容和权限保持不变。
 - 已有轮换服务自动迁移为 root oneshot；定时器的启用状态及运行时间不变。
   未启用轮换的部署不会自动启用。两种卸载方式都清理受管邮件和轮换任务。
+- `credential revoke NAME` 同时撤销该名称下的当前链接和仍在宽限期内的历史链接。
+  指定撤销宽限期时，不延长历史链接已有的到期时间。
 - 订阅总览页使用修正后的总量；`upload`/`download` 仍表示方向流量，
   订阅头 `total` 仍表示月额度。
 
@@ -78,12 +80,28 @@ External proxy 的域名协议证书必须已存在于该域名的 Certbot live 
   三发行版均通过完整补充验收，固定脚本复跑退出码为 0。
   覆盖实际 HTTP-01 失败后的配置／工件恢复、成功签发及受信任 HTTPS、AnyTLS
   客户端到真实服务端的数据传输、强制续期部署钩子、HTTPS 证书热更新且进程不重启、
-  跨模式证书复用、首次 Direct 安装和卸载保留签发历史。本轮未发现新的产品代码问题。
+  跨模式证书复用、首次 Direct 安装和卸载保留签发历史。该轮本地验收未发现新的产品代码问题。
 - 补充验收仅修改测试基础设施：使用测试 CA、关闭容器内续期随机等待、有限次重试
   等待首次安装的证书异步加载。未关闭 TLS 校验或 ACME 挑战验证。
   日志：`.scratch/acceptance-bin/docker-acme-debian-final.log`、
   `.scratch/acceptance-bin/docker-acme-ubuntu-final.log`。
-  公网 DNS、防火墙、Let's Encrypt 公网签发及生产网络仍未验证。
+  此轮仅覆盖本地网络，后续公网结果见下一条。
+- 授权 VPS 的公网验证：Ubuntu 22.04、Certbot 1.21.0、既有 sing-box 1.14.2。
+  升级前保存完整部署备份；sbctl 从 0.0.6 升级到本次 0.0.7 构建。
+  升级期间暂停流量写入任务，核对配置、流量状态、内核文件 SHA-256 一致后恢复任务。
+  Let's Encrypt staging 的实际 HTTP-01 与 `certbot renew --dry-run` 已通过，
+  正式证书内容未变。旧 Certbot 不支持 dry-run 的 `--run-deploy-hooks`，因此另行执行
+  受管钩子，验证固定证书副本与权限。生产 CA 强制重签未执行。
+- 公网凭据验证发现并修复同名历史链接撤销遗漏：原实现只修改第一条有效记录，
+  可能使宽限期旧链接在撤销后继续有效。新增回归覆盖同名有效历史、当前、已到期
+  记录及其他名称；立即撤销全部有效同名记录，带宽限期撤销保留较早的原到期时间。
+  修复后在 VPS 外部以正常 TLS 校验访问首页、订阅和二维码，并实际解码二维码，
+  默认、命名、宽限期旧链接隔离及撤销后统一 404 均通过。临时测试凭据全部撤销，
+  原有默认凭据、协议配置和服务保持正常。Windows 9 个凭据测试、Linux 269 个
+  库测试和 145 个 CLI 测试、Clippy 已通过。
+- 同名撤销补丁的独立生产／测试签名工件再次执行既有三发行版 Docker/systemd
+  验收，Debian 12、Ubuntu 22.04、Ubuntu 24.04 全部通过，脚本退出码为 0。
+  日志：`.scratch/acceptance-bin/docker-acceptance-public-revoke-fix.log`。
 
 ```sh
 cargo fmt --all -- --check
