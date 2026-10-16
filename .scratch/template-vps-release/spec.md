@@ -1,6 +1,6 @@
 # 原始订阅模板保真与 VPS 验证
 
-Status: ready-for-agent
+Status: resolved
 
 按管理员提供的 mihomo-test 两份模板生成完整订阅，保留 DNS、门户直连、TUN、嗅探、规则与节点参数。Mihomo 仅生成代理与自动选择，Global 使用内核自带组，不含表情图标。
 
