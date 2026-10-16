@@ -25,7 +25,7 @@ use crate::subscription::render::SELECTOR_TAG;
 /// The sing-box outbound a rule names to send traffic outside the tunnel, and
 /// the pre-1.11 block outbound. Both match the renderer's own vocabulary; a
 /// rename there must break this module loudly rather than mis-route silently.
-const DIRECT_OUTBOUND: &str = "direct";
+const DIRECT_OUTBOUND: &str = "DIRECT";
 const LEGACY_BLOCK_OUTBOUND: &str = "block-out";
 
 /// Match types accepted in a list line. Clash's `GEOSITE`/`RULE-SET` words are
@@ -221,11 +221,15 @@ impl RuleLists {
         else {
             return false;
         };
-        // "lan" is one of the built-in suffixes, so exactly one rule matches.
+        // Rich catalogs carry LAN exceptions; the supplied standard template
+        // carries portal exceptions resolved by the local DNS server instead.
         let Some(target) = rules.iter_mut().find(|rule| {
             rule.get("domain_suffix")
                 .and_then(Value::as_array)
-                .is_some_and(|list| list.iter().any(|value| value.as_str() == Some("lan")))
+                .is_some_and(|list| {
+                    rule["server"] == "dns-local"
+                        || list.iter().any(|value| value.as_str() == Some("lan"))
+                })
         }) else {
             return false;
         };
@@ -469,7 +473,7 @@ mod tests {
         assert_eq!(rules[0]["domain_suffix"], json!(["ads.example"]));
         assert_eq!(rules[1]["outbound"], SELECTOR_TAG);
         assert_eq!(rules[1]["domain"], json!(["api.openai.example"]));
-        assert_eq!(rules[2]["outbound"], "direct");
+        assert_eq!(rules[2]["outbound"], "DIRECT");
         assert_eq!(rules[2]["ip_cidr"], json!(["192.168.0.0/16"]));
 
         // Pre-1.11 has no rule actions, so the same list blocks through the

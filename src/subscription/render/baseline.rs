@@ -38,20 +38,10 @@ pub(super) fn clash_settings(
         }
         .into(),
     );
-    // Keep established group names so existing administrator overrides resolve.
-    for server in base["dns"]["nameserver"].as_array_mut().unwrap() {
-        *server = Value::String(server.as_str().unwrap().replace("#代理", "#节点选择"));
-    }
     let policies = base["dns"]["nameserver-policy"].as_object_mut().unwrap();
-    let domestic = policies.remove("geosite:cn,private").unwrap();
-    // rule-set policies reuse our providers rather than implicitly fetching geosite.dat.
-    if remote {
-        policies.insert("rule-set:geosite-private".into(), domestic.clone());
-        if cn_direct {
-            policies.insert("rule-set:geosite-cn".into(), domestic.clone());
-        }
-    }
+    let domestic = policies["geosite:cn,private"].clone();
     if !remote {
+        policies.remove("geosite:cn,private");
         for domain in RuleMatcher::PRIVATE_DOMAINS.iter().chain(
             if cn_direct {
                 RuleMatcher::CN_DOMAINS

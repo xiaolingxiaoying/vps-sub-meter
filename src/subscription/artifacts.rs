@@ -1109,11 +1109,8 @@ mod tests {
                     "{name} must stay frozen under the {template} template"
                 );
             }
-            for name in [
-                "subscription-sing-box-full.json",
-                "subscription-clash.yaml",
-                "subscription-clash-1.18.yaml",
-            ] {
+            {
+                let name = "subscription-sing-box-full.json";
                 assert_ne!(
                     artifact_text(&standard, name),
                     artifact_text(&artifacts, name),
@@ -1200,7 +1197,7 @@ mod tests {
                 "{template} must reference more rule-sets than standard: {sets:?}"
             );
             for expected in [
-                "节点选择",
+                "代理",
                 "自动选择",
                 "代理分组",
                 "AI服务",
@@ -1232,11 +1229,11 @@ mod tests {
                 .iter()
                 .map(|group| group["name"].as_str().expect("a group has a name"))
                 .collect();
-            assert!(
-                clash_groups.len() > 3,
-                "{template} must grow the clash groups too: {clash_groups:?}"
+            assert_eq!(
+                clash_groups,
+                ["代理", "自动选择"],
+                "Mihomo always uses the supplied two-group layout"
             );
-            assert!(clash_groups.contains(&"故障转移"));
             assert!(
                 !artifact_text(&artifacts, "subscription-sing-box-full.json").contains("故障转移"),
                 "sing-box must not be handed a group it cannot build"
@@ -1275,8 +1272,8 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(cn_verdict(&standard_value), vec!["\"direct\"".to_owned()]);
-        assert_eq!(cn_verdict(&split), vec!["\"direct\"".to_owned()]);
+        assert_eq!(cn_verdict(&standard_value), vec!["\"DIRECT\"".to_owned()]);
+        assert_eq!(cn_verdict(&split), vec!["\"DIRECT\"".to_owned()]);
         assert_eq!(cn_verdict(&global), vec!["\"代理分组\"".to_owned()]);
     }
 
@@ -1326,7 +1323,7 @@ mod tests {
             let rules = full["route"]["rules"].as_array().expect("route rules");
             let direct_rules: Vec<&serde_json::Value> = rules
                 .iter()
-                .filter(|rule| rule["outbound"] == "direct")
+                .filter(|rule| rule["outbound"] == "DIRECT")
                 .collect();
             assert!(
                 direct_rules
@@ -1354,11 +1351,6 @@ mod tests {
                 assert!(
                     !clash.contains("RULE-SET,") && !clash.contains("rule-providers:"),
                     "{name} under {template}/minimal must not reference a rule-set"
-                );
-                assert!(
-                    clash.contains("DOMAIN-SUFFIX,doubleclick.net,REJECT")
-                        || template == ClientTemplate::Standard,
-                    "{name} under {template}/minimal must keep the ads verdict inline"
                 );
                 assert!(
                     !clash.contains("GEOIP,") && !clash.contains("GEOSITE,"),
@@ -1599,7 +1591,9 @@ mod tests {
                     {
                         let key = key.as_str().unwrap();
                         assert!(
-                            !key.starts_with("geosite:"),
+                            !key.starts_with("geosite:")
+                                || (name == "subscription-clash.yaml"
+                                    && rule_profile == crate::config::ClientRuleProfile::Standard),
                             "{name}: implicit geosite download"
                         );
                         if let Some(tag) = key.strip_prefix("rule-set:") {
@@ -1838,12 +1832,12 @@ ot-a-sing-box.bin"
         fs::create_dir_all(&overrides).expect("override directory is created");
         fs::write(
             overrides.join("sing-box-override.json"),
-            r#"{"route":{"rules":[{"domain_suffix":["novixlink"],"outbound":"节点选择"}]}}"#,
+            r#"{"route":{"rules":[{"domain_suffix":["novixlink"],"outbound":"代理"}]}}"#,
         )
         .expect("sing-box override is written");
         fs::write(
             overrides.join("clash-override.yaml"),
-            "rules:\n  - DOMAIN-SUFFIX,novixlink,节点选择\n",
+            "rules:\n  - DOMAIN-SUFFIX,novixlink,代理\n",
         )
         .expect("clash override is written");
         let artifacts = generated_artifacts(&config, fixture.path())
@@ -2444,7 +2438,7 @@ ot-a-sing-box.bin"
             "a block always wins over a later allow, and sing-box blocks with a \
              route action rather than an outbound nobody declares"
         );
-        assert_eq!(route_rules[1]["outbound"], "节点选择");
+        assert_eq!(route_rules[1]["outbound"], "代理");
         assert_eq!(
             route_rules[1]["domain_suffix"],
             serde_json::json!(["need-proxy.test"])
@@ -2483,7 +2477,7 @@ ot-a-sing-box.bin"
                 .expect("clash artifact is YAML");
         let clash_rules = clash["rules"].as_sequence().expect("clash rules");
         assert_eq!(clash_rules[0], "DOMAIN-SUFFIX,ads.test,REJECT");
-        assert_eq!(clash_rules[1], "DOMAIN-SUFFIX,need-proxy.test,节点选择");
+        assert_eq!(clash_rules[1], "DOMAIN-SUFFIX,need-proxy.test,代理");
         let filter = clash["dns"]["fake-ip-filter"]
             .as_sequence()
             .expect("clash fake-ip filter");
@@ -2532,7 +2526,7 @@ ot-a-sing-box.bin"
             .as_array()
             .expect("dns servers")
             .iter()
-            .find(|server| server["tag"] == "dns-direct")
+            .find(|server| server["tag"] == "dns-cn")
             .expect("the direct resolver is present");
         assert_eq!(direct["type"], "udp", "the default must stay UDP");
 
@@ -2550,7 +2544,7 @@ ot-a-sing-box.bin"
             .as_array()
             .expect("dns servers")
             .iter()
-            .find(|server| server["tag"] == "dns-direct")
+            .find(|server| server["tag"] == "dns-cn")
             .expect("the direct resolver is present");
         assert_eq!(direct["type"], "https");
         assert_eq!(direct["server"], "223.5.5.5");
@@ -2570,7 +2564,7 @@ ot-a-sing-box.bin"
             .as_array()
             .expect("legacy dns servers")
             .iter()
-            .find(|server| server["tag"] == "dns-direct")
+            .find(|server| server["tag"] == "dns-cn")
             .expect("the legacy direct resolver is present");
         assert_eq!(
             legacy_direct["address"], "https://223.5.5.5/dns-query",

@@ -5,13 +5,12 @@ use super::{
 use crate::canonical::CanonicalNode;
 use crate::config::{ClientRuleProfile, DeploymentConfig};
 use crate::subscription::artifacts::SubscriptionError;
-use crate::subscription::template::{GroupMember, GroupTag};
+use crate::subscription::template::GroupTag;
 use crate::subscription::{GroupRole, GroupSpec, RuleMatcher, RuleSetKind, TemplateSpec};
 
-/// The clash artifact's group tag vocabulary, kept apart from the sing-box
-/// tags in `render/mod.rs` so neither format's names drift.
-const CLASH_SELECTOR_TAG: &str = "节点选择";
-const CLASH_DIRECT_TAG: &str = "全球直连";
+/// The supplied template group names; GLOBAL belongs to the Mihomo core.
+const CLASH_SELECTOR_TAG: &str = "代理";
+const CLASH_DIRECT_TAG: &str = "DIRECT";
 /// The core's own direct policy, which is what a `GEOIP,LAN` / `GEOIP,CN`
 /// verdict has always carried here: the pseudo-proxy, not the `全球直连`
 /// group that wraps it for the user.
@@ -74,7 +73,7 @@ fn clash_proxies(
                 tls_server_name,
                 password,
             } => format!(
-                "  - name: {}\n    type: hysteria2\n    server: {host}\n    port: {port}\n    password: {password}\n    sni: {tls_server_name}\n    skip-cert-verify: {skip}\n",
+                "  - name: {}\n    type: hysteria2\n    server: {host}\n    port: {port}\n    password: {password}\n    sni: {tls_server_name}\n    skip-cert-verify: {skip}\n    up: 50 Mbps\n    down: 200 Mbps\n",
                 node.tag()
             ),
             CanonicalNode::Tuic {
@@ -103,7 +102,7 @@ fn clash_proxies(
     for group in spec
         .groups
         .iter()
-        .filter(|group| group.renderers.includes_clash())
+        .filter(|group| matches!(group.tag, GroupTag::Selector | GroupTag::Auto))
     {
         let tag = clash_tag(group.tag);
         match group.role {
@@ -132,21 +131,9 @@ fn clash_proxies(
 
 /// A group's members as clash proxy names, in declaration order.
 fn clash_members(group: &GroupSpec, nodes: &[CanonicalNode]) -> Vec<String> {
-    if group.role == GroupRole::Direct {
-        // The direct group opens with the core's own `DIRECT` pseudo-proxy —
-        // the tag its built-in geo verdicts (`GEOIP,LAN`, `GEOIP,CN`) resolve
-        // to as well — and then lists the nodes, which is the historical shape.
-        let mut members = vec![CLASH_BUILTIN_DIRECT.to_owned()];
-        members.extend(nodes.iter().map(|node| node.tag().to_owned()));
-        return members;
-    }
-    let mut members = Vec::new();
-    for member in &group.members {
-        match member {
-            GroupMember::Group(tag) => members.push(clash_tag(*tag).to_owned()),
-            GroupMember::BuiltinDirect => members.push(CLASH_BUILTIN_DIRECT.to_owned()),
-            GroupMember::AllNodes => members.extend(nodes.iter().map(|node| node.tag().to_owned())),
-        }
+    let mut members: Vec<String> = nodes.iter().map(|node| node.tag().to_owned()).collect();
+    if group.tag == GroupTag::Selector {
+        members.extend([AUTO_TAG.to_owned(), CLASH_BUILTIN_DIRECT.to_owned()]);
     }
     members
 }
@@ -374,7 +361,7 @@ pub(crate) fn clash(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
 ) -> Result<String, SubscriptionError> {
-    let spec = TemplateSpec::for_template(config, config.client_template.clone());
+    let spec = TemplateSpec::for_template(config, crate::subscription::ClientTemplate::Standard);
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
     let mut output = clash_proxies(config, nodes, &spec)?;
     // The AI suffix rules must precede the CN rule-set so OpenAI/X domains
@@ -402,7 +389,7 @@ pub(crate) fn clash_legacy(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
 ) -> Result<String, SubscriptionError> {
-    let spec = TemplateSpec::for_template(config, config.client_template.clone());
+    let spec = TemplateSpec::for_template(config, crate::subscription::ClientTemplate::Standard);
     let mut output = clash_proxies(config, nodes, &spec)?;
     output.push_str(&clash_rules(&spec, false, config));
     Ok(super::baseline::clash_settings(

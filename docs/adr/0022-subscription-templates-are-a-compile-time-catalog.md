@@ -66,3 +66,19 @@ are repository inputs, not deployment-time administrator files. Portal DNS and
 routing, TUN MTU 1400, the sample campus subnet exclusion and the mixed listener
 now follow the supplied templates. See `src/subscription/templates/README.md`
 for the precise adaptation boundary.
+
+## Amendment — 2026-10-16: preserve the supplied standard template
+
+The administrator explicitly requires all supplied template settings to survive.
+Standard full sing-box profiles now use the complete vendored document, adapting
+only live nodes, explicit administrator options and per-minor compatibility.
+This supersedes the earlier amendment's DNS pruning and historical group names.
+The standard resolver tags, DIRECT outbound and selector name follow the source.
+Default sing-box rule-set URLs retain the supplied SagerNet sources; explicitly
+configured mirrors still override them. Bare node/URI bytes remain unchanged.
+
+All Mihomo artifacts use exactly the supplied manual and automatic groups,
+regardless of the optional sing-box policy catalog. No custom GLOBAL or direct
+group is emitted: the Mihomo core owns GLOBAL. The manual group lists nodes,
+automatic selection and DIRECT in that order. This deliberately supersedes
+Mihomo purpose-group catalogs; sing-box global/split remain available.

@@ -153,6 +153,10 @@ pub(crate) fn sing_box_full(
         )));
     }
     let nodes = &compatible_nodes;
+    if config.client_template == crate::subscription::ClientTemplate::Standard {
+        return standard_full(config, nodes, profile);
+    }
+
     let baseline = &*super::baseline::SING_BOX;
     let spec = TemplateSpec::for_template(config, config.client_template.clone());
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
@@ -442,6 +446,158 @@ pub(crate) fn sing_box_full(
         }
     }))
     .expect("JSON values serialize"))
+}
+
+/// The supplied template is authoritative for the standard profile. Only live
+/// nodes, explicit administrator settings and documented version adapters vary.
+fn standard_full(
+    config: &DeploymentConfig,
+    nodes: &[CanonicalNode],
+    profile: &SingBoxVersionProfile,
+) -> Result<String, SubscriptionError> {
+    let mut value = super::baseline::SING_BOX.clone();
+    let baseline = &*super::baseline::SING_BOX;
+    let fake_ip = config.client_dns_mode == crate::config::ClientDnsMode::FakeIp;
+    let remote = config.client_rule_profile == ClientRuleProfile::Standard;
+    let mut outbounds = baseline["outbounds"].as_array().unwrap()[..2].to_vec();
+    let tags: Vec<_> = nodes.iter().map(CanonicalNode::tag).collect();
+    let mut manual = tags.clone();
+    manual.extend([AUTO_TAG, DIRECT_TAG]);
+    outbounds[0]["outbounds"] = json!(manual);
+    outbounds[1]["outbounds"] = json!(tags);
+    outbounds[1]["url"] = json!(config.client_latency_probe_url);
+    for live in client_outbounds(config, nodes) {
+        let mut node = baseline["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["type"] == live["type"])
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        // Live TLS objects carry real SNI, trust and Reality parameters.
+        for (key, field) in live.as_object().unwrap() {
+            node[key] = field.clone();
+        }
+        if node["type"] == "vmess" {
+            node["transport"]["headers"] = json!({"Host": node["tls"]["server_name"]});
+        }
+        outbounds.push(node);
+    }
+    outbounds.push(json!({"type": "direct", "tag": DIRECT_TAG}));
+    if config.client_dns_preset == crate::config::ClientDnsPreset::Privacy {
+        value["dns"]["servers"][1]["type"] = json!("https");
+    }
+    if !fake_ip {
+        value["dns"]["servers"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|s| s["type"] != "fakeip");
+        value["dns"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|r| r["server"] != "dns-fakeip");
+    }
+    if !remote {
+        value["route"]["rule_set"] = json!([]);
+        value["route"]["rules"].as_array_mut().unwrap().pop();
+        for rule in [
+            json!({"domain_suffix": RuleMatcher::PRIVATE_DOMAINS, "outbound": DIRECT_TAG}),
+            json!({"domain_suffix": RuleMatcher::CN_DOMAINS, "outbound": DIRECT_TAG}),
+            json!({"ip_cidr": RuleMatcher::CN_ADDRESSES, "outbound": DIRECT_TAG}),
+        ] {
+            value["route"]["rules"].as_array_mut().unwrap().push(rule);
+        }
+        value["dns"]["rules"][1] = json!({"domain_suffix":
+            RuleMatcher::PRIVATE_DOMAINS.iter().chain(RuleMatcher::CN_DOMAINS).collect::<Vec<_>>(),
+            "server": "dns-cn"});
+    } else {
+        // Preserve the supplied SagerNet sources by default; keep explicit mirrors.
+        let custom_base = config.client_rule_set_base_url.trim_end_matches('/');
+        for entry in value["route"]["rule_set"].as_array_mut().unwrap() {
+            if custom_base != "https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat" {
+                let tag = entry["tag"].as_str().unwrap();
+                let (kind, name) = tag.split_once('-').unwrap();
+                entry["url"] = json!(format!("{custom_base}@sing/geo/{kind}/{name}.srs"));
+            }
+            entry["update_interval"] = json!(config.client_rule_set_update_interval);
+        }
+        let (sets, rules) = extra_rule_sets(config, !profile.route_rule_actions);
+        value["route"]["rule_set"]
+            .as_array_mut()
+            .unwrap()
+            .extend(sets);
+        let existing = value["route"]["rules"].as_array_mut().unwrap();
+        existing.splice(0..0, rules);
+    }
+    if !profile.typed_dns {
+        let mut servers = Vec::new();
+        for server in value["dns"]["servers"].as_array().unwrap() {
+            let address = match server["type"].as_str().unwrap() {
+                "local" => "local".to_owned(),
+                "https" => format!("https://{}/dns-query", server["server"].as_str().unwrap()),
+                "fakeip" => "fakeip".to_owned(),
+                _ => server["server"].as_str().unwrap().to_owned(),
+            };
+            let mut legacy = json!({"tag": server["tag"], "address": address});
+            if let Some(detour) = server.get("detour") {
+                legacy["detour"] = detour.clone();
+            }
+            servers.push(legacy);
+        }
+        value["dns"]["servers"] = json!(servers);
+        if fake_ip {
+            let mut pool = baseline["dns"]["servers"][4].clone();
+            pool.as_object_mut().unwrap().remove("tag");
+            pool.as_object_mut().unwrap().remove("type");
+            pool["enabled"] = json!(true);
+            value["dns"]["fakeip"] = pool;
+        }
+        value["dns"]["rules"]
+            .as_array_mut()
+            .unwrap()
+            .insert(1, json!({"outbound": "any", "server": "dns-cn"}));
+        value["route"]
+            .as_object_mut()
+            .unwrap()
+            .remove("default_domain_resolver");
+    }
+    if !profile.route_rule_actions {
+        value["inbounds"][0]["sniff"] = json!(true);
+        let rules = value["route"]["rules"].as_array_mut().unwrap();
+        rules.retain(|r| r["action"] != "sniff");
+        for rule in rules {
+            if rule["action"] == "hijack-dns" {
+                rule["outbound"] = json!("dns-out");
+            } else if rule["action"] == "reject" {
+                rule["outbound"] = json!(LEGACY_BLOCK_TAG);
+            }
+            rule.as_object_mut().unwrap().remove("action");
+        }
+        outbounds.push(json!({"type": "dns", "tag": "dns-out"}));
+        if config
+            .client_extra_rule_sets
+            .iter()
+            .any(|s| s.outbound == "reject")
+        {
+            outbounds.push(json!({"type": "block", "tag": LEGACY_BLOCK_TAG}));
+        }
+    }
+    value["inbounds"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("stack");
+    if let Some(stack) = profile.tun_stack {
+        value["inbounds"][0]["stack"] = json!(stack);
+    }
+    value["experimental"]["cache_file"]["store_fakeip"] = json!(fake_ip);
+    if profile.supports_store_dns {
+        value["experimental"]["cache_file"]["store_dns"] = json!(true);
+    }
+    if let Some(secret) = &config.client_clash_api_secret {
+        value["experimental"]["clash_api"]["secret"] = json!(secret);
+    }
+    value["outbounds"] = json!(outbounds);
+    Ok(serde_json::to_string_pretty(&value).expect("template serializes"))
 }
 
 fn remote_rule_set(tag: &str, url: &str, update_interval: &str) -> Value {
@@ -1030,7 +1186,7 @@ mod tests {
             "1.14 DNS must be typed"
         );
         assert_eq!(
-            typed["route"]["default_domain_resolver"]["server"], "dns-direct",
+            typed["route"]["default_domain_resolver"]["server"], "dns-cn",
             "1.14 resolves outbound server domains through default_domain_resolver"
         );
     }

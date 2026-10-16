@@ -115,9 +115,9 @@ pub(super) fn client_outbounds(config: &DeploymentConfig, nodes: &[CanonicalNode
 
 /// Group tags shared by the full sing-box client profile and the clash
 /// artifact so panel screenshots and docs read the same everywhere.
-pub const SELECTOR_TAG: &str = "节点选择";
+pub const SELECTOR_TAG: &str = "代理";
 pub const AUTO_TAG: &str = "自动选择";
-pub(super) const DIRECT_TAG: &str = "direct";
+pub(super) const DIRECT_TAG: &str = "DIRECT";
 
 /// The tags the richer templates add. Unlike the three above, a group's name is
 /// identical in both formats — nothing historical has to stay compatible, and
@@ -268,24 +268,23 @@ mod tests {
             .expect("full config generates");
         let uri = uri(&config, &nodes).expect("uri artifacts generate");
 
-        assert!(
-            clash.contains("  - name: 节点选择\n    type: select\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    proxies:\n      - 自动选择\n      - DIRECT\n"),
-            "clash subscription exposes the manual selection group"
-        );
-        assert!(
-            clash.contains("  - name: 自动选择\n    type: url-test\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    tolerance: 50\n"),
-            "clash subscription exposes the automatic selection group"
-        );
-        assert!(
-            clash.contains("  - name: 全球直连\n    type: select\n    url: \"https://www.gstatic.com/generate_204\"\n    interval: 300\n    lazy: false\n    proxies:\n      - DIRECT\n"),
-            "clash subscription exposes the direct selection group"
-        );
+        let parsed: serde_yaml::Value = serde_yaml::from_str(&clash).unwrap();
+        let groups = parsed["proxy-groups"].as_sequence().unwrap();
+        assert_eq!(groups.len(), 2);
+        assert_eq!(groups[0]["name"], "代理");
+        assert_eq!(groups[1]["name"], "自动选择");
+        let names: Vec<_> = nodes.iter().map(|node| node.tag()).collect();
+        let mut manual = names.clone();
+        manual.extend(["自动选择", "DIRECT"]);
+        assert_eq!(groups[0]["proxies"], serde_yaml::to_value(manual).unwrap());
+        assert_eq!(groups[1]["proxies"], serde_yaml::to_value(names).unwrap());
+        assert!(groups.iter().all(|g| g["name"] != "GLOBAL"));
         for rule in [
-            "  - DOMAIN-SUFFIX,chatgpt.com,节点选择\n",
-            "  - DOMAIN-SUFFIX,x.com,节点选择\n",
-            "  - RULE-SET,geosite-cn,全球直连\n",
-            "  - RULE-SET,geoip-cn,全球直连\n",
-            "  - MATCH,节点选择\n",
+            "  - DOMAIN-SUFFIX,chatgpt.com,代理\n",
+            "  - DOMAIN-SUFFIX,x.com,代理\n",
+            "  - RULE-SET,geosite-cn,DIRECT\n",
+            "  - RULE-SET,geoip-cn,DIRECT\n",
+            "  - MATCH,代理\n",
         ] {
             assert!(
                 clash.contains(rule),
@@ -307,13 +306,13 @@ mod tests {
         // a database mihomo downloads from GitHub on first use, so this artifact
         // spells the same verdicts out as compiled-in lists instead.
         for rule in [
-            "  - RULE-SET,geosite-cn,全球直连\n",
+            "  - RULE-SET,geosite-cn,DIRECT\n",
             "  - GEOIP,LAN,DIRECT\n",
             "  - GEOIP,CN,DIRECT\n",
             "  - DOMAIN-SUFFIX,baidu.com,DIRECT\n",
             "  - IP-CIDR,27.192.0.0/11,DIRECT,no-resolve\n",
             "  - IP-CIDR6,fc00::/7,DIRECT,no-resolve\n",
-            "  - MATCH,节点选择\n",
+            "  - MATCH,代理\n",
         ] {
             assert_eq!(
                 clash_legacy.contains(rule),
@@ -322,7 +321,7 @@ mod tests {
                     "  - DOMAIN-SUFFIX,baidu.com,DIRECT\n"
                         | "  - IP-CIDR,27.192.0.0/11,DIRECT,no-resolve\n"
                         | "  - IP-CIDR6,fc00::/7,DIRECT,no-resolve\n"
-                        | "  - MATCH,节点选择\n"
+                        | "  - MATCH,代理\n"
                 ),
                 "legacy clash inlines its verdicts and asks for no external data: {rule}"
             );
@@ -381,7 +380,7 @@ mod tests {
         // rule-sets, and the clash API for dashboards.
         for fragment in [
             "\"tun\"",
-            "节点选择",
+            "代理",
             "自动选择",
             "\"selector\"",
             "\"urltest\"",
@@ -397,6 +396,88 @@ mod tests {
                 sing_box_full.contains(fragment),
                 "full sing-box client profile carries {fragment}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod supplied_template_tests {
+    use super::*;
+    use crate::config::{ClientRuleProfile, SubscriptionMode};
+    use crate::subscription::{ClientTemplate, latest_version_profile};
+
+    fn config() -> DeploymentConfig {
+        DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "192.0.2.1".into(),
+            None,
+            Some(2080),
+            "eth0".into(),
+            vec![
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::VmessWebsocket,
+                ManagedProtocol::Hysteria2,
+                ManagedProtocol::Tuic,
+                ManagedProtocol::Anytls,
+            ],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn standard_sing_box_preserves_supplied_dns_route_and_node_defaults() {
+        let config = config();
+        let nodes = crate::canonical::nodes(&config);
+        let actual: Value = serde_json::from_str(
+            &sing_box_full(&config, &nodes, latest_version_profile()).unwrap(),
+        )
+        .unwrap();
+        let expected = &*baseline::SING_BOX;
+        for section in ["dns", "inbounds", "route", "log"] {
+            assert_eq!(
+                actual[section], expected[section],
+                "template section {section}"
+            );
+        }
+        let outbounds = actual["outbounds"].as_array().unwrap();
+        let hysteria = outbounds.iter().find(|o| o["type"] == "hysteria2").unwrap();
+        assert_eq!(hysteria["up_mbps"], 50);
+        assert_eq!(hysteria["down_mbps"], 200);
+        let vmess = outbounds.iter().find(|o| o["type"] == "vmess").unwrap();
+        assert_eq!(
+            vmess["transport"]["headers"]["Host"],
+            vmess["tls"]["server_name"]
+        );
+        assert!(!actual.to_string().contains("YOUR-"));
+    }
+
+    #[test]
+    fn mihomo_preserves_supplied_settings_and_only_declares_two_groups() {
+        for template in [
+            ClientTemplate::Standard,
+            ClientTemplate::Global,
+            ClientTemplate::Split,
+        ] {
+            let mut config = config();
+            config.client_template = template;
+            let nodes = crate::canonical::nodes(&config);
+            let actual: Value = serde_yaml::from_str(&clash(&config, &nodes).unwrap()).unwrap();
+            for (key, expected) in baseline::MIHOMO.as_object().unwrap() {
+                if ["proxies", "proxy-groups", "rules"].contains(&key.as_str()) {
+                    continue;
+                }
+                assert_eq!(&actual[key], expected, "template setting {key}");
+            }
+            assert_eq!(actual["rules"], baseline::MIHOMO["rules"]);
+            assert_eq!(actual["proxy-groups"].as_array().unwrap().len(), 2);
+            let members: Vec<_> = nodes.iter().map(|n| n.tag()).collect();
+            assert_eq!(actual["proxy-groups"][1]["proxies"], json!(members));
+            assert!(!actual.to_string().contains("GLOBAL"));
+            config.client_rule_profile = ClientRuleProfile::Minimal;
+            let minimal = clash(&config, &nodes).unwrap();
+            assert!(!minimal.contains("geosite:cn,private"));
+            assert!(!minimal.contains("rule-providers:"));
         }
     }
 }

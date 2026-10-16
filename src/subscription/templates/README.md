@@ -1,14 +1,18 @@
 # 内置客户端配置模板
 
-来源：`C:\Users\ranly\Documents\mihomo-test` 的 `mihomo.yaml`、`sing-box.json`（2026-10-16）。Mihomo 保留原始 YAML；sing-box 移除 JSONC 注释后保存为标准 JSON。通过 `include_str!` 编译进程序，VPS 不依赖此 Windows 路径，也不会随来源文件的后续编辑自动更新。
+来源：`C:\Users\ranly\Documents\mihomo-test` 的 `mihomo.yaml`、`sing-box.json`（2026-10-16）。Mihomo 保留原始 YAML；sing-box 仅移除 JSONC 注释后保存为标准 JSON。通过 `include_str!` 编译进程序，VPS 不依赖此 Windows 路径。
 
-生成器读取这里的客户端基础设置，并作以下适配：
+默认 `standard` 完整 sing-box 订阅以原模板为主体，保留全部五个 DNS 服务器、DNS 与路由规则顺序、SagerNet 规则源、TUN/mixed 入站、缓存和控制接口。仅填入真实节点、凭据、端口、TLS 信任策略，并应用明确配置的测速 URL、规则镜像、更新周期、DNS 模式、privacy 预设与覆写。VMess 保留实际 SNI 对应的 Host，Hysteria2 保留上行 50 / 下行 200 Mbps。
 
-- 节点、凭据、端口和证书策略由部署配置填入，模板中的 `YOUR-` 示例节点不会进入订阅。
-- 保留现有策略组名称（`节点选择`、`自动选择`、`direct` 等）、standard/global/split 策略目录、自定义规则源、测速 URL 和覆写优先级。
-- Mihomo 采用模板中的基础端口、DNS、嗅探和 TUN 设置；`geosite:` DNS 策略改为引用已生成的 `rule-set:`，避免额外下载 geosite 数据库。minimal / 1.18 配置改用内置域名列表，不引用远程规则集。
-- sing-box 使用模板中的 TUN、mixed 入站、DNS 服务器、IPv4 优先和门户直连设置；1.10/1.11 继续转换为旧版 DNS，1.10 使用入站 sniff 和 DNS 出站，AnyTLS / store_dns 仍按版本控制。
-- sing-box 的 DNS 标识保留 `dns-direct` / `dns-proxy`，国内解析的 privacy 预设仍切换为 DoH。未被策略目录使用的示例节点、冗余 DNS 服务器不输出。
-- 模板中的校园网示例网段 `202.202.145.0/24` 原样保留在 TUN 排除与直连规则中。实际使用其他校园网段时，通过客户端覆写文件调整两处设置。
+Mihomo 所有模板选项均采用原模板的两个策略组：
 
-本次更换会更新完整客户端订阅的配置快照；裸节点 `sing-box.json`、URI 和服务端配置沿用原有生成契约。
+- `代理`：全部节点、`自动选择`、`DIRECT`，依次排列。
+- `自动选择`：仅全部节点。
+
+不生成自定义 `GLOBAL`、直连、故障转移或服务分类组，Global 由 Mihomo 内核提供。保留模板的 DNS（包括 `geosite:cn,private` 策略）、嗅探、TUN、门户直连及其优先级。组名与规则引用均无表情图标。
+
+兼容性适配：sing-box 1.10/1.11 转换为旧版 DNS；1.10 用入站 sniff 与 DNS 出站；旧版移除不支持的 AnyTLS，缓存和 TUN stack 按版本控制。minimal 规则配置与 Mihomo 1.18 仍使用内置规则，不下载远程规则集或地理数据库。sing-box 的可选 global/split 策略目录仍保留。
+
+裸节点 `sing-box.json`、URI 和服务端配置保留原有生成契约。完整 sing-box 组名现在为 `代理`、`自动选择`、`DIRECT`，DNS 标签与原模板一致。已有覆写若引用 `节点选择`、`direct`、`dns-direct` 或 `dns-proxy`，应分别改为 `代理`、`DIRECT`、`dns-cn`、`dns-remote`；不再需要的旧默认值覆写应移除，避免覆盖模板。
+
+校园网示例网段 `202.202.145.0/24` 原样保留；需要其他网段时，通过覆写同时调整 TUN 排除与直连规则。

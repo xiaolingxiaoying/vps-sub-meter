@@ -988,7 +988,7 @@ fn rule_add_writes_the_list_and_regenerates_the_subscription() {
         "the added rule must be the first verdict: {}",
         value["route"]["rules"]
     );
-    assert_eq!(value["route"]["rules"][0]["outbound"], "节点选择");
+    assert_eq!(value["route"]["rules"][0]["outbound"], "代理");
 
     // Re-adding is a no-op with an explanation, not a duplicated line.
     Command::cargo_bin("sbctl")
