@@ -1,0 +1,301 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "dns": {
+    "servers": [
+      {
+        "tag": "dns-local",
+        "type": "local"
+      },
+      {
+        "tag": "dns-cn",
+        "type": "udp",
+        "server": "223.5.5.5",
+        "detour": "DIRECT"
+      },
+      {
+        "tag": "dns-cn-doh",
+        "type": "https",
+        "server": "223.5.5.5",
+        "detour": "DIRECT"
+      },
+      {
+        "tag": "dns-remote",
+        "type": "https",
+        "server": "1.1.1.1",
+        "detour": "代理"
+      },
+      {
+        "tag": "dns-fakeip",
+        "type": "fakeip",
+        "inet4_range": "198.18.0.0/15",
+        "inet6_range": "fc00::/18"
+      }
+    ],
+    "rules": [
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com",
+          "captive.apple.com",
+          "connectivitycheck.gstatic.com",
+          "detectportal.firefox.com",
+          "connectivity-check.ubuntu.com",
+          "networkcheck.kde.org"
+        ],
+        "server": "dns-local"
+      },
+      {
+        "rule_set": [
+          "geosite-cn",
+          "geosite-private"
+        ],
+        "server": "dns-cn"
+      },
+      {
+        "query_type": [
+          "A",
+          "AAAA"
+        ],
+        "server": "dns-fakeip"
+      }
+    ],
+    "final": "dns-remote",
+    "strategy": "prefer_ipv4"
+  },
+  "inbounds": [
+    {
+      "type": "tun",
+      "tag": "tun-in",
+      "interface_name": "singbox-tun",
+      "address": [
+        "172.18.0.1/30"
+      ],
+      "mtu": 1400,
+      "auto_route": true,
+      "strict_route": false,
+      "route_exclude_address": [
+        "202.202.145.0/24"
+      ],
+      "stack": "mixed"
+    },
+    {
+      "type": "mixed",
+      "tag": "mixed-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7890
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "selector",
+      "tag": "代理",
+      "outbounds": [
+        "node-01-vless-reality",
+        "node-02-vmess-ws",
+        "node-03-hysteria2",
+        "node-04-tuic",
+        "自动选择",
+        "DIRECT"
+      ],
+      "default": "自动选择"
+    },
+    {
+      "type": "urltest",
+      "tag": "自动选择",
+      "outbounds": [
+        "node-01-vless-reality",
+        "node-02-vmess-ws",
+        "node-03-hysteria2",
+        "node-04-tuic"
+      ],
+      "url": "https://www.gstatic.com/generate_204",
+      "interval": "5m",
+      "tolerance": 50
+    },
+    {
+      "type": "vless",
+      "tag": "node-01-vless-reality",
+      "server": "YOUR-SERVER.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "flow": "xtls-rprx-vision",
+      "tls": {
+        "enabled": true,
+        "server_name": "YOUR-CAMOUFLAGE.example.com",
+        "utls": {
+          "enabled": true,
+          "fingerprint": "chrome"
+        },
+        "reality": {
+          "enabled": true,
+          "public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+          "short_id": "0123456789abcdef"
+        }
+      }
+    },
+    {
+      "type": "vmess",
+      "tag": "node-02-vmess-ws",
+      "server": "YOUR-SERVER.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "security": "auto",
+      "alter_id": 0,
+      "tls": {
+        "enabled": true,
+        "server_name": "YOUR-SNI.example.com"
+      },
+      "transport": {
+        "type": "ws",
+        "path": "/YOUR-WS-PATH",
+        "headers": {
+          "Host": "YOUR-SNI.example.com"
+        }
+      }
+    },
+    {
+      "type": "hysteria2",
+      "tag": "node-03-hysteria2",
+      "server": "YOUR-SERVER.example.com",
+      "server_port": 443,
+      "password": "YOUR-PASSWORD",
+      "tls": {
+        "enabled": true,
+        "server_name": "YOUR-SNI.example.com"
+      },
+      "up_mbps": 50,
+      "down_mbps": 200
+    },
+    {
+      "type": "tuic",
+      "tag": "node-04-tuic",
+      "server": "YOUR-SERVER.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-0000-0000-000000000000",
+      "password": "YOUR-PASSWORD",
+      "congestion_control": "bbr",
+      "tls": {
+        "enabled": true,
+        "server_name": "YOUR-SNI.example.com",
+        "alpn": [
+          "h3"
+        ]
+      }
+    },
+    {
+      "type": "direct",
+      "tag": "DIRECT"
+    }
+  ],
+  "route": {
+    "auto_detect_interface": true,
+    "final": "代理",
+    "default_domain_resolver": {
+      "server": "dns-cn",
+      "strategy": "prefer_ipv4"
+    },
+    "rules": [
+      {
+        "action": "sniff"
+      },
+      {
+        "protocol": "dns",
+        "action": "hijack-dns"
+      },
+      {
+        "domain_suffix": [
+          "msftconnecttest.com",
+          "msftncsi.com",
+          "captive.apple.com",
+          "connectivitycheck.gstatic.com",
+          "detectportal.firefox.com",
+          "connectivity-check.ubuntu.com",
+          "networkcheck.kde.org"
+        ],
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "ip_cidr": [
+          "202.202.145.0/24"
+        ],
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "ip_is_private": true,
+        "action": "route",
+        "outbound": "DIRECT"
+      },
+      {
+        "domain_suffix": [
+          "chatgpt.com",
+          "openai.com",
+          "oaistatic.com",
+          "oaiusercontent.com",
+          "x.com",
+          "twitter.com",
+          "twimg.com"
+        ],
+        "action": "route",
+        "outbound": "代理"
+      },
+      {
+        "rule_set": [
+          "geosite-private",
+          "geoip-private",
+          "geosite-cn",
+          "geoip-cn"
+        ],
+        "action": "route",
+        "outbound": "DIRECT"
+      }
+    ],
+    "rule_set": [
+      {
+        "type": "remote",
+        "tag": "geosite-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-cn.srs",
+        "download_detour": "DIRECT",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geosite-private",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geosite@rule-set/geosite-private.srs",
+        "download_detour": "DIRECT",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-cn",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
+        "download_detour": "DIRECT",
+        "update_interval": "1d"
+      },
+      {
+        "type": "remote",
+        "tag": "geoip-private",
+        "format": "binary",
+        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-private.srs",
+        "download_detour": "DIRECT",
+        "update_interval": "1d"
+      }
+    ]
+  },
+  "experimental": {
+    "cache_file": {
+      "enabled": true,
+      "store_fakeip": true
+    },
+    "clash_api": {
+      "external_controller": "127.0.0.1:9090"
+    }
+  }
+}

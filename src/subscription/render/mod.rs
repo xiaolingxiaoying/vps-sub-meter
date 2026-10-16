@@ -1,6 +1,7 @@
 //! The per-format subscription renderers: the bare sing-box outbound list, the
 //! full client profiles, the clash artefacts and the share-link URIs. The group
 //! tags and the shared domain lists live here so no two formats can drift apart.
+mod baseline;
 mod clash;
 mod singbox;
 mod uri;
@@ -212,7 +213,6 @@ mod tests {
         )
         .expect("an ip fallback deployment is valid");
         let nodes = crate::canonical::nodes(&config);
-        let block = "sniffer:\n  enable: true\n  sniffing:\n    - http\n    - tls\n    - quic\n";
 
         for (name, artifact) in [
             (
@@ -224,24 +224,18 @@ mod tests {
                 clash_legacy(&config, &nodes).expect("legacy clash generates"),
             ),
         ] {
+            let value: serde_yaml::Value = serde_yaml::from_str(&artifact).unwrap();
+            assert_eq!(value["sniffer"]["enable"].as_bool(), Some(true), "{name}");
             assert_eq!(
-                artifact.matches(block).count(),
-                1,
-                "{name} must enable sniffing exactly once"
+                value["sniffer"]["sniffing"],
+                serde_yaml::to_value(["http", "tls", "quic"]).unwrap()
             );
-            for rejected in [
-                "dns-hijack",
-                "sniffers:",
-                "override-destination",
-                "- domain",
-                "- dns",
-            ] {
-                assert!(
-                    !artifact.contains(rejected),
-                    "{name} must not carry {rejected}: it is either already the core's \
-                     default or refused by the pinned mihomo parser"
-                );
-            }
+            assert_eq!(
+                value["sniffer"]["override-destination"].as_bool(),
+                Some(false)
+            );
+            assert_eq!(value["tun"]["dns-hijack"][0].as_str(), Some("any:53"));
+            assert!(value["sniffer"]["skip-domain"].as_sequence().unwrap().len() >= 5);
         }
     }
 

@@ -1,6 +1,6 @@
 use super::{
-    AI_DOMAIN_SUFFIXES, AI_TAG, AUTO_TAG, FAKE_IP_FILTER_SUFFIXES, FALLBACK_TAG, PROXY_TAG,
-    STREAM_TAG, TELEGRAM_TAG, client_skip_cert_verify,
+    AI_DOMAIN_SUFFIXES, AI_TAG, AUTO_TAG, FALLBACK_TAG, PROXY_TAG, STREAM_TAG, TELEGRAM_TAG,
+    client_skip_cert_verify,
 };
 use crate::canonical::CanonicalNode;
 use crate::config::{ClientRuleProfile, DeploymentConfig};
@@ -161,6 +161,15 @@ fn clash_rules(spec: &TemplateSpec, remote_rule_sets: bool, config: &DeploymentC
     // template's generic geo verdicts — same precedence as the operator lists.
     if remote_rule_sets {
         rules.push_str(&clash_extra_rules(config));
+    }
+    // Portal detection and the local campus subnet must precede proxy rules.
+    for rule in super::baseline::MIHOMO["rules"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .take(8)
+    {
+        rules.push_str(&format!("  - {}\n", rule.as_str().unwrap()));
     }
     for rule in spec
         .inline_rules
@@ -375,67 +384,12 @@ pub(crate) fn clash(
     if remote_rule_sets {
         output.push_str(&clash_rule_providers(&spec, config));
     }
-    output.push_str(&clash_dns(config));
-    if spec.sniff {
-        output.push_str(clash_sniffer());
-    }
-    Ok(output)
-}
-
-/// The `dns:` block shared by the current and legacy clash artifacts; the
-/// fake-ip filter keeps LAN names, OS connectivity checks, and NTP on real
-/// DNS answers so captive-portal detection keeps working.
-fn clash_dns(config: &DeploymentConfig) -> String {
-    let mode = match config.client_dns_mode {
-        crate::config::ClientDnsMode::FakeIp => "fake-ip",
-        crate::config::ClientDnsMode::RedirHost => "redir-host",
-    };
-    let mut dns = format!(
-        "dns:\n  enable: true\n  ipv6: false\n  enhanced-mode: {mode}\n  fake-ip-range: 198.18.0.1/16\n  fake-ip-filter:\n"
-    );
-    for suffix in FAKE_IP_FILTER_SUFFIXES {
-        dns.push_str(&format!("    - '+.{suffix}'\n"));
-    }
-    dns.push_str(&format!(
-        concat!(
-            "  use-hosts: false\n  use-system-hosts: false\n",
-            "  nameserver:\n    - 'https://1.1.1.1/dns-query#{selector}'\n",
-            "    - 'https://8.8.8.8/dns-query#{selector}'\n",
-            "  proxy-server-nameserver:\n    - https://223.5.5.5/dns-query\n",
-        ),
-        selector = CLASH_SELECTOR_TAG
-    ));
-    dns
-}
-
-/// The `sniffer:` block shared by both clash artifacts.
-///
-/// mihomo ships sniffing **off** (`Enable: false` in `DefaultRawConfig`, with no
-/// sniffer names selected), so a subscriber who never touches the client's own
-/// settings gets connections routed on the raw SNI/host only.
-///
-/// The list is `http`/`tls`/`quic` because that is exactly what the pinned core
-/// accepts: `.scratch/mihomo-sniff-probe.sh` runs candidate names through
-/// mihomo v1.19.30's own config parser, which rejects anything else with
-/// `not find the sniffer[domain]` — the `domain` and `dns` names some guides
-/// advertise do not exist in this build.
-///
-/// No `dns-hijack` is written on purpose. It lives under `tun:`, its default is
-/// already `0.0.0.0:53`, and emitting a `tun:` block from a subscription would
-/// overwrite whatever the client operator configured there.
-///
-/// `override-destination` stays unset: it makes a sniffed domain replace the
-/// original destination for the whole connection, which changes what the remote
-/// server sees, and that is not this project's call to make silently.
-fn clash_sniffer() -> &'static str {
-    concat!(
-        "sniffer:\n",
-        "  enable: true\n",
-        "  sniffing:\n",
-        "    - http\n",
-        "    - tls\n",
-        "    - quic\n"
-    )
+    Ok(super::baseline::clash_settings(
+        &output,
+        config,
+        remote_rule_sets,
+        spec.dns.direct_rule_set.is_some(),
+    ))
 }
 
 /// The mihomo 1.18.x compatibility artifact: same node and group layout as the
@@ -451,9 +405,10 @@ pub(crate) fn clash_legacy(
     let spec = TemplateSpec::for_template(config, config.client_template.clone());
     let mut output = clash_proxies(config, nodes, &spec)?;
     output.push_str(&clash_rules(&spec, false, config));
-    output.push_str(&clash_dns(config));
-    if spec.sniff {
-        output.push_str(clash_sniffer());
-    }
-    Ok(output)
+    Ok(super::baseline::clash_settings(
+        &output,
+        config,
+        false,
+        spec.dns.direct_rule_set.is_some(),
+    ))
 }

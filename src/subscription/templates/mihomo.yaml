@@ -1,0 +1,327 @@
+# =============================================================================
+#  mihomo 配置模板（适配 mihomo v1.19.x / Clash Party / Clash Verge / mihomo CLI）
+#  设计要点（都是实测踩过的坑）：
+#   1. 国内域名用「国内/校园 DNS 直连解析」→ 否则直连也会连到海外 CDN（实测 3.16s → 0.1s）
+#   2. 强制门户/探测域名 → DIRECT + 校园 DNS → 认证页能自动弹、也能手动打开
+#   3. tcp-concurrent 并发拨号 → 解析出多个 IP 时不被黑洞 IP 拖死（实测 502 的元凶）
+#   4. TUN device 必须显式填写 → 留空会用默认值(Meta/mtu9000/gvisor)生成僵尸网卡
+#
+#  ⚙️ 标记的项：在 Clash Party 里由「内核设置」控制，写在覆写里无效（实测）。
+#     如果你用的是 mihomo CLI / 其他客户端，本文件可整体直接使用。
+#
+#  占位符：搜索 "YOUR-" 全部替换成你自己的值（保持格式，配置即可通过 mihomo -t 校验）。
+# =============================================================================
+
+# ------------------------------- 端口 / 基础 ⚙️ ------------------------------
+mixed-port: 7890
+socks-port: 7891
+port: 7892
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+bind-address: "*"
+mode: rule
+log-level: info
+ipv6: false                 # ⚙️ 本机没有可用 IPv6，开着只会产生 AAAA 死路
+unified-delay: true         # ⚙️ 延迟更接近真实
+tcp-concurrent: true        # ⚙️ ★关键：并发拨号，坏 IP 不再拖死整条连接
+find-process-mode: always   # ⚙️ strict 会遍历全部进程；没有 PROCESS-NAME 规则时纯浪费
+external-controller: 127.0.0.1:9090
+secret: ""
+
+profile:
+  store-selected: true
+  store-fake-ip: true
+
+# ------------------------------- 规则集 --------------------------------------
+rule-providers:
+  geosite-private:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs
+    path: ./ruleset/geosite-private.mrs
+    interval: 86400
+  geoip-private:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs
+    path: ./ruleset/geoip-private.mrs
+    interval: 86400
+  geosite-cn:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs
+    path: ./ruleset/geosite-cn.mrs
+    interval: 86400
+  geoip-cn:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs
+    path: ./ruleset/geoip-cn.mrs
+    interval: 86400
+
+# ------------------------------- 节点（占位符）-------------------------------
+# ★ 搜索 "YOUR-" 把所有占位符换成你自己的值（保持当前格式，配置就能通过 mihomo -t 校验）。
+# 想加节点：复制一个 - name: 块就行；记得同时把它加进下面两个策略组的列表。
+proxies:
+  - name: node-01-vless-reality
+    type: vless
+    server: YOUR-SERVER.example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    network: tcp
+    udp: true
+    flow: xtls-rprx-vision
+    tls: true
+    servername: YOUR-CAMOUFLAGE.example.com
+    client-fingerprint: chrome
+    reality-opts:
+      public-key: AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA   # ★43 位 base64url，换成你自己的 REALITY 公钥
+      short-id: 0123456789abcdef                                # ★换成你自己的 short-id
+
+  - name: node-02-vmess-ws
+    type: vmess
+    server: YOUR-SERVER.example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    alterId: 0
+    cipher: auto
+    tls: true
+    servername: YOUR-SNI.example.com
+    network: ws
+    ws-opts:
+      path: /YOUR-WS-PATH
+      headers:
+        Host: YOUR-SNI.example.com
+
+  - name: node-03-hysteria2
+    type: hysteria2
+    server: YOUR-SERVER.example.com
+    port: 443
+    password: YOUR-PASSWORD
+    sni: YOUR-SNI.example.com
+    skip-cert-verify: false     # 能校验就别跳过；只有自签证书才设 true
+    up: 50 Mbps
+    down: 200 Mbps
+
+  - name: node-04-tuic
+    type: tuic
+    server: YOUR-SERVER.example.com
+    port: 443
+    uuid: 00000000-0000-0000-0000-000000000000
+    password: YOUR-PASSWORD
+    sni: YOUR-SNI.example.com
+    alpn: [h3]
+    skip-cert-verify: false
+
+  # - name: node-05-anytls
+  #   type: anytls
+  #   server: YOUR-SERVER.example.com
+  #   port: 443
+  #   password: YOUR-PASSWORD
+  #   sni: YOUR-SNI.example.com
+  #   client-fingerprint: chrome
+  #   udp: true
+
+# ------------------------------- 策略组 --------------------------------------
+proxy-groups:
+  # 代理：手动选择，含所有节点 + 自动选择 + DIRECT
+  - name: 代理
+    type: select
+    url: https://www.gstatic.com/generate_204
+    interval: 300
+    proxies:
+      - node-01-vless-reality
+      - node-02-vmess-ws
+      - node-03-hysteria2
+      - node-04-tuic
+      # - node-05-anytls
+      - 自动选择
+      - DIRECT
+
+  # 自动选择：延迟测速，只含节点
+  - name: 自动选择
+    type: url-test
+    url: https://www.gstatic.com/generate_204   # 用 HTTPS：HTTP 测速会被劫持/不支持 HEAD
+    interval: 300
+    tolerance: 50
+    proxies:
+      - node-01-vless-reality
+      - node-02-vmess-ws
+      - node-03-hysteria2
+      - node-04-tuic
+      # - node-05-anytls
+
+# ------------------------------- 规则（顺序即优先级）-------------------------
+rules:
+  # ---- 0. 强制门户 / 校园网认证：必须最靠前 ----
+  - DOMAIN-SUFFIX,msftconnecttest.com,DIRECT            # Windows NCSI
+  - DOMAIN-SUFFIX,msftncsi.com,DIRECT                   # Windows NCSI(DNS 探测)
+  - DOMAIN-SUFFIX,captive.apple.com,DIRECT              # Apple
+  - DOMAIN-SUFFIX,connectivitycheck.gstatic.com,DIRECT  # Android/Chrome
+  - DOMAIN-SUFFIX,detectportal.firefox.com,DIRECT       # Firefox
+  - DOMAIN-SUFFIX,connectivity-check.ubuntu.com,DIRECT  # Ubuntu / NetworkManager
+  - DOMAIN-SUFFIX,networkcheck.kde.org,DIRECT           # KDE
+  - IP-CIDR,202.202.145.0/24,DIRECT,no-resolve          # ★改成你学校的「门户/校园 DNS」网段（这里是示例）
+
+  # ---- 1. 必须走代理的站点（一定要放在国内规则之前）----
+  - DOMAIN-SUFFIX,chatgpt.com,代理
+  - DOMAIN-SUFFIX,openai.com,代理
+  - DOMAIN-SUFFIX,oaistatic.com,代理
+  - DOMAIN-SUFFIX,oaiusercontent.com,代理
+  - DOMAIN-SUFFIX,x.com,代理
+  - DOMAIN-SUFFIX,twitter.com,代理
+  - DOMAIN-SUFFIX,twimg.com,代理
+
+  # ---- 2. 国内 / 内网直连 ----
+  - RULE-SET,geosite-private,DIRECT
+  - RULE-SET,geoip-private,DIRECT
+  - RULE-SET,geosite-cn,DIRECT
+  - RULE-SET,geoip-cn,DIRECT
+
+  # ---- 3. 兜底 ----
+  - MATCH,代理
+
+  # 可选：QUIC(UDP/443) 不稳时强制回落 TCP（先注释，需要时打开）
+  # - AND,((NETWORK,udp),(DST-PORT,443)),REJECT
+
+# ------------------------------- DNS（本模板的核心）--------------------------
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  # 这些域名必须拿「真实 IP」：
+  #   ① Windows 会拿 dns.msftncsi.com 必须等于 131.107.255.255 来判定是否有网，
+  #      fake-ip 会让它永远认为处于强制门户状态；
+  #   ② 认证前后都要能靠校园 DNS 正常解析。
+  fake-ip-filter:
+    - +.lan
+    - +.local
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - +.captive.apple.com
+    - +.connectivitycheck.gstatic.com
+    - +.detectportal.firefox.com
+    - +.connectivity-check.ubuntu.com
+    - +.time.windows.com
+    - +.time.apple.com
+    - +.time.android.com
+    - +.ntp.org
+    - stun.*.*
+    - +.stun.*.*
+  use-hosts: false
+  use-system-hosts: false
+  respect-rules: false
+  default-nameserver:                # 仅用于引导解析 DoH 服务器域名
+    - 223.5.5.5
+    - 119.29.29.29
+  nameserver-policy:
+    # ★ 国内/内网：system(系统=校园 DHCP 的 DNS) 放第一位——认证前只有它能用，
+    #   平时也最贴近本地 CDN。想强制走加密 DNS 就删掉 system，只留 DoH。
+    "geosite:cn,private":
+      - system
+      - https://223.5.5.5/dns-query
+      - https://doh.pub/dns-query
+    # ★ 强制门户探测域名：必须用校园/系统 DNS，否则认证前解析失败 → 门户不弹
+    "msftconnecttest.com,+.msftconnecttest.com,msftncsi.com,+.msftncsi.com,captive.apple.com,+.captive.apple.com":
+      - system
+    "connectivitycheck.gstatic.com,+.connectivitycheck.gstatic.com,detectportal.firefox.com,+.detectportal.firefox.com":
+      - system
+    "connectivity-check.ubuntu.com,+.connectivity-check.ubuntu.com,networkcheck.kde.org,+.networkcheck.kde.org":
+      - system
+  # 其余（国外）域名：DoH 走代理，按节点出口位置解析（避免污染 + 就近 CDN）
+  nameserver:
+    - https://1.1.1.1/dns-query#代理
+    - https://8.8.8.8/dns-query#代理
+  # 兜底：任何「直连」拨号都用国内 DNS 解析（含你自己加 DIRECT 规则的域名）
+  direct-nameserver:
+    - system
+    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+  # 只用于解析节点域名；永远直连，不要走上面的 nameserver
+  proxy-server-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+
+# ------------------------------- 嗅探 ----------------------------------------
+sniffer:
+  enable: true
+  sniffing: [http, tls, quic]
+  parse-pure-ip: true
+  force-dns-mapping: true
+  override-destination: false        # 只用于匹配规则，不改写目标地址
+  skip-domain:                       # 门户探测类域名不做嗅探
+    - +.msftconnecttest.com
+    - +.msftncsi.com
+    - +.captive.apple.com
+    - +.connectivitycheck.gstatic.com
+    - +.detectportal.firefox.com
+  sniff:
+    HTTP: { ports: [80, 443], override-destination: false }
+    TLS:  { ports: [443], override-destination: false }
+    QUIC: { ports: [443] }
+  skip-dst-address:                  # 这些地址不嗅探（Telegram 等）
+    - 91.105.192.0/23
+    - 91.108.4.0/22
+    - 91.108.8.0/21
+    - 91.108.16.0/21
+    - 91.108.56.0/22
+    - 95.161.64.0/20
+    - 149.154.160.0/20
+    - 185.76.151.0/24
+
+# ------------------------------- TUN ⚙️（全部在「内核设置」）-----------------
+tun:
+  enable: true
+  stack: mixed
+  device: Mihomo                     # ★ 千万别留空，否则用默认值生成 Meta/mtu9000/gvisor 僵尸网卡
+  mtu: 1400                          # 1500→1400，规避 PMTU 黑洞 / QUIC 卡顿
+  auto-route: true
+  auto-redirect: false
+  auto-detect-interface: true
+  strict-route: false                # true 更防泄漏，但可能影响 LAN / WSL / VMware
+  dns-hijack:
+    - any:53
+  route-exclude-address:
+    - 202.202.145.0/24               # ★改成你学校的「门户/校园 DNS」网段：该网段完全绕过 TUN
+
+# ------------------------------- 其它 ⚙️ -------------------------------------
+geo-auto-update: false
+geo-update-interval: 24
+geodata-mode: false
+geox-url:
+  geoip:   https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat
+  geosite: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat
+  mmdb:    https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb
+  asn:     https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb
+
+# =============================================================================
+#  配套项（不在本文件里！）
+#
+#  A) Clash Party → 设置 → 系统代理 →「代理绕过」= 条目列表，逐个添加（不要粘贴整串）：
+#       *.msftconnecttest.com     msftconnecttest.com
+#       *.msftncsi.com            msftncsi.com
+#       *.connectivitycheck.gstatic.com   connectivitycheck.gstatic.com
+#       *.detectportal.firefox.com        *.captive.apple.com
+#       202.202.145.*   ← 换成你学校的门户/DNS 网段通配
+#     作用：Windows 的联网探测不再经过内核 → 内核即使半死也能弹门户/手动开认证页。
+#
+#  B) Clash Party「内核设置」里要填（覆写无效）：
+#       ipv6: false
+#       tcp-concurrent: true
+#       find-process-mode: always
+#       tun.device: Mihomo / tun.mtu: 1400 / tun.stack: mixed
+#       tun.auto-route: true / tun.route-exclude-address: 202.202.145.0/24（换成你的）
+#
+#  C) 验证：
+#       netstat -ano | findstr LISTENING | findstr 7890
+#       Get-NetIPAddress -AddressFamily IPv4 | ? IPAddress -like '198.18*'
+#       1..10 | % { curl.exe -s -o NUL -w "%{http_code} " -x http://127.0.0.1:7890 `
+#                    http://www.msftconnecttest.com/connecttest.txt }; ""
+#     期望：端口在听 / 有 198.18.0.1 / 全 200(已认证) 或 302(未认证)，无 502/000
+# =============================================================================

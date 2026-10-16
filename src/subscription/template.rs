@@ -4,8 +4,8 @@
 //! full client artifact carries (proxy groups, rule sets, inline rules, DNS,
 //! sniffing and the final group). The catalog is compiled in, never a file on
 //! disk, so a malformed administrator paste cannot take down the default
-//! subscription. `Standard` reproduces the pre-template output byte-for-byte —
-//! the artifact goldens in `src/subscription/snapshots/` are the proof.
+//! subscription. Full profiles layer this policy catalog over the vendored
+//! mihomo-test settings (see the 2026-10-16 amendment to ADR-0022).
 //!
 //! `Global` and `Split` are the richer catalogs the axis exists for: eight
 //! declared policy groups instead of three (seven for sing-box, which has no
@@ -257,9 +257,8 @@ pub struct TemplateSpec {
 }
 
 impl TemplateSpec {
-    /// The spec for `template`. `Standard` must keep reproducing the pre-axis
-    /// artifacts byte-for-byte (the goldens in `snapshots/` are the gate);
-    /// `Global` and `Split` are the catalogs that grew the content.
+    /// The policy spec for `template`, layered over the vendored client defaults.
+    /// `Global` and `Split` add their own purpose groups and routing verdicts.
     pub fn for_template(config: &DeploymentConfig, template: ClientTemplate) -> Self {
         let bases = RuleSetBases::for_config(config);
         match template {
@@ -269,7 +268,7 @@ impl TemplateSpec {
         }
     }
 
-    /// The historical structure: three groups, the CN rule-sets routed direct,
+    /// Three groups, the CN and private rule-sets routed direct,
     /// the AI suffixes pinned to the selector, and `ip_is_private` for LAN.
     /// Every byte here is pinned by `the_generated_artifact_set_matches_the_pinned_goldens`.
     fn standard(bases: &RuleSetBases) -> Self {
@@ -280,8 +279,8 @@ impl TemplateSpec {
                 group(GroupTag::Direct, GroupRole::Direct, &[]),
             ],
             rule_sets: vec![
-                bases.clash_only("geosite-private", RuleSetKind::Domain, "geosite/private"),
-                bases.clash_only("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
+                bases.both("geosite-private", RuleSetKind::Domain, "geosite/private"),
+                bases.both("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
                 bases.both("geosite-cn", RuleSetKind::Domain, "geosite/cn"),
                 bases.both("geoip-cn", RuleSetKind::IpCidr, "geoip/cn"),
             ],

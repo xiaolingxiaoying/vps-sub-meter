@@ -153,6 +153,7 @@ pub(crate) fn sing_box_full(
         )));
     }
     let nodes = &compatible_nodes;
+    let baseline = &*super::baseline::SING_BOX;
     let spec = TemplateSpec::for_template(config, config.client_template.clone());
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
     let node_tags: Vec<&str> = nodes.iter().map(CanonicalNode::tag).collect();
@@ -210,22 +211,20 @@ pub(crate) fn sing_box_full(
     // tag the DNS rules already name, so nothing downstream changes.
     let direct_privacy = config.client_dns_preset == crate::config::ClientDnsPreset::Privacy;
     let mut dns = if profile.typed_dns {
-        let direct = if direct_privacy {
-            json!({"type": "https", "tag": dns_spec.direct_tag, "server": dns_spec.direct_server})
-        } else {
-            json!({"type": "udp", "tag": dns_spec.direct_tag, "server": dns_spec.direct_server})
-        };
-        let mut dns_servers = vec![
-            direct,
-            json!({"type": "https", "tag": dns_spec.proxy_tag, "server": dns_spec.proxy_server, "detour": SELECTOR_TAG}),
-        ];
+        let mut direct = baseline["dns"]["servers"][1].clone();
+        direct["tag"] = json!(dns_spec.direct_tag);
+        direct.as_object_mut().unwrap().remove("detour");
+        if direct_privacy {
+            direct["type"] = json!("https");
+        }
+        let mut proxy = baseline["dns"]["servers"][3].clone();
+        proxy["tag"] = json!(dns_spec.proxy_tag);
+        proxy["detour"] = json!(SELECTOR_TAG);
+        let mut dns_servers = vec![direct, proxy];
         if fake_ip {
-            dns_servers.push(json!({
-                "type": "fakeip",
-                "tag": dns_spec.fake_ip_tag,
-                "inet4_range": dns_spec.fake_ip_inet4_range,
-                "inet6_range": dns_spec.fake_ip_inet6_range
-            }));
+            let mut pool = baseline["dns"]["servers"][4].clone();
+            pool["tag"] = json!(dns_spec.fake_ip_tag);
+            dns_servers.push(pool);
         }
         json!({"servers": dns_servers})
     } else {
@@ -252,7 +251,17 @@ pub(crate) fn sing_box_full(
         dns
     };
 
-    let mut dns_rules = Vec::new();
+    dns["servers"]
+        .as_array_mut()
+        .unwrap()
+        .push(if profile.typed_dns {
+            json!({"tag": "dns-local", "type": "local"})
+        } else {
+            json!({"tag": "dns-local", "address": "local"})
+        });
+    let mut dns_rules = vec![json!({
+        "domain_suffix": super::baseline::portal_domains(), "server": "dns-local"
+    })];
     if !profile.typed_dns {
         // Pre-1.12 cores have no route.default_domain_resolver; the legacy
         // `outbound: any` DNS rule (removed in 1.14) resolves proxy server
@@ -261,8 +270,22 @@ pub(crate) fn sing_box_full(
     }
     dns_rules.push(json!({"clash_mode": "Direct", "server": dns_spec.direct_tag}));
     dns_rules.push(json!({"clash_mode": "Global", "server": dns_spec.proxy_tag}));
-    if remote_rule_sets && let Some(rule_set) = dns_spec.direct_rule_set {
-        dns_rules.push(json!({"rule_set": [rule_set], "server": dns_spec.direct_tag}));
+    if let Some(rule_set) = dns_spec.direct_rule_set {
+        if remote_rule_sets {
+            let mut tags = vec![rule_set];
+            if spec
+                .rule_sets
+                .iter()
+                .any(|entry| entry.tag == "geosite-private" && entry.sing_box_url.is_some())
+            {
+                tags.push("geosite-private");
+            }
+            dns_rules.push(json!({"rule_set": tags, "server": dns_spec.direct_tag}));
+        } else {
+            dns_rules.push(
+                json!({"domain_suffix": RuleMatcher::CN_DOMAINS, "server": dns_spec.direct_tag}),
+            );
+        }
     }
     dns_rules.push(json!({
         "domain_suffix": FAKE_IP_FILTER_SUFFIXES,
@@ -275,16 +298,12 @@ pub(crate) fn sing_box_full(
     // brings no benefit here, so the DNS object stays lean across versions.
     dns["rules"] = json!(dns_rules);
     dns["final"] = json!(dns_spec.proxy_tag);
+    dns["strategy"] = baseline["dns"]["strategy"].clone();
 
     let legacy_route = !profile.route_rule_actions;
-    let mut tun = json!({
-        "type": "tun",
-        "tag": "tun-in",
-        "address": ["172.19.0.1/30", "fdfe:dcba:9876::1/126"],
-        "mtu": 9000,
-        "auto_route": true,
-        "strict_route": true
-    });
+    let mut tun = baseline["inbounds"][0].clone();
+    // The registry owns stack compatibility, including profiles omitting it.
+    tun.as_object_mut().unwrap().remove("stack");
     // Inserted before the legacy `sniff` key below, so the object keeps the
     // same key order — and therefore the same bytes — as when stack was a
     // literal here. The goldens are the proof, not this comment.
@@ -306,6 +325,12 @@ pub(crate) fn sing_box_full(
     } else {
         json!({"protocol": "dns", "action": "hijack-dns"})
     });
+    route_rules.push(json!({
+        "domain_suffix": super::baseline::portal_domains(), "outbound": DIRECT_TAG
+    }));
+    route_rules.push(json!({
+        "ip_cidr": baseline["inbounds"][0]["route_exclude_address"], "outbound": DIRECT_TAG
+    }));
     for rule in spec
         .inline_rules
         .iter()
@@ -385,7 +410,8 @@ pub(crate) fn sing_box_full(
         "auto_detect_interface": true
     });
     if profile.typed_dns {
-        route["default_domain_resolver"] = json!({"server": dns_spec.direct_tag});
+        route["default_domain_resolver"] =
+            json!({"server": dns_spec.direct_tag, "strategy": "prefer_ipv4"});
     }
 
     let mut cache_file = json!({"enabled": true, "store_fakeip": fake_ip});
@@ -407,7 +433,7 @@ pub(crate) fn sing_box_full(
     Ok(serde_json::to_string_pretty(&json!({
         "log": {"level": "info", "timestamp": true},
         "dns": dns,
-        "inbounds": [tun],
+        "inbounds": [tun, baseline["inbounds"][1]],
         "outbounds": outbounds,
         "route": route,
         "experimental": {

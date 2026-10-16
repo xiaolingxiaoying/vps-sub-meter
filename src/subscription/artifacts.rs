@@ -1180,7 +1180,7 @@ mod tests {
             2,
             "standard ships exactly the manual and automatic groups"
         );
-        assert_eq!(standard_rule_sets.len(), 2);
+        assert_eq!(standard_rule_sets.len(), 4);
 
         for template in [ClientTemplate::Global, ClientTemplate::Split] {
             let artifacts = render(
@@ -1528,11 +1528,30 @@ mod tests {
                                 .all(|server| server.get("type").is_some())
                         );
                     }
+                    assert_eq!(value["inbounds"][0]["mtu"], 1400, "{name}");
+                    assert_eq!(value["inbounds"][0]["strict_route"], false, "{name}");
+                    assert_eq!(
+                        value["inbounds"][0]["route_exclude_address"][0],
+                        "202.202.145.0/24"
+                    );
+                    assert_eq!(value["inbounds"][1]["listen_port"], 7890, "{name}");
+                    assert_eq!(value["dns"]["rules"][0]["server"], "dns-local", "{name}");
+                    assert!(
+                        !value.to_string().contains("YOUR-"),
+                        "{name}: placeholder leaked"
+                    );
                 }
                 // The clash side: every rule target has to exist as far as mihomo
                 // is concerned, or the whole configuration is rejected at load.
                 for name in ["subscription-clash.yaml", "subscription-clash-1.18.yaml"] {
                     let clash = artifact_yaml(&artifacts, name);
+                    assert_eq!(clash["mixed-port"].as_u64(), Some(7890), "{name}");
+                    assert_eq!(clash["tun"]["mtu"].as_u64(), Some(1400), "{name}");
+                    assert_eq!(clash["tcp-concurrent"].as_bool(), Some(true), "{name}");
+                    assert_eq!(
+                        clash["tun"]["route-exclude-address"][0].as_str(),
+                        Some("202.202.145.0/24")
+                    );
                     let mut known: Vec<String> = clash["proxies"]
                         .as_sequence()
                         .expect("proxies")
@@ -1573,6 +1592,23 @@ mod tests {
                         .keys()
                         .map(|key| key.as_str().expect("a provider key is a string").to_owned())
                         .collect();
+                    for key in clash["dns"]["nameserver-policy"]
+                        .as_mapping()
+                        .unwrap()
+                        .keys()
+                    {
+                        let key = key.as_str().unwrap();
+                        assert!(
+                            !key.starts_with("geosite:"),
+                            "{name}: implicit geosite download"
+                        );
+                        if let Some(tag) = key.strip_prefix("rule-set:") {
+                            assert!(
+                                provider_tags.iter().any(|provider| provider == tag),
+                                "{name}: missing DNS provider {tag}"
+                            );
+                        }
+                    }
                     for rule in clash["rules"].as_sequence().expect("rules") {
                         let rule = rule.as_str().expect("a clash rule is a string");
                         // `IP-CIDR,<cidr>,<target>,no-resolve` carries a trailing

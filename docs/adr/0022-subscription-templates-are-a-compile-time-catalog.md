@@ -49,3 +49,20 @@ any change to the bare `sing-box.json` / `uri` / `uri.txt` / `shadowrocket.txt`
 artifacts, whose bytes are frozen. Enabling `--client-template split` may grow
 groups, rule sets and `sniffers` in the full profiles; those four artifacts must
 stay byte-identical, which is asserted by the goldens.
+
+## Amendment — 2026-10-16: vendored client defaults
+
+At the administrator's request, full client artifacts now take their baseline
+settings from the mihomo-test `mihomo.yaml` and `sing-box.json` vendored under
+`src/subscription/templates/` and embedded at compile time. This deliberately
+supersedes Standard's historical byte-for-byte full-profile guarantee above;
+the updated snapshots record the new product defaults. Bare node and URI
+artifacts retain their previous contract.
+
+The catalog still owns policy groups, routing modes and configurable rule-set
+sources. Renderers adapt the baseline to those group names, DNS mode and
+per-minor compatibility, keeping administrator overrides last. Template files
+are repository inputs, not deployment-time administrator files. Portal DNS and
+routing, TUN MTU 1400, the sample campus subnet exclusion and the mixed listener
+now follow the supplied templates. See `src/subscription/templates/README.md`
+for the precise adaptation boundary.
