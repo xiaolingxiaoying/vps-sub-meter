@@ -44,6 +44,8 @@ pub enum ClientTemplate {
     Standard,
     Global,
     Split,
+    /// A single manual proxy group containing real nodes and DIRECT only.
+    Compact,
 }
 
 impl fmt::Display for ClientTemplate {
@@ -52,6 +54,7 @@ impl fmt::Display for ClientTemplate {
             Self::Standard => "standard",
             Self::Global => "global",
             Self::Split => "split",
+            Self::Compact => "compact",
         })
     }
 }
@@ -265,6 +268,7 @@ impl TemplateSpec {
             ClientTemplate::Standard => Self::standard(&bases),
             ClientTemplate::Global => Self::global(&bases),
             ClientTemplate::Split => Self::split(&bases),
+            ClientTemplate::Compact => Self::compact(&bases),
         }
     }
 
@@ -274,7 +278,15 @@ impl TemplateSpec {
     fn standard(bases: &RuleSetBases) -> Self {
         Self {
             groups: vec![
-                group(GroupTag::Selector, GroupRole::Selector, MANUAL_MEMBERS),
+                group(
+                    GroupTag::Selector,
+                    GroupRole::Selector,
+                    &[
+                        GroupMember::AllNodes,
+                        GroupMember::Group(GroupTag::Auto),
+                        GroupMember::BuiltinDirect,
+                    ],
+                ),
                 group(GroupTag::Auto, GroupRole::UrlTest, ALL_NODES),
                 group(GroupTag::Direct, GroupRole::Direct, &[]),
             ],
@@ -310,6 +322,18 @@ impl TemplateSpec {
             sniff: true,
             final_group: GroupTag::Selector,
         }
+    }
+
+    /// Compact changes only proxy choice structure. It deliberately inherits
+    /// Standard DNS, TUN, routing rules and rule-set policy.
+    fn compact(bases: &RuleSetBases) -> Self {
+        let mut spec = Self::standard(bases);
+        spec.groups = vec![group(
+            GroupTag::Selector,
+            GroupRole::Selector,
+            &[GroupMember::AllNodes, GroupMember::BuiltinDirect],
+        )];
+        spec
     }
 
     /// 全局代理导向: everything except private/LAN is proxied, ads are
@@ -831,8 +855,8 @@ const PRIVATE_IP_CIDRS: &[&str] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        CN_DOMAIN_SUFFIXES, CN_IP_CIDRS, ClientTemplate, GroupRole, GroupTag, RuleMatcher,
-        TemplateSpec,
+        CN_DOMAIN_SUFFIXES, CN_IP_CIDRS, ClientTemplate, GroupMember, GroupRole, GroupTag,
+        RuleMatcher, TemplateSpec,
     };
     use crate::config::{DeploymentConfig, ManagedProtocol, SubscriptionMode};
 
@@ -860,11 +884,21 @@ mod tests {
         let standard = spec(ClientTemplate::Standard);
         let global = spec(ClientTemplate::Global);
         let split = spec(ClientTemplate::Split);
+        let compact = spec(ClientTemplate::Compact);
 
         assert_eq!(standard.groups.len(), 3, "standard keeps its three groups");
         assert_eq!(standard.rule_sets.len(), 4);
         assert_eq!(global.groups.len(), 8);
         assert_eq!(split.groups.len(), 8);
+        assert_eq!(compact.groups.len(), 1);
+        assert_eq!(compact.groups[0].tag, GroupTag::Selector);
+        assert_eq!(
+            compact.groups[0].members,
+            vec![GroupMember::AllNodes, GroupMember::BuiltinDirect]
+        );
+        assert_eq!(compact.rule_sets, standard.rule_sets);
+        assert_eq!(compact.inline_rules, standard.inline_rules);
+        assert_eq!(compact.dns, standard.dns);
         assert_eq!(global.rule_sets.len(), 8);
         assert_eq!(split.rule_sets.len(), 9);
         assert_ne!(standard.inline_rules, global.inline_rules);

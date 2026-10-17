@@ -26,6 +26,7 @@ fn generated_profiles_pass_a_real_sing_box_check() {
         ClientTemplate::Standard,
         ClientTemplate::Global,
         ClientTemplate::Split,
+        ClientTemplate::Compact,
     ] {
         let mut config = DeploymentConfig::new(
             SubscriptionMode::IpFallback,
@@ -50,7 +51,7 @@ fn generated_profiles_pass_a_real_sing_box_check() {
             checked += check_against_cores(&format!("{template}/{rules}"), &artifacts);
         }
     }
-    let expected = SING_BOX_VERSION_PROFILES.len() * 3 * 2;
+    let expected = SING_BOX_VERSION_PROFILES.len() * 4 * 2;
     assert_eq!(
         checked, expected,
         "every template must be validated by every core: {checked} of {expected} \

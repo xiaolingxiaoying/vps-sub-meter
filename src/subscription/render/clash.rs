@@ -4,7 +4,7 @@ use super::{
 use crate::canonical::CanonicalNode;
 use crate::config::{ClientRuleProfile, DeploymentConfig};
 use crate::subscription::artifacts::SubscriptionError;
-use crate::subscription::template::GroupTag;
+use crate::subscription::template::{GroupMember, GroupTag};
 use crate::subscription::{GroupRole, GroupSpec, RuleMatcher, TemplateSpec};
 
 /// The supplied template group names; GLOBAL belongs to the Mihomo core.
@@ -130,9 +130,13 @@ fn clash_proxies(
 
 /// A group's members as clash proxy names, in declaration order.
 fn clash_members(group: &GroupSpec, nodes: &[CanonicalNode]) -> Vec<String> {
-    let mut members: Vec<String> = nodes.iter().map(|node| node.tag().to_owned()).collect();
-    if group.tag == GroupTag::Selector {
-        members.extend([AUTO_TAG.to_owned(), CLASH_BUILTIN_DIRECT.to_owned()]);
+    let mut members = Vec::new();
+    for member in &group.members {
+        match member {
+            GroupMember::AllNodes => members.extend(nodes.iter().map(|node| node.tag().to_owned())),
+            GroupMember::Group(tag) => members.push(clash_tag(*tag).to_owned()),
+            GroupMember::BuiltinDirect => members.push(CLASH_BUILTIN_DIRECT.to_owned()),
+        }
     }
     members
 }
@@ -270,7 +274,12 @@ pub(crate) fn clash(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
 ) -> Result<String, SubscriptionError> {
-    let spec = TemplateSpec::for_template(config, crate::subscription::ClientTemplate::Standard);
+    let template = if config.client_template == crate::subscription::ClientTemplate::Compact {
+        crate::subscription::ClientTemplate::Compact
+    } else {
+        crate::subscription::ClientTemplate::Standard
+    };
+    let spec = TemplateSpec::for_template(config, template);
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
     let mut output = clash_proxies(config, nodes, &spec)?;
     // The AI suffix rules must precede the CN rule-set so OpenAI/X domains
@@ -298,7 +307,12 @@ pub(crate) fn clash_legacy(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
 ) -> Result<String, SubscriptionError> {
-    let spec = TemplateSpec::for_template(config, crate::subscription::ClientTemplate::Standard);
+    let template = if config.client_template == crate::subscription::ClientTemplate::Compact {
+        crate::subscription::ClientTemplate::Compact
+    } else {
+        crate::subscription::ClientTemplate::Standard
+    };
+    let spec = TemplateSpec::for_template(config, template);
     let mut output = clash_proxies(config, nodes, &spec)?;
     output.push_str(&clash_rules(&spec, false, config));
     Ok(super::baseline::clash_settings(

@@ -73,7 +73,7 @@ fn ask_client_template_fields<C: Prompts>(
     // external rule-sets are reachable (ADR-0022).
     config.client_template = ask_required(
         prompts,
-        "客户端内容模板（1 standard 历史结构 / 2 global 除私有地址外走代理 / 3 split 按规则分流，广告阻断）",
+        "客户端内容模板（1 compact：精简，仅代理手动组 / 2 standard：审核模板与自动选择两组）",
         Some(config.client_template.to_string()),
         parse_client_template,
     )?;
@@ -85,7 +85,7 @@ fn ask_client_template_fields<C: Prompts>(
     )?;
     config.client_dns_preset = ask_required(
         prompts,
-        "直连 DNS 传输（1 cn-direct：UDP 223.5.5.5，大陆解析最快 / 2 privacy：同一地址改用 DoH，防 ISP 窥探或劫持明文 DNS）",
+        "直连 DNS 预设（1 cn-direct / 2 privacy；审核模板默认已使用 DoH）",
         Some(config.client_dns_preset.to_string()),
         parse_dns_preset,
     )?;
@@ -311,52 +311,63 @@ pub fn run<C: Prompts>(
         None
     };
 
-    let monthly_traffic_limit = ask_value(
-        prompts,
-        "每月流量上限（GiB，0 = 不限；可输入 GB）",
-        existing.map(|config| crate::traffic::format_gib(config.monthly_traffic_limit)),
-        crate::traffic::parse_traffic_amount,
-    )?
-    .unwrap_or(0);
-
-    let accounting_timezone = ask_required(
-        prompts,
-        "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
-        Some(
-            existing
-                .map(|config| config.accounting_timezone.clone())
-                .unwrap_or_else(|| "America/Los_Angeles".to_owned()),
-        ),
-        parse_accounting_timezone,
-    )?;
-
-    let client_display_timezone = ask_required(
-        prompts,
-        "客户端显示时区（只影响可读时间，不改变实际刷新时刻）",
-        existing
-            .map(|config| config.client_display_timezone.clone())
-            .or_else(|| Some("Asia/Shanghai".to_owned())),
-        parse_timezone,
-    )?;
-
-    let accounting_policy = ask_required(
-        prompts,
-        "账期策略 (natural-month / anchored-month)",
-        existing
-            .map(|config| config.accounting_policy.to_string())
-            .or_else(|| Some(AccountingPolicy::NaturalMonth.to_string())),
-        parse_policy,
-    )?;
-
-    let anchored_reset_at = if accounting_policy == AccountingPolicy::AnchoredMonth {
-        Some(ask_required(
+    let (
+        monthly_traffic_limit,
+        accounting_timezone,
+        client_display_timezone,
+        accounting_policy,
+        anchored_reset_at,
+    ) = if existing.is_some() {
+        let monthly_traffic_limit = ask_value(
             prompts,
-            "Anchored reset 首次重置时间 (YYYY-MM-DDTHH:MM)",
-            existing.and_then(|config| config.anchored_reset_at.clone()),
-            parse_reset_at,
-        )?)
+            "每月流量上限（GiB，0 = 不限；可输入 GB）",
+            existing.map(|config| crate::traffic::format_gib(config.monthly_traffic_limit)),
+            crate::traffic::parse_traffic_amount,
+        )?
+        .unwrap_or(0);
+        let accounting_timezone = ask_required(
+            prompts,
+            "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
+            existing.map(|config| config.accounting_timezone.clone()),
+            parse_accounting_timezone,
+        )?;
+        let client_display_timezone = ask_required(
+            prompts,
+            "客户端显示时区（只影响可读时间，不改变实际刷新时刻）",
+            existing.map(|config| config.client_display_timezone.clone()),
+            parse_timezone,
+        )?;
+        let accounting_policy = ask_required(
+            prompts,
+            "账期策略 (natural-month / anchored-month)",
+            existing.map(|config| config.accounting_policy.to_string()),
+            parse_policy,
+        )?;
+        let anchored_reset_at = if accounting_policy == AccountingPolicy::AnchoredMonth {
+            Some(ask_required(
+                prompts,
+                "Anchored reset 首次重置时间 (YYYY-MM-DDTHH:MM)",
+                existing.and_then(|config| config.anchored_reset_at.clone()),
+                parse_reset_at,
+            )?)
+        } else {
+            None
+        };
+        (
+            monthly_traffic_limit,
+            accounting_timezone,
+            client_display_timezone,
+            accounting_policy,
+            anchored_reset_at,
+        )
     } else {
-        None
+        (
+            0,
+            "America/Los_Angeles".to_owned(),
+            "Asia/Shanghai".to_owned(),
+            AccountingPolicy::NaturalMonth,
+            None,
+        )
     };
 
     let mut new = DeploymentConfig::apply_options(
@@ -386,15 +397,10 @@ pub fn run<C: Prompts>(
     // menu topic, so a first install silently shipped standard/fake-ip/remote
     // rules and left the operator a second pass. Only a fresh deployment is
     // asked: an existing one already carries whatever the operator chose, and
-    // those preferences survive a wizard rebuild. One confirmation keeps the
-    // common path short while making the knobs part of installing.
-    if existing.is_none()
-        && prompts.confirm(
-            "自定义客户端模板与规则来源？（默认：标准模板 + fake-ip + 远程规则集）",
-            false,
-        )?
-    {
-        ask_client_template_fields(&mut new, prompts)?;
+    // those preferences survive a wizard rebuild. Independent optional steps
+    // keep template selection separate from accounting schedule changes.
+    if existing.is_none() {
+        ask_initial_customization(&mut new, prompts)?;
     }
 
     if existing.is_some_and(|current| current == &new) {
@@ -410,6 +416,103 @@ pub fn run<C: Prompts>(
     }
 
     Ok(WizardOutcome::Changed(new))
+}
+
+/// Offers the compact two-choice template selector used by the menu's
+/// first-run preset shortcut. Empty input keeps even a legacy global/split
+/// value, so opening and cancelling this UI cannot silently rewrite it.
+pub fn run_template_selection<C: Prompts>(
+    existing: &DeploymentConfig,
+    prompts: &mut C,
+) -> Result<WizardOutcome, WizardError> {
+    let mut updated = existing.clone();
+    updated.client_template = ask_client_template_preset(existing, prompts)?;
+    if updated == *existing {
+        return Ok(WizardOutcome::Unchanged);
+    }
+    prompts.report("");
+    prompts.report("配置变更预览：");
+    prompts.report(&updated.summary());
+    if !prompts.confirm("确认应用以上配置？", false)? {
+        return Ok(WizardOutcome::Cancelled);
+    }
+    Ok(WizardOutcome::Changed(updated))
+}
+
+/// Shared optional first-install customization for quick and guided installs.
+/// Skipping preserves the fresh-deployment defaults; accepting exposes the
+/// client profile and accounting schedule before the final install summary.
+pub fn ask_initial_customization<C: Prompts>(
+    config: &mut DeploymentConfig,
+    prompts: &mut C,
+) -> Result<(), WizardError> {
+    if prompts.confirm("自定义客户端内容模板？（默认：standard）", false)? {
+        config.client_template = ask_client_template_preset(config, prompts)?;
+    }
+    if prompts.confirm(
+        "自定义 VPS 流量限额与账期？（默认：不限额、美西自然月刷新、上海显示）",
+        false,
+    )? {
+        config.monthly_traffic_limit = ask_value(
+            prompts,
+            "每月流量上限（GiB，0 = 不限；可输入 GB）",
+            Some(crate::traffic::format_gib(config.monthly_traffic_limit)),
+            crate::traffic::parse_traffic_amount,
+        )?
+        .unwrap_or(0);
+        config.accounting_timezone = ask_required(
+            prompts,
+            "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
+            Some(config.accounting_timezone.clone()),
+            parse_accounting_timezone,
+        )?;
+        config.client_display_timezone = ask_required(
+            prompts,
+            "客户端显示时区（只影响可读时间，不改变实际刷新时刻）",
+            Some(config.client_display_timezone.clone()),
+            parse_timezone,
+        )?;
+        config.accounting_policy = ask_required(
+            prompts,
+            "账期策略 (natural-month / anchored-month)",
+            Some(config.accounting_policy.to_string()),
+            parse_policy,
+        )?;
+        config.anchored_reset_at = if config.accounting_policy == AccountingPolicy::AnchoredMonth {
+            Some(ask_required(
+                prompts,
+                "Anchored reset 首次重置时间 (YYYY-MM-DDTHH:MM)",
+                config.anchored_reset_at.clone(),
+                parse_reset_at,
+            )?)
+        } else {
+            None
+        };
+    }
+    config.validate()?;
+    Ok(())
+}
+
+fn ask_client_template_preset<C: Prompts>(
+    existing: &DeploymentConfig,
+    prompts: &mut C,
+) -> Result<crate::subscription::ClientTemplate, WizardError> {
+    prompts.report("精简：一个代理手动组，保留 DNS/TUN 与必要分流；标准：审核模板与自动选择两组。");
+    if matches!(
+        existing.client_template,
+        crate::subscription::ClientTemplate::Global | crate::subscription::ClientTemplate::Split
+    ) {
+        prompts.report(&format!(
+            "当前为旧策略 {}；回车保留。旧策略不会作为新选项列出。",
+            existing.client_template
+        ));
+    }
+    ask_required(
+        prompts,
+        "客户端内容模板（1 compact 精简，仅代理手动组 / 2 standard 审核模板与自动选择两组）",
+        Some(existing.client_template.to_string()),
+        parse_client_template,
+    )
 }
 
 /// Runs a focused editor for an existing deployment. The editor carries all
@@ -977,10 +1080,13 @@ fn parse_rule_profile(value: &str) -> Result<crate::config::ClientRuleProfile, S
 fn parse_client_template(value: &str) -> Result<crate::subscription::ClientTemplate, String> {
     use crate::subscription::ClientTemplate;
     match value.trim().to_ascii_lowercase().as_str() {
-        "standard" | "1" => Ok(ClientTemplate::Standard),
-        "global" | "2" => Ok(ClientTemplate::Global),
-        "split" | "3" => Ok(ClientTemplate::Split),
-        _ => Err("内容模板必须是 standard、global 或 split".to_owned()),
+        "compact" | "1" => Ok(ClientTemplate::Compact),
+        "standard" | "2" => Ok(ClientTemplate::Standard),
+        // Retain legacy typed values for scripts and administrators who have
+        // stored these richer templates, while omitting them from the UI.
+        "global" => Ok(ClientTemplate::Global),
+        "split" => Ok(ClientTemplate::Split),
+        _ => Err("内容模板必须是 compact 或 standard".to_owned()),
     }
 }
 
@@ -1005,7 +1111,10 @@ mod tests {
     use std::collections::VecDeque;
     use std::io;
 
-    use super::{ConfigurationTopic, Prompts, WizardOutcome, run, run_topic};
+    use super::{
+        AccountingPolicy, ConfigurationTopic, Prompts, WizardOutcome, ask_initial_customization,
+        run, run_template_selection, run_topic,
+    };
     use crate::config::{DeploymentConfig, ManagedProtocol, SubscriptionMode};
 
     struct ScriptPrompts {
@@ -1065,9 +1174,9 @@ mod tests {
         use crate::subscription::ClientTemplate;
 
         let config = ip_fallback_config();
-        // One answer per question, in prompt order: template, DNS mode, rule
-        // profile, rule-set base URL, latency probe URL.
-        let answers = ["3", "", "", "", ""];
+        // One answer per question, in prompt order: template, DNS mode, DNS
+        // preset, IPv4 policy, rules, mirror, probe, and panel secret.
+        let answers = ["1", "", "", "", "", "", "", ""];
         let mut prompts = ScriptPrompts::new(&answers, &[true]);
 
         let outcome = run_topic(&config, ConfigurationTopic::ClientTemplate, &mut prompts)
@@ -1076,7 +1185,7 @@ mod tests {
         let WizardOutcome::Changed(updated) = outcome else {
             panic!("selecting split must produce a new configuration");
         };
-        assert_eq!(updated.client_template, ClientTemplate::Split);
+        assert_eq!(updated.client_template, ClientTemplate::Compact);
         // The control: the answer that moved is the only one that moved.
         assert_eq!(updated.client_dns_mode, ClientDnsMode::FakeIp);
         assert_eq!(updated.client_rule_profile, ClientRuleProfile::Standard);
@@ -1089,7 +1198,9 @@ mod tests {
             config.client_latency_probe_url
         );
         assert!(
-            updated.summary().contains("client content template: split"),
+            updated
+                .summary()
+                .contains("client content template: compact"),
             "the preview must show which template was selected"
         );
         assert!(
@@ -1105,6 +1216,23 @@ mod tests {
                 )),
             "the preview must show the other client settings affected by this topic"
         );
+    }
+
+    #[test]
+    fn preset_only_template_selection_keeps_a_legacy_value_on_empty_input() {
+        let mut config = ip_fallback_config();
+        config.client_template = crate::subscription::ClientTemplate::Global;
+        let mut prompts = ScriptPrompts::new(&[""], &[]);
+
+        let outcome = run_template_selection(&config, &mut prompts)
+            .expect("the preset selector keeps a legacy choice by default");
+
+        assert_eq!(outcome, WizardOutcome::Unchanged);
+        assert_eq!(
+            config.client_template,
+            crate::subscription::ClientTemplate::Global
+        );
+        assert!(prompts.reports().iter().any(|r| r.contains("旧策略")));
     }
 
     #[test]
@@ -1149,7 +1277,7 @@ mod tests {
         use crate::subscription::ClientTemplate;
 
         let config = ip_fallback_config();
-        let answers = ["nope", "2", "", "", "", ""];
+        let answers = ["nope", "1", "", "", "", "", "", ""];
         let mut prompts = ScriptPrompts::new(&answers, &[true]);
 
         let outcome = run_topic(&config, ConfigurationTopic::ClientTemplate, &mut prompts)
@@ -1158,12 +1286,12 @@ mod tests {
         let WizardOutcome::Changed(updated) = outcome else {
             panic!("a corrected template answer must produce a new configuration");
         };
-        assert_eq!(updated.client_template, ClientTemplate::Global);
+        assert_eq!(updated.client_template, ClientTemplate::Compact);
         assert!(
             prompts
                 .reports()
                 .iter()
-                .any(|message| message.contains("内容模板必须是 standard、global 或 split")),
+                .any(|message| message.contains("内容模板必须是 compact 或 standard")),
             "the rejected answer has to say what it expected"
         );
     }
@@ -1394,7 +1522,7 @@ mod tests {
             "",
             "",
         ];
-        let mut prompts = ScriptPrompts::new(&answers, &[true, false, true]);
+        let mut prompts = ScriptPrompts::new(&answers, &[true, false, false, true]);
 
         let outcome =
             run(None, Some("ens3".to_owned()), &mut prompts).expect("a fresh wizard completes");
@@ -1416,10 +1544,9 @@ mod tests {
     }
 
     #[test]
-    fn a_fresh_deployment_can_customize_the_client_template() {
-        // These knobs used to exist only behind the focused menu topic, which
-        // is what forced a second configuration pass after installing.
-        // Accepting the offer must actually land on the fresh deployment.
+    fn a_fresh_deployment_can_select_a_client_template_preset() {
+        // The first-install shortcut selects only the preset; the advanced
+        // DNS and rules fields remain under the focused configuration topic.
         let answers = [
             "",
             "sub.example.test",
@@ -1439,20 +1566,12 @@ mod tests {
             "",
             "www.cloudflare.com",
             "",
-            "",
-            "",
-            "",
-            "",
-            // template / dns mode / preset / ipv4-only / rule profile / mirror / probe
-            "3",
-            "2",
-            "2",
-            "",
-            "2",
-            "https://cdn.jsdelivr.net/gh/Custom/rules",
-            "http://aliyun.com/generate_204",
+            // template / dns mode / preset / IPv4 policy / rules / mirror /
+            // probe / secret are all independent interactive prompts, but the
+            // first-install preset asks only for the template.
+            "compact",
         ];
-        let mut prompts = ScriptPrompts::new(&answers, &[true, true, true]);
+        let mut prompts = ScriptPrompts::new(&answers, &[true, true, false, true]);
 
         let outcome = run(None, Some("ens3".to_owned()), &mut prompts)
             .expect("a fresh wizard with template answers completes");
@@ -1462,25 +1581,41 @@ mod tests {
         };
         assert_eq!(
             config.client_template,
-            crate::subscription::ClientTemplate::Split
+            crate::subscription::ClientTemplate::Compact
         );
-        assert_eq!(
-            config.client_dns_mode,
-            crate::config::ClientDnsMode::RedirHost
-        );
+        assert_eq!(config.client_dns_mode, crate::config::ClientDnsMode::FakeIp);
         assert_eq!(
             config.client_dns_preset,
-            crate::config::ClientDnsPreset::Privacy,
-            "the new direct-DNS transport question must reach the fresh deployment"
+            crate::config::ClientDnsPreset::CnDirect
         );
-        assert!(!config.ipv4_only, "an empty answer keeps the default");
         assert_eq!(
             config.client_rule_profile,
-            crate::config::ClientRuleProfile::Minimal
+            crate::config::ClientRuleProfile::Standard
         );
+        assert!(
+            !config.ipv4_only,
+            "preset selection must preserve unrelated defaults"
+        );
+    }
+
+    #[test]
+    fn first_install_accounting_customization_is_independent_of_template_choice() {
+        let mut config = ip_fallback_config();
+        let original_template = config.client_template.clone();
+        let answers = ["128", "1", "", "anchored-month", "2026-10-20T12:30"];
+        let mut prompts = ScriptPrompts::new(&answers, &[false, true]);
+
+        ask_initial_customization(&mut config, &mut prompts)
+            .expect("the accounting schedule can be customized independently");
+
+        assert_eq!(config.client_template, original_template);
+        assert_eq!(config.monthly_traffic_limit, 128 * 1024_u64.pow(3));
+        assert_eq!(config.accounting_timezone, "America/Los_Angeles");
+        assert_eq!(config.client_display_timezone, "Asia/Shanghai");
+        assert_eq!(config.accounting_policy, AccountingPolicy::AnchoredMonth);
         assert_eq!(
-            config.client_rule_set_base_url,
-            "https://cdn.jsdelivr.net/gh/Custom/rules"
+            config.anchored_reset_at.as_deref(),
+            Some("2026-10-20T12:30")
         );
     }
 

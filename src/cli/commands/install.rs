@@ -3,6 +3,7 @@
 
 use crate::cli::args::InstallOptions;
 use crate::cli::prompt::{protocol_ports, required_install_value, select_protocols};
+use sbctl::wizard::Prompts;
 use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::process::ExitCode;
@@ -72,8 +73,9 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
     } else {
         None
     };
+    let mut install_cancelled = false;
     let result = (|| {
-        let config = if let Some(config) = guided_config {
+        let mut config = if let Some(config) = guided_config {
             config
         } else {
             let subscription_host =
@@ -116,6 +118,23 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             config.ipv4_only = options.ipv4_only;
             config
         };
+        if !options.guided && io::stdin().is_terminal() {
+            let mut prompts = crate::cli::prompt::ConsolePrompts;
+            sbctl::wizard::ask_initial_customization(&mut config, &mut prompts)
+                .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+            prompts.report("");
+            prompts.report(&config.summary());
+            prompts.report("");
+            if !prompts
+                .confirm("确认提交以上配置？", false)
+                .map_err(sbctl::config::ConfigError::Storage)?
+            {
+                install_cancelled = true;
+                return Err(sbctl::config::ConfigError::StateContent(
+                    "installation cancelled".to_owned(),
+                ));
+            }
+        }
         if options.guided {
             sbctl::preflight::preflight_install(
                 root,
@@ -304,6 +323,10 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         }
         Ok::<_, sbctl::config::ConfigError>((config, certificate))
     })();
+    if install_cancelled {
+        println!("installation cancelled; the host was not changed");
+        return ExitCode::SUCCESS;
+    }
     match result {
         Ok((config, certificate)) => {
             print_post_install_checklist_with(&config, certificate, options.manage_firewall);

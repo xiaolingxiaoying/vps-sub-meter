@@ -6,6 +6,24 @@ state under `$work/<name>` for `/etc`, `/proc`, `/sys`, systemd command shims an
 certificates. A fixture command is rooted below `usr/bin` and never falls back to the
 container's real command.
 
+`verify-menu.py` exercises the six sections, invalid input, deployed/fresh views,
+template success/cancellation/rollback, and refusal of destructive confirmations in
+PTY sessions. Every session uses a temporary root and local service/core fixtures.
+
+```sh
+python3 tests/acceptance/verify-menu.py /absolute/path/to/sbctl
+```
+
+`verify-onboarding.py` uses a PTY to exercise the guided and quick first-install
+prompts against separate temporary `--root` fixtures. Both cases cancel at the final
+summary, proving that the default and customized summaries are visible before any
+deployment file is written. The fake sing-box checker prevents artifact downloads if
+the flow regresses unexpectedly.
+
+```sh
+python3 tests/acceptance/verify-onboarding.py --cli /absolute/path/to/sbctl
+```
+
 The shell flow is suitable for local development and CI smoke checks. Production
 support is established only by `run.sh` in a Debian/Ubuntu VM or equivalent real
 systemd environment. WSL2 is a Development host for compilation, Rust tests and

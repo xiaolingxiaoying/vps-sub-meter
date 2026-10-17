@@ -26,6 +26,7 @@ fn generated_clash_artifacts_load_in_a_real_mihomo() {
         (ClientTemplate::Standard, ClientRuleProfile::Standard),
         (ClientTemplate::Global, ClientRuleProfile::Standard),
         (ClientTemplate::Split, ClientRuleProfile::Standard),
+        (ClientTemplate::Compact, ClientRuleProfile::Standard),
         // `minimal` is the profile that promises no download at all, and its
         // clash artifact now spells CN/LAN out as compiled-in lists instead of
         // the `GEOIP,*` codes mihomo answers from a database it fetches on first
@@ -33,6 +34,7 @@ fn generated_clash_artifacts_load_in_a_real_mihomo() {
         (ClientTemplate::Standard, ClientRuleProfile::Minimal),
         (ClientTemplate::Global, ClientRuleProfile::Minimal),
         (ClientTemplate::Split, ClientRuleProfile::Minimal),
+        (ClientTemplate::Compact, ClientRuleProfile::Minimal),
     ] {
         let mut config = DeploymentConfig::new(
             SubscriptionMode::IpFallback,

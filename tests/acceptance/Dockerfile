@@ -8,6 +8,8 @@ RUN apt-get update \
 COPY tests/acceptance/verify.sh /usr/local/lib/sbctl-acceptance/verify.sh
 COPY tests/acceptance/verify-real.sh /usr/local/lib/sbctl-acceptance/verify-real.sh
 COPY tests/acceptance/verify-bootstrap.sh /usr/local/lib/sbctl-acceptance/verify-bootstrap.sh
+COPY tests/acceptance/verify-menu.py /usr/local/lib/sbctl-acceptance/verify-menu.py
+COPY tests/acceptance/verify-onboarding.py /usr/local/lib/sbctl-acceptance/verify-onboarding.py
 COPY tests/acceptance/verify-replacement.sh /usr/local/lib/sbctl-acceptance/verify-replacement.sh
 COPY tests/acceptance/fixture.sh /usr/local/lib/sbctl-acceptance/fixture.sh
 COPY tests/acceptance/verify-client.sh /usr/local/lib/sbctl-acceptance/verify-client.sh

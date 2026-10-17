@@ -48,6 +48,10 @@ jobs:
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --features sbctl/test-signing
+      - name: Exercise menu and first-install prompts in isolated terminals
+        run: |
+          python3 tests/acceptance/verify-menu.py target/debug/sbctl
+          python3 tests/acceptance/verify-onboarding.py --cli target/debug/sbctl
       - name: Verify private mail and daemon storage with real Linux UIDs
         run: sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
       - run: cargo test -p sbctl --no-default-features --test release_trust

@@ -2,7 +2,7 @@
 //! install path and the interactive menu, so they live apart from `cli::menu`.
 
 use crate::cli::args::CliManagedProtocol;
-use std::io::{self, IsTerminal, Write};
+use std::io::{self, Write};
 
 pub(crate) fn select_protocols(
     disabled: &[CliManagedProtocol],
@@ -19,7 +19,7 @@ pub(crate) fn select_protocols(
         let disabled_by_flag = disabled
             .iter()
             .any(|disabled| std::mem::discriminant(disabled) == std::mem::discriminant(&protocol));
-        if !disabled_by_flag && (!io::stdin().is_terminal() || confirm_protocol(&protocol)?) {
+        if !disabled_by_flag {
             selected.push(protocol.into());
         }
     }
@@ -40,28 +40,6 @@ pub(crate) fn protocol_ports(
         tuic,
         anytls,
     }
-}
-
-fn confirm_protocol(protocol: &CliManagedProtocol) -> Result<bool, sbctl::config::ConfigError> {
-    let name = match protocol {
-        CliManagedProtocol::VlessReality => "vless-reality",
-        CliManagedProtocol::VmessWebsocket => "vmess-websocket",
-        CliManagedProtocol::Hysteria2 => "hysteria2",
-        CliManagedProtocol::Tuic => "tuic",
-        CliManagedProtocol::Anytls => "anytls",
-    };
-    print!("Enable {name} [Y/n]: ");
-    io::stdout()
-        .flush()
-        .map_err(sbctl::config::ConfigError::Storage)?;
-    let mut answer = String::new();
-    io::stdin()
-        .read_line(&mut answer)
-        .map_err(sbctl::config::ConfigError::Storage)?;
-    Ok(!matches!(
-        answer.trim().to_ascii_lowercase().as_str(),
-        "n" | "no"
-    ))
 }
 
 pub(crate) fn required_install_value(

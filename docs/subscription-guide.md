@@ -60,7 +60,7 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 ## mihomo 差异（1.18 → 1.19）
 
-- `clash.yaml` 使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）和两个策略组：`代理`、`自动选择`。手动组依次包含真实节点、自动组和 `DIRECT`；GLOBAL 由内核提供。
+- `clash.yaml` 使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）。标准模板有 `代理`、`自动选择` 两个组；精简模板只输出 `代理`，成员为真实节点与 `DIRECT`。GLOBAL 由内核提供。
 - `clash-1.18.yaml` 通过内置域名/IP 列表保留直连分流，不引用远程规则集或自动下载地理数据库。
 - 两份工件都保留参考模板的 HTTP/TLS/QUIC `sniff` 映射、端口和跳过列表，明确设置 `override-destination: false`；TUN 严格路由与 UDP/TCP 53 DNS 劫持开启。完整基础设置见 [内置模板说明](../src/subscription/templates/README.md)。
 - rule-providers 的本地 `path` 使用相对路径 `./ruleset/*.mrs`，位于客户端 workdir 内。
@@ -96,19 +96,16 @@ sbctl config override clear all    # 清除所有覆写
 
 ## 客户端模板配置
 
-`sbctl` 菜单「订阅中心 → 12. 客户端模板配置」（或向导主题）可调：
+`sbctl menu` →「订阅与客户端」可切换精简 / 标准模板；其他客户端设置通过同页「高级客户端设置」调整：
 
 每项都会显示当前值作为默认答案；保存前预览会列出模板、DNS 模式、规则档位、规则镜像和测速 URL，
 订阅凭据保持脱敏，URL 中的认证信息、查询参数和片段也会隐藏。URL 选项仅接受 `http://` 或 `https://` 地址。
 
 - `client_dns_mode`：fake-ip（默认）/ redir-host
-- `client_template`：**standard（默认）/ global / split** —— 编译期内置的内容目录（ADR-0022），
-  决定订阅里的策略组、规则集、内联分流规则、DNS 与最终出口，不是磁盘上的管理员模板文件。
-  - `standard`：三组（选择 / 自动选择 / direct），CN 走直连，AI 后缀钉在选择组——
-    **逐字节复现本轴引入之前的输出**，所以升级默认不会改动任何客户端工件
-    （工件一变，`sbctl` 会重启被管内核，见 §排期陷阱）。
-  - `global`：除私有地址外全部走代理，广告阻断。
-  - `split`：CN 与私有直连、广告阻断，AI / 流媒体 / Telegram 各自成组，另有故障转移组。
+- `client_template`：**compact / standard** —— 编译期内置的客户端结构（ADR-0022），不代表磁盘上的管理员模板文件。
+  - `compact`：单一手动 `代理` 组，只含真实节点与 `DIRECT`，不提供自动选择组。
+  - `standard`（新部署默认）：手动 `代理` 组含真实节点、`自动选择` 与 `DIRECT`，并另有只含真实节点的测速组。
+  - 两种档位共享审阅过的 DNS、TUN、嗅探、规则顺序和规则集策略。`global` / `split` 保留序列化兼容，也可通过非交互 `sbctl config template global|split` 显式使用；交互选择器只显示精简与标准。
 - `client_rule_profile`：standard（远程 rule-set，默认）/ minimal（全部内置规则，不访问规则 CDN）。
   `minimal` **只改获取方式，不改分流结果**：每个规则集支撑的规则都带一份编译期内联孪生，
   所以在 `minimal` 下 CN/私有目标仍然直连，而不是悄悄落到代理组。
@@ -118,10 +115,9 @@ sbctl config override clear all    # 清除所有覆写
   能接受这个代价、又要零下载的客户端用 `minimal`，否则用默认 `standard`。
 - `client_rule_set_base_url`：默认 `https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat`（`@sing`/`@meta` 分支由 sbctl 附加；换镜像只改这一处）。
   注意 `geoip/lan` 在该镜像上解析不到，因此 LAN 一直是内置列表而不是规则集 URL。
-- `client_latency_probe_url`：默认 `http://aliyun.com/generate_204`（选择组含 DIRECT，探测必须国内可达）
+- `client_latency_probe_url`：默认 `https://www.gstatic.com/generate_204`（选择组含 DIRECT，探测必须国内可达）
 
-修改后运行 `sbctl regenerate` 重新生成并生效（`sbctl restart` 只做 `sing-box check` 与重启服务，不重新生成工件）。三档模板都已过 1.10–1.14 五个真实内核的
-`sing-box check`（`cargo test --test version_profiles -- --ignored`，5 内核 × 3 模板 = 15 种组合）。
+修改后运行 `sbctl regenerate` 重新生成并生效（`sbctl restart` 只做 `sing-box check` 与重启服务，不重新生成工件）。真实内核校验命令为 `cargo test --test version_profiles -- --ignored`，覆盖 1.10–1.14、四种可渲染模板和两种规则档位；Mihomo 校验命令为 `cargo test --test clash_mihomo -- --ignored`。这些忽略测试需要通过环境变量提供实际上游二进制；本段说明校验入口，不表示当前环境已经运行或通过。
 
 ## 安全边界
 

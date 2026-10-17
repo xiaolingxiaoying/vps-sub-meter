@@ -322,6 +322,13 @@ impl InstallOptions {
 #[allow(clippy::large_enum_variant)]
 #[derive(Debug, Subcommand)]
 pub(crate) enum ConfigCommand {
+    /// Switch the client template without restarting the VPS proxy service.
+    Template {
+        #[arg(value_parser = ["compact", "standard", "global", "split"])]
+        preset: String,
+        #[arg(long, value_name = "PATH")]
+        sing_box_bin: Option<PathBuf>,
+    },
     /// Print the complete generated configuration (contains proxy credentials).
     Preview {
         #[arg(long, default_value = "server")]

@@ -153,8 +153,13 @@ pub(crate) fn sing_box_full(
         )));
     }
     let nodes = &compatible_nodes;
-    if config.client_template == crate::subscription::ClientTemplate::Standard {
-        return standard_full(config, nodes, profile);
+    if matches!(
+        &config.client_template,
+        crate::subscription::ClientTemplate::Standard
+            | crate::subscription::ClientTemplate::Compact
+    ) {
+        let spec = TemplateSpec::for_template(config, config.client_template.clone());
+        return standard_full(config, nodes, profile, &spec);
     }
 
     let baseline = &*super::baseline::SING_BOX;
@@ -455,18 +460,33 @@ fn standard_full(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
     profile: &SingBoxVersionProfile,
+    spec: &TemplateSpec,
 ) -> Result<String, SubscriptionError> {
     let mut value = super::baseline::SING_BOX.clone();
     let baseline = &*super::baseline::SING_BOX;
     let fake_ip = config.client_dns_mode == crate::config::ClientDnsMode::FakeIp;
     let remote = config.client_rule_profile == ClientRuleProfile::Standard;
-    let mut outbounds = baseline["outbounds"].as_array().unwrap()[..2].to_vec();
     let tags: Vec<_> = nodes.iter().map(CanonicalNode::tag).collect();
-    let mut manual = tags.clone();
-    manual.extend([AUTO_TAG, DIRECT_TAG]);
-    outbounds[0]["outbounds"] = json!(manual);
-    outbounds[1]["outbounds"] = json!(tags);
-    outbounds[1]["url"] = json!(config.client_latency_probe_url);
+    let mut outbounds = Vec::new();
+    for group in spec
+        .groups
+        .iter()
+        .filter(|g| matches!(g.role, GroupRole::Selector | GroupRole::UrlTest))
+    {
+        let tag = sing_box_tag(group.tag);
+        let mut outbound = baseline["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|o| o["tag"] == tag)
+            .expect("reviewed template declares the group")
+            .clone();
+        outbound["outbounds"] = json!(group_members(group, &tags));
+        if group.role == GroupRole::UrlTest {
+            outbound["url"] = json!(config.client_latency_probe_url);
+        }
+        outbounds.push(outbound);
+    }
     for live in client_outbounds(config, nodes) {
         let mut node = baseline["outbounds"]
             .as_array()

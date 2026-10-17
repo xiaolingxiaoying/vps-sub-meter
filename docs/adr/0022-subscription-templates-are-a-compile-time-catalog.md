@@ -95,3 +95,31 @@ proxied-DoH policy, Fake-IP exclusions, explicit proxy exceptions, strict TUN
 and local listeners. The new snapshots deliberately replace full-profile defaults;
 bare nodes and URI artifacts retain their contract. Version limitations and DNS
 upstream selection differences are documented in the template README.
+
+## Amendment — 2026-10-17: compact and standard client choices
+
+The interactive template selector offers two profiles:
+
+- `compact` emits one manual proxy group containing the real nodes and
+  `DIRECT`; it has no automatic-selection group.
+- `standard` retains the reviewed manual and automatic group arrangement.
+
+This is a group-layout choice only. Both profiles retain the reviewed DNS, TUN,
+sniffing, routing rules, and rule-set behavior. The independent
+`client_rule_profile` still selects remote rule sets (`standard`) or their
+compiled-in twins (`minimal`); neither template choice removes those reviewed
+policies. The sing-box 1.10–1.14 adapters remain responsible for each core's
+DNS, AnyTLS, cache, and TUN-stack compatibility.
+
+`global` and `split` remain valid serialized configuration values and
+non-interactive `sbctl config template` inputs for existing deployments and
+scripts. They are legacy choices hidden from the interactive template
+selector; an explicit CLI request or a persisted legacy value continues to
+render its existing policy. New menu choices are limited to `compact` and
+`standard`.
+
+The Standard sing-box artifact follows the reviewed baseline recorded above;
+the compact profile changes only its selector membership and omits the
+automatic group. The Mihomo standard profile keeps both supplied groups, while
+compact omits `自动选择` and removes it from `代理` membership. Bare node and
+URI artifacts remain byte-stable for every template.

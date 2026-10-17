@@ -3,8 +3,9 @@
 //! by the non-interactive install path live in `cli::prompt`, not here.
 
 use crate::cli::args::{
-    ApiCommand, CertificateCommand, CliOverrideTarget, CliSubscriptionMode, ConfigCommand,
-    EmailCommand, InstallOptions, KernelSource, OverrideCommand, SingBoxCommand,
+    ApiCommand, CertificateCommand, CliOverrideTarget, CliRuleKind, CliSubscriptionMode,
+    ConfigCommand, CredentialCommand, EmailCommand, InstallOptions, KernelSource, OverrideCommand,
+    RuleCommand, SingBoxCommand,
 };
 use crate::cli::commands::{
     config::{commit_config_change, regenerate, restart, run_config_wizard},
@@ -22,43 +23,52 @@ use std::io::{self, IsTerminal, Write};
 use std::path::Path;
 use std::process::ExitCode;
 
+mod navigation;
+use navigation::{Action, Page};
+
 pub(crate) fn menu(root: &Path) -> ExitCode {
     if !io::stdin().is_terminal() {
         eprintln!("menu requires an interactive terminal");
         return ExitCode::from(2);
     }
+    menu_page(root, Page::Home);
+    ExitCode::SUCCESS
+}
 
+fn menu_page(root: &Path, page: Page) {
     loop {
         clear_menu_screen();
         print_menu_header(root);
-        println!();
-        println!("{}", sbctl::term::green(" 1. 安装与部署"));
-        println!("{}", sbctl::term::green(" 2. 节点与协议"));
-        println!("{}", sbctl::term::green(" 3. 订阅中心"));
-        println!("{}", sbctl::term::green(" 4. 流量与账期"));
-        println!("{}", sbctl::term::green(" 5. 服务与诊断"));
-        println!("{}", sbctl::term::green(" 6. 更新与卸载"));
-        println!("{}", sbctl::term::green(" 7. 配置与路由规则"));
-        println!("{}", sbctl::term::green(" 8. 邮件通知"));
-        println!("{}", sbctl::term::green(" 0. 退出"));
-        println!();
-        match read_menu_choice("请选择 [0]: ") {
-            Some(choice) => match choice.as_str() {
-                "0" => return ExitCode::SUCCESS,
-                "1" => menu_deployment(root),
-                "2" => menu_protocols(root),
-                "3" => menu_subscriptions(root),
-                "4" => menu_traffic(root),
-                "5" => menu_services(root),
-                "6" => menu_updates(root),
-                "7" => menu_configuration(root),
-                "8" => menu_email(root),
-                _ => {
-                    eprintln!("无效选择，请输入 0 到 8。");
-                    pause_menu();
-                }
-            },
-            None => return ExitCode::from(2),
+        print_menu_section(navigation::title(page));
+        let installed = sbctl::config::DeploymentStore::new(root).load().is_ok();
+        let entries = navigation::entries(page, installed);
+        for (i, entry) in entries.iter().enumerate() {
+            println!("{}. {}", i + 1, entry.label);
+        }
+        println!(
+            "0. {}",
+            if page == Page::Home {
+                "退出"
+            } else {
+                "返回"
+            }
+        );
+        let Some(input) = read_menu_choice("请选择 [0]: ") else {
+            return;
+        };
+        if input.is_empty() || input == "0" {
+            return;
+        }
+        match navigation::select(&entries, &input) {
+            Some(Action::Open(next)) => menu_page(root, next),
+            Some(action) => {
+                execute_action(root, action);
+                pause_menu();
+            }
+            None => {
+                eprintln!("无效选择，请按菜单中的编号输入。");
+                pause_menu();
+            }
         }
     }
 }
@@ -95,6 +105,13 @@ fn print_menu_header(root: &Path) {
                     config.enabled_protocols.len()
                 ))
             );
+            let template = match config.client_template {
+                sbctl::subscription::ClientTemplate::Compact => "精简 (compact)",
+                sbctl::subscription::ClientTemplate::Standard => "标准 (standard)",
+                sbctl::subscription::ClientTemplate::Global => "旧策略 global",
+                sbctl::subscription::ClientTemplate::Split => "旧策略 split",
+            };
+            println!("客户端模板: {template}");
             if let Some(port) = config.http_port {
                 println!("{}", sbctl::term::yellow(format!("公网回退端口: {port}")));
             }
@@ -146,7 +163,10 @@ fn print_menu_header(root: &Path) {
             }
             println!("{}", sbctl::term::green("状态: 已部署"));
         }
-        Err(_) => println!("{}", sbctl::term::red("状态: 未安装，请选择 1 安装")),
+        Err(_) => println!(
+            "{}",
+            sbctl::term::red("状态: 未安装，请进入「部署与协议」安装")
+        ),
     }
     println!("{bar}");
 }
@@ -175,418 +195,6 @@ fn pause_menu() {
 
 fn print_menu_section(title: &str) {
     println!("\n{}", sbctl::term::blue(format!("=== {title} ===")));
-}
-
-fn menu_deployment(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("安装与部署");
-        let installed = sbctl::config::DeploymentStore::new(root).load().is_ok();
-        if installed {
-            println!("1. 重新生成并校验现有配置工件");
-            println!("2. 完整配置向导");
-        } else {
-            println!("1. 快速安装（默认配置）");
-            println!("2. 引导式安装（完整配置向导）");
-        }
-        println!("3. 备份旧部署并重新安装（停止并禁用冲突服务）");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") if installed => {
-                regenerate(root, None);
-            }
-            Some("1") => {
-                menu_install(root, false);
-            }
-            Some("2") if !installed => {
-                menu_install(root, true);
-            }
-            Some("2") => {
-                run_config_wizard(root, None);
-            }
-            Some("3") => {
-                menu_install(root, true);
-            }
-            Some(_) => eprintln!("无效选择，请输入 0 到 3。"),
-        }
-        pause_menu();
-    }
-}
-
-fn menu_protocols(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("节点与协议");
-        println!("1. 查看节点与监听端口");
-        println!("2. 配置协议启停、端口、SNI 和证书");
-        println!("3. 查看节点分享链接（含节点凭据）");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                print_nodes(root, false, None, false);
-                pause_menu();
-            }
-            Some("2") => {
-                run_topic_wizard(root, sbctl::wizard::ConfigurationTopic::Protocols);
-                pause_menu();
-            }
-            Some("3") => {
-                if confirm_menu_action(
-                    "确认显示节点分享链接？链接包含 Proxy credential，会显示在当前终端",
-                ) {
-                    print_nodes(root, true, None, false);
-                }
-                pause_menu();
-            }
-            Some(_) => {
-                eprintln!("无效选择，请按菜单中的编号输入。");
-                pause_menu();
-            }
-        }
-    }
-}
-
-fn menu_subscriptions(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("订阅中心");
-        println!("1. 查看全部订阅链接与二维码");
-        println!("2. 显示 sing-box 完整配置二维码");
-        println!("3. 显示 sing-box 精简配置二维码");
-        println!("4. 显示 Clash/Mihomo 二维码");
-        println!("5. 显示 Clash 1.18 兼容二维码");
-        println!("6. 显示 URI 二维码");
-        println!("7. 显示 Base64 URI 二维码（V2rayN）");
-        println!("8. 显示 Shadowrocket 二维码");
-        println!("9. 配置订阅入口");
-        println!("10. 轮换订阅凭据（旧链接立即失效）");
-        println!("11. 重新生成订阅工件");
-        println!("12. 客户端模板配置（DNS / 分流规则档位 / 延迟探测）");
-        println!("13. 命名订阅凭据（按设备发放 / 吊销 / 查看，泄露时只断一台）");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                print_subscription_urls(root, None);
-                pause_menu();
-            }
-            Some("2") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::SingBoxFull),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("3") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::SingBox),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("4") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::Clash),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("5") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::ClashLegacy(
-                        sbctl::subscription::CLASH_LEGACY_VERSION,
-                    )),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("6") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::Uri),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("7") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::Base64Uri),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("8") => {
-                print_subscription_qr(
-                    root,
-                    Some(sbctl::subscription::SubscriptionFormat::Shadowrocket),
-                    false,
-                );
-                pause_menu();
-            }
-            Some("9") => {
-                run_topic_wizard(root, sbctl::wizard::ConfigurationTopic::Subscription);
-                pause_menu();
-            }
-            Some("10") => {
-                if confirm_menu_action("确认轮换订阅凭据？旧订阅 URL 将立即失效") {
-                    rotate_subscription_credential(root);
-                }
-                pause_menu();
-            }
-            Some("11") => {
-                if confirm_menu_action("确认重新生成并校验订阅工件？") {
-                    regenerate(root, None);
-                }
-                pause_menu();
-            }
-            Some("12") => {
-                run_topic_wizard(root, sbctl::wizard::ConfigurationTopic::ClientTemplate);
-                pause_menu();
-            }
-            Some("13") => {
-                menu_named_credentials(root);
-                pause_menu();
-            }
-            Some(_) => {
-                eprintln!("无效选择，请输入 0 到 13。");
-                pause_menu();
-            }
-        }
-    }
-}
-
-/// The named-credential sub-menu. It delegates to `run_credential` instead of
-/// reimplementing the flows, so the same URL-safe and uniqueness rules apply
-/// whether the operator types the CLI verb or walks this menu.
-fn menu_named_credentials(root: &Path) {
-    use crate::cli::args::CredentialCommand;
-    use crate::cli::commands::system::run_credential;
-    print_menu_section("命名订阅凭据");
-    println!("1. 查看（密钥只显示前几位）");
-    println!("2. 新增一个设备凭据");
-    println!("3. 吊销某个凭据");
-    println!("0. 返回");
-    match read_menu_choice("请选择 [0]: ").as_deref() {
-        Some("1") => {
-            run_credential(root, CredentialCommand::List);
-        }
-        Some("2") => {
-            if let Some(name) = read_menu_choice("凭据名称（例如 phone）: ") {
-                run_credential(root, CredentialCommand::Add { name });
-            }
-        }
-        Some("3") => {
-            let Some(name) = read_menu_choice("要吊销的凭据名称: ") else {
-                return;
-            };
-            let grace = read_menu_choice("宽限期（留空则立即失效，例如 30m）: ")
-                .unwrap_or_default()
-                .trim()
-                .to_owned();
-            let grace = (!grace.is_empty()).then_some(grace);
-            let prompt = if grace.is_some() {
-                "确认吊销该凭据？宽限期结束后旧链接失效"
-            } else {
-                "确认立即吊销该凭据？该设备的旧链接将马上失效"
-            };
-            if confirm_menu_action(prompt) {
-                run_credential(root, CredentialCommand::Revoke { name, grace });
-            }
-        }
-        _ => {}
-    }
-}
-
-fn menu_traffic(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("流量与账期");
-        println!("1. 查看本周期流量");
-        println!("2. 配置上限、已用量、时区、刷新规则和出口网卡");
-        println!("3. 修正本周期总流量（GiB）");
-        println!("4. 修正本周期 RX/TX 流量（GiB）");
-        println!("5. 立即建立/刷新当前账期");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                print_traffic(root);
-                pause_menu();
-            }
-            Some("2") => {
-                run_topic_wizard(root, sbctl::wizard::ConfigurationTopic::Traffic);
-                pause_menu();
-            }
-            Some("3") => {
-                menu_total_traffic_correction(root);
-                pause_menu();
-            }
-            Some("4") => {
-                menu_direction_traffic_correction(root);
-                pause_menu();
-            }
-            Some("5") => {
-                if confirm_menu_action("确认建立/刷新当前账期？") {
-                    run_accounting_reset(root);
-                }
-                pause_menu();
-            }
-            Some(_) => {
-                eprintln!("无效选择，请输入 0 到 5。");
-                pause_menu();
-            }
-        }
-    }
-}
-
-fn menu_services(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("服务与诊断");
-        println!("1. 查看完整部署状态");
-        println!("2. 校验配置并重启服务");
-        println!("3. 查看运行日志");
-        println!("4. 查看内核状态（版本、PID、内存、CPU、运行时长）");
-        println!("5. 查看当前连接");
-        println!("6. 启用连接观察 API（仅监听本机）");
-        println!("7. 关闭连接观察 API");
-        println!("8. 查看证书状态");
-        println!("9. 签发 / 修复 HTTPS 证书");
-        println!("10. 续期 HTTPS 证书");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                print_status(root);
-                pause_menu();
-            }
-            Some("2") => {
-                if confirm_menu_action("确认校验配置并重启服务？") {
-                    restart(root, None);
-                }
-                pause_menu();
-            }
-            Some("3") => {
-                menu_logs(root);
-                pause_menu();
-            }
-            Some("4") => {
-                sing_box(root, SingBoxCommand::Status);
-                pause_menu();
-            }
-            Some("5") => {
-                sing_box(root, SingBoxCommand::Connections);
-                pause_menu();
-            }
-            Some("6") => {
-                sing_box(
-                    root,
-                    SingBoxCommand::Api {
-                        command: ApiCommand::Enable { port: None },
-                    },
-                );
-                pause_menu();
-            }
-            Some("7") => {
-                sing_box(
-                    root,
-                    SingBoxCommand::Api {
-                        command: ApiCommand::Disable,
-                    },
-                );
-                pause_menu();
-            }
-            Some("8") => {
-                crate::cli::commands::certificate::run_certificate(
-                    root,
-                    CertificateCommand::Status,
-                );
-                pause_menu();
-            }
-            Some("9") => {
-                if let Some(email) = read_menu_choice("ACME 邮箱: ") {
-                    crate::cli::commands::certificate::run_certificate(
-                        root,
-                        CertificateCommand::Obtain {
-                            email: Some(email),
-                            no_email: false,
-                        },
-                    );
-                }
-                pause_menu();
-            }
-            Some("10") => {
-                crate::cli::commands::certificate::run_certificate(root, CertificateCommand::Renew);
-                pause_menu();
-            }
-            Some(_) => {
-                eprintln!("无效选择，请按菜单中的编号输入。");
-                pause_menu();
-            }
-        }
-    }
-}
-
-fn menu_updates(root: &Path) {
-    loop {
-        clear_menu_screen();
-        print_menu_header(root);
-        print_menu_section("更新与卸载");
-        println!("1. 更新 sbctl");
-        println!("2. 更新 / 切换 sing-box 内核");
-        println!("3. 卸载服务和二进制（保留备份）");
-        println!("4. 彻底清理 sbctl 数据");
-        println!("0. 返回");
-        match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                if confirm_menu_action("确认更新 sbctl？将自动校验签名 manifest") {
-                    update(root, false, None, None, None);
-                }
-                pause_menu();
-            }
-            Some("2") => {
-                if sbctl::config::DeploymentStore::new(root).load().is_err() {
-                    menu_install(root, true);
-                } else if let Some((source, version)) = select_kernel() {
-                    sing_box(root, SingBoxCommand::Fetch { source, version });
-                }
-                pause_menu();
-            }
-            Some("3") => {
-                if confirm_menu_action("确认卸载服务和二进制并保留备份？") {
-                    uninstall(root, false);
-                    return;
-                }
-                pause_menu();
-            }
-            Some("4") => {
-                if confirm_menu_action("确认彻底清理 sbctl 数据？此操作不可恢复")
-                    && confirm_menu_action("再次确认：删除配置、状态、证书和备份？")
-                {
-                    uninstall(root, true);
-                    return;
-                }
-                pause_menu();
-            }
-            Some(_) => {
-                eprintln!("无效选择，请输入 0 到 4。");
-                pause_menu();
-            }
-        }
-    }
 }
 
 fn run_topic_wizard(root: &Path, topic: sbctl::wizard::ConfigurationTopic) {
@@ -769,97 +377,361 @@ fn select_kernel() -> Option<(KernelSource, Option<String>)> {
             }
             Some((KernelSource::Official, version))
         }
-        _ => None,
+        "0" => None,
+        _ => {
+            eprintln!("无效选择，请输入 0、1 或 2。");
+            None
+        }
     }
 }
 
-fn menu_configuration(root: &Path) {
-    loop {
-        print_menu_section("配置与路由规则");
-        println!("1. 添加入站 / 出站 / 路由规则（服务端 JSON 覆写）");
-        println!("2. 编辑客户端 sing-box 出站与规则");
-        println!("3. 编辑 Clash 规则");
-        println!("4. 预览整体配置（含凭据）");
-        println!("5. 导出 / 下载整体配置（私有文件）");
-        println!("6. 查看覆写层");
-        println!("0. 返回");
-        let selection = read_menu_choice("请选择 [0]: ");
-        let command = match selection.as_deref() {
-            Some("0") | None => return,
-            Some("1") => {
-                println!(
-                    "自定义入站使用 custom- 开头的 tag；会保留现有入站。可在 JSON 中添加 inbounds、outbounds、route.rules。"
+fn execute_action(root: &Path, action: Action) {
+    use crate::cli::commands::config::{commit_client_template, run_config};
+    use crate::cli::commands::{certificate, email, rule, ruleset, system};
+    use Action::*;
+    match action {
+        Open(page) => menu_page(root, page),
+        Status => {
+            print_status(root);
+        }
+        Logs => menu_logs(root),
+        KernelStatus => {
+            sing_box(root, SingBoxCommand::Status);
+        }
+        Connections => {
+            sing_box(root, SingBoxCommand::Connections);
+        }
+        CertificateStatus => {
+            certificate::run_certificate(root, CertificateCommand::Status);
+        }
+        QuickInstall => {
+            menu_install(root, false);
+        }
+        GuidedInstall | Reinstall => {
+            menu_install(root, true);
+        }
+        Nodes => {
+            print_nodes(root, false, None, false);
+        }
+        NodeLinks => {
+            if confirm_menu_action("确认显示节点分享链接？其中包含 Proxy credential")
+            {
+                print_nodes(root, true, None, false);
+            }
+        }
+        Topic(topic) => run_topic_wizard(root, topic),
+        Template => {
+            let store = sbctl::config::DeploymentStore::new(root);
+            let config = match store.load() {
+                Ok(c) => c,
+                Err(e) => {
+                    eprintln!("读取部署配置失败：{e}");
+                    return;
+                }
+            };
+            run_config(
+                root,
+                ConfigCommand::Override {
+                    command: OverrideCommand::Show,
+                },
+            );
+            println!("这些覆写在切换后仍会生效；失效的组或 DNS 引用将拒绝应用。");
+            match sbctl::wizard::run_template_selection(&config, &mut ConsolePrompts) {
+                Ok(sbctl::wizard::WizardOutcome::Changed(new)) => {
+                    commit_client_template(root, new.client_template, None);
+                }
+                Ok(sbctl::wizard::WizardOutcome::Cancelled) => {
+                    println!("模板切换已取消，原配置保留")
+                }
+                Ok(sbctl::wizard::WizardOutcome::Unchanged) => println!("模板未变化"),
+                Err(e) => eprintln!("模板选择失败：{e}"),
+            }
+        }
+        SubscriptionUrls => {
+            print_subscription_urls(root, None);
+        }
+        Qr(format) => {
+            print_subscription_qr(root, Some(format), false);
+        }
+        CredentialList => {
+            system::run_credential(root, CredentialCommand::List);
+        }
+        CredentialAdd => {
+            if let Some(name) = required_menu_text("设备凭据名称: ") {
+                system::run_credential(root, CredentialCommand::Add { name });
+            }
+        }
+        CredentialRevoke => {
+            let Some(name) = required_menu_text("要吊销的凭据名称: ") else {
+                return;
+            };
+            let Some(grace) = read_menu_choice("宽限期（留空立即失效，例如 30m）: ")
+            else {
+                return;
+            };
+            let grace = (!grace.is_empty()).then_some(grace);
+            if confirm_menu_action(
+                "确认吊销该凭据？其链接将在宽限期结束后失效，未设宽限期则立即失效",
+            ) {
+                system::run_credential(root, CredentialCommand::Revoke { name, grace });
+            }
+        }
+        Rotate => {
+            if confirm_menu_action("确认轮换默认订阅凭据？旧默认订阅 URL 将立即失效")
+            {
+                rotate_subscription_credential(root);
+            }
+        }
+        Traffic => {
+            print_traffic(root);
+        }
+        TotalCorrection => menu_total_traffic_correction(root),
+        DirectionCorrection => menu_direction_traffic_correction(root),
+        Reset => {
+            if confirm_menu_action(
+                "确认建立/刷新当前账期？仅在需要时建立新基线，不清空当前账期用量",
+            ) {
+                run_accounting_reset(root);
+            }
+        }
+        Restart => {
+            if confirm_menu_action("确认校验配置并重启服务？") {
+                restart(root, None);
+            }
+        }
+        ApiEnable => {
+            sing_box(
+                root,
+                SingBoxCommand::Api {
+                    command: ApiCommand::Enable { port: None },
+                },
+            );
+        }
+        ApiDisable => {
+            sing_box(
+                root,
+                SingBoxCommand::Api {
+                    command: ApiCommand::Disable,
+                },
+            );
+        }
+        CertificateObtain => {
+            if let Some(email) = required_menu_text("ACME 邮箱: ") {
+                certificate::run_certificate(
+                    root,
+                    CertificateCommand::Obtain {
+                        email: Some(email),
+                        no_email: false,
+                    },
                 );
+            }
+        }
+        CertificateRenew => {
+            if confirm_menu_action("确认续期 HTTPS 证书？") {
+                certificate::run_certificate(root, CertificateCommand::Renew);
+            }
+        }
+        Update => {
+            if confirm_menu_action("确认更新 sbctl？将校验签名清单") {
+                update(root, false, None, None, None);
+            }
+        }
+        KernelUpdate => {
+            if sbctl::config::DeploymentStore::new(root).load().is_err() {
+                eprintln!("尚未部署，请先进入「部署与协议」安装");
+            } else if let Some((source, version)) = select_kernel()
+                && confirm_menu_action("确认更新/切换 sing-box 内核？")
+            {
+                sing_box(root, SingBoxCommand::Fetch { source, version });
+            }
+        }
+        EditServer | EditSingBox | EditClash => {
+            let target = match action {
+                EditServer => CliOverrideTarget::Server,
+                EditSingBox => CliOverrideTarget::SingBox,
+                _ => CliOverrideTarget::Clash,
+            };
+            run_config(
+                root,
                 ConfigCommand::Override {
                     command: OverrideCommand::Edit {
-                        target: CliOverrideTarget::Server,
+                        target,
                         layer: None,
                         sing_box_bin: None,
                     },
-                }
-            }
-            Some("2") => ConfigCommand::Override {
-                command: OverrideCommand::Edit {
-                    target: CliOverrideTarget::SingBox,
-                    layer: None,
-                    sing_box_bin: None,
                 },
-            },
-            Some("3") => ConfigCommand::Override {
-                command: OverrideCommand::Edit {
-                    target: CliOverrideTarget::Clash,
-                    layer: None,
-                    sing_box_bin: None,
+            );
+        }
+        OverrideShow => {
+            run_config(
+                root,
+                ConfigCommand::Override {
+                    command: OverrideCommand::Show,
                 },
-            },
-            Some("4") | Some("5") => {
-                let export = selection.as_deref() == Some("5");
-                let format = read_menu_choice("格式 server / sing-box-full / clash [server]: ")
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or_else(|| "server".into());
-                if export {
-                    let Some(output) = read_menu_choice("导出到新文件路径（可使用 scp 下载）: ")
-                        .filter(|s| !s.is_empty())
-                    else {
-                        continue;
-                    };
-                    ConfigCommand::Export {
-                        format,
-                        output: output.into(),
-                    }
-                } else {
-                    ConfigCommand::Preview { format }
-                }
+            );
+        }
+        OverrideValidate => {
+            run_config(
+                root,
+                ConfigCommand::Override {
+                    command: OverrideCommand::Validate { sing_box_bin: None },
+                },
+            );
+        }
+        Preview | Export => {
+            if action == Preview && !confirm_menu_action("确认在终端显示完整配置？其中包含代理凭据")
+            {
+                return;
             }
-            Some("6") => ConfigCommand::Override {
-                command: OverrideCommand::Show,
-            },
-            _ => continue,
-        };
-        crate::cli::commands::config::run_config(root, command);
-        pause_menu();
+            let Some(format) = read_menu_choice("格式 server / sing-box-full / clash [server]: ")
+            else {
+                return;
+            };
+            let format = if format.is_empty() {
+                "server".into()
+            } else {
+                format
+            };
+            let command = if action == Export {
+                let Some(output) = required_menu_text("导出到私有新文件路径: ") else {
+                    return;
+                };
+                ConfigCommand::Export {
+                    format,
+                    output: output.into(),
+                }
+            } else {
+                ConfigCommand::Preview { format }
+            };
+            run_config(root, command);
+        }
+        FullWizard => {
+            run_config_wizard(root, None);
+        }
+        Regenerate => {
+            if confirm_menu_action("确认重新生成并校验全部配置工件？") {
+                regenerate(root, None);
+            }
+        }
+        Uninstall => {
+            if confirm_menu_action("确认卸载服务和二进制并保留备份？") {
+                uninstall(root, false);
+            }
+        }
+        Purge => {
+            if confirm_menu_action("确认彻底清理 sbctl 数据？此操作不可恢复")
+                && confirm_menu_action("再次确认：删除配置、状态、证书和备份？")
+            {
+                uninstall(root, true);
+            }
+        }
+        RuleList => {
+            rule::run_rule(root, RuleCommand::List { kind: None }, None);
+        }
+        RuleAdd | RuleRemove => {
+            let Some(kind) = menu_rule_kind(true) else {
+                return;
+            };
+            let Some(entry) = required_menu_text("规则（TYPE,value 或裸域名，一次一条）: ")
+            else {
+                return;
+            };
+            let command = if action == RuleAdd {
+                RuleCommand::Add {
+                    kind,
+                    entries: vec![entry],
+                }
+            } else {
+                RuleCommand::Remove {
+                    kind,
+                    entries: vec![entry],
+                }
+            };
+            rule::run_rule(root, command, None);
+        }
+        RuleSetList => {
+            ruleset::list(root);
+        }
+        RuleSetAdd => {
+            let Some(name) = required_menu_text("规则集名称: ") else {
+                return;
+            };
+            let Some(url) = required_menu_text("编译规则集 HTTPS URL（.srs / .mrs）: ")
+            else {
+                return;
+            };
+            let Some(target) = menu_rule_set_target() else {
+                return;
+            };
+            ruleset::add(root, &name, &url, target, None);
+        }
+        RuleSetRemove => {
+            if let Some(name) = required_menu_text("要移除的规则集名称: ") {
+                ruleset::remove(root, &name, None);
+            }
+        }
+        RuleImport => {
+            let Some(url) = required_menu_text("文本规则列表 HTTPS URL: ") else {
+                return;
+            };
+            let Some(target) = menu_rule_set_target() else {
+                return;
+            };
+            ruleset::import_list(&url, target, root, None);
+        }
+        RuleInterval => {
+            if let Some(value) = required_menu_text("规则集刷新间隔（例如 12h / 1d）: ")
+            {
+                ruleset::set_interval(root, &value, None);
+            }
+        }
+        EmailConfigure | EmailStatus | EmailSend | EmailEnable | EmailDisable => {
+            if action == EmailSend
+                && !confirm_menu_action("确认向已配置收件人发送状态/流量/订阅报告？")
+            {
+                return;
+            }
+            let command = match action {
+                EmailConfigure => EmailCommand::Configure,
+                EmailStatus => EmailCommand::Status,
+                EmailSend => EmailCommand::Send,
+                EmailEnable => EmailCommand::Enable,
+                _ => EmailCommand::Disable,
+            };
+            email::run_email(root, command);
+        }
     }
 }
-
-fn menu_email(root: &Path) {
-    loop {
-        print_menu_section("邮件通知");
-        println!("1. 配置 SMTP、收件人、日报和刷新提醒");
-        println!("2. 查看邮件配置（隐藏密码）");
-        println!("3. 立即发送状态 / 流量 / 订阅报告");
-        println!("4. 启用定时邮件");
-        println!("5. 关闭定时邮件");
-        println!("0. 返回");
-        let command = match read_menu_choice("请选择 [0]: ").as_deref() {
-            Some("0") | None => return,
-            Some("1") => EmailCommand::Configure,
-            Some("2") => EmailCommand::Status,
-            Some("3") => EmailCommand::Send,
-            Some("4") => EmailCommand::Enable,
-            Some("5") => EmailCommand::Disable,
-            _ => continue,
-        };
-        crate::cli::commands::email::run_email(root, command);
-        pause_menu();
+fn required_menu_text(label: &str) -> Option<String> {
+    read_menu_choice(label).filter(|value| !value.is_empty())
+}
+fn menu_rule_kind(include_filter: bool) -> Option<CliRuleKind> {
+    println!(
+        "1. 直连  2. 代理  3. 拒绝{}
+0. 取消",
+        if include_filter {
+            "  4. Fake-IP 例外"
+        } else {
+            ""
+        }
+    );
+    match read_menu_choice("请选择 [0]: ").as_deref() {
+        Some("1") => Some(CliRuleKind::Direct),
+        Some("2") => Some(CliRuleKind::Proxy),
+        Some("3") => Some(CliRuleKind::Reject),
+        Some("4") if include_filter => Some(CliRuleKind::FakeipFilter),
+        Some("0" | "") | None => None,
+        _ => {
+            eprintln!("无效规则类型");
+            None
+        }
     }
+}
+fn menu_rule_set_target() -> Option<crate::cli::commands::ruleset::RuleSetTarget> {
+    use crate::cli::commands::ruleset::RuleSetTarget;
+    menu_rule_kind(false).map(|kind| match kind {
+        CliRuleKind::Direct => RuleSetTarget::Direct,
+        CliRuleKind::Proxy => RuleSetTarget::Proxy,
+        _ => RuleSetTarget::Reject,
+    })
 }

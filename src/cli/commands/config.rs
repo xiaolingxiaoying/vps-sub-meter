@@ -591,6 +591,19 @@ pub(crate) fn regenerate_locked(root: &Path, sing_box_bin: Option<PathBuf>) -> E
 pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
     let result = match command {
+        ConfigCommand::Template { preset, sing_box_bin } => {
+            let template = match preset.as_str() {
+                "compact" => sbctl::subscription::ClientTemplate::Compact,
+                "standard" => sbctl::subscription::ClientTemplate::Standard,
+                "global" => sbctl::subscription::ClientTemplate::Global,
+                "split" => sbctl::subscription::ClientTemplate::Split,
+                _ => {
+                    eprintln!("模板必须是 compact 或 standard");
+                    return ExitCode::from(2);
+                }
+            };
+            return commit_client_template(root, template, sing_box_bin);
+        }
         ConfigCommand::Preview { format } => return configuration_artifact(root, &format, None),
         ConfigCommand::Export { format, output } => return configuration_artifact(root, &format, Some(&output)),
         ConfigCommand::Wizard { sing_box_bin } => return run_config_wizard(root, sing_box_bin),
@@ -727,6 +740,50 @@ pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
     }
 }
 
+/// A preset changes client artifacts only. Read the latest configuration under
+/// the operation lock so a menu selection cannot overwrite concurrent edits.
+pub(crate) fn commit_client_template(
+    root: &Path,
+    template: sbctl::subscription::ClientTemplate,
+    sing_box_bin: Option<PathBuf>,
+) -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let store = sbctl::config::DeploymentStore::new(root);
+        let _lock = store.acquire_operation_lock().map_err(|e| e.to_string())?;
+        let mut config = store.load().map_err(|e| e.to_string())?;
+        if config.client_template == template {
+            println!("模板未变化：{template}");
+            return Ok(());
+        }
+        config.client_template = template;
+        let binary = resolve_sing_box_bin(root, sing_box_bin)
+            .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?;
+        let snapshot =
+            sbctl::subscription::apply_config_transaction_locked(&store, &config, Some(&binary))
+                .map_err(|e| e.to_string())?;
+        if let Err(error) = sbctl::lifecycle::prepare_daemon_storage(
+            root,
+            config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+        ) {
+            sbctl::subscription::restore_config_transaction_locked(&store, &snapshot)
+                .map_err(|recovery| format!("{error}; rollback failed: {recovery}"))?;
+            return Err(error);
+        }
+        println!(
+            "客户端模板已切换为 {}；现有覆写保留，VPS 代理服务未重启。请刷新客户端订阅。",
+            config.client_template
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("模板切换失败，原配置保留：{error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
 pub(crate) fn run_config_wizard(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
     let existing = match store.load() {
@@ -784,6 +841,13 @@ pub(crate) fn commit_config_change(
             return ExitCode::from(2);
         }
     };
+    if let Some(prior) = existing.as_ref() {
+        let mut template_only = prior.clone();
+        template_only.client_template = new.client_template.clone();
+        if template_only == *new && prior.client_template != new.client_template {
+            return commit_client_template(root, new.client_template.clone(), sing_box_bin);
+        }
+    }
     let result = (|| -> Result<(), sbctl::config::ConfigError> {
         if !sbctl::traffic::interface_exists(root, &new.interface) {
             return Err(sbctl::config::ConfigError::InvalidValue(

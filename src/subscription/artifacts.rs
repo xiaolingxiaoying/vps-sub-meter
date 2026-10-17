@@ -295,8 +295,14 @@ pub fn apply_config_transaction_with_server_locked(
             ));
         };
         check_sing_box_config(sing_box_bin, server)?;
+        let template_changed = prior_config
+            .as_deref()
+            .and_then(|bytes| std::str::from_utf8(bytes).ok())
+            .and_then(|text| toml::from_str::<DeploymentConfig>(text).ok())
+            .is_some_and(|previous| previous.client_template != config.client_template);
         if (client_customization_is_present(store.root())?
-            || !config.client_extra_rule_sets.is_empty())
+            || !config.client_extra_rule_sets.is_empty()
+            || template_changed)
             && let Some((_, merged)) = artifacts
                 .iter()
                 .find(|(name, _)| *name == SubscriptionFormat::SingBoxFull.artifact_name())
@@ -517,7 +523,413 @@ pub fn generated_artifacts_for_kernel(
     ));
     apply_client_overrides(root, &mut artifacts)?;
     apply_rule_lists(root, &mut artifacts)?;
+    validate_client_references(&artifacts)?;
     Ok(artifacts)
+}
+
+/// Rejects client artifacts whose merged policy points at groups, nodes, or
+/// rule sets that are not present in that same artifact.
+fn validate_client_references(artifacts: &[(String, String)]) -> Result<(), SubscriptionError> {
+    let legacy_name = SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION)
+        .artifact_name()
+        .into_owned();
+    for (name, contents) in artifacts {
+        if name.starts_with("subscription-sing-box") && name != SING_BOX_ARTIFACT {
+            let value: serde_json::Value = serde_json::from_str(contents)
+                .map_err(|e| SubscriptionError::Override(e.to_string()))?;
+            validate_sing_box_references(name, &value)?;
+        } else if name == CLASH_ARTIFACT || name == &legacy_name {
+            let value: serde_yaml::Value = serde_yaml::from_str(contents)
+                .map_err(|e| SubscriptionError::Override(e.to_string()))?;
+            validate_mihomo_references(name, &value)?;
+        }
+    }
+    Ok(())
+}
+
+fn reference_error(name: &str, kind: &str, target: &str) -> SubscriptionError {
+    SubscriptionError::Override(format!("{name} 引用了不存在的 {kind}: {target}"))
+}
+
+fn tag_references(value: &serde_json::Value) -> impl Iterator<Item = &str> {
+    value.as_str().into_iter().chain(
+        value
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_json::Value::as_str),
+    )
+}
+
+fn validate_sing_box_references(
+    name: &str,
+    value: &serde_json::Value,
+) -> Result<(), SubscriptionError> {
+    use std::collections::HashSet;
+    let outbounds = value["outbounds"].as_array().cloned().unwrap_or_default();
+    let outbound_tags: HashSet<String> = outbounds
+        .iter()
+        .filter_map(|x| x["tag"].as_str().map(str::to_owned))
+        .collect();
+    let rule_sets: HashSet<String> = value["route"]["rule_set"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x["tag"].as_str().map(str::to_owned))
+        .collect();
+    let dns_tags: HashSet<String> = value["dns"]["servers"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|x| x["tag"].as_str().map(str::to_owned))
+        .collect();
+    let check_out = |target: &str| {
+        if outbound_tags.contains(target) {
+            Ok(())
+        } else {
+            Err(reference_error(name, "outbound", target))
+        }
+    };
+    if let Some(target) = value["route"]["default"]["outbound"].as_str() {
+        check_out(target)?;
+    }
+    for target in value["route"]["default"]["outbound"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        check_out(target)?;
+    }
+    if let Some(target) = value["route"]["final"].as_str() {
+        check_out(target)?;
+    }
+    if let Some(target) = value["route"]["default_domain_resolver"]
+        .as_str()
+        .or_else(|| value["route"]["default_domain_resolver"]["server"].as_str())
+        && !dns_tags.contains(target)
+    {
+        return Err(reference_error(name, "DNS resolver", target));
+    }
+    for set in value["route"]["rule_set"].as_array().into_iter().flatten() {
+        if let Some(target) = set["download_detour"].as_str() {
+            check_out(target)?;
+        }
+    }
+    for outbound in &outbounds {
+        if let Some(target) = outbound["detour"].as_str() {
+            check_out(target)?;
+        }
+        if let Some(target) = outbound["default"].as_str() {
+            check_out(target)?;
+        }
+        for target in outbound["outbounds"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            check_out(target)?;
+        }
+        for key in ["download_detour", "address_resolver"] {
+            if let Some(target) = outbound[key].as_str() {
+                if key == "download_detour" {
+                    check_out(target)?;
+                } else if !dns_tags.contains(target) {
+                    return Err(reference_error(name, "DNS resolver", target));
+                }
+            }
+        }
+        if let Some(target) = outbound["domain_resolver"]
+            .as_str()
+            .or_else(|| outbound["domain_resolver"]["server"].as_str())
+            && !dns_tags.contains(target)
+        {
+            return Err(reference_error(name, "DNS resolver", target));
+        }
+    }
+    fn walk_rules(
+        name: &str,
+        rules: &[serde_json::Value],
+        outs: &HashSet<String>,
+        sets: &HashSet<String>,
+    ) -> Result<(), SubscriptionError> {
+        for rule in rules {
+            if let Some(target) = rule["outbound"].as_str()
+                && !outs.contains(target)
+            {
+                return Err(reference_error(name, "outbound", target));
+            }
+            for target in tag_references(&rule["rule_set"]) {
+                if !sets.contains(target) {
+                    return Err(reference_error(name, "rule-set", target));
+                }
+            }
+            for key in ["rules", "rule"] {
+                if let Some(nested) = rule[key].as_array() {
+                    walk_rules(name, nested, outs, sets)?;
+                }
+            }
+        }
+        Ok(())
+    }
+    let rules = value["route"]["rules"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    walk_rules(name, &rules, &outbound_tags, &rule_sets)?;
+    if let Some(target) = value["dns"]["final"].as_str()
+        && !dns_tags.contains(target)
+    {
+        return Err(reference_error(name, "DNS server", target));
+    }
+    if let Some(target) = value["dns"]["default_domain_resolver"]["server"].as_str()
+        && !dns_tags.contains(target)
+    {
+        return Err(reference_error(name, "DNS resolver", target));
+    }
+    for server in value["dns"]["servers"].as_array().into_iter().flatten() {
+        if let Some(target) = server["detour"].as_str() {
+            check_out(target)?;
+        }
+        if let Some(target) = server["domain_resolver"]
+            .as_str()
+            .or_else(|| server["domain_resolver"]["server"].as_str())
+            && !dns_tags.contains(target)
+        {
+            return Err(reference_error(name, "DNS resolver", target));
+        }
+        if let Some(target) = server["address_resolver"]
+            .as_str()
+            .or_else(|| server["address_resolver"]["server"].as_str())
+            && !dns_tags.contains(target)
+        {
+            return Err(reference_error(name, "DNS resolver", target));
+        }
+    }
+    fn walk_dns_rules(
+        name: &str,
+        rules: &[serde_json::Value],
+        dns_tags: &HashSet<String>,
+        rule_sets: &HashSet<String>,
+    ) -> Result<(), SubscriptionError> {
+        for rule in rules {
+            if let Some(target) = rule["server"].as_str()
+                && !dns_tags.contains(target)
+            {
+                return Err(reference_error(name, "DNS server", target));
+            }
+            for target in tag_references(&rule["rule_set"]) {
+                if !rule_sets.contains(target) {
+                    return Err(reference_error(name, "DNS rule-set", target));
+                }
+            }
+            if let Some(nested) = rule["rules"].as_array() {
+                walk_dns_rules(name, nested, dns_tags, rule_sets)?;
+            }
+        }
+        Ok(())
+    }
+    if let Some(rules) = value["dns"]["rules"].as_array() {
+        walk_dns_rules(name, rules, &dns_tags, &rule_sets)?;
+    }
+    Ok(())
+}
+
+fn validate_mihomo_references(
+    name: &str,
+    value: &serde_yaml::Value,
+) -> Result<(), SubscriptionError> {
+    use std::collections::HashSet;
+    let names: HashSet<String> = value["proxies"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|p| p["name"].as_str().map(str::to_owned))
+        .collect();
+    let groups = value["proxy-groups"].as_sequence().into_iter().flatten();
+    let mut known = names;
+    let mut group_values = Vec::new();
+    for group in groups {
+        if let Some(n) = group["name"].as_str() {
+            known.insert(n.to_owned());
+        }
+        group_values.push(group.clone());
+    }
+    known.extend(
+        [
+            "DIRECT",
+            "REJECT",
+            "REJECT-DROP",
+            "COMPATIBLE",
+            "PASS",
+            "GLOBAL",
+        ]
+        .into_iter()
+        .map(str::to_owned),
+    );
+    for group in &group_values {
+        for member in group["proxies"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_str())
+        {
+            if !known.contains(member) && !["DIRECT", "REJECT", "PASS", "GLOBAL"].contains(&member)
+            {
+                return Err(reference_error(name, "proxy/group", member));
+            }
+        }
+    }
+    for rule in value["rules"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        if let Some(target) = rule
+            .strip_suffix(",no-resolve")
+            .unwrap_or(rule)
+            .rsplit(',')
+            .next()
+            && !known.contains(target)
+            && !["DIRECT", "REJECT", "PASS", "GLOBAL"].contains(&target)
+        {
+            return Err(reference_error(name, "proxy/group", target));
+        }
+    }
+    let providers: HashSet<String> = value["rule-providers"]
+        .as_mapping()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .filter_map(|k| k.as_str().map(str::to_owned))
+        .collect();
+    for rule in value["rules"]
+        .as_sequence()
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        if rule.starts_with("RULE-SET,") {
+            let set = rule.split(',').nth(1).unwrap_or("");
+            if !providers.contains(set) {
+                return Err(reference_error(name, "rule-set", set));
+            }
+        }
+    }
+    for key in ["nameserver-policy", "proxy-server-nameserver-policy"] {
+        for policy in value["dns"][key]
+            .as_mapping()
+            .into_iter()
+            .flat_map(|m| m.keys())
+            .filter_map(serde_yaml::Value::as_str)
+        {
+            if let Some(tags) = policy.strip_prefix("rule-set:") {
+                for tag in tags.split(',').map(str::trim) {
+                    if !providers.contains(tag) {
+                        return Err(reference_error(name, "DNS rule-set", tag));
+                    }
+                }
+            }
+        }
+    }
+    fn check_dns_group_values(
+        name: &str,
+        value: &serde_yaml::Value,
+        known: &HashSet<String>,
+    ) -> Result<(), SubscriptionError> {
+        match value {
+            serde_yaml::Value::String(s) => {
+                for fragment in s.split('#').skip(1).flat_map(|f| f.split('&')) {
+                    let key = fragment.split('=').next().unwrap_or("");
+                    let flag = [
+                        "h3",
+                        "h2",
+                        "http3",
+                        "ecs",
+                        "ecs-override",
+                        "disable-ipv4",
+                        "disable-ipv6",
+                        "disable-aaaa",
+                        "prefer-h3",
+                        "no-resolve",
+                        "skip-cert-verify",
+                        "name-cert-verify",
+                        "RULES",
+                    ]
+                    .contains(&key);
+                    // Mihomo treats an unknown name here as a client network
+                    // interface, not necessarily a proxy. Preserve that syntax.
+                    // The removed built-in automatic group is unambiguously a
+                    // stale template reference. See wiki.metacubex.one/config/dns/.
+                    let stale_group =
+                        fragment == crate::subscription::AUTO_TAG && !known.contains(fragment);
+                    if !fragment.is_empty() && !flag && stale_group {
+                        return Err(reference_error(name, "DNS proxy/group", fragment));
+                    }
+                }
+            }
+            serde_yaml::Value::Sequence(values) => {
+                for v in values {
+                    check_dns_group_values(name, v, known)?;
+                }
+            }
+            serde_yaml::Value::Mapping(values) => {
+                for v in values.values() {
+                    check_dns_group_values(name, v, known)?;
+                }
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+    for key in [
+        "nameserver-policy",
+        "nameserver",
+        "fallback",
+        "default-nameserver",
+        "direct-nameserver",
+        "proxy-server-nameserver",
+    ] {
+        check_dns_group_values(name, &value["dns"][key], &known)?;
+    }
+    let proxy_providers: HashSet<&str> = value["proxy-providers"]
+        .as_mapping()
+        .into_iter()
+        .flat_map(|m| m.keys())
+        .filter_map(serde_yaml::Value::as_str)
+        .collect();
+    for group in &group_values {
+        for provider in group["use"]
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter_map(serde_yaml::Value::as_str)
+        {
+            if !proxy_providers.contains(provider) {
+                return Err(reference_error(name, "proxy-provider", provider));
+            }
+        }
+    }
+    for key in ["rule-providers", "proxy-providers"] {
+        for provider in value[key].as_mapping().into_iter().flat_map(|m| m.values()) {
+            if let Some(target) = provider["proxy"].as_str()
+                && !known.contains(target)
+            {
+                return Err(reference_error(name, "provider proxy/group", target));
+            }
+        }
+    }
+    if let Some(filters) = value["dns"]["fake-ip-filter"].as_sequence() {
+        for f in filters.iter().filter_map(|v| v.as_str()) {
+            if let Some(set) = f.strip_prefix("rule-set:")
+                && !providers.contains(set)
+            {
+                return Err(reference_error(name, "fake-ip-filter rule-set", set));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Injects the operator's `etc/sbctl/rules/*.list` entries into the client
@@ -1060,9 +1472,10 @@ mod tests {
     }
 
     /// Every template, rendered through the same pinned config.
-    fn all_templates() -> [ClientTemplate; 3] {
+    fn all_templates() -> [ClientTemplate; 4] {
         [
             ClientTemplate::Standard,
+            ClientTemplate::Compact,
             ClientTemplate::Global,
             ClientTemplate::Split,
         ]
@@ -1109,7 +1522,11 @@ mod tests {
             ClientTemplate::Standard,
             crate::config::ClientRuleProfile::Standard,
         );
-        for template in [ClientTemplate::Global, ClientTemplate::Split] {
+        for template in [
+            ClientTemplate::Compact,
+            ClientTemplate::Global,
+            ClientTemplate::Split,
+        ] {
             let artifacts = render(
                 &fixture,
                 template.clone(),
@@ -1360,7 +1777,8 @@ mod tests {
                 "{template}/minimal must still name the CN domains inline"
             );
             assert!(
-                text.contains("doubleclick.net") || template == ClientTemplate::Standard,
+                text.contains("doubleclick.net")
+                    || matches!(template, ClientTemplate::Standard | ClientTemplate::Compact),
                 "{template}/minimal must still block ads inline"
             );
             assert!(
@@ -1904,6 +2322,86 @@ ot-a-sing-box.bin"
                     .expect("the first rule is a string")
                     .contains("novixlink"),
                 "{name} must prepend the override rule"
+            );
+        }
+    }
+
+    #[test]
+    fn merged_overrides_must_not_leave_dangling_client_references() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (_store, config, _) = seed_direct_subscription(&fixture);
+        let overrides = fixture.path().join("etc/sbctl/overrides");
+        fs::create_dir_all(&overrides).expect("override directory is created");
+        fs::write(
+            overrides.join("sing-box-override.json"),
+            r#"{"route":{"rules":[{"domain_suffix":["example.test"],"outbound":"missing-group"}]}}"#,
+        ).expect("dangling sing-box reference is written");
+        let error = generated_artifacts(&config, fixture.path())
+            .expect_err("a rule to an absent outbound must be rejected");
+        assert!(matches!(error, super::SubscriptionError::Override(_)));
+
+        fs::remove_file(overrides.join("sing-box-override.json")).unwrap();
+        fs::write(
+            overrides.join("clash-override.yaml"),
+            "proxy-groups:\n  - name: Extra\n    type: select\n    proxies: [missing-node]\n",
+        )
+        .expect("dangling Mihomo reference is written");
+        let error = generated_artifacts(&config, fixture.path())
+            .expect_err("a group containing an absent node must be rejected");
+        assert!(matches!(error, super::SubscriptionError::Override(_)));
+    }
+
+    #[test]
+    fn reference_checks_use_declared_groups_and_distinguish_dns_and_route_targets() {
+        let sing_box = serde_json::json!({
+            "outbounds": [
+                {"type":"selector", "tag":"Proxy", "default":"node", "outbounds":["node"]},
+                {"type":"direct", "tag":"DIRECT"},
+                {"type":"vless", "tag":"node"}
+            ],
+            "route": {"final":"Proxy", "rule_set":[{"tag":"geo"}], "rules":[
+                {"type":"logical", "rules":[{"outbound":"node"},{"rule_set":["geo"]}]}
+            ]},
+            "dns": {"servers":[{"tag":"resolver"},{"tag":"doh","domain_resolver":{"server":"resolver"}}],
+                "final":"doh", "rules":[{"outbound":"any","server":"resolver","rule_set":["geo"]}]}
+        });
+        super::validate_sing_box_references("sing-box.json", &sing_box)
+            .expect("defined selector/node/DNS/rule-set references are accepted");
+        let mut invalid = sing_box.clone();
+        invalid["outbounds"]
+            .as_array_mut()
+            .unwrap()
+            .retain(|o| o["tag"] != "DIRECT");
+        invalid["route"]["final"] = serde_json::json!("DIRECT");
+        assert!(
+            super::validate_sing_box_references("sing-box.json", &invalid).is_err(),
+            "sing-box target names must be declared outbound tags"
+        );
+
+        for section in ["dns", "route"] {
+            let mut missing_set = sing_box.clone();
+            missing_set[section]["rules"][0]["rule_set"] = serde_json::json!("missing-set");
+            assert!(super::validate_sing_box_references("sing-box.json", &missing_set).is_err());
+        }
+        let mihomo: serde_yaml::Value = serde_yaml::from_str(
+            "proxies:\n  - name: node\nproxy-groups:\n  - name: Proxy\n    proxies: [node, DIRECT]\nrules:\n  - MATCH,Proxy\ndns:\n  nameserver: [https://dns.test/query#Proxy, https://dns.test/query#h3]\n  nameserver-policy:\n    example.test: ['#Proxy']\n",
+        ).unwrap();
+        super::validate_mihomo_references("mihomo.yaml", &mihomo)
+            .expect("defined group and Mihomo DNS flags are accepted");
+        let mut reject_drop = mihomo.clone();
+        reject_drop["rules"] = serde_yaml::to_value(["MATCH,REJECT-DROP"]).unwrap();
+        super::validate_mihomo_references("mihomo.yaml", &reject_drop).unwrap();
+        for (address, valid) in [
+            ("https://dns.test/query#Proxy&h3", true),
+            ("https://dns.test/query#自动选择#h3", false),
+            ("https://dns.test/query#eth0&disable-qtype-65=true", true),
+            ("https://dns.test/query#RULES&ecs=1.1.1.1/24", true),
+        ] {
+            let mut overlay = mihomo.clone();
+            overlay["dns"]["nameserver"] = serde_yaml::to_value([address]).unwrap();
+            assert_eq!(
+                super::validate_mihomo_references("mihomo.yaml", &overlay).is_ok(),
+                valid
             );
         }
     }

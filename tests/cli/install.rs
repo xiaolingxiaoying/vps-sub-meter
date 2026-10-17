@@ -44,13 +44,14 @@ fn guided_install_uses_one_confirmed_wizard_and_installs_its_configuration() {
         true,
         &["vless", "vmess", "hysteria2", "tuic", "anytls"],
     );
-    let mut answers = vec![String::new(); 25];
+    let mut answers = vec![String::new(); 22];
     answers[1] = "sub.example.test".into();
-    answers[4] = "y".into();
+    answers[4] = "y".into(); // confirm skipping the optional Certbot email
     answers[17] = "www.cloudflare.com".into();
-    // Decline the client-template offer, then confirm the summary.
-    answers[23] = "n".into();
-    answers[24] = "y".into();
+    // Decline template and accounting customization separately, then confirm summary.
+    answers[19] = "n".into();
+    answers[20] = "n".into();
+    answers[21] = "y".into();
 
     Command::cargo_bin("sbctl")
         .expect("sbctl binary is built")
@@ -100,12 +101,13 @@ fn cancelling_guided_install_leaves_no_managed_state() {
     .expect("default route is written");
     fs::create_dir_all(fixture.path().join("sys/class/net/ens3"))
         .expect("default interface is created");
-    let mut answers = vec![String::new(); 25];
+    let mut answers = vec![String::new(); 22];
     answers[1] = "sub.example.test".into();
     answers[4] = "y".into();
     answers[17] = "www.cloudflare.com".into();
-    answers[23] = "n".into();
-    answers[24] = "n".into();
+    answers[19] = "n".into();
+    answers[20] = "n".into();
+    answers[21] = "n".into();
 
     Command::cargo_bin("sbctl")
         .expect("sbctl binary is built")
@@ -191,12 +193,13 @@ fn guided_replacement_installs_over_residual_units_and_recovers_on_failure() {
         fs::create_dir_all(link.parent().unwrap()).unwrap();
         symlink("/missing/sing-box.service", &link).unwrap();
         let checker = sing_box_check_fixture(&fixture, accepts_config, &[]);
-        let mut answers = vec![String::new(); 25];
+        let mut answers = vec![String::new(); 22];
         answers[1] = "sub.example.test".into();
         answers[4] = "y".into();
         answers[17] = "www.cloudflare.com".into();
-        answers[23] = "n".into();
-        answers[24] = "y".into();
+        answers[19] = "n".into();
+        answers[20] = "n".into();
+        answers[21] = "y".into();
         let mut command = Command::cargo_bin("sbctl").unwrap();
         command
             .args([
@@ -1104,14 +1107,15 @@ for inbound in config.get('inbounds', []):
     )
     .unwrap();
     fs::set_permissions(&checker, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut answers = vec![String::new(); 24];
+    let mut answers = vec![String::new(); 21];
     answers[1] = "sub.example.test".into();
     answers[3] = "admin@example.com".into();
     answers[4] = "ens3".into();
     answers[5] = "domain".into();
     answers[16] = "www.cloudflare.com".into();
-    answers[22] = "n".into();
-    answers[23] = "y".into();
+    answers[18] = "n".into();
+    answers[19] = "n".into();
+    answers[20] = "y".into();
     Command::cargo_bin("sbctl")
         .unwrap()
         .args([

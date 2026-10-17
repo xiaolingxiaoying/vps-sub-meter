@@ -1,6 +1,8 @@
 //! `sbctl config`: initialization, validation, regeneration and the
 //! interactive wizard, and the accounting anchors they persist.
 
+#[cfg(unix)]
+use crate::fixture::write_command_fixture;
 use assert_cmd::Command;
 use base64::Engine;
 use predicates::prelude::*;
@@ -739,7 +741,7 @@ fn config_wizard_creates_a_new_deployment_with_secure_defaults() {
         true,
         &["vless", "vmess", "hysteria2", "tuic", "anytls"],
     );
-    let mut answers = vec![String::new(); 25];
+    let mut answers = vec![String::new(); 22];
     answers[1] = "sub.example.test".into();
     // Confirm the no-email ACME path (the wizard asks for an email and, when
     // it is empty, requires an explicit confirmation).
@@ -747,8 +749,9 @@ fn config_wizard_creates_a_new_deployment_with_secure_defaults() {
     answers[17] = "www.cloudflare.com".into();
     // Decline the fresh-deployment client-template offer, then confirm the
     // summary on the following line.
-    answers[23] = "n".into();
-    answers[24] = "y".into();
+    answers[19] = "n".into();
+    answers[20] = "n".into();
+    answers[21] = "y".into();
     let input = answers.join("\n") + "\n";
 
     Command::cargo_bin("sbctl")
@@ -794,6 +797,114 @@ fn config_wizard_creates_a_new_deployment_with_secure_defaults() {
         assert!(
             config.contains(protocol),
             "{protocol} is enabled by default"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn client_template_switch_changes_only_client_artifacts_without_restarting_or_resetting_accounting()
+{
+    let fixture = TempDir::new().expect("temporary root is created");
+    write_traffic_fixture(&fixture, 100, 200, "boot-a");
+    // A failing systemctl stub proves this client-only operation never calls it.
+    write_command_fixture(
+        &fixture,
+        "usr/bin/systemctl",
+        1,
+        "unexpected systemctl call",
+    );
+    seed_ip_fallback(fixture.path().to_str().unwrap());
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            fixture.path().to_str().unwrap(),
+            "accounting-reset",
+        ])
+        .assert()
+        .success();
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    let state_path = fixture.path().join("var/lib/sbctl/state.json");
+    let state_before = fs::read(&state_path).expect("accounting state exists");
+    let server_path = fixture
+        .path()
+        .join("var/lib/sbctl/artifacts/sing-box-server.json");
+    let server_before = fs::read(&server_path).expect("server artifact exists");
+    let full_path = fixture
+        .path()
+        .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json");
+    let full_before = fs::read(&full_path).expect("client artifact exists");
+
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            fixture.path().to_str().unwrap(),
+            "config",
+            "template",
+            "compact",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("VPS 代理服务未重启"));
+
+    let config = fs::read_to_string(fixture.path().join("etc/sbctl/config.toml")).unwrap();
+    assert!(config.contains("client_template = \"compact\""));
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(fs::read(&server_path).unwrap(), server_before);
+    assert_ne!(
+        fs::read(&full_path).unwrap(),
+        full_before,
+        "selected template changes the client artifact"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn client_template_switch_rolls_back_config_and_artifacts_for_invalid_override_or_failed_kernel_check()
+ {
+    for reject_by_override in [true, false] {
+        let fixture = TempDir::new().expect("temporary root is created");
+        seed_ip_fallback(fixture.path().to_str().unwrap());
+        let config_path = fixture.path().join("etc/sbctl/config.toml");
+        let config_before = fs::read(&config_path).unwrap();
+        let artifact_dir = fixture.path().join("var/lib/sbctl/artifacts");
+        let artifact_before = fs::read_dir(&artifact_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        if reject_by_override {
+            let overrides = fixture.path().join("etc/sbctl/overrides");
+            fs::create_dir_all(&overrides).unwrap();
+            fs::write(overrides.join("sing-box-override.json"), r#"{"route":{"rules":[{"domain_suffix":["example.test"],"outbound":"missing-group"}]}}"#).unwrap();
+        }
+        let checker = sing_box_check_fixture(&fixture, reject_by_override, &["vless"]);
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args([
+                "--root",
+                fixture.path().to_str().unwrap(),
+                "config",
+                "template",
+                "compact",
+                "--sing-box-bin",
+                checker.to_str().unwrap(),
+            ])
+            .assert()
+            .failure();
+        assert_eq!(fs::read(&config_path).unwrap(), config_before);
+        let after = fs::read_dir(&artifact_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| (entry.file_name(), fs::read(entry.path()).unwrap()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(
+            after, artifact_before,
+            "failed validation preserves every generated artifact"
         );
     }
 }
