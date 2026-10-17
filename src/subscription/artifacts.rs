@@ -97,6 +97,15 @@ pub fn regenerate_current(
     update_active_config: bool,
 ) -> Result<DeploymentConfig, SubscriptionError> {
     let _lock = store.acquire_operation_lock()?;
+    regenerate_current_locked(store, sing_box_bin, update_active_config)
+}
+
+/// Caller holds the operation lock while changing rule sources and regenerating.
+pub fn regenerate_current_locked(
+    store: &DeploymentStore,
+    sing_box_bin: Option<&Path>,
+    update_active_config: bool,
+) -> Result<DeploymentConfig, SubscriptionError> {
     let config = store.load()?;
     regenerate_locked(store, &config, sing_box_bin, update_active_config)?;
     Ok(config)
@@ -117,7 +126,8 @@ fn regenerate_locked(
         // kernel about would be served to every subscriber on the strength of a
         // check that never covered it. When customization exists, pay for one
         // extra check of the bytes that actually ship.
-        if client_customization_is_present(store.root())?
+        if (client_customization_is_present(store.root())?
+            || !config.client_extra_rule_sets.is_empty())
             && let Some((_, merged)) = artifacts
                 .iter()
                 .find(|(name, _)| *name == SubscriptionFormat::SingBoxFull.artifact_name())
@@ -285,6 +295,14 @@ pub fn apply_config_transaction_with_server_locked(
             ));
         };
         check_sing_box_config(sing_box_bin, server)?;
+        if (client_customization_is_present(store.root())?
+            || !config.client_extra_rule_sets.is_empty())
+            && let Some((_, merged)) = artifacts
+                .iter()
+                .find(|(name, _)| *name == SubscriptionFormat::SingBoxFull.artifact_name())
+        {
+            check_sing_box_config(sing_box_bin, merged)?;
+        }
         for (name, contents) in &artifacts {
             if let Err(error) = store.write_artifact_locked(name, contents.as_bytes()) {
                 restore_replaced(store, &prior_artifacts, prior_active.as_deref());

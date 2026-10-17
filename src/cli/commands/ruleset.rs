@@ -12,10 +12,10 @@
 //!   the command line, because generation must stay free of network access for
 //!   the artifacts to remain reproducible.
 
-use crate::cli::commands::config::regenerate;
+use crate::cli::commands::config::regenerate_locked;
+use crate::cli::commands::rule::with_list_transaction;
 use sbctl::rule_list::{RuleKind, RuleLists, validate_entry};
 use std::fs;
-use std::io::Write;
 use std::path::Path;
 use std::process::{Command, ExitCode};
 
@@ -124,34 +124,27 @@ pub(crate) fn add(
         eprintln!("拒绝 {url}：{message}");
         return ExitCode::from(2);
     }
-    let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|mut config| {
-        let entry = sbctl::config::ExtraRuleSet {
-            name: name.to_owned(),
-            url: url.to_owned(),
-            outbound: target.word().to_owned(),
-        };
-        match config
-            .client_extra_rule_sets
-            .iter_mut()
-            .find(|set| set.name == name)
-        {
-            Some(existing) => *existing = entry,
-            None => config.client_extra_rule_sets.push(entry),
-        }
-        config.validate()?;
-        store.replace(&config)
-    });
-    match result {
-        Ok(()) => {
-            println!("已注册规则集 {name} -> {}", target.word());
-            regenerate(root, sing_box_bin)
-        }
-        Err(error) => {
-            eprintln!("rule-set add failed: {error}");
-            ExitCode::from(2)
-        }
-    }
+    commit_rule_set_change(
+        root,
+        sing_box_bin,
+        &format!("已注册规则集 {name} -> {}", target.word()),
+        |config| {
+            let entry = sbctl::config::ExtraRuleSet {
+                name: name.to_owned(),
+                url: url.to_owned(),
+                outbound: target.word().to_owned(),
+            };
+            match config
+                .client_extra_rule_sets
+                .iter_mut()
+                .find(|set| set.name == name)
+            {
+                Some(existing) => *existing = entry,
+                None => config.client_extra_rule_sets.push(entry),
+            }
+            Ok(())
+        },
+    )
 }
 
 pub(crate) fn remove(
@@ -159,25 +152,61 @@ pub(crate) fn remove(
     name: &str,
     sing_box_bin: Option<std::path::PathBuf>,
 ) -> ExitCode {
+    commit_rule_set_change(
+        root,
+        sing_box_bin,
+        &format!("已移除规则集 {name}"),
+        |config| {
+            let before = config.client_extra_rule_sets.len();
+            config.client_extra_rule_sets.retain(|set| set.name != name);
+            if config.client_extra_rule_sets.len() == before {
+                return Err(sbctl::config::ConfigError::StateContent(format!(
+                    "未注册名为 {name:?} 的规则集"
+                )));
+            }
+            Ok(())
+        },
+    )
+}
+
+/// Keep configuration and generated artifacts in one validated transaction.
+fn commit_rule_set_change(
+    root: &Path,
+    sing_box_bin: Option<std::path::PathBuf>,
+    success_message: &str,
+    change: impl FnOnce(&mut sbctl::config::DeploymentConfig) -> Result<(), sbctl::config::ConfigError>,
+) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|mut config| {
-        let before = config.client_extra_rule_sets.len();
-        config.client_extra_rule_sets.retain(|set| set.name != name);
-        if config.client_extra_rule_sets.len() == before {
-            return Err(sbctl::config::ConfigError::StateContent(format!(
-                "未注册名为 {name:?} 的规则集"
-            )));
+    let result = (|| -> Result<(), String> {
+        let _lock = store
+            .acquire_operation_lock()
+            .map_err(|error| error.to_string())?;
+        let mut config = store.load().map_err(|error| error.to_string())?;
+        change(&mut config).map_err(|error| error.to_string())?;
+        let binary = sing_box_bin.unwrap_or_else(|| root.join("usr/local/bin/sing-box"));
+        let snapshot =
+            sbctl::subscription::apply_config_transaction_locked(&store, &config, Some(&binary))
+                .map_err(|error| error.to_string())?;
+        if let Err(error) = sbctl::lifecycle::prepare_daemon_storage(
+            root,
+            config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+        ) {
+            if let Err(recovery) =
+                sbctl::subscription::restore_config_transaction_locked(&store, &snapshot)
+            {
+                return Err(format!("{error}; rollback failed: {recovery}"));
+            }
+            return Err(error);
         }
-        config.validate()?;
-        store.replace(&config)
-    });
+        Ok(())
+    })();
     match result {
         Ok(()) => {
-            println!("已移除规则集 {name}");
-            regenerate(root, sing_box_bin)
+            println!("{success_message}\n规则集配置和订阅已验证并更新");
+            ExitCode::SUCCESS
         }
         Err(error) => {
-            eprintln!("rule-set remove failed: {error}");
+            eprintln!("rule-set change failed: {error}");
             ExitCode::from(2)
         }
     }
@@ -254,12 +283,17 @@ pub(crate) fn import_list(
     };
     // A failed import must not fall through to a regeneration of half-written
     // rules: report, and leave the previous lists and artifacts in place.
-    if let Err(message) = append_lines(&text, target, root) {
-        eprintln!("导入失败: {message}");
-        return ExitCode::from(2);
-    }
-    println!("已导入 {url} -> {}", target.rule_kind().file_name());
-    regenerate(root, sing_box_bin)
+    with_list_transaction(root, target.rule_kind(), || {
+        if let Err(message) = append_lines(&text, target, root) {
+            eprintln!("导入失败: {message}");
+            return ExitCode::from(2);
+        }
+        let result = regenerate_locked(root, sing_box_bin);
+        if result == ExitCode::SUCCESS {
+            println!("已导入 {url} -> {}", target.rule_kind().file_name());
+        }
+        result
+    })
 }
 
 /// Stores the subscriber refresh interval and regenerates.
@@ -278,35 +312,30 @@ pub(crate) fn set_interval(
         eprintln!("{value:?} 不是合法时长；请用 30m / 12h / 7d 这类写法");
         return ExitCode::from(2);
     }
-    let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|mut config| {
-        config.client_rule_set_update_interval = value.to_owned();
-        config.validate()?;
-        store.replace(&config)
-    });
-    match result {
-        Ok(()) => {
-            println!("订阅端规则集刷新间隔已设为 {value}");
-            regenerate(root, sing_box_bin)
-        }
-        Err(error) => {
-            eprintln!("rule-set interval failed: {error}");
-            ExitCode::from(2)
-        }
-    }
+    commit_rule_set_change(
+        root,
+        sing_box_bin,
+        &format!("订阅端规则集刷新间隔已设为 {value}"),
+        |config| {
+            config.client_rule_set_update_interval = value.to_owned();
+            Ok(())
+        },
+    )
 }
 
 /// Parses fetched lines and appends the valid ones to the operator list.
 pub(crate) fn append_lines(text: &str, target: RuleSetTarget, root: &Path) -> Result<(), String> {
+    let lists = RuleLists::load(root).map_err(|error| error.to_string())?;
+    let mut seen = lists.entries_for(target.rule_kind()).to_vec();
     let path = root
         .join("etc/sbctl/rules")
         .join(target.rule_kind().file_name());
-    let mut existing = if path.is_file() {
-        fs::read_to_string(&path).map_err(|error| error.to_string())?
-    } else {
-        fs::create_dir_all(path.parent().expect("list path has a parent"))
-            .map_err(|error| error.to_string())?;
-        String::from("# sbctl 规则列表：TYPE,value 每行一条，# 为注释\n")
+    let mut existing = match sbctl::config::read_managed_file_no_follow(&path) {
+        Ok(bytes) => String::from_utf8(bytes).map_err(|error| error.to_string())?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            String::from("# sbctl 规则列表：TYPE,value 每行一条，# 为注释\n")
+        }
+        Err(error) => return Err(error.to_string()),
     };
     let mut added = 0;
     for line in text.lines() {
@@ -324,19 +353,27 @@ pub(crate) fn append_lines(text: &str, target: RuleSetTarget, root: &Path) -> Re
             return Err(format!("无法解析行 {line:?}"));
         }
         validate_entry(&matcher, value).map_err(|error| format!("{line:?}: {error}"))?;
-        let entry = format!("{matcher},{value}");
-        if existing.contains(&entry) || existing.contains(&format!("{entry},")) {
+        let entry = sbctl::rule_list::RuleEntry {
+            matcher,
+            value: value.to_owned(),
+            no_resolve: parts.any(|part| part.trim() == "no-resolve"),
+        };
+        if seen.contains(&entry) {
             continue;
         }
         if !existing.ends_with('\n') {
             existing.push('\n');
         }
-        existing.push_str(&entry);
+        existing.push_str(&entry.to_string());
+        seen.push(entry);
         existing.push('\n');
         added += 1;
     }
-    let mut file = fs::File::create(&path).map_err(|error| error.to_string())?;
-    file.write_all(existing.as_bytes())
+    sbctl::config::DeploymentStore::new(root)
+        .write_relative_locked(
+            &format!("etc/sbctl/rules/{}", target.rule_kind().file_name()),
+            existing.as_bytes(),
+        )
         .map_err(|error| error.to_string())?;
     println!("新增 {added} 条规则");
     Ok(())
@@ -381,7 +418,10 @@ mod tests {
             "{written}"
         );
         assert!(written.contains("DOMAIN,api.example\n"), "{written}");
-        assert!(written.contains("IP-CIDR,10.20.0.0/16\n"), "{written}");
+        assert!(
+            written.contains("IP-CIDR,10.20.0.0/16,no-resolve\n"),
+            "{written}"
+        );
 
         // A second import of the same lines adds nothing.
         append_lines(text, RuleSetTarget::Reject, root).expect("re-import succeeds");
@@ -405,5 +445,33 @@ mod tests {
             !root.join("etc/sbctl/rules/direct.list").exists(),
             "a refused import must not leave a partial file behind"
         );
+    }
+
+    #[test]
+    fn import_deduplicates_entries_instead_of_substrings_or_comments() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let root = directory.path();
+        let path = root.join("etc/sbctl/rules/direct.list");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, "# DOMAIN,comment.example\nDOMAIN,api.example.com\n").unwrap();
+        let text = "DOMAIN,api.example\nDOMAIN,comment.example\nDOMAIN,api.example\n";
+        append_lines(text, RuleSetTarget::Direct, root).unwrap();
+        let lists = sbctl::rule_list::RuleLists::load(root).unwrap();
+        assert_eq!(lists.direct.len(), 3);
+        assert!(
+            lists
+                .direct
+                .iter()
+                .any(|entry| entry.value == "api.example")
+        );
+        assert!(
+            lists
+                .direct
+                .iter()
+                .any(|entry| entry.value == "comment.example")
+        );
+        let before = std::fs::read(&path).unwrap();
+        append_lines(text, RuleSetTarget::Direct, root).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), before);
     }
 }

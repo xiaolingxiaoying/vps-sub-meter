@@ -224,7 +224,7 @@ fn override_target_spec(target: CliOverrideTarget) -> OverrideTargetSpec {
             base_relative: SING_BOX_OVERRIDE_RELATIVE_PATH,
             directory_relative: SING_BOX_OVERRIDE_DIRECTORY,
             extension: ".json",
-            base_sample: "{\n  \"log\": {\"level\": \"warn\"},\n  \"route\": {\n    \"rules\": [\n      {\"domain_suffix\": [\"example.com\"], \"outbound\": \"节点选择\"}\n    ]\n  }\n}\n",
+            base_sample: include_str!("../../../examples/overrides/sing-box-override.json"),
             layer_sample: "{}\n",
         },
         CliOverrideTarget::Clash => OverrideTargetSpec {
@@ -233,7 +233,7 @@ fn override_target_spec(target: CliOverrideTarget) -> OverrideTargetSpec {
             base_relative: CLASH_OVERRIDE_RELATIVE_PATH,
             directory_relative: CLASH_OVERRIDE_DIRECTORY,
             extension: ".yaml",
-            base_sample: "# 键名为 rules 的数组会前插到生成规则之前。\nrules:\n  - DOMAIN-SUFFIX,example.com,节点选择\n",
+            base_sample: include_str!("../../../examples/overrides/clash-override.yaml"),
             layer_sample: "{}\n",
         },
         CliOverrideTarget::Server => OverrideTargetSpec {
@@ -540,13 +540,26 @@ pub(crate) fn resolve_sing_box_bin(root: &Path, explicit: Option<PathBuf>) -> Op
 
 pub(crate) fn regenerate(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
+    let _lock = match store.acquire_operation_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("regenerate failed: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    regenerate_locked(root, sing_box_bin)
+}
+
+/// Caller holds the operation lock through source updates and generation.
+pub(crate) fn regenerate_locked(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
     // Regenerate always re-syncs the active sing-box configuration on a live
     // host (root "/"), even for an installation that never wrote the ownership
     // marker (a `--no-start` install). Fixture roots are left untouched.
     let update_active_config =
         root == std::path::Path::new("/") || root.join("var/lib/sbctl/ownership").is_file();
     let binary = sing_box_bin.unwrap_or_else(|| root.join("usr/local/bin/sing-box"));
-    let result = sbctl::subscription::regenerate_current(
+    let result = sbctl::subscription::regenerate_current_locked(
         &store,
         Some(binary.as_path()),
         update_active_config,

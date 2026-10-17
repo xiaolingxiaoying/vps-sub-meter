@@ -1,0 +1,27 @@
+{
+  "dns": {
+    "strategy": "ipv4_only"
+  },
+  "route": {
+    "rules": [
+      {
+        "domain": [
+          "services.googleapis.cn"
+        ],
+        "outbound": "代理"
+      },
+      {
+        "domain_suffix": [
+          "chatgpt.com",
+          "openai.com",
+          "oaistatic.com",
+          "oaiusercontent.com",
+          "x.com",
+          "twitter.com",
+          "twimg.com"
+        ],
+        "outbound": "代理"
+      }
+    ]
+  }
+}

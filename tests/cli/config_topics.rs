@@ -1059,6 +1059,202 @@ fn rule_add_refuses_a_match_type_the_generator_cannot_honour() {
     );
 }
 
+#[test]
+fn rule_changes_restore_sources_and_artifacts_after_a_failed_check() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let checker = sing_box_check_fixture(&fixture, false, &[]);
+    let list = fixture.path().join("etc/sbctl/rules/direct.list");
+    let artifact = fixture
+        .path()
+        .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json");
+    let prior_artifact = fs::read(&artifact).unwrap();
+    let prior_config = fs::read(fixture.path().join("etc/sbctl/config.toml")).unwrap();
+    for prior in [None, Some("# keep my comment\nDOMAIN,existing.example\n")] {
+        if let Some(text) = prior {
+            fs::create_dir_all(list.parent().unwrap()).unwrap();
+            fs::write(&list, text).unwrap();
+        }
+        for (verb, entry) in [("add", "new.example"), ("remove", "existing.example")] {
+            if prior.is_none() && verb == "remove" {
+                continue;
+            }
+            Command::cargo_bin("sbctl")
+                .unwrap()
+                .args([
+                    "--root",
+                    root,
+                    "rule",
+                    verb,
+                    "direct",
+                    entry,
+                    "--sing-box-bin",
+                    checker.to_str().unwrap(),
+                ])
+                .assert()
+                .failure();
+            assert_eq!(fs::read_to_string(&list).ok().as_deref(), prior);
+            assert_eq!(fs::read(&artifact).unwrap(), prior_artifact);
+            assert_eq!(
+                fs::read(fixture.path().join("etc/sbctl/config.toml")).unwrap(),
+                prior_config
+            );
+        }
+    }
+}
+
+#[test]
+fn rule_add_cidr_can_be_listed_updated_and_removed() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    for (verb, entry) in [
+        ("add", "IP-CIDR,2001:db8::/32"),
+        ("add", "IP-CIDR,10.0.0.0/8"),
+        ("remove", "IP-CIDR,2001:db8::/32"),
+    ] {
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args([
+                "--root",
+                root,
+                "rule",
+                verb,
+                "direct",
+                entry,
+                "--sing-box-bin",
+                checker.to_str().unwrap(),
+            ])
+            .assert()
+            .success();
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root, "rule", "list", "direct"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("no-resolve"));
+    }
+    let lists = sbctl::rule_list::RuleLists::load(fixture.path()).unwrap();
+    assert_eq!(lists.direct.len(), 1);
+    assert_eq!(lists.direct[0].value, "10.0.0.0/8");
+}
+
+#[test]
+fn rule_set_changes_keep_configuration_and_artifacts_after_a_failed_check() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let accepting = sing_box_check_fixture(&fixture, true, &["vless"]);
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule-set",
+            "add",
+            "game",
+            "--url",
+            "https://cdn.example/game.srs",
+            "--sing-box-bin",
+            accepting.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let config_path = fixture.path().join("etc/sbctl/config.toml");
+    let prior = fs::read(&config_path).unwrap();
+    let artifact_path = fixture
+        .path()
+        .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json");
+    let artifact = fs::read(&artifact_path).unwrap();
+    let rejecting = sing_box_check_fixture(&fixture, false, &[]);
+    for args in [
+        vec!["add", "new", "--url", "https://cdn.example/new.srs"],
+        vec!["remove", "game"],
+        vec!["interval", "12h"],
+    ] {
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root, "rule-set"])
+            .args(args)
+            .args(["--sing-box-bin", rejecting.to_str().unwrap()])
+            .assert()
+            .failure();
+        assert_eq!(fs::read(&config_path).unwrap(), prior);
+        assert_eq!(fs::read(&artifact_path).unwrap(), artifact);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn rule_set_change_checks_the_merged_client_before_publishing() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let config_path = fixture.path().join("etc/sbctl/config.toml");
+    let prior = fs::read(&config_path).unwrap();
+    let checker = fixture.path().join("check-merged");
+    fs::write(&checker, "#!/bin/sh\nif [ \"$1\" = version ]; then echo 'sing-box version 1.14.0'; exit 0; fi\nif grep -q 'game.srs' \"$3\"; then exit 1; fi\nexit 0\n").unwrap();
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o700)).unwrap();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule-set",
+            "add",
+            "game",
+            "--url",
+            "https://cdn.example/game.srs",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .failure();
+    assert_eq!(fs::read(&config_path).unwrap(), prior);
+}
+
+#[test]
+fn concurrent_rule_adds_keep_both_sources_and_published_rules() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    let mut children = Vec::new();
+    for domain in ["first.example", "second.example"] {
+        children.push(
+            std::process::Command::new(assert_cmd::cargo::cargo_bin!("sbctl"))
+                .args([
+                    "--root",
+                    root,
+                    "rule",
+                    "add",
+                    "direct",
+                    domain,
+                    "--sing-box-bin",
+                    checker.to_str().unwrap(),
+                ])
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+    }
+    for mut child in children {
+        assert!(child.wait().unwrap().success());
+    }
+    let lists = sbctl::rule_list::RuleLists::load(fixture.path()).unwrap();
+    assert_eq!(lists.direct.len(), 2);
+    let artifact = fs::read_to_string(
+        fixture
+            .path()
+            .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json"),
+    )
+    .unwrap();
+    assert!(artifact.contains("first.example") && artifact.contains("second.example"));
+}
+
 /// Shared setup: an ip-fallback deployment a verb can regenerate against.
 fn seed_ip_fallback(root: &str) {
     Command::cargo_bin("sbctl")

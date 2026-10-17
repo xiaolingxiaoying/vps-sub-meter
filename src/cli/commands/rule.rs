@@ -8,10 +8,9 @@
 //! command, so `sbctl rule add` is the whole operation.
 
 use crate::cli::args::RuleCommand;
-use crate::cli::commands::config::regenerate;
+use crate::cli::commands::config::regenerate_locked;
 use sbctl::rule_list::{RuleEntry, RuleKind, RuleLists, validate_entry};
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -26,8 +25,12 @@ pub(crate) fn run_rule(
 ) -> ExitCode {
     match command {
         RuleCommand::List { kind } => list(root, kind.map(Into::into)),
-        RuleCommand::Add { kind, entries } => add(root, kind.into(), &entries, sing_box_bin),
-        RuleCommand::Remove { kind, entries } => remove(root, kind.into(), &entries, sing_box_bin),
+        RuleCommand::Add { kind, entries } => with_list_transaction(root, kind.into(), || {
+            add(root, kind.into(), &entries, sing_box_bin)
+        }),
+        RuleCommand::Remove { kind, entries } => with_list_transaction(root, kind.into(), || {
+            remove(root, kind.into(), &entries, sing_box_bin)
+        }),
     }
 }
 
@@ -77,30 +80,68 @@ fn parse_entry(text: &str) -> Result<(String, RuleEntry), String> {
     Ok((matcher, entry))
 }
 
-fn write_list(kind: RuleKind, entries: &[RuleEntry], path: &Path) -> Result<(), String> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| error.to_string())?;
-    }
-    // Write through a temporary file in the same directory: a rule list the
-    // generator is about to read must never be observed half-written.
-    let temporary = path.with_extension("tmp");
-    let mut file = fs::File::create(&temporary).map_err(|error| error.to_string())?;
-    writeln!(
-        file,
+fn write_list(root: &Path, kind: RuleKind, entries: &[RuleEntry]) -> Result<(), String> {
+    let mut contents = format!(
         "# sbctl 规则列表：{kind}（TYPE,value 每行一条，# 为注释）",
         kind = kind.file_name()
-    )
-    .map_err(|error| error.to_string())?;
+    );
+    contents.push('\n');
     for entry in entries {
-        writeln!(file, "{entry}").map_err(|error| error.to_string())?;
+        contents.push_str(&format!("{entry}\n"));
     }
-    drop(file);
-    fs::rename(&temporary, path).map_err(|error| error.to_string())?;
+    sbctl::config::DeploymentStore::new(root)
+        .write_relative_locked(
+            &format!("etc/sbctl/rules/{}", kind.file_name()),
+            contents.as_bytes(),
+        )
+        .map_err(|error| error.to_string())?;
     Ok(())
 }
 
-fn add(root: &Path, kind: RuleKind, texts: &[String], sing_box_bin: Option<PathBuf>) -> ExitCode {
+/// Serialize the complete read/modify/check operation and restore the original
+/// source bytes when generation rejects a change.
+pub(crate) fn with_list_transaction(
+    root: &Path,
+    kind: RuleKind,
+    change: impl FnOnce() -> ExitCode,
+) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
+    let _lock = match store.acquire_operation_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("规则事务失败：{error}");
+            return ExitCode::from(2);
+        }
+    };
     let path = list_path(root, kind);
+    let prior = match sbctl::config::read_managed_file_no_follow(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            eprintln!("规则列表读取失败：{error}");
+            return ExitCode::from(2);
+        }
+    };
+    let result = change();
+    if result != ExitCode::SUCCESS {
+        let restored = match prior {
+            Some(bytes) => store
+                .write_relative_locked(&format!("etc/sbctl/rules/{}", kind.file_name()), &bytes)
+                .map_err(|error| error.to_string()),
+            None => match fs::remove_file(path) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(error.to_string()),
+            },
+        };
+        if let Err(error) = restored {
+            eprintln!("规则列表回滚失败：{error}");
+        }
+    }
+    result
+}
+
+fn add(root: &Path, kind: RuleKind, texts: &[String], sing_box_bin: Option<PathBuf>) -> ExitCode {
     let mut entries = match RuleLists::load(root) {
         Ok(lists) => lists.entries_for(kind).to_vec(),
         Err(error) => {
@@ -125,9 +166,13 @@ fn add(root: &Path, kind: RuleKind, texts: &[String], sing_box_bin: Option<PathB
     if added.is_empty() {
         return ExitCode::SUCCESS;
     }
-    if let Err(message) = write_list(kind, &entries, &path) {
+    if let Err(message) = write_list(root, kind, &entries) {
         eprintln!("写入 {} 失败：{message}", kind.file_name());
         return ExitCode::from(2);
+    }
+    let result = regenerate_locked(root, sing_box_bin);
+    if result != ExitCode::SUCCESS {
+        return result;
     }
     println!(
         "已写入 {}：{}",
@@ -138,7 +183,7 @@ fn add(root: &Path, kind: RuleKind, texts: &[String], sing_box_bin: Option<PathB
             .collect::<Vec<_>>()
             .join(", ")
     );
-    regenerate(root, sing_box_bin)
+    result
 }
 
 fn remove(
@@ -147,7 +192,6 @@ fn remove(
     texts: &[String],
     sing_box_bin: Option<PathBuf>,
 ) -> ExitCode {
-    let path = list_path(root, kind);
     let entries = match RuleLists::load(root) {
         Ok(lists) => lists.entries_for(kind).to_vec(),
         Err(error) => {
@@ -178,10 +222,13 @@ fn remove(
     if removed.is_empty() {
         return ExitCode::SUCCESS;
     }
-    if let Err(message) = write_list(kind, &kept, &path) {
+    if let Err(message) = write_list(root, kind, &kept) {
         eprintln!("写入 {} 失败：{message}", kind.file_name());
         return ExitCode::from(2);
     }
-    println!("已从 {} 移除：{}", kind.file_name(), removed.join(", "));
-    regenerate(root, sing_box_bin)
+    let result = regenerate_locked(root, sing_box_bin);
+    if result == ExitCode::SUCCESS {
+        println!("已从 {} 移除：{}", kind.file_name(), removed.join(", "));
+    }
+    result
 }

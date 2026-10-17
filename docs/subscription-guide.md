@@ -38,9 +38,9 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 `sing-box-full.json`（及各版本文件）与 `sing-box.json` 的区别：
 
 - `log`：info + 时间戳；
-- `dns`：fake-ip 模式（`client_dns_mode` 可切 redir-host）；直连侧 AliDNS（223.5.5.5），代理侧 DoH（1.1.1.1，detour 选择组）；局域网、系统连通性检测与 NTP 域名走直连解析；
-- `inbounds`：tun（auto_route/strict_route/mixed 栈，v4+v6 地址）；
-- `outbounds`：节点选择（selector）+ 自动选择（url-test，探测 URL 可配置）+ 五协议节点 + direct；
+- `dns`：fake-ip 模式（`client_dns_mode` 可切 redir-host）；私有域名走系统 DNS，国内、连通性检测与 NTP 域名走国内 DoH（223.5.5.5），其他查询走境外 DoH（1.1.1.1，detour `代理` 组）；
+- `inbounds`：tun（auto_route/strict_route/mixed 栈，MTU 1400，无示例网段排除）及回环 mixed/SOCKS/HTTP 监听（7890/7891/7892）；
+- `outbounds`：`代理`（selector）+ `自动选择`（url-test，探测 URL 可配置）+ 五协议节点 + `DIRECT`；
 - `route`：AI 域名（chatgpt/openai/x.com 等）优先走选择组；geosite-cn / geoip-cn rule-set 直连（standard 档）；私有地址直连；`default_domain_resolver` 指向直连 DNS；
 - `experimental`：clash_api（127.0.0.1:9090，供 SFA/SFW 面板与 sbtui 使用）+ cache_file（记住选择与 fake-ip 映射）。
 
@@ -60,10 +60,10 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 ## mihomo 差异（1.18 → 1.19）
 
-- `clash.yaml` 使用 rule-providers（远程 `.mrs`，`@meta` 分支：geosite/geoip 的 cn 与 private 四个规则集）+ 三组代理组（节点选择 / 自动选择 / 全球直连）+ AI 域名分流；需要 mihomo ≥1.14（rule-set）。
-- `clash-1.18.yaml` 保留内置 GEOIP,CN 直连写法，不引用任何远程规则集，适合旧内核或不想加载远程规则的场景。
-- 两份 Clash 工件都带 `sniffer: {enable: true, sniffing: [http, tls, quic]}`：mihomo 默认**关闭**嗅探（`Enable: false` 且不选任何协议），不写就没有"从 TLS SNI / HTTP Host 还原真实域名再分流"的能力。键名与取值是用 CI 同一 pin 的内核（v1.19.30）实测出来的：`domain`、`dns` 会被直接拒绝（`not find the sniffer[domain]`），`override-destination` 故意不写（它会改变远端服务器看到的目的地），`dns-hijack` 也不写（它属于 `tun:`，默认已是 `0.0.0.0:53`，从订阅里输出 `tun:` 会覆盖客户端自己的 TUN 设置）。
-- 1.19.6 起配置内所有本地路径被限制在 workdir 内：rule-providers 的 `path` 均为相对路径 `./ruleset/*.mrs`，符合该限制。
+- `clash.yaml` 使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）和两个策略组：`代理`、`自动选择`。手动组依次包含真实节点、自动组和 `DIRECT`；GLOBAL 由内核提供。
+- `clash-1.18.yaml` 通过内置域名/IP 列表保留直连分流，不引用远程规则集或自动下载地理数据库。
+- 两份工件都保留参考模板的 HTTP/TLS/QUIC `sniff` 映射、端口和跳过列表，明确设置 `override-destination: false`；TUN 严格路由与 UDP/TCP 53 DNS 劫持开启。完整基础设置见 [内置模板说明](../src/subscription/templates/README.md)。
+- rule-providers 的本地 `path` 使用相对路径 `./ruleset/*.mrs`，位于客户端 workdir 内。
 
 ## Shadowrocket 适配说明
 
@@ -78,7 +78,9 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 ## 覆写模板（服务端统一分发）
 
-不想在每个客户端里手工维护覆写时，把规则放到服务器上：
+不想在每个客户端里手工维护覆写时，把规则放到服务器上。修改这些文件无需重新编译 Rust；[不重编译的覆写操作指南](client-overrides.md) 提供可直接使用的 YAML/JSON 示例、应用及恢复步骤。
+
+常用命令：
 
 ```bash
 sbctl config override show      # 查看路径与合并语义

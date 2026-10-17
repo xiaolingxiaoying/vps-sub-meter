@@ -343,7 +343,7 @@ fn load_list(path: &Path) -> Result<Vec<RuleEntry>, RuleListError> {
     Ok(entries)
 }
 
-/// A CIDR prefix with a numeric octet/hextet body and a 0-128 prefix length.
+/// A parsed IPv4 or IPv6 address with a prefix length for that address family.
 fn is_cidr(value: &str) -> bool {
     let Some((address, prefix)) = value.rsplit_once('/') else {
         return false;
@@ -351,15 +351,10 @@ fn is_cidr(value: &str) -> bool {
     let Ok(bits) = prefix.parse::<u8>() else {
         return false;
     };
-    if address.contains(':') {
-        bits <= 128
-            && !address
-                .split(':')
-                .any(|part| part.is_empty() && address != "::")
-    } else {
-        bits <= 32
-            && address.split('.').count() == 4
-            && address.split('.').all(|part| part.parse::<u8>().is_ok())
+    match address.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(_)) => bits <= 32,
+        Ok(std::net::IpAddr::V6(_)) => bits <= 128,
+        Err(_) => false,
     }
 }
 
@@ -367,7 +362,7 @@ fn is_cidr(value: &str) -> bool {
 impl std::fmt::Display for RuleEntry {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.no_resolve {
-            write!(formatter, "{},{}(no-resolve)", self.matcher, self.value)
+            write!(formatter, "{},{},no-resolve", self.matcher, self.value)
         } else {
             write!(formatter, "{},{}", self.matcher, self.value)
         }
@@ -602,5 +597,40 @@ mod tests {
         assert!(validate_entry("IP-CIDR", "10.0.0.0").is_err());
         assert!(validate_entry("RULE-SET", "cn").is_err());
         assert!(validate_entry("DOMAIN", "has space").is_err());
+    }
+
+    #[test]
+    fn cidr_validation_parses_the_address_and_checks_its_family() {
+        for value in [
+            "::/0",
+            "::1/128",
+            "2001:db8::/32",
+            "fe80::/10",
+            "192.0.2.0/24",
+        ] {
+            assert!(validate_entry("IP-CIDR", value).is_ok(), "{value}");
+        }
+        for value in [
+            "garbage:address/64",
+            "1:2:3/64",
+            "gggg:1:2:3:4:5:6:7/64",
+            "::/129",
+            "192.0.2.0/33",
+        ] {
+            assert!(validate_entry("IP-CIDR", value).is_err(), "{value}");
+        }
+    }
+
+    #[test]
+    fn displayed_entries_round_trip_through_the_list_loader() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let entry = RuleEntry {
+            matcher: "IP-CIDR".into(),
+            value: "2001:db8::/32".into(),
+            no_resolve: true,
+        };
+        write_list(directory.path(), RuleKind::Direct, &format!("{entry}\n"));
+        let loaded = RuleLists::load(directory.path()).expect("displayed syntax is loadable");
+        assert_eq!(loaded.direct, vec![entry]);
     }
 }

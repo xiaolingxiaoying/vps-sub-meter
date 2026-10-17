@@ -100,6 +100,34 @@ fn check_against_cores(template: &str, artifacts: &[(String, String)]) -> usize 
     checked
 }
 
+#[test]
+#[ignore = "requires real sing-box cores; run by the CI sing-box-profiles job"]
+fn shipped_override_example_passes_every_supported_core() {
+    let root = tempfile::tempdir().expect("temporary root");
+    let directory = root.path().join("etc/sbctl/overrides");
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(
+        directory.join("sing-box-override.json"),
+        include_str!("../examples/overrides/sing-box-override.json"),
+    )
+    .unwrap();
+    let config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "127.0.0.1".into(),
+        None,
+        Some(2080),
+        "ens3".into(),
+        vec![ManagedProtocol::VlessReality],
+        Some("www.cloudflare.com".into()),
+    )
+    .unwrap();
+    let artifacts = generated_artifacts(&config, root.path()).unwrap();
+    assert_eq!(
+        check_against_cores("shipped override example", &artifacts),
+        SING_BOX_VERSION_PROFILES.len()
+    );
+}
+
 /// The registry's newest minor has to be the newest *stable* upstream release.
 ///
 /// `sing-box-full.json` targets `SING_BOX_VERSION_PROFILES.last()`, so the

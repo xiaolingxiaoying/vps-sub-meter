@@ -1,0 +1,29 @@
+# 服务端客户端覆写；保留自动生成的节点、凭据和策略组。
+# rules 默认前插，下面的域名明确使用“代理”组。
+dns:
+  ipv6: false
+  nameserver:
+    - https://1.1.1.1/dns-query#代理
+    - https://8.8.8.8/dns-query#代理
+  direct-nameserver:
+    - https://223.5.5.5/dns-query
+    - https://doh.pub/dns-query
+  direct-nameserver-follow-policy: true
+tun:
+  mtu: 1400
+  strict-route: true
+  route-exclude-address: []
+  route-exclude-address-set: []
+  inet4-route-exclude-address: []
+  inet6-route-exclude-address: []
+sniffer:
+  override-destination: false
+rules:
+  - DOMAIN,services.googleapis.cn,代理
+  - DOMAIN-SUFFIX,chatgpt.com,代理
+  - DOMAIN-SUFFIX,openai.com,代理
+  - DOMAIN-SUFFIX,oaistatic.com,代理
+  - DOMAIN-SUFFIX,oaiusercontent.com,代理
+  - DOMAIN-SUFFIX,x.com,代理
+  - DOMAIN-SUFFIX,twitter.com,代理
+  - DOMAIN-SUFFIX,twimg.com,代理
