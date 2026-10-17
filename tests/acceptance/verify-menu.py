@@ -64,7 +64,12 @@ class Menu:
             "服务与更新", "高级与维护", "主菜单",
         }:
             expected = f"=== {expected} ==="
-        return self.wait(expected)
+        text = self.wait(expected)
+        # A PTY read may stop after the title, before any entries are printed.
+        # Inspect a page only once its input prompt proves rendering finished.
+        if expected.startswith("=== ") and expected.endswith(" ==="):
+            text = self.wait("请选择 [0]: ")
+        return text
 
     def pause(self):
         self.wait("按回车返回菜单")
