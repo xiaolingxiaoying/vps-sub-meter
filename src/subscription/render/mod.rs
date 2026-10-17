@@ -195,7 +195,7 @@ mod tests {
                 group["url"].as_str(),
                 Some(config.client_latency_probe_url.as_str())
             );
-            assert_eq!(group["lazy"].as_bool(), Some(false));
+            assert!(group["lazy"].is_null());
             assert!(group["interval"].as_u64().unwrap() > 0);
         }
     }
@@ -227,8 +227,8 @@ mod tests {
             let value: serde_yaml::Value = serde_yaml::from_str(&artifact).unwrap();
             assert_eq!(value["sniffer"]["enable"].as_bool(), Some(true), "{name}");
             assert_eq!(
-                value["sniffer"]["sniffing"],
-                serde_yaml::to_value(["http", "tls", "quic"]).unwrap()
+                value["sniffer"]["sniff"],
+                serde_yaml::to_value(&super::baseline::MIHOMO["sniffer"]["sniff"]).unwrap()
             );
             assert_eq!(
                 value["sniffer"]["override-destination"].as_bool(),
@@ -282,8 +282,8 @@ mod tests {
         for rule in [
             "  - DOMAIN-SUFFIX,chatgpt.com,代理\n",
             "  - DOMAIN-SUFFIX,x.com,代理\n",
-            "  - RULE-SET,geosite-cn,DIRECT\n",
-            "  - RULE-SET,geoip-cn,DIRECT\n",
+            "  - RULE-SET,review-cn-domain,DIRECT\n",
+            "  - RULE-SET,review-cn-ip,DIRECT\n",
             "  - MATCH,代理\n",
         ] {
             assert!(
@@ -306,7 +306,7 @@ mod tests {
         // a database mihomo downloads from GitHub on first use, so this artifact
         // spells the same verdicts out as compiled-in lists instead.
         for rule in [
-            "  - RULE-SET,geosite-cn,DIRECT\n",
+            "  - RULE-SET,review-cn-domain,DIRECT\n",
             "  - GEOIP,LAN,DIRECT\n",
             "  - GEOIP,CN,DIRECT\n",
             "  - DOMAIN-SUFFIX,baidu.com,DIRECT\n",
@@ -476,7 +476,7 @@ mod supplied_template_tests {
             assert!(!actual.to_string().contains("GLOBAL"));
             config.client_rule_profile = ClientRuleProfile::Minimal;
             let minimal = clash(&config, &nodes).unwrap();
-            assert!(!minimal.contains("geosite:cn,private"));
+            assert!(!minimal.contains("rule-set:review-"));
             assert!(!minimal.contains("rule-providers:"));
         }
     }

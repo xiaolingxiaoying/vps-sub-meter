@@ -1,12 +1,11 @@
 use super::{
-    AI_DOMAIN_SUFFIXES, AI_TAG, AUTO_TAG, FALLBACK_TAG, PROXY_TAG, STREAM_TAG, TELEGRAM_TAG,
-    client_skip_cert_verify,
+    AI_TAG, AUTO_TAG, FALLBACK_TAG, PROXY_TAG, STREAM_TAG, TELEGRAM_TAG, client_skip_cert_verify,
 };
 use crate::canonical::CanonicalNode;
 use crate::config::{ClientRuleProfile, DeploymentConfig};
 use crate::subscription::artifacts::SubscriptionError;
 use crate::subscription::template::GroupTag;
-use crate::subscription::{GroupRole, GroupSpec, RuleMatcher, RuleSetKind, TemplateSpec};
+use crate::subscription::{GroupRole, GroupSpec, RuleMatcher, TemplateSpec};
 
 /// The supplied template group names; GLOBAL belongs to the Mihomo core.
 const CLASH_SELECTOR_TAG: &str = "代理";
@@ -108,17 +107,17 @@ fn clash_proxies(
         match group.role {
             GroupRole::Selector | GroupRole::Direct => {
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: select\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    proxies:\n"
+                    "  - name: {tag}\n    type: select\n    url: {probe_url}\n    interval: 300\n    proxies:\n"
                 ));
             }
             GroupRole::UrlTest => {
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: url-test\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    tolerance: 50\n    proxies:\n"
+                    "  - name: {tag}\n    type: url-test\n    url: {probe_url}\n    interval: 300\n    tolerance: 50\n    proxies:\n"
                 ));
             }
             GroupRole::Fallback => {
                 proxies.push_str(&format!(
-                    "  - name: {tag}\n    type: fallback\n    url: {probe_url}\n    interval: 300\n    lazy: false\n    proxies:\n"
+                    "  - name: {tag}\n    type: fallback\n    url: {probe_url}\n    interval: 300\n    proxies:\n"
                 ));
             }
         }
@@ -142,114 +141,34 @@ fn clash_members(group: &GroupSpec, nodes: &[CanonicalNode]) -> Vec<String> {
 /// differ only in whether external rule-sets exist at all: mihomo 1.18 has no
 /// `.mrs` rule-providers to reference, which is precisely the `minimal` case, so
 /// the legacy artifact renders the twins and nothing else.
-fn clash_rules(spec: &TemplateSpec, remote_rule_sets: bool, config: &DeploymentConfig) -> String {
+fn clash_rules(_spec: &TemplateSpec, remote: bool, config: &DeploymentConfig) -> String {
     let mut rules = String::from("rules:\n");
-    // A registered rule-set is an explicit decision, so it outranks the
-    // template's generic geo verdicts — same precedence as the operator lists.
-    if remote_rule_sets {
+    if remote {
         rules.push_str(&clash_extra_rules(config));
     }
-    // Portal detection and the local campus subnet must precede proxy rules.
-    for rule in super::baseline::MIHOMO["rules"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .take(8)
-    {
-        rules.push_str(&format!("  - {}\n", rule.as_str().unwrap()));
-    }
-    for rule in spec
-        .inline_rules
-        .iter()
-        .filter(|rule| rule.renderers.includes_clash())
-    {
-        // Which matcher survives to the artifact. An entry clash has no URL for
-        // is not this renderer's content in either profile, and a rule-set rule
-        // under `minimal` is the twin — because naming the CDN is exactly what
-        // that profile forbids. Anything already inline needs no substitution.
-        let matcher = match rule.matcher {
-            RuleMatcher::RuleSet(tags) => {
-                let referenced = tags.iter().copied().any(|tag| {
-                    spec.rule_sets
-                        .iter()
-                        .any(|entry| entry.tag == tag && entry.clash_url.is_some())
-                });
-                if !referenced {
-                    continue;
+    for rule in super::baseline::MIHOMO["rules"].as_array().unwrap() {
+        let rule = rule.as_str().unwrap();
+        if !remote && rule.starts_with("RULE-SET,") {
+            let tag = rule.split(',').nth(1).unwrap();
+            match tag {
+                "review-private-domain" => {
+                    push_inline_domains(&mut rules, RuleMatcher::PRIVATE_DOMAINS, "DIRECT")
                 }
-                if remote_rule_sets {
-                    rule.matcher
-                } else {
-                    match rule.minimal_twin {
-                        Some(twin) => twin,
-                        None => continue,
-                    }
+                "review-cn-domain" => {
+                    push_inline_domains(&mut rules, RuleMatcher::CN_DOMAINS, "DIRECT")
                 }
+                "review-private-ip" => {
+                    push_inline_cidrs(&mut rules, RuleMatcher::PRIVATE_ADDRESS_LIST, "DIRECT")
+                }
+                "review-cn-ip" => {
+                    push_inline_cidrs(&mut rules, RuleMatcher::CN_ADDRESSES, "DIRECT")
+                }
+                _ => unreachable!("bundled provider has an inline twin"),
             }
-            other => other,
-        };
-        let target = match matcher {
-            // The two built-in geo codes have always carried the core's own
-            // `DIRECT` policy here, not the `全球直连` group that wraps it.
-            RuleMatcher::Private | RuleMatcher::Cn => CLASH_BUILTIN_DIRECT,
-            _ => clash_tag(rule.outbound),
-        };
-        match matcher {
-            // The two built-in geo codes. `GEOIP,*` is answered from mihomo's own
-            // geo database — which mihomo *downloads* from GitHub when the file is
-            // absent, so under `minimal` the same verdict is spelled out from the
-            // compiled-in lists instead. That is a real trade: the CN blocks are
-            // the coarse /10–/11 supernets and the private names are a curated
-            // list, not the full database. The alternative is a profile that
-            // promises no downloads and performs two of them on first start.
-            RuleMatcher::Private => {
-                if remote_rule_sets {
-                    rules.push_str(&format!("  - GEOIP,LAN,{target}\n"));
-                } else {
-                    push_inline_domains(&mut rules, RuleMatcher::PRIVATE_DOMAINS, target);
-                    push_inline_cidrs(&mut rules, RuleMatcher::PRIVATE_ADDRESS_LIST, target);
-                }
-            }
-            RuleMatcher::Cn => {
-                if remote_rule_sets {
-                    rules.push_str(&format!("  - GEOIP,CN,{target}\n"));
-                } else {
-                    push_inline_domains(&mut rules, RuleMatcher::CN_DOMAINS, target);
-                    push_inline_cidrs(&mut rules, RuleMatcher::CN_ADDRESSES, target);
-                }
-            }
-            RuleMatcher::AiDomains => {
-                for suffix in AI_DOMAIN_SUFFIXES {
-                    rules.push_str(&format!("  - DOMAIN-SUFFIX,{suffix},{target}\n"));
-                }
-            }
-            RuleMatcher::DomainSuffix(suffixes) => {
-                for suffix in suffixes.iter() {
-                    rules.push_str(&format!("  - DOMAIN-SUFFIX,{suffix},{target}\n"));
-                }
-            }
-            RuleMatcher::IpCidr(cidrs) => {
-                for cidr in cidrs.iter() {
-                    // `no-resolve` keeps an IP rule from triggering a lookup of
-                    // the destination it is about to match on.
-                    rules.push_str(&format!("  - IP-CIDR,{cidr},{target},no-resolve\n"));
-                }
-            }
-            RuleMatcher::RuleSet(tags) => {
-                for tag in tags.iter().copied().filter(|tag| {
-                    spec.rule_sets
-                        .iter()
-                        .any(|entry| entry.tag == *tag && entry.clash_url.is_some())
-                }) {
-                    rules.push_str(&format!("  - RULE-SET,{tag},{target}\n"));
-                }
-            }
+        } else {
+            rules.push_str(&format!("  - {rule}\n"));
         }
     }
-    rules.push_str(&format!(
-        "  - MATCH,{final_group}\n",
-        final_group = clash_tag(spec.final_group)
-    ));
     rules
 }
 
@@ -276,27 +195,17 @@ fn push_inline_cidrs(rules: &mut String, cidrs: &[&str], target: &str) {
 }
 
 /// The `rule-providers:` block for the rule-sets this template references.
-fn clash_rule_providers(spec: &TemplateSpec, config: &DeploymentConfig) -> String {
-    let mut providers = String::from("rule-providers:\n");
-    for entry in spec
-        .rule_sets
-        .iter()
-        .filter(|entry| entry.clash_url.is_some())
-    {
-        let behavior = match entry.kind {
-            RuleSetKind::Domain => "domain",
-            RuleSetKind::IpCidr => "ipcidr",
-        };
-        let url = entry
-            .clash_url
-            .as_deref()
-            .expect("a clash rule-set carries a URL");
-        providers.push_str(&format!(
-            "  {tag}:\n    type: http\n    behavior: {behavior}\n    format: mrs\n    url: {url}\n    path: ./ruleset/{tag}.mrs\n    interval: {interval}\n",
-            tag = entry.tag,
-            interval = clash_interval(config)
-        ));
+fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> String {
+    let mut values = super::baseline::MIHOMO["rule-providers"].clone();
+    let base = config.client_rule_set_base_url.trim_end_matches('/');
+    for provider in values.as_object_mut().unwrap().values_mut() {
+        let url = provider["url"].as_str().unwrap();
+        let suffix = url.split_once("@meta/").unwrap().1;
+        provider["url"] = serde_json::json!(format!("{base}@meta/{suffix}"));
+        provider["interval"] = serde_json::json!(clash_interval(config));
     }
+    let mut providers =
+        serde_yaml::to_string(&serde_json::json!({"rule-providers": values})).unwrap();
     // An operator registers a URL, not a behaviour, so everything is declared as
     // a domain set: mihomo only mis-sorts a domain list, never mis-routes an IP
     // one, and `rule-set add` documents that a CIDR list belongs in

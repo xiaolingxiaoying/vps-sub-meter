@@ -11,15 +11,14 @@
       },
       {
         "tag": "dns-cn",
-        "type": "udp",
-        "server": "223.5.5.5",
-        "detour": "DIRECT"
+        "type": "https",
+        "server": "223.5.5.5"
       },
       {
         "tag": "dns-cn-doh",
         "type": "https",
-        "server": "223.5.5.5",
-        "detour": "DIRECT"
+        "server": "doh.pub",
+        "domain_resolver": "dns-cn"
       },
       {
         "tag": "dns-remote",
@@ -30,11 +29,26 @@
       {
         "tag": "dns-fakeip",
         "type": "fakeip",
-        "inet4_range": "198.18.0.0/15",
-        "inet6_range": "fc00::/18"
+        "inet4_range": "198.18.0.0/16"
       }
     ],
     "rules": [
+      {
+        "domain_suffix": [
+          "lan",
+          "local",
+          "home.arpa",
+          "in-addr.arpa",
+          "ip6.arpa"
+        ],
+        "server": "dns-local"
+      },
+      {
+        "rule_set": [
+          "geosite-private"
+        ],
+        "server": "dns-local"
+      },
       {
         "domain_suffix": [
           "msftconnecttest.com",
@@ -43,14 +57,23 @@
           "connectivitycheck.gstatic.com",
           "detectportal.firefox.com",
           "connectivity-check.ubuntu.com",
-          "networkcheck.kde.org"
+          "networkcheck.kde.org",
+          "time.windows.com",
+          "time.apple.com",
+          "time.android.com",
+          "ntp.org"
         ],
-        "server": "dns-local"
+        "server": "dns-cn"
+      },
+      {
+        "domain_regex": [
+          "(^|\\.)stun\\.[^.]+\\.[^.]+$"
+        ],
+        "server": "dns-cn"
       },
       {
         "rule_set": [
-          "geosite-cn",
-          "geosite-private"
+          "geosite-cn"
         ],
         "server": "dns-cn"
       },
@@ -63,7 +86,7 @@
       }
     ],
     "final": "dns-remote",
-    "strategy": "prefer_ipv4"
+    "strategy": "ipv4_only"
   },
   "inbounds": [
     {
@@ -75,10 +98,8 @@
       ],
       "mtu": 1400,
       "auto_route": true,
-      "strict_route": false,
-      "route_exclude_address": [
-        "202.202.145.0/24"
-      ],
+      "strict_route": true,
+      "route_exclude_address": [],
       "stack": "mixed"
     },
     {
@@ -86,6 +107,18 @@
       "tag": "mixed-in",
       "listen": "127.0.0.1",
       "listen_port": 7890
+    },
+    {
+      "type": "socks",
+      "tag": "socks-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7891
+    },
+    {
+      "type": "http",
+      "tag": "http-in",
+      "listen": "127.0.0.1",
+      "listen_port": 7892
     }
   ],
   "outbounds": [
@@ -99,8 +132,7 @@
         "node-04-tuic",
         "自动选择",
         "DIRECT"
-      ],
-      "default": "自动选择"
+      ]
     },
     {
       "type": "urltest",
@@ -195,15 +227,64 @@
     "final": "代理",
     "default_domain_resolver": {
       "server": "dns-cn",
-      "strategy": "prefer_ipv4"
+      "strategy": "ipv4_only"
     },
     "rules": [
       {
-        "action": "sniff"
-      },
-      {
         "protocol": "dns",
         "action": "hijack-dns"
+      },
+      {
+        "type": "logical",
+        "mode": "and",
+        "rules": [
+          {
+            "domain_suffix": [
+              "msftconnecttest.com",
+              "msftncsi.com",
+              "captive.apple.com",
+              "connectivitycheck.gstatic.com",
+              "detectportal.firefox.com",
+              "connectivity-check.ubuntu.com",
+              "networkcheck.kde.org",
+              "push.apple.com"
+            ],
+            "invert": true
+          },
+          {
+            "ip_cidr": [
+              "91.105.192.0/23",
+              "91.108.4.0/22",
+              "91.108.8.0/21",
+              "91.108.16.0/21",
+              "91.108.56.0/22",
+              "95.161.64.0/20",
+              "149.154.160.0/20",
+              "185.76.151.0/24"
+            ],
+            "invert": true
+          },
+          {
+            "port": [
+              80,
+              8080,
+              443,
+              8443
+            ]
+          }
+        ],
+        "action": "sniff",
+        "sniffer": [
+          "http",
+          "tls",
+          "quic"
+        ]
+      },
+      {
+        "domain": [
+          "services.googleapis.cn"
+        ],
+        "outbound": "代理"
       },
       {
         "domain_suffix": [
@@ -215,19 +296,6 @@
           "connectivity-check.ubuntu.com",
           "networkcheck.kde.org"
         ],
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "ip_cidr": [
-          "202.202.145.0/24"
-        ],
-        "action": "route",
-        "outbound": "DIRECT"
-      },
-      {
-        "ip_is_private": true,
-        "action": "route",
         "outbound": "DIRECT"
       },
       {
@@ -240,17 +308,38 @@
           "twitter.com",
           "twimg.com"
         ],
-        "action": "route",
         "outbound": "代理"
       },
       {
+        "domain_suffix": [
+          "lan",
+          "local",
+          "home.arpa"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
         "rule_set": [
-          "geosite-private",
-          "geoip-private",
-          "geosite-cn",
+          "geosite-private"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": [
+          "geosite-cn"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": [
+          "geoip-private"
+        ],
+        "outbound": "DIRECT"
+      },
+      {
+        "rule_set": [
           "geoip-cn"
         ],
-        "action": "route",
         "outbound": "DIRECT"
       }
     ],

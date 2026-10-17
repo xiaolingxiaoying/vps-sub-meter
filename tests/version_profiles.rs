@@ -7,7 +7,7 @@
 
 use std::path::Path;
 
-use sbctl::config::{DeploymentConfig, ManagedProtocol, SubscriptionMode};
+use sbctl::config::{ClientRuleProfile, DeploymentConfig, ManagedProtocol, SubscriptionMode};
 use sbctl::subscription::{
     ClientTemplate, ClientVersion, SING_BOX_VERSION_PROFILES, SubscriptionFormat, band_warning_for,
     generated_artifacts, installed_kernel_version, kernel_band_warning, parse_kernel_version,
@@ -44,10 +44,13 @@ fn generated_profiles_pass_a_real_sing_box_check() {
         )
         .expect("a five-protocol IP fallback deployment is valid");
         config.client_template = template.clone();
-        let artifacts = generated_artifacts(&config, root.path()).expect("artifacts generate");
-        checked += check_against_cores(&template.to_string(), &artifacts);
+        for rules in [ClientRuleProfile::Standard, ClientRuleProfile::Minimal] {
+            config.client_rule_profile = rules.clone();
+            let artifacts = generated_artifacts(&config, root.path()).expect("artifacts generate");
+            checked += check_against_cores(&format!("{template}/{rules}"), &artifacts);
+        }
     }
-    let expected = SING_BOX_VERSION_PROFILES.len() * 3;
+    let expected = SING_BOX_VERSION_PROFILES.len() * 3 * 2;
     assert_eq!(
         checked, expected,
         "every template must be validated by every core: {checked} of {expected} \

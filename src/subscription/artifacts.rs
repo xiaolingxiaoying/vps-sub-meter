@@ -1272,7 +1272,10 @@ mod tests {
                 })
                 .collect()
         };
-        assert_eq!(cn_verdict(&standard_value), vec!["\"DIRECT\"".to_owned()]);
+        assert_eq!(
+            cn_verdict(&standard_value),
+            vec!["\"DIRECT\"".to_owned(); 2]
+        );
         assert_eq!(cn_verdict(&split), vec!["\"DIRECT\"".to_owned()]);
         assert_eq!(cn_verdict(&global), vec!["\"代理分组\"".to_owned()]);
     }
@@ -1521,10 +1524,10 @@ mod tests {
                         );
                     }
                     assert_eq!(value["inbounds"][0]["mtu"], 1400, "{name}");
-                    assert_eq!(value["inbounds"][0]["strict_route"], false, "{name}");
+                    assert_eq!(value["inbounds"][0]["strict_route"], true, "{name}");
                     assert_eq!(
-                        value["inbounds"][0]["route_exclude_address"][0],
-                        "202.202.145.0/24"
+                        value["inbounds"][0]["route_exclude_address"],
+                        serde_json::json!([])
                     );
                     assert_eq!(value["inbounds"][1]["listen_port"], 7890, "{name}");
                     assert_eq!(value["dns"]["rules"][0]["server"], "dns-local", "{name}");
@@ -1541,8 +1544,11 @@ mod tests {
                     assert_eq!(clash["tun"]["mtu"].as_u64(), Some(1400), "{name}");
                     assert_eq!(clash["tcp-concurrent"].as_bool(), Some(true), "{name}");
                     assert_eq!(
-                        clash["tun"]["route-exclude-address"][0].as_str(),
-                        Some("202.202.145.0/24")
+                        clash["tun"]["route-exclude-address"]
+                            .as_sequence()
+                            .unwrap()
+                            .len(),
+                        0
                     );
                     let mut known: Vec<String> = clash["proxies"]
                         .as_sequence()
@@ -1607,12 +1613,11 @@ mod tests {
                         let rule = rule.as_str().expect("a clash rule is a string");
                         // `IP-CIDR,<cidr>,<target>,no-resolve` carries a trailing
                         // option, so its target is not the last field.
-                        let target =
-                            if rule.starts_with("IP-CIDR,") || rule.starts_with("IP-CIDR6,") {
-                                rule.split(',').nth(2)
-                            } else {
-                                rule.split(',').next_back()
-                            };
+                        let target = if rule.ends_with(",no-resolve") {
+                            rule.split(',').nth(2)
+                        } else {
+                            rule.split(',').next_back()
+                        };
                         let Some(target) = target else { continue };
                         assert!(
                             known.contains(&target.to_owned())
@@ -2511,12 +2516,11 @@ ot-a-sing-box.bin"
     }
 
     #[test]
-    fn the_direct_dns_preset_switches_transport_without_touching_the_default_bytes() {
+    fn both_dns_presets_keep_domestic_doh_in_typed_and_legacy_profiles() {
         let fixture = TempDir::new().expect("temporary root is created");
         let (_store, mut config, _) = seed_direct_subscription(&fixture);
 
-        // The default preset is what every existing subscriber already gets:
-        // plaintext UDP to the public CN resolver.
+        // Both presets use the reviewed template's encrypted domestic resolver.
         let standard =
             generated_artifacts(&config, fixture.path()).expect("default preset generates");
         let typed: serde_json::Value =
@@ -2528,12 +2532,9 @@ ot-a-sing-box.bin"
             .iter()
             .find(|server| server["tag"] == "dns-cn")
             .expect("the direct resolver is present");
-        assert_eq!(direct["type"], "udp", "the default must stay UDP");
+        assert_eq!(direct["type"], "https", "the reviewed default uses DoH");
 
-        // `privacy` upgrades the same resolver to DoH on the same address, in
-        // both the typed (1.12+) and the legacy (1.10/1.11) shapes, because a
-        // preset that only fixed half the version matrix would leak on the
-        // clients least able to notice.
+        // Privacy must retain DoH across typed and legacy version adapters.
         config.client_dns_preset = crate::config::ClientDnsPreset::Privacy;
         let private =
             generated_artifacts(&config, fixture.path()).expect("privacy preset generates");

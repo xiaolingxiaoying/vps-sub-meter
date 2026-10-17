@@ -82,3 +82,16 @@ regardless of the optional sing-box policy catalog. No custom GLOBAL or direct
 group is emitted: the Mihomo core owns GLOBAL. The manual group lists nodes,
 automatic selection and DIRECT in that order. This deliberately supersedes
 Mihomo purpose-group catalogs; sing-box global/split remain available.
+
+## Amendment — 2026-10-17: reviewed Mihomo template
+
+The administrator supplied `mihomo-reviewed.template.yaml` as the new baseline.
+It replaces the vendored Mihomo document verbatim and supersedes the campus
+subnet exclusion, non-strict TUN, geo-based DNS policy and old sniff settings.
+Generated Mihomo preserves its complete routing order and four review-prefixed
+providers; minimal and legacy output substitute inline twins in both routing
+and DNS. The standard sing-box baseline follows the same private-system / CN-DoH /
+proxied-DoH policy, Fake-IP exclusions, explicit proxy exceptions, strict TUN
+and local listeners. The new snapshots deliberately replace full-profile defaults;
+bare nodes and URI artifacts retain their contract. Version limitations and DNS
+upstream selection differences are documented in the template README.

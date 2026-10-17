@@ -1,18 +1,11 @@
 # 内置客户端配置模板
 
-来源：`C:\Users\ranly\Documents\mihomo-test` 的 `mihomo.yaml`、`sing-box.json`（2026-10-16）。Mihomo 保留原始 YAML；sing-box 仅移除 JSONC 注释后保存为标准 JSON。通过 `include_str!` 编译进程序，VPS 不依赖此 Windows 路径。
+Mihomo 来源：`C:\Users\ranly\Documents\mihomo-test\mihomo-reviewed.template.yaml`（2026-10-17），原样保存为 `mihomo.yaml`。sing-box 的 `sing-box.json` 按同一策略适配。两份文件通过 `include_str!` 编译进程序，VPS 不依赖此 Windows 路径。
 
-默认 `standard` 完整 sing-box 订阅以原模板为主体，保留全部五个 DNS 服务器、DNS 与路由规则顺序、SagerNet 规则源、TUN/mixed 入站、缓存和控制接口。仅填入真实节点、凭据、端口、TLS 信任策略，并应用明确配置的测速 URL、规则镜像、更新周期、DNS 模式、privacy 预设与覆写。VMess 保留实际 SNI 对应的 Host，Hysteria2 保留上行 50 / 下行 200 Mbps。
+Mihomo 保留模板全部基础设置、DNS、嗅探、TUN 与规则顺序，包括四个 `review-*` MRS 规则集，不再使用旧版 GEOIP/geosite DNS 策略或校园网示例网段。`代理` 组按真实节点、`自动选择`、`DIRECT` 排列；自动组仅含真实节点。节点凭据、测速 URL、规则集镜像与更新周期仍来自部署配置。minimal 与 1.18 兼容订阅用内置域名/IP 列表替换远程规则集，同时移除 DNS 的规则集引用，避免启动时下载外部数据。
 
-Mihomo 所有模板选项均采用原模板的两个策略组：
+完整 sing-box 默认策略与新模板对应：私有域名及反向查询使用系统 DNS，门户、时间同步、STUN 和国内域名使用国内 DoH，其他查询经 `代理` 组访问境外 DoH。Fake-IP 使用 `198.18.0.0/16`、IPv4-only DNS，并保留私有域名、门户、时间同步及 STUN 例外。`services.googleapis.cn`、OpenAI/X 强制代理规则排在国内分流前；私有和国内域名/IP 分别直连。TUN 开启严格路由、MTU 1400，无示例网段排除；回环地址提供 mixed 7890、SOCKS 7891、HTTP 7892。手动组默认使用首个节点，与 Mihomo 的节点顺序一致。
 
-- `代理`：全部节点、`自动选择`、`DIRECT`，依次排列。
-- `自动选择`：仅全部节点。
+sing-box 使用 SagerNet SRS 规则集；显式规则镜像仍覆盖默认 URL。其 DNS 规则一次选一个服务器，未把 Mihomo 的多个并发上游伪装成等价行为：默认国内使用 `223.5.5.5`，境外使用 `1.1.1.1`，保留 `dns-cn-doh`（doh.pub）供覆写选择。控制接口 `127.0.0.1:9090` 保留供客户端管理。1.11+ 嗅探限定 HTTP/TLS/QUIC 和模板端口、域名/IP 例外；不覆写目标。1.10 仅支持入站嗅探，无法完整表达这些例外，保留入站 sniff 且不启用目标覆写。1.10/1.11 转换为旧版 DNS；旧版移除不支持的 AnyTLS，缓存和 TUN stack 按版本控制。global/split 保留各自分流策略，同时采用新 DNS/TUN 基础设置。
 
-不生成自定义 `GLOBAL`、直连、故障转移或服务分类组，Global 由 Mihomo 内核提供。保留模板的 DNS（包括 `geosite:cn,private` 策略）、嗅探、TUN、门户直连及其优先级。组名与规则引用均无表情图标。
-
-兼容性适配：sing-box 1.10/1.11 转换为旧版 DNS；1.10 用入站 sniff 与 DNS 出站；旧版移除不支持的 AnyTLS，缓存和 TUN stack 按版本控制。minimal 规则配置与 Mihomo 1.18 仍使用内置规则，不下载远程规则集或地理数据库。sing-box 的可选 global/split 策略目录仍保留。
-
-裸节点 `sing-box.json`、URI 和服务端配置保留原有生成契约。完整 sing-box 组名现在为 `代理`、`自动选择`、`DIRECT`，DNS 标签与原模板一致。已有覆写若引用 `节点选择`、`direct`、`dns-direct` 或 `dns-proxy`，应分别改为 `代理`、`DIRECT`、`dns-cn`、`dns-remote`；不再需要的旧默认值覆写应移除，避免覆盖模板。
-
-校园网示例网段 `202.202.145.0/24` 原样保留；需要其他网段时，通过覆写同时调整 TUN 排除与直连规则。
+裸节点 `sing-box.json`、URI 和服务端配置保留原有生成契约。管理员覆写最后应用；旧覆写仍可能覆盖新模板默认值。

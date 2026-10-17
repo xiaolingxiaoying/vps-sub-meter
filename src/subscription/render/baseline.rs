@@ -17,7 +17,15 @@ pub(super) static MIHOMO: LazyLock<Value> = LazyLock::new(|| {
 });
 
 pub(super) fn portal_domains() -> Value {
-    SING_BOX["dns"]["rules"][0]["domain_suffix"].clone()
+    serde_json::json!([
+        "msftconnecttest.com",
+        "msftncsi.com",
+        "captive.apple.com",
+        "connectivitycheck.gstatic.com",
+        "detectportal.firefox.com",
+        "connectivity-check.ubuntu.com",
+        "networkcheck.kde.org"
+    ])
 }
 
 pub(super) fn clash_settings(
@@ -39,19 +47,24 @@ pub(super) fn clash_settings(
         .into(),
     );
     let policies = base["dns"]["nameserver-policy"].as_object_mut().unwrap();
-    let domestic = policies["geosite:cn,private"].clone();
     if !remote {
-        policies.remove("geosite:cn,private");
-        for domain in RuleMatcher::PRIVATE_DOMAINS.iter().chain(
-            if cn_direct {
-                RuleMatcher::CN_DOMAINS
-            } else {
-                &[]
-            }
-            .iter(),
-        ) {
-            policies.insert(format!("+.{domain}"), domestic.clone());
+        let domestic = policies.remove("rule-set:review-cn-domain").unwrap();
+        let private = policies.remove("rule-set:review-private-domain").unwrap();
+        for domain in RuleMatcher::PRIVATE_DOMAINS {
+            policies.insert(format!("+.{domain}"), private.clone());
         }
+        if cn_direct {
+            for domain in RuleMatcher::CN_DOMAINS {
+                policies.insert(format!("+.{domain}"), domestic.clone());
+            }
+        }
+        let filters = base["dns"]["fake-ip-filter"].as_array_mut().unwrap();
+        filters.retain(|v| !v.as_str().unwrap().starts_with("rule-set:"));
+        filters.extend(
+            RuleMatcher::PRIVATE_DOMAINS
+                .iter()
+                .map(|d| Value::String(format!("+.{d}"))),
+        );
         base.as_object_mut().unwrap().remove("geox-url");
     }
     format!(

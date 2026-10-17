@@ -232,11 +232,7 @@ pub(crate) fn sing_box_full(
         }
         json!({"servers": dns_servers})
     } else {
-        let direct_address = if direct_privacy {
-            format!("https://{}/dns-query", dns_spec.direct_server)
-        } else {
-            dns_spec.direct_server.to_owned()
-        };
+        let direct_address = format!("https://{}/dns-query", dns_spec.direct_server);
         let mut dns_servers = vec![
             json!({"tag": dns_spec.direct_tag, "address": direct_address}),
             json!({"tag": dns_spec.proxy_tag, "address": dns_spec.proxy_url, "detour": SELECTOR_TAG}),
@@ -248,8 +244,7 @@ pub(crate) fn sing_box_full(
         if fake_ip {
             dns["fakeip"] = json!({
                 "enabled": true,
-                "inet4_range": dns_spec.fake_ip_inet4_range,
-                "inet6_range": dns_spec.fake_ip_inet6_range
+                "inet4_range": baseline["dns"]["servers"][4]["inet4_range"]
             });
         }
         dns
@@ -264,8 +259,13 @@ pub(crate) fn sing_box_full(
             json!({"tag": "dns-local", "address": "local"})
         });
     let mut dns_rules = vec![json!({
-        "domain_suffix": super::baseline::portal_domains(), "server": "dns-local"
+        "domain_suffix": RuleMatcher::PRIVATE_DOMAINS, "server": "dns-local"
     })];
+    for rule in &baseline["dns"]["rules"].as_array().unwrap()[2..4] {
+        let mut rule = rule.clone();
+        rule["server"] = json!(dns_spec.direct_tag);
+        dns_rules.push(rule);
+    }
     if !profile.typed_dns {
         // Pre-1.12 cores have no route.default_domain_resolver; the legacy
         // `outbound: any` DNS rule (removed in 1.14) resolves proxy server
@@ -322,19 +322,20 @@ pub(crate) fn sing_box_full(
 
     let mut route_rules = Vec::new();
     if !legacy_route && spec.sniff {
-        route_rules.push(json!({"action": "sniff"}));
+        route_rules.push(baseline["route"]["rules"][1].clone());
     }
     route_rules.push(if legacy_route {
         json!({"protocol": "dns", "outbound": "dns-out"})
     } else {
         json!({"protocol": "dns", "action": "hijack-dns"})
     });
+    route_rules.push(json!({"domain": ["services.googleapis.cn"], "outbound": SELECTOR_TAG}));
     route_rules.push(json!({
         "domain_suffix": super::baseline::portal_domains(), "outbound": DIRECT_TAG
     }));
-    route_rules.push(json!({
-        "ip_cidr": baseline["inbounds"][0]["route_exclude_address"], "outbound": DIRECT_TAG
-    }));
+    route_rules
+        .push(json!({"domain_suffix": RuleMatcher::PRIVATE_DOMAINS, "outbound": DIRECT_TAG}));
+
     for rule in spec
         .inline_rules
         .iter()
@@ -437,7 +438,7 @@ pub(crate) fn sing_box_full(
     Ok(serde_json::to_string_pretty(&json!({
         "log": {"level": "info", "timestamp": true},
         "dns": dns,
-        "inbounds": [tun, baseline["inbounds"][1]],
+        "inbounds": std::iter::once(tun).chain(baseline["inbounds"].as_array().unwrap()[1..].iter().cloned()).collect::<Vec<_>>(),
         "outbounds": outbounds,
         "route": route,
         "experimental": {
@@ -499,17 +500,33 @@ fn standard_full(
     }
     if !remote {
         value["route"]["rule_set"] = json!([]);
-        value["route"]["rules"].as_array_mut().unwrap().pop();
-        for rule in [
-            json!({"domain_suffix": RuleMatcher::PRIVATE_DOMAINS, "outbound": DIRECT_TAG}),
-            json!({"domain_suffix": RuleMatcher::CN_DOMAINS, "outbound": DIRECT_TAG}),
-            json!({"ip_cidr": RuleMatcher::CN_ADDRESSES, "outbound": DIRECT_TAG}),
-        ] {
-            value["route"]["rules"].as_array_mut().unwrap().push(rule);
+        let routes = value["route"]["rules"].as_array_mut().unwrap();
+        let mut inline = Vec::new();
+        for rule in routes.drain(..) {
+            let Some(tags) = rule.get("rule_set").and_then(Value::as_array) else {
+                inline.push(rule);
+                continue;
+            };
+            for tag in tags {
+                inline.push(match tag.as_str().unwrap() {
+                    "geosite-private" => json!({"domain_suffix": RuleMatcher::PRIVATE_DOMAINS, "outbound": DIRECT_TAG}),
+                    "geosite-cn" => json!({"domain_suffix": RuleMatcher::CN_DOMAINS, "outbound": DIRECT_TAG}),
+                    "geoip-private" => json!({"ip_is_private": true, "outbound": DIRECT_TAG}),
+                    "geoip-cn" => json!({"ip_cidr": RuleMatcher::CN_ADDRESSES, "outbound": DIRECT_TAG}),
+                    _ => unreachable!("bundled set has an inline twin"),
+                });
+            }
         }
-        value["dns"]["rules"][1] = json!({"domain_suffix":
-            RuleMatcher::PRIVATE_DOMAINS.iter().chain(RuleMatcher::CN_DOMAINS).collect::<Vec<_>>(),
-            "server": "dns-cn"});
+        *routes = inline;
+        for rule in value["dns"]["rules"].as_array_mut().unwrap() {
+            if let Some(tags) = rule.as_object_mut().unwrap().remove("rule_set") {
+                rule["domain_suffix"] = if tags[0] == "geosite-private" {
+                    json!(RuleMatcher::PRIVATE_DOMAINS)
+                } else {
+                    json!(RuleMatcher::CN_DOMAINS)
+                };
+            }
+        }
     } else {
         // Preserve the supplied SagerNet sources by default; keep explicit mirrors.
         let custom_base = config.client_rule_set_base_url.trim_end_matches('/');
@@ -541,6 +558,9 @@ fn standard_full(
             let mut legacy = json!({"tag": server["tag"], "address": address});
             if let Some(detour) = server.get("detour") {
                 legacy["detour"] = detour.clone();
+            }
+            if let Some(resolver) = server.get("domain_resolver") {
+                legacy["address_resolver"] = resolver.clone();
             }
             servers.push(legacy);
         }
