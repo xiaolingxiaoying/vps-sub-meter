@@ -759,7 +759,7 @@ pub(crate) fn commit_client_template(
         let binary = resolve_sing_box_bin(root, sing_box_bin)
             .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?;
         let snapshot =
-            sbctl::subscription::apply_config_transaction_locked(&store, &config, Some(&binary))
+            sbctl::subscription::apply_client_template_transaction_locked(&store, &config, &binary)
                 .map_err(|e| e.to_string())?;
         if let Err(error) = sbctl::lifecycle::prepare_daemon_storage(
             root,

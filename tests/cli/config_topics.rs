@@ -830,7 +830,32 @@ fn client_template_switch_changes_only_client_artifacts_without_restarting_or_re
     let server_path = fixture
         .path()
         .join("var/lib/sbctl/artifacts/sing-box-server.json");
-    let server_before = fs::read(&server_path).expect("server artifact exists");
+    let mut server_before = fs::read(&server_path).expect("server artifact exists");
+    // Simulate retained bytes from a prior release rather than an already
+    // synchronized deployment. A preset must not reconcile server drift.
+    server_before.extend_from_slice(b"\n");
+    fs::write(&server_path, &server_before).unwrap();
+    let active_path = fixture.path().join("etc/sing-box/config.json");
+    fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+    let mut active_before: serde_json::Value = serde_json::from_slice(&server_before).unwrap();
+    active_before["log"]["level"] = serde_json::json!("warn");
+    let active_before = serde_json::to_vec_pretty(&active_before).unwrap();
+    fs::write(&active_path, &active_before).unwrap();
+    let bare_before: Vec<_> = [
+        "subscription-sing-box.json",
+        "subscription-uri.txt",
+        "subscription-base64-uri.txt",
+        "subscription-shadowrocket.txt",
+    ]
+    .into_iter()
+    .map(|name| {
+        let path = fixture.path().join("var/lib/sbctl/artifacts").join(name);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes.extend_from_slice(b"\n");
+        fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    })
+    .collect();
     let full_path = fixture
         .path()
         .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json");
@@ -855,6 +880,10 @@ fn client_template_switch_changes_only_client_artifacts_without_restarting_or_re
     assert!(config.contains("client_template = \"compact\""));
     assert_eq!(fs::read(&state_path).unwrap(), state_before);
     assert_eq!(fs::read(&server_path).unwrap(), server_before);
+    assert_eq!(fs::read(&active_path).unwrap(), active_before);
+    for (path, bytes) in bare_before {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
     assert_ne!(
         fs::read(&full_path).unwrap(),
         full_before,
