@@ -144,7 +144,10 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
         Subscriptions => vec![
             entry("切换客户端模板（精简 / 标准）", Template),
             entry("查看订阅链接 / 按格式显示二维码", Open(Formats)),
-            entry("配置订阅入口", Topic(ConfigurationTopic::Subscription)),
+            entry(
+                "配置订阅入口与交付模式（直连 / 反代 / IP降级）",
+                Topic(ConfigurationTopic::Subscription),
+            ),
             entry("命名订阅凭据（按设备管理）", Open(Credentials)),
             entry("轮换默认订阅凭据（旧默认链接立即失效）", Rotate),
             entry(

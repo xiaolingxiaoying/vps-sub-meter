@@ -146,7 +146,11 @@ fn parse_clash_api_secret(value: &str) -> Result<String, String> {
     if trimmed.is_empty() || trimmed.split_whitespace().count() > 1 {
         return Err("secret 只能是单个不含空格的词，或留空 / random".to_owned());
     }
-    Ok(trimmed.to_ascii_lowercase())
+    match trimmed.to_ascii_lowercase().as_str() {
+        "none" | "off" | "0" => Ok("none".to_owned()),
+        "random" | "1" => Ok("random".to_owned()),
+        _ => Ok(trimmed.to_owned()),
+    }
 }
 
 /// Runs the wizard. `existing` is the loaded deployment (`None` for a fresh
@@ -1635,5 +1639,24 @@ mod tests {
             "the wizard summary must redact the Subscription credential"
         );
         assert!(joined.contains("subscription credential: [redacted]"));
+    }
+
+    #[test]
+    fn parse_clash_api_secret_preserves_case_for_explicit_secrets() {
+        use super::parse_clash_api_secret;
+
+        assert_eq!(
+            parse_clash_api_secret("MyCustomSecret_123").unwrap(),
+            "MyCustomSecret_123"
+        );
+        assert_eq!(parse_clash_api_secret("None").unwrap(), "none");
+        assert_eq!(parse_clash_api_secret("NONE").unwrap(), "none");
+        assert_eq!(parse_clash_api_secret("Random").unwrap(), "random");
+        assert_eq!(parse_clash_api_secret("RANDOM").unwrap(), "random");
+        assert_eq!(parse_clash_api_secret("0").unwrap(), "none");
+        assert_eq!(parse_clash_api_secret("1").unwrap(), "random");
+
+        assert!(parse_clash_api_secret("").is_err());
+        assert!(parse_clash_api_secret("has whitespace").is_err());
     }
 }

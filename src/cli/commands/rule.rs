@@ -65,17 +65,24 @@ fn list(root: &Path, kind: Option<RuleKind>) -> ExitCode {
 }
 
 /// Accepts `DOMAIN-SUFFIX,example.com` or the bare value (which means
-/// `DOMAIN-SUFFIX`, the match operators almost always want).
+/// `DOMAIN-SUFFIX`, the match operators almost always want). A trailing Clash
+/// policy word (e.g. `,DIRECT`) and `,no-resolve` are accepted.
 fn parse_entry(text: &str) -> Result<(String, RuleEntry), String> {
-    let (matcher, value) = match text.split_once(',') {
-        Some((matcher, value)) => (matcher.trim().to_ascii_uppercase(), value.trim()),
-        None => ("DOMAIN-SUFFIX".to_owned(), text.trim()),
+    let mut parts = text.split(',');
+    let first = parts.next().unwrap_or_default().trim();
+    let (matcher, value) = match parts.next() {
+        Some(second) => (first.to_ascii_uppercase(), second.trim()),
+        None => ("DOMAIN-SUFFIX".to_owned(), first),
     };
     validate_entry(&matcher, value)?;
+    // IP-CIDR operator rules default to no-resolve (address matches should
+    // bypass client domain lookups), and an explicit `,no-resolve` or trailing
+    // Clash policy word (e.g. `,DIRECT`) is accepted.
+    let no_resolve = matcher == "IP-CIDR";
     let entry = RuleEntry {
         matcher: matcher.clone(),
         value: value.to_owned(),
-        no_resolve: matcher == "IP-CIDR" && value.contains('/'),
+        no_resolve,
     };
     Ok((matcher, entry))
 }
@@ -231,4 +238,66 @@ fn remove(
         println!("已从 {} 移除：{}", kind.file_name(), removed.join(", "));
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_entry_supports_bare_values_and_typed_matchers() {
+        let (matcher, entry) = parse_entry("example.com").expect("valid bare entry");
+        assert_eq!(matcher, "DOMAIN-SUFFIX");
+        assert_eq!(entry.value, "example.com");
+        assert!(!entry.no_resolve);
+
+        let (matcher, entry) = parse_entry("DOMAIN,example.com").expect("valid DOMAIN entry");
+        assert_eq!(matcher, "DOMAIN");
+        assert_eq!(entry.value, "example.com");
+        assert!(!entry.no_resolve);
+
+        let (matcher, entry) = parse_entry("DOMAIN-KEYWORD,google").expect("valid keyword entry");
+        assert_eq!(matcher, "DOMAIN-KEYWORD");
+        assert_eq!(entry.value, "google");
+        assert!(!entry.no_resolve);
+    }
+
+    #[test]
+    fn parse_entry_handles_trailing_clash_policy_and_no_resolve() {
+        // Clash-style policy trailing word is accepted and dropped
+        let (matcher, entry) =
+            parse_entry("DOMAIN-SUFFIX,google.com,DIRECT").expect("valid clash rule");
+        assert_eq!(matcher, "DOMAIN-SUFFIX");
+        assert_eq!(entry.value, "google.com");
+        assert!(!entry.no_resolve);
+
+        // IP-CIDR defaults to no_resolve = true
+        let (matcher, entry) = parse_entry("IP-CIDR,192.168.1.0/24").expect("valid IP-CIDR");
+        assert_eq!(matcher, "IP-CIDR");
+        assert_eq!(entry.value, "192.168.1.0/24");
+        assert!(entry.no_resolve);
+
+        // IP-CIDR with no-resolve flag sets no_resolve = true
+        let (matcher, entry) =
+            parse_entry("IP-CIDR,10.0.0.0/8,no-resolve").expect("valid no-resolve CIDR");
+        assert_eq!(matcher, "IP-CIDR");
+        assert_eq!(entry.value, "10.0.0.0/8");
+        assert!(entry.no_resolve);
+
+        // IP-CIDR with policy and no-resolve
+        let (matcher, entry) =
+            parse_entry("IP-CIDR,172.16.0.0/12,DIRECT,no-resolve").expect("valid combo");
+        assert_eq!(matcher, "IP-CIDR");
+        assert_eq!(entry.value, "172.16.0.0/12");
+        assert!(entry.no_resolve);
+    }
+
+    #[test]
+    fn parse_entry_rejects_malformed_inputs() {
+        assert!(parse_entry("").is_err());
+        assert!(parse_entry("  ").is_err());
+        assert!(parse_entry("UNKNOWN-TYPE,example.com").is_err());
+        assert!(parse_entry("IP-CIDR,not-a-cidr").is_err());
+        assert!(parse_entry("IP-CIDR,1.1.1.1/33").is_err());
+    }
 }

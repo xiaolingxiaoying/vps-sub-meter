@@ -206,12 +206,22 @@ fn restore_replaced(
     prior_active: Option<&[u8]>,
 ) {
     for (name, prior) in prior_artifacts.iter().rev() {
-        if let Some(prior) = prior {
-            let _ = store.write_artifact_locked(name, prior);
+        match prior {
+            Some(prior) => {
+                let _ = store.write_artifact_locked(name, prior);
+            }
+            None => {
+                let _ = fs::remove_file(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name));
+            }
         }
     }
-    if let Some(prior_active) = prior_active {
-        let _ = store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, prior_active);
+    match prior_active {
+        Some(prior_active) => {
+            let _ = store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, prior_active);
+        }
+        None => {
+            let _ = fs::remove_file(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH));
+        }
     }
 }
 
@@ -219,7 +229,7 @@ fn restore_replaced(
 /// replace, used to restore the previous known-good deployment after a failed
 /// service health check.
 pub struct DeploymentSnapshot {
-    pub config: Vec<u8>,
+    pub config: Option<Vec<u8>>,
     pub artifacts: Vec<(String, Option<Vec<u8>>)>,
     pub active_config: Option<Vec<u8>>,
 }
@@ -369,7 +379,7 @@ fn apply_transaction_locked(
         eprintln!("warning: superseded subscription artifacts could not be removed: {error}");
     }
     Ok(DeploymentSnapshot {
-        config: prior_config.unwrap_or_default(),
+        config: prior_config,
         artifacts: prior_artifacts,
         active_config: prior_active,
     })
@@ -450,10 +460,32 @@ pub fn restore_config_transaction_locked(
             }
         }
     }
-    if let Some(active) = &snapshot.active_config {
-        store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, active)?;
+    match &snapshot.active_config {
+        Some(active) => {
+            store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, active)?;
+        }
+        None => {
+            let path = store.root().join(ACTIVE_CONFIG_RELATIVE_PATH);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(SubscriptionError::Storage(error.into())),
+            }
+        }
     }
-    store.write_relative_locked(crate::config::CONFIG_RELATIVE_PATH, &snapshot.config)?;
+    match &snapshot.config {
+        Some(config) => {
+            store.write_relative_locked(crate::config::CONFIG_RELATIVE_PATH, config)?;
+        }
+        None => {
+            let path = store.root().join(crate::config::CONFIG_RELATIVE_PATH);
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(SubscriptionError::Storage(error.into())),
+            }
+        }
+    }
     Ok(())
 }
 
@@ -2856,10 +2888,55 @@ ot-a-sing-box.bin"
         );
         assert_eq!(
             snapshot.config,
-            toml::to_string_pretty(&old)
-                .expect("old serializes")
-                .as_bytes()
-                .to_vec()
+            Some(
+                toml::to_string_pretty(&old)
+                    .expect("old serializes")
+                    .as_bytes()
+                    .to_vec()
+            )
+        );
+    }
+
+    #[test]
+    fn restore_config_transaction_removes_files_when_prior_deployment_was_absent() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let store = DeploymentStore::new(fixture.path());
+
+        let config_path = store.root().join(crate::config::CONFIG_RELATIVE_PATH);
+        fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        fs::write(&config_path, b"temporary config").unwrap();
+
+        let active_path = store.root().join(super::ACTIVE_CONFIG_RELATIVE_PATH);
+        fs::create_dir_all(active_path.parent().unwrap()).unwrap();
+        fs::write(&active_path, b"temporary active").unwrap();
+
+        let artifact_name = "subscription-sing-box.json".to_string();
+        store
+            .write_artifact_locked(&artifact_name, b"temporary artifact")
+            .unwrap();
+
+        let snapshot = super::DeploymentSnapshot {
+            config: None,
+            artifacts: vec![(artifact_name.clone(), None)],
+            active_config: None,
+        };
+
+        super::restore_config_transaction(&store, &snapshot).expect("restore succeeds");
+        assert!(
+            !config_path.exists(),
+            "restoring with None prior config must remove the config file"
+        );
+        assert!(
+            !active_path.exists(),
+            "restoring with None prior active config must remove the active file"
+        );
+        assert!(
+            !store
+                .root()
+                .join(super::ARTIFACTS_RELATIVE_DIR)
+                .join(&artifact_name)
+                .exists(),
+            "restoring with None prior artifact must remove the artifact"
         );
     }
 

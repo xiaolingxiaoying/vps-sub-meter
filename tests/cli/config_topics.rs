@@ -1282,6 +1282,72 @@ fn rule_add_cidr_can_be_listed_updated_and_removed() {
 }
 
 #[test]
+fn rule_add_handles_no_resolve_suffix_and_clash_policy_words() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+
+    // Add entry with explicit ,no-resolve
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule",
+            "add",
+            "direct",
+            "IP-CIDR,192.168.0.0/16,no-resolve",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    // Add entry with trailing Clash policy
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule",
+            "add",
+            "direct",
+            "DOMAIN-SUFFIX,clash.example,DIRECT",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let lists = sbctl::rule_list::RuleLists::load(fixture.path()).unwrap();
+    assert_eq!(lists.direct.len(), 2);
+    assert_eq!(lists.direct[0].value, "192.168.0.0/16");
+    assert!(lists.direct[0].no_resolve);
+    assert_eq!(lists.direct[1].value, "clash.example");
+
+    // Remove entry using the exact line with ,no-resolve
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule",
+            "remove",
+            "direct",
+            "IP-CIDR,192.168.0.0/16,no-resolve",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+
+    let lists = sbctl::rule_list::RuleLists::load(fixture.path()).unwrap();
+    assert_eq!(lists.direct.len(), 1);
+    assert_eq!(lists.direct[0].value, "clash.example");
+}
+
+#[test]
 fn rule_set_changes_keep_configuration_and_artifacts_after_a_failed_check() {
     let fixture = TempDir::new().unwrap();
     let root = fixture.path().to_str().unwrap();

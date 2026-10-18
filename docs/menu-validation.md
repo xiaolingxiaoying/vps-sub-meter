@@ -47,7 +47,7 @@ Debian/Ubuntu containers in `tests/acceptance/run.sh`; WSL-only tests do not est
 | 切换客户端模板（精简 / 标准） | `sbctl config template compact` or `sbctl config template standard` | `tests/cli/config_topics.rs` and `tests/acceptance/verify-menu.py`; `tests/version_profiles.rs -- --ignored` checks sing-box 1.10–1.14 cores, and `tests/clash_mihomo.rs -- --ignored` checks Mihomo. |
 | 查看全部订阅链接 | `sbctl sub` | `tests/cli/subscription_formats.rs`; isolated HTTP route tests verify generated links and credential handling. |
 | 按格式显示二维码 | `sbctl qr <format>` (or `sbctl qr --all`) | `tests/cli/subscription_formats.rs`: format matrix and QR generation. |
-| 配置订阅入口 | `sbctl config wizard` (subscription topic) | `tests/cli/config_topics.rs` and `tests/cli/lifecycle.rs`; Direct HTTPS socket ownership and external proxy routing require isolated host validation. |
+| 配置订阅入口与交付模式 | `sbctl config wizard` (subscription topic) | `tests/cli/config_topics.rs` and `tests/cli/lifecycle.rs`; Direct HTTPS socket ownership and external proxy routing require isolated host validation. |
 | 查看命名订阅凭据 | `sbctl credential list` | `tests/cli/credentials.rs`: secrets remain masked. |
 | 新增设备凭据 | `sbctl credential add --name <name>` | `tests/cli/credentials.rs`: independent named routes and rollback on failure. |
 | 吊销指定凭据 | `sbctl credential revoke <name>` | `tests/cli/credentials.rs`: immediate and grace-window behavior. |

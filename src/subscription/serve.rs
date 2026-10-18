@@ -762,7 +762,12 @@ fn acme_http_response(
         .uri()
         .path()
         .strip_prefix("/.well-known/acme-challenge/")
-        .filter(|token| !token.is_empty() && !token.contains('/') && !token.contains('?'))
+        .filter(|token| {
+            !token.is_empty()
+                && token
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
         .and_then(|token| {
             fs::read_to_string(
                 store
@@ -1339,13 +1344,17 @@ mod tests {
         let handler = tokio::spawn(super::serve_acme_listener(
             listener,
             Arc::new(store),
-            Some(3),
+            Some(5),
         ));
 
         let missing = http_get(port, "/.well-known/acme-challenge/unknown").await;
         assert!(missing.starts_with("HTTP/1.1 404 Not Found"));
         let traversal = http_get(port, "/.well-known/acme-challenge/../config.toml").await;
         assert!(traversal.starts_with("HTTP/1.1 404 Not Found"));
+        let dot_token = http_get(port, "/.well-known/acme-challenge/token.with.dot").await;
+        assert!(dot_token.starts_with("HTTP/1.1 404 Not Found"));
+        let backslash_token = http_get(port, "/.well-known/acme-challenge/token\\test").await;
+        assert!(backslash_token.starts_with("HTTP/1.1 404 Not Found"));
         let wrong_root = http_get(port, "/sub/anything/uri").await;
         assert!(wrong_root.starts_with("HTTP/1.1 404 Not Found"));
         handler.await.expect("handler completes").expect("no error");
