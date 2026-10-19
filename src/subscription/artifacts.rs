@@ -608,12 +608,13 @@ pub fn generated_artifacts_for_kernel(
             sing_box_full(config, &nodes, profile)?,
         ));
     }
-    artifacts.push((
-        SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION)
-            .artifact_name()
-            .into_owned(),
-        clash_legacy(config, &nodes)?,
-    ));
+    let legacy = SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION);
+    if legacy.has_compatible_nodes(config) {
+        artifacts.push((
+            legacy.artifact_name().into_owned(),
+            clash_legacy(config, &nodes)?,
+        ));
+    }
     apply_client_overrides(root, &mut artifacts)?;
     apply_rule_lists(root, &mut artifacts)?;
     validate_client_references(&artifacts)?;
@@ -1229,6 +1230,9 @@ pub fn read_authorized(
     {
         return Err(SubscriptionError::InvalidCredential);
     }
+    if !format.has_compatible_nodes(config) {
+        return Err(SubscriptionError::ClientIncompatible(format.path_name()));
+    }
     let contents = fs::read(
         store
             .root()
@@ -1269,6 +1273,14 @@ pub fn route_url_with_credential(
     route: SubscriptionRoute,
 ) -> Result<String, SubscriptionError> {
     ensure_subscription_nodes(config)?;
+    if let SubscriptionRoute::Format(format) | SubscriptionRoute::Qr(format) = route
+        && !format.has_compatible_nodes(config)
+    {
+        return Err(SubscriptionError::ClientIncompatible(format!(
+            "{} 不支持当前启用的节点协议",
+            format.path_name()
+        )));
+    }
     let prefix = match config.subscription_mode {
         SubscriptionMode::IpFallback => format!(
             "http://{}:{}",
@@ -2537,6 +2549,34 @@ ot-a-sing-box.bin"
             !names.contains(&"subscription-sing-box-1.11.json"),
             "the 1.11 profile must be skipped for an AnyTLS-only deployment"
         );
+        assert!(!names.contains(&"subscription-clash-1.18.yaml"));
+        let advertised = super::super::available_subscription_matrix(&config);
+        assert_eq!(
+            advertised.len() + 1,
+            artifacts.len(),
+            "all generated client artifacts are advertised"
+        );
+        for row in advertised {
+            assert!(names.contains(&row.format.artifact_name().as_ref()));
+        }
+        for row in super::super::available_client_subscription_matrix(&config) {
+            for entry in row.formats {
+                assert!(names.contains(&entry.format.artifact_name().as_ref()));
+            }
+        }
+        let html = crate::index_page::render(&_store, &config).unwrap();
+        for format in [
+            super::SubscriptionFormat::SingBoxVersion(super::super::ClientVersion::new(1, 10)),
+            super::SubscriptionFormat::SingBoxVersion(super::super::ClientVersion::new(1, 11)),
+            super::SubscriptionFormat::ClashLegacy(super::CLASH_LEGACY_VERSION),
+        ] {
+            assert!(super::subscription_url(&config, format).is_err());
+            assert!(!html.contains(&format!("/{}\"", format.path_name())));
+            assert!(
+                super::read_authorized(&_store, &config, &config.subscription_credential, format)
+                    .is_err()
+            );
+        }
         assert!(
             names.contains(&"subscription-clash.yaml")
                 && names.contains(&"subscription-sing-box-full.json"),

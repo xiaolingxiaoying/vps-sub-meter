@@ -24,8 +24,9 @@ pub use artifacts::{
 pub use profile::{
     CLASH_LEGACY_VERSION, ClientSubscriptionFormat, ClientSubscriptionRow, ClientVersion,
     SING_BOX_VERSION_PROFILES, SingBoxVersionProfile, SubscriptionFormat, SubscriptionLinkInfo,
-    SubscriptionRoute, band_warning_for, client_subscription_matrix, installed_kernel_version,
-    kernel_band_warning, latest_version_profile, parse_kernel_version, subscription_matrix,
+    SubscriptionRoute, available_client_subscription_matrix, available_subscription_matrix,
+    band_warning_for, client_subscription_matrix, installed_kernel_version, kernel_band_warning,
+    latest_version_profile, parse_kernel_version, subscription_matrix,
 };
 pub use render::{
     AI_DOMAIN_SUFFIXES, AUTO_TAG, SELECTOR_TAG, ensure_external_proxy_listener_available,

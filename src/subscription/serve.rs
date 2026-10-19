@@ -827,6 +827,11 @@ fn subscription_http_response(
     if !super::credential_matches(config, credential, chrono::Utc::now().timestamp()) {
         return not_found_http_response();
     }
+    if let SubscriptionRoute::Format(format) | SubscriptionRoute::Qr(format) = route
+        && !format.has_compatible_nodes(config)
+    {
+        return not_found_http_response();
+    }
     match route {
         SubscriptionRoute::Qr(format) => qr_http_response(config, credential, format),
         SubscriptionRoute::Index => index_http_response(store, config, credential),

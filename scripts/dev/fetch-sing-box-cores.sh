@@ -55,6 +55,14 @@ done
 # Written separately so the gate can source one file instead of re-listing the
 # versions in three places.
 env_file="$BIN_DIR/sb-cores.env"
+legacy="$BIN_DIR/mihomo-1.18.10"
+if [ ! -x "$legacy" ]; then
+  curl --fail --location --silent --show-error --retry 3 --connect-timeout 20 \
+    "https://github.com/MetaCubeX/mihomo/releases/download/v1.18.10/mihomo-linux-amd64-v1.18.10.gz" \
+    --output "$BIN_DIR/mihomo-1.18.10.gz"
+  gzip -dc "$BIN_DIR/mihomo-1.18.10.gz" > "$legacy"
+  chmod +x "$legacy"
+fi
 : > "$env_file"
 for version in $CORE_VERSIONS; do
   major_minor=$(printf '%s' "$version" | cut -d. -f1,2 | tr '.' '_')
@@ -63,6 +71,7 @@ done
 {
   echo "export SBCTL_UPSTREAM_LATEST=v$(printf '%s\n' $CORE_VERSIONS | head -1)"
   echo "export MIHOMO_BIN=$BIN_DIR/mihomo"
+  echo "export MIHOMO_LEGACY_BIN=$legacy"
 } >> "$env_file"
 
 echo "env file: $env_file"

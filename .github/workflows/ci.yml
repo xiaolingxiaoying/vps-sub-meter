@@ -149,7 +149,13 @@ jobs:
           gunzip -c mihomo/mihomo.gz > mihomo/mihomo
           chmod +x mihomo/mihomo
           mihomo/mihomo -v
+          curl -fsSL --retry 3 -o mihomo/mihomo-legacy.gz \
+            "https://github.com/MetaCubeX/mihomo/releases/download/v1.18.10/mihomo-linux-amd64-v1.18.10.gz"
+          gunzip -c mihomo/mihomo-legacy.gz > mihomo/mihomo-legacy
+          chmod +x mihomo/mihomo-legacy
+          mihomo/mihomo-legacy -v
       - name: Load every generated clash artifact in mihomo
         env:
           MIHOMO_BIN: ${{ github.workspace }}/mihomo/mihomo
+          MIHOMO_LEGACY_BIN: ${{ github.workspace }}/mihomo/mihomo-legacy
         run: cargo test --test clash_mihomo -- --ignored --nocapture

@@ -13,7 +13,8 @@ use chrono_tz::Tz;
 
 use crate::config::{DeploymentConfig, DeploymentStore};
 use crate::subscription::{
-    ClientVersion, SubscriptionRoute, client_subscription_matrix, subscription_matrix,
+    ClientVersion, SubscriptionRoute, available_client_subscription_matrix,
+    available_subscription_matrix,
 };
 
 /// Renders the overview page. Fails only when a QR code or a route URL cannot
@@ -45,7 +46,7 @@ pub fn render_with_credential(
         }
     };
     let mut client_rows = String::new();
-    for row in client_subscription_matrix() {
+    for row in available_client_subscription_matrix(config) {
         client_rows.push_str("<tr><th>");
         client_rows.push_str(&esc(row.client));
         client_rows.push_str("</th><td><ul>");
@@ -81,7 +82,7 @@ pub fn render_with_credential(
         ));
     }
     let mut rows = String::new();
-    for info in subscription_matrix() {
+    for info in available_subscription_matrix(config) {
         let url = crate::subscription::route_url_with_credential(
             config,
             credential,
@@ -134,7 +135,7 @@ code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
 <p><span class=\"badge\">主机：{host}</span>\
 <span class=\"badge\">模式：{mode}</span>\
 {traffic_badges}</p>\n\
-<p class=\"note\">每个链接都可以直接下载，或用手机扫描旁边的二维码一键导入。订阅凭据泄露时请在服务器上执行 <code>sbctl credential rotate</code> 更换。</p>\n\
+<p class=\"note\">二维码内容是对应的订阅 URL，请使用客户端的订阅扫码功能，或复制链接添加订阅；系统相机可能只会打开下载页面。订阅凭据泄露时请在服务器上执行 <code>sbctl credential rotate</code> 更换。</p>\n\
 <h2>按客户端选择</h2>\n\
 <table>\n{client_rows}</table>\n\
 <h2>节点与原生分享链接</h2>\n\
@@ -146,8 +147,8 @@ code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
 {rows}\n\
 <h2>客户端导入</h2>\n\
 <ul>\n\
-<li><strong>Clash Party / Clash Verge</strong>：粘贴 <code>clash.yaml</code> 链接导入订阅；旧版内核使用 <code>clash-1.18.yaml</code>。</li>\n\
-<li><strong>sing-box（SFA / SFI / SFW / 桌面版）</strong>：按已安装内核版本选择对应 <code>sing-box-&lt;版本&gt;.json</code>；不确定就用 <code>sing-box-full.json</code>。1.10/1.11 内核不支持 AnyTLS 节点。</li>\n\
+<li><strong>Clash Party / Clash Verge</strong>：粘贴 <code>clash.yaml</code> 链接导入订阅；1.18 内核使用 <code>clash-1.18.yaml</code>，不含 AnyTLS 节点；仅启用 AnyTLS 时无此旧版订阅。</li>\n\
+<li><strong>sing-box（SFA / SFI / SFW / 桌面版）</strong>：先查看客户端内核版本，再选择对应 <code>sing-box-&lt;版本&gt;.json</code>。1.10/1.11 内核不支持 AnyTLS 节点；仅启用 AnyTLS 时不提供这两个旧版订阅。</li>\n\
 <li><strong>V2rayN</strong>：粘贴 <code>uri.txt</code>（Base64 URI）或复制 <code>uri</code> 明文分享链接；6.6+ 也可导入 <code>sing-box-full.json</code>。</li>\n\
 <li><strong>Shadowrocket（iOS）</strong>：扫码或粘贴 <code>shadowrocket.txt</code> 链接 → 首页添加配置 → 自动更新。五协议均受支持，最低版本：VLESS Reality 2.2.16、TUIC 2.2.12、Hysteria2 2.2.35、AnyTLS 2.2.64；低于对应版本时该协议节点不会被识别（其余节点仍可正常导入）。</li>\n\
 </ul>\n\

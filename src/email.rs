@@ -178,7 +178,7 @@ pub fn report(
     }
     if include_subscription {
         text.push_str("\n私有订阅链接（包含订阅凭据，请妥善保管）：\n");
-        for row in crate::subscription::subscription_matrix() {
+        for row in crate::subscription::available_subscription_matrix(config) {
             let url = crate::subscription::subscription_url(config, row.format)
                 .map_err(|_| "无法生成订阅链接")?;
             text.push_str(&format!("{}：{url}\n", row.format.display_label()));

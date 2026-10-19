@@ -63,7 +63,7 @@ pub(crate) fn print_subscription_urls(
                 .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?,
             None => {
                 let mut table = String::from("按客户端选择订阅链接（推荐）：\n\n");
-                for row in sbctl::subscription::client_subscription_matrix() {
+                for row in sbctl::subscription::available_client_subscription_matrix(&config) {
                     table.push_str(&format!("{}：{}\n", row.client, row.note));
                     for recommended in &row.formats {
                         let url =
@@ -76,7 +76,7 @@ pub(crate) fn print_subscription_urls(
                     table.push('\n');
                 }
                 table.push_str("全部订阅格式：\n\n");
-                for info in sbctl::subscription::subscription_matrix() {
+                for info in sbctl::subscription::available_subscription_matrix(&config) {
                     let url = sbctl::subscription::subscription_url(&config, info.format).map_err(
                         |error| sbctl::config::ConfigError::StateContent(error.to_string()),
                     )?;
@@ -129,7 +129,7 @@ pub(crate) fn print_subscription_qr(
     let store = sbctl::config::DeploymentStore::new(root);
     let result = store.load().and_then(|config| {
         let formats: Vec<SubscriptionFormat> = if all {
-            sbctl::subscription::subscription_matrix()
+            sbctl::subscription::available_subscription_matrix(&config)
                 .into_iter()
                 .map(|info| info.format)
                 .collect()

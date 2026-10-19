@@ -40,8 +40,14 @@ fn menu_page(root: &Path, page: Page) {
         clear_menu_screen();
         print_menu_header(root);
         print_menu_section(navigation::title(page));
-        let installed = sbctl::config::DeploymentStore::new(root).load().is_ok();
-        let entries = navigation::entries(page, installed);
+        let config = sbctl::config::DeploymentStore::new(root).load().ok();
+        let mut entries = navigation::entries(page, config.is_some());
+        if let Some(config) = &config {
+            entries.retain(|entry| match entry.action {
+                Action::Qr(format) => format.has_compatible_nodes(config),
+                _ => true,
+            });
+        }
         for (i, entry) in entries.iter().enumerate() {
             println!("{}. {}", i + 1, entry.label);
         }

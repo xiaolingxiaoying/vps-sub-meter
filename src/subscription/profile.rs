@@ -45,6 +45,23 @@ pub enum SubscriptionFormat {
 }
 
 impl SubscriptionFormat {
+    /// Whether this client format can carry at least one enabled protocol.
+    /// Older sing-box and mihomo versions cannot import AnyTLS at all.
+    pub fn has_compatible_nodes(self, config: &crate::config::DeploymentConfig) -> bool {
+        let supports_anytls = match self {
+            Self::SingBoxVersion(version) => SING_BOX_VERSION_PROFILES
+                .iter()
+                .find(|profile| profile.version == version)
+                .is_some_and(|profile| profile.supports_anytls),
+            Self::ClashLegacy(_) => false,
+            _ => true,
+        };
+        config
+            .enabled_protocols
+            .iter()
+            .any(|protocol| supports_anytls || *protocol != crate::config::ManagedProtocol::Anytls)
+    }
+
     pub fn path_name(self) -> String {
         match self {
             Self::SingBox => "sing-box.json".to_owned(),
@@ -285,8 +302,8 @@ fn static_matrix_rows() -> Vec<SubscriptionLinkInfo> {
         SubscriptionLinkInfo {
             format: SubscriptionFormat::SingBox,
             label: "sing-box 精简配置".to_owned(),
-            audience: "sing-box（全版本兼容）".to_owned(),
-            note: "仅 outbounds 节点列表，与历史版本逐字节一致".to_owned(),
+            audience: "sing-box 节点配置片段".to_owned(),
+            note: "仅 outbounds 节点列表，需合并到客户端配置；含 AnyTLS 时要求 1.12+".to_owned(),
         },
         SubscriptionLinkInfo {
             format: SubscriptionFormat::SingBoxFull,
@@ -304,7 +321,7 @@ fn static_matrix_rows() -> Vec<SubscriptionLinkInfo> {
             format: SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION),
             label: "Clash / mihomo 旧版兼容".to_owned(),
             audience: "mihomo 1.18.x".to_owned(),
-            note: "面向上一大版本的兼容写法（内置 GEOIP 规则）".to_owned(),
+            note: "内置分流规则；1.18 不支持 AnyTLS，自动排除该节点".to_owned(),
         },
         SubscriptionLinkInfo {
             format: SubscriptionFormat::Uri,
@@ -356,6 +373,30 @@ pub fn subscription_matrix() -> Vec<SubscriptionLinkInfo> {
         rows.push(info);
     }
     rows
+}
+
+/// The links this deployment actually generates, excluding empty old-client
+/// profiles for an AnyTLS-only deployment.
+pub fn available_subscription_matrix(
+    config: &crate::config::DeploymentConfig,
+) -> Vec<SubscriptionLinkInfo> {
+    subscription_matrix()
+        .into_iter()
+        .filter(|row| row.format.has_compatible_nodes(config))
+        .collect()
+}
+
+pub fn available_client_subscription_matrix(
+    config: &crate::config::DeploymentConfig,
+) -> Vec<ClientSubscriptionRow> {
+    client_subscription_matrix()
+        .into_iter()
+        .filter_map(|mut row| {
+            row.formats
+                .retain(|entry| entry.format.has_compatible_nodes(config));
+            (!row.formats.is_empty()).then_some(row)
+        })
+        .collect()
 }
 
 /// One recommended format inside a per-client quick-pick row.

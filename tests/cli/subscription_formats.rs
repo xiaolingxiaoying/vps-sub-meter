@@ -1239,7 +1239,7 @@ fn qr_all_renders_every_matrix_format_and_a_positional_format_selects_one() {
         .success();
     let stdout = String::from_utf8(all.get_output().stdout.clone()).expect("stdout is UTF-8");
     assert_eq!(
-        stdout.matches("\x1b[30;47m").count(),
+        stdout.matches("订阅二维码：").count(),
         sbctl::subscription::subscription_matrix().len(),
         "qr --all renders one terminal code per matrix row"
     );
@@ -1255,10 +1255,93 @@ fn qr_all_renders_every_matrix_format_and_a_positional_format_selects_one() {
         .success();
     let stdout = String::from_utf8(single.get_output().stdout.clone()).expect("stdout is UTF-8");
     assert_eq!(
-        stdout.matches("\x1b[30;47m").count(),
+        stdout.matches("订阅二维码：").count(),
         1,
         "a positional format renders exactly one terminal code"
     );
+}
+
+#[test]
+fn anytls_only_links_and_qrs_exclude_formats_with_no_compatible_nodes() {
+    use sbctl::config::{DeploymentConfig, DeploymentStore, ManagedProtocol, SubscriptionMode};
+    let fixture = TempDir::new().unwrap();
+    let port = free_high_tcp_port();
+    let config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "127.0.0.1".into(),
+        None,
+        Some(port),
+        "ens3".into(),
+        vec![ManagedProtocol::Anytls],
+        None,
+    )
+    .unwrap();
+    let store = DeploymentStore::new(fixture.path());
+    store.initialize(&config).unwrap();
+    sbctl::subscription::regenerate(&store, &config, None, false).unwrap();
+    let root = fixture.path().to_str().unwrap();
+    let output = Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "sub"])
+        .assert()
+        .success();
+    let text = String::from_utf8_lossy(&output.get_output().stdout);
+    for missing in [
+        "sing-box-1.10.json",
+        "sing-box-1.11.json",
+        "clash-1.18.yaml",
+    ] {
+        assert!(!text.contains(&format!("/{missing}")));
+    }
+    let output = Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "qr", "--all"])
+        .assert()
+        .success();
+    assert_eq!(
+        String::from_utf8_lossy(&output.get_output().stdout)
+            .matches("订阅二维码：")
+            .count(),
+        9
+    );
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "qr", "sing-box-1.10"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("不支持"));
+
+    // Even a stale artifact left from a previous protocol selection must not
+    // revive an unsupported format or advertise its QR code.
+    fs::write(
+        fixture
+            .path()
+            .join("var/lib/sbctl/artifacts/subscription-clash-1.18.yaml"),
+        "stale artifact",
+    )
+    .unwrap();
+    let mut server = spawn_sbctl_serve(&fixture, port, 7, &fixture.path().join("serve.err"));
+    for path in [
+        "sing-box-1.10.json",
+        "sing-box-1.11.json",
+        "clash-1.18.yaml",
+    ] {
+        for prefix in ["", "qr/"] {
+            let response = http_get(
+                port,
+                &format!("/sub/{}/{prefix}{path}", config.subscription_credential),
+            );
+            assert!(response.starts_with("HTTP/1.1 404"));
+        }
+    }
+    assert!(
+        http_get(
+            port,
+            &format!("/sub/{}/sing-box-1.12.json", config.subscription_credential)
+        )
+        .starts_with("HTTP/1.1 200")
+    );
+    assert!(server.wait().unwrap().success());
 }
 
 #[test]

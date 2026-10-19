@@ -215,7 +215,8 @@ pub(crate) fn node_uri(insecure: u8, node: &CanonicalNode) -> String {
             decoy_sni,
             ..
         } => format!(
-            "vless://{uuid}@{host}:{port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={decoy_sni}&fp=chrome&pbk={public_key}&sid={short_id}&type=tcp#{}\n",
+            "vless://{uuid}@{host}:{port}?encryption=none&flow=xtls-rprx-vision&security=reality&sni={}&fp=chrome&pbk={public_key}&sid={short_id}&type=tcp#{}\n",
+            percent_encode(decoy_sni),
             node.tag()
         ),
         CanonicalNode::VmessWebsocket {
@@ -239,7 +240,9 @@ pub(crate) fn node_uri(insecure: u8, node: &CanonicalNode) -> String {
             tls_server_name,
             password,
         } => format!(
-            "hysteria2://{password}@{host}:{port}?insecure={insecure}{aliases}&sni={tls_server_name}#{}\n",
+            "hysteria2://{}@{host}:{port}?insecure={insecure}{aliases}&sni={}#{}\n",
+            percent_encode(password),
+            percent_encode(tls_server_name),
             node.tag()
         ),
         CanonicalNode::Tuic {
@@ -249,7 +252,10 @@ pub(crate) fn node_uri(insecure: u8, node: &CanonicalNode) -> String {
             uuid,
             password,
         } => format!(
-            "tuic://{uuid}:{password}@{host}:{port}?congestion_control=bbr&alpn=h3&insecure={insecure}{tuic_aliases}&sni={tls_server_name}#{}\n",
+            "tuic://{}:{}@{host}:{port}?congestion_control=bbr&alpn=h3&insecure={insecure}{tuic_aliases}&sni={}#{}\n",
+            percent_encode(uuid),
+            percent_encode(password),
+            percent_encode(tls_server_name),
             node.tag()
         ),
         CanonicalNode::Anytls {
@@ -258,7 +264,9 @@ pub(crate) fn node_uri(insecure: u8, node: &CanonicalNode) -> String {
             tls_server_name,
             password,
         } => format!(
-            "anytls://{password}@{host}:{port}?security=tls&insecure={insecure}{aliases}&sni={tls_server_name}#{}\n",
+            "anytls://{}@{host}:{port}?security=tls&insecure={insecure}{aliases}&sni={}#{}\n",
+            percent_encode(password),
+            percent_encode(tls_server_name),
             node.tag()
         ),
     }
@@ -311,6 +319,65 @@ mod tests {
     };
     use crate::subscription::render::{clash, sing_box};
     use crate::subscription::{SubscriptionFormat, SubscriptionRoute, route_url};
+
+    #[test]
+    fn uri_credentials_with_reserved_characters_survive_import() {
+        let password = "pa:ss@word/?#&=+% 空";
+        let encoded = "pa%3Ass%40word%2F%3F%23%26%3D%2B%25%20%E7%A9%BA";
+        for host in ["203.0.113.7", "2001:db8::1"] {
+            let mut config = DeploymentConfig::new(
+                SubscriptionMode::IpFallback,
+                host.into(),
+                None,
+                Some(2080),
+                "ens3".into(),
+                vec![
+                    ManagedProtocol::Hysteria2,
+                    ManagedProtocol::Tuic,
+                    ManagedProtocol::Anytls,
+                ],
+                None,
+            )
+            .unwrap();
+            config.hysteria2.as_mut().unwrap().password = password.into();
+            config.tuic.as_mut().unwrap().password = password.into();
+            config.anytls.as_mut().unwrap().password = password.into();
+            config.validate().unwrap();
+            let nodes = crate::canonical::nodes(&config);
+            let plain = uri(&config, &nodes).unwrap();
+            let rocket = String::from_utf8(
+                base64::engine::general_purpose::STANDARD
+                    .decode(shadowrocket(&config, &nodes).unwrap())
+                    .unwrap(),
+            )
+            .unwrap();
+            for body in [&plain, &rocket] {
+                assert_eq!(body.lines().count(), 3);
+                for line in body.lines() {
+                    let parsed = url::Url::parse(line).unwrap();
+                    let auth = if parsed.scheme() == "tuic" {
+                        parsed.password().unwrap()
+                    } else {
+                        parsed.username()
+                    };
+                    assert_eq!(auth, encoded);
+                    assert_eq!(
+                        parsed.port(),
+                        Some(
+                            nodes
+                                .iter()
+                                .find(|node| node.protocol().to_string() == parsed.scheme())
+                                .unwrap()
+                                .port()
+                        )
+                    );
+                    let query: std::collections::HashMap<_, _> = parsed.query_pairs().collect();
+                    assert_eq!(query.get("sni").unwrap(), config.protocol_server_name());
+                    assert_eq!(query.get("insecure").unwrap(), "1");
+                }
+            }
+        }
+    }
 
     #[test]
     fn every_uri_import_preserves_the_certificate_policy_for_each_tls_protocol() {

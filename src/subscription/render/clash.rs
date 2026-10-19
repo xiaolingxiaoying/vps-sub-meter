@@ -307,6 +307,14 @@ pub(crate) fn clash_legacy(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
 ) -> Result<String, SubscriptionError> {
+    // mihomo 1.18 rejects the whole profile on an unknown proxy type. Filter
+    // before expanding groups so they cannot retain dangling AnyTLS names.
+    let compatible_nodes: Vec<_> = nodes
+        .iter()
+        .filter(|node| !matches!(node, CanonicalNode::Anytls { .. }))
+        .cloned()
+        .collect();
+    let nodes = compatible_nodes.as_slice();
     let template = if config.client_template == crate::subscription::ClientTemplate::Compact {
         crate::subscription::ClientTemplate::Compact
     } else {

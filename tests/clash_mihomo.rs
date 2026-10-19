@@ -18,6 +18,13 @@ fn generated_clash_artifacts_load_in_a_real_mihomo() {
     let Ok(binary) = std::env::var("MIHOMO_BIN") else {
         panic!("MIHOMO_BIN must point at a mihomo binary");
     };
+    let legacy_binary = std::env::var("MIHOMO_LEGACY_BIN")
+        .expect("MIHOMO_LEGACY_BIN must point at a mihomo 1.18 core");
+    let version = Command::new(&legacy_binary).arg("-v").output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&version.stdout).contains("v1.18."),
+        "the legacy profile must be checked by a real 1.18 core"
+    );
     let root = tempfile::tempdir().expect("temporary root is created");
     // One run per combination: 3 templates x 2 rule profiles x 2 clash
     // artifacts. Before the templates carried different content all three
@@ -83,7 +90,12 @@ fn generated_clash_artifacts_load_in_a_real_mihomo() {
                     .unwrap_or_else(|| panic!("missing clash artifact {name}"));
                 let config_path = root.path().join(&name);
                 fs::write(&config_path, contents).expect("clash artifact is written");
-                let output = Command::new(&binary)
+                let checker = if matches!(format, SubscriptionFormat::ClashLegacy(_)) {
+                    &legacy_binary
+                } else {
+                    &binary
+                };
+                let output = Command::new(checker)
                     .arg("-t")
                     .arg("-d")
                     .arg(root.path())

@@ -19,6 +19,7 @@ export CARGO_TARGET_DIR=${CARGO_TARGET_DIR:-$HOME/ws/target-vps}
 
 # shellcheck disable=SC1090
 source "$HOME/bin/sb-cores.env"
+export MIHOMO_LEGACY_BIN=${MIHOMO_LEGACY_BIN:-$HOME/bin/mihomo-1.18.10}
 
 # Same sync the daily gate uses, so the matrix runs the tree you are looking at.
 mkdir -p "$DST"

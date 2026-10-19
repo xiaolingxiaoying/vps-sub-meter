@@ -4,7 +4,7 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 | 链接 | 内容 | 适用客户端 |
 | --- | --- | --- |
-| `/sub/<cred>/sing-box.json` | 仅 outbounds 节点列表（历史格式，逐字节稳定） | sing-box 全版本 |
+| `/sub/<cred>/sing-box.json` | 仅 outbounds 节点片段，需合并到客户端配置 | 含 AnyTLS 时要求 sing-box 1.12+ |
 | `/sub/<cred>/sing-box-full.json` | 最新稳定版完整客户端配置 | sing-box 最新稳定版（V2rayN 6.6+ 亦可导入） |
 | `/sub/<cred>/sing-box-1.10.json` | 1.10.x 适配完整配置 | sing-box ≥1.10.0, <1.11.0（无 AnyTLS 节点） |
 | `/sub/<cred>/sing-box-1.11.json` | 1.11.x 适配完整配置 | sing-box ≥1.11.0, <1.12.0（无 AnyTLS 节点） |
@@ -12,7 +12,7 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 | `/sub/<cred>/sing-box-1.13.json` | 1.13.x 适配完整配置 | sing-box ≥1.13.0, <1.14.0 |
 | `/sub/<cred>/sing-box-1.14.json` | 1.14.x 适配完整配置 | sing-box ≥1.14.0 |
 | `/sub/<cred>/clash.yaml` | 现行稳定版 mihomo 配置 | mihomo 现行稳定版（rule-set 分流） |
-| `/sub/<cred>/clash-1.18.yaml` | 旧版兼容配置 | mihomo 1.18.x / 不想用远程规则集 |
+| `/sub/<cred>/clash-1.18.yaml` | 旧版兼容配置，不含 AnyTLS | mihomo 1.18.x |
 | `/sub/<cred>/uri` | 明文分享 URI（每行一条） | 通用 |
 | `/sub/<cred>/uri.txt` | 明文 URI 整体 Base64 | V2rayN 等 |
 | `/sub/<cred>/shadowrocket.txt` | Shadowrocket 适配 Base64 URI | Shadowrocket (iOS) |
@@ -58,10 +58,19 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 生成策略：每个版本 profile 只带该版本内核能接受的字段——1.10/1.11 用 legacy DNS 与顶层 `dns.fakeip`，1.10 的路由规则不用动作式写法，任何版本都不会收到它不认识的字段。`store_dns` 仅 1.14 工件携带。AnyTLS 节点只在 1.12+ 工件中出现；**当部署只启用了 AnyTLS 时，1.10/1.11 工件不会生成**（生成时打印警告，其余格式不受影响）。
 
+仅启用 AnyTLS 时，也不生成 `clash-1.18.yaml`。CLI、菜单、邮件和总览页会隐藏这三个无兼容节点的格式；手动请求对应订阅或二维码返回 404，避免把缺失工件误报为服务故障。
+
 ## mihomo 差异（1.18 → 1.19）
 
 - `clash.yaml` 使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）。标准模板有 `代理`、`自动选择` 两个组；精简模板只输出 `代理`，成员为真实节点与 `DIRECT`。GLOBAL 由内核提供。
 - `clash-1.18.yaml` 通过内置域名/IP 列表保留直连分流，不引用远程规则集或自动下载地理数据库。
+- mihomo 1.18 不认识 `type: anytls`，会拒绝加载包含该类型的整份配置。旧版工件在生成代理组前排除 AnyTLS 节点；真实内核测试分别使用现行版本和 1.18.10，不能仅用新内核验证旧版兼容文件。
+
+## 二维码使用
+
+订阅二维码编码的是对应订阅 URL。请在客户端的“添加订阅 / 扫码”入口使用；系统相机可能只打开浏览器下载，不能保证自动导入。节点分享二维码编码的则是单个节点 URI，二者用途不同。
+
+终端二维码包含四个模块宽的白色留边，每行在换行前恢复终端颜色。请保留全部留边、使用等宽字体，并确保窗口足够宽以免二维码自动折行；密集节点二维码可扩大终端或使用订阅总览页的 SVG。
 - 两份工件都保留参考模板的 HTTP/TLS/QUIC `sniff` 映射、端口和跳过列表，明确设置 `override-destination: false`；TUN 严格路由与 UDP/TCP 53 DNS 劫持开启。完整基础设置见 [内置模板说明](../src/subscription/templates/README.md)。
 - rule-providers 的本地 `path` 使用相对路径 `./ruleset/*.mrs`，位于客户端 workdir 内。
 
