@@ -13,7 +13,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio_rustls::TlsAcceptor;
 
 use super::artifacts::{SubscriptionError, read_authorized};
@@ -116,7 +116,67 @@ const CERTIFICATE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const CERTIFICATE_RELOAD_FAILURE_BACKOFF: Duration = Duration::from_secs(30);
 const TLS_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
+const MAX_CONNECTIONS_PER_PEER: usize = 8;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Charge before TLS or HTTP parsing: the request budget cannot see a peer
+/// that never finishes its handshake or headers. Track only active sources,
+/// bounded by the global cap, and release on every task exit (including abort).
+struct ConnectionLimits {
+    global: Arc<Semaphore>,
+    peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    per_peer: bool,
+}
+
+impl ConnectionLimits {
+    fn new(per_peer: bool) -> Self {
+        Self {
+            global: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            peers: Arc::new(Mutex::new(HashMap::new())),
+            per_peer,
+        }
+    }
+
+    fn try_acquire(&self, peer: Option<IpAddr>) -> Option<ConnectionPermit> {
+        let global = self.global.clone().try_acquire_owned().ok()?;
+        let peer = peer
+            .filter(|_| self.per_peer)
+            .map(|address| address.to_canonical());
+        if let Some(peer) = peer {
+            let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+            let count = peers.entry(peer).or_default();
+            if *count >= MAX_CONNECTIONS_PER_PEER {
+                return None;
+            }
+            *count += 1;
+        }
+        Some(ConnectionPermit {
+            _global: global,
+            peers: Arc::clone(&self.peers),
+            peer,
+        })
+    }
+}
+
+struct ConnectionPermit {
+    _global: OwnedSemaphorePermit,
+    peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
+    peer: Option<IpAddr>,
+}
+
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        if let Some(peer) = self.peer {
+            let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(count) = peers.get_mut(&peer) {
+                *count -= 1;
+                if *count == 0 {
+                    peers.remove(&peer);
+                }
+            }
+        }
+    }
+}
 
 /// Requests a single source address may spend before it starts waiting, and how
 /// fast the allowance returns afterwards.
@@ -273,7 +333,7 @@ async fn serve_http_listener(
     budget: &SharedBudget,
     max_requests: Option<usize>,
 ) -> Result<(), SubscriptionError> {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let limits = ConnectionLimits::new(config.subscription_mode != SubscriptionMode::ExternalProxy);
     let counter = Arc::new(AtomicUsize::new(0));
     loop {
         if max_requests.is_some_and(|max| counter.load(Ordering::Acquire) >= max) {
@@ -282,11 +342,11 @@ async fn serve_http_listener(
         let Some(stream) = accept_next(&listener, max_requests).await? else {
             continue;
         };
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        let peer = stream.peer_addr().ok().map(|address| address.ip());
+        let Some(permit) = limits.try_acquire(peer) else {
             drop(stream);
             continue;
         };
-        let peer = stream.peer_addr().ok().map(|address| address.ip());
         let store = Arc::clone(store);
         let config = Arc::clone(config);
         let budget = Arc::clone(budget);
@@ -311,7 +371,7 @@ async fn serve_acme_listener(
     store: Arc<DeploymentStore>,
     max_requests: Option<usize>,
 ) -> Result<(), SubscriptionError> {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let limits = ConnectionLimits::new(true);
     let counter = Arc::new(AtomicUsize::new(0));
     loop {
         if max_requests.is_some_and(|max| counter.load(Ordering::Acquire) >= max) {
@@ -320,7 +380,8 @@ async fn serve_acme_listener(
         let Some(stream) = accept_next(&listener, max_requests).await? else {
             continue;
         };
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        let Some(permit) = limits.try_acquire(stream.peer_addr().ok().map(|address| address.ip()))
+        else {
             drop(stream);
             continue;
         };
@@ -370,7 +431,7 @@ async fn serve_tls_listener_with_timeouts(
     handshake_timeout: Duration,
     connection_timeout: Duration,
 ) -> Result<(), SubscriptionError> {
-    let semaphore = Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS));
+    let limits = ConnectionLimits::new(true);
     let counter = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(TlsConnectionMetrics::default());
     let (tls_sender, tls_receiver) = tokio::sync::watch::channel(None);
@@ -410,7 +471,8 @@ async fn serve_tls_listener_with_timeouts(
             drop(stream);
             continue;
         };
-        let Ok(permit) = semaphore.clone().try_acquire_owned() else {
+        let peer = stream.peer_addr().ok().map(|address| address.ip());
+        let Some(permit) = limits.try_acquire(peer) else {
             metrics.capacity_rejected.fetch_add(1, Ordering::Relaxed);
             drop(stream);
             continue;
@@ -422,9 +484,6 @@ async fn serve_tls_listener_with_timeouts(
         let metrics = Arc::clone(&metrics);
         connections.spawn(async move {
             let _permit = permit;
-            // The peer has to be read before the handshake, because the
-            // accepted TLS stream no longer exposes the TCP socket it came from.
-            let peer = stream.peer_addr().ok().map(|address| address.ip());
             let outcome = serve_tls_connection(
                 stream,
                 tls,
@@ -1109,6 +1168,54 @@ mod tests {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
     }
 
+    #[tokio::test]
+    async fn connection_limits_release_capacity_on_task_cancellation_and_normal_exit() {
+        let limits = super::ConnectionLimits::new(true);
+        let mut permits = Vec::new();
+        for _ in 0..super::MAX_CONNECTIONS_PER_PEER {
+            permits.push(limits.try_acquire(Some(peer(1))).unwrap());
+        }
+        assert!(limits.try_acquire(Some(peer(1))).is_none());
+        let mapped = IpAddr::V6(Ipv4Addr::new(203, 0, 113, 1).to_ipv6_mapped());
+        assert!(
+            limits.try_acquire(Some(mapped)).is_none(),
+            "mapped IPv4 must share the cap"
+        );
+        let permit = permits.pop().unwrap();
+        let task = tokio::spawn(async move {
+            let _permit = permit;
+            std::future::pending::<()>().await;
+        });
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(limits.try_acquire(Some(peer(1))).is_some());
+        drop(permits);
+        assert!(limits.peers.lock().unwrap().is_empty());
+        assert_eq!(
+            limits.global.available_permits(),
+            super::MAX_CONCURRENT_CONNECTIONS
+        );
+    }
+
+    #[test]
+    fn connection_limits_keep_global_cap_and_exempt_reverse_proxy_source() {
+        for per_peer in [false, true] {
+            let limits = super::ConnectionLimits::new(per_peer);
+            let permits: Vec<_> = (0..super::MAX_CONCURRENT_CONNECTIONS)
+                .map(|index| {
+                    limits
+                        .try_acquire(Some(peer(if per_peer { index as u8 + 1 } else { 1 })))
+                        .unwrap()
+                })
+                .collect();
+            assert!(limits.try_acquire(Some(peer(200))).is_none());
+            drop(permits);
+            assert!(limits.peers.lock().unwrap().is_empty());
+            assert!(limits.try_acquire(Some(peer(200))).is_some());
+        }
+    }
+
     /// The whole point of the bucket is that honest use is never punished and a
     /// flood is. Both halves need a clock the test controls.
     #[test]
@@ -1222,6 +1329,69 @@ mod tests {
             .await
             .expect("response is readable");
         response
+    }
+
+    async fn tcp_from(port: u16, last: u8) -> tokio::net::TcpStream {
+        let socket = tokio::net::TcpSocket::new_v4().unwrap();
+        socket.bind(([127, 0, 0, last], 0).into()).unwrap();
+        socket.connect(([127, 0, 0, 1], port).into()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn stalled_source_cannot_exhaust_http_or_acme_connections() {
+        for acme in [false, true] {
+            let fixture = TempDir::new().unwrap();
+            let (store, config, credential) = seed_direct_subscription(&fixture);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let handler = if acme {
+                tokio::spawn(super::serve_acme_listener(listener, Arc::new(store), None))
+            } else {
+                let store = Arc::new(store);
+                let config = Arc::new(config);
+                tokio::spawn(async move {
+                    super::serve_http_listener(
+                        listener,
+                        &store,
+                        &config,
+                        &super::fresh_budget(),
+                        None,
+                    )
+                    .await
+                })
+            };
+            let mut stalled = Vec::new();
+            for _ in 0..super::MAX_CONCURRENT_CONNECTIONS {
+                let stream = tcp_from(port, 2).await;
+                stalled.push(stream);
+                tokio::task::yield_now().await;
+            }
+            let mut neighbour = tcp_from(port, 3).await;
+            let path = if acme {
+                "/.well-known/acme-challenge/missing".into()
+            } else {
+                format!("/sub/{credential}/uri")
+            };
+            neighbour
+                .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+                .await
+                .unwrap();
+            let mut response = String::new();
+            let read = tokio::time::timeout(
+                Duration::from_secs(2),
+                neighbour.read_to_string(&mut response),
+            )
+            .await;
+            handler.abort();
+            assert!(
+                matches!(read, Ok(Ok(_))),
+                "a stalled source must leave other sources capacity: {read:?}"
+            );
+            assert!(
+                response.starts_with(if acme { "HTTP/1.1 404" } else { "HTTP/1.1 200" }),
+                "unexpected response: {response}"
+            );
+        }
     }
 
     #[test]
@@ -1610,12 +1780,8 @@ mod tests {
         ));
 
         let mut stalled = Vec::new();
-        for _ in 0..super::MAX_CONCURRENT_CONNECTIONS {
-            stalled.push(
-                tokio::net::TcpStream::connect(("127.0.0.1", port))
-                    .await
-                    .expect("stalled TLS peer connects"),
-            );
+        for index in 0..super::MAX_CONCURRENT_CONNECTIONS {
+            stalled.push(tcp_from(port, (index / super::MAX_CONNECTIONS_PER_PEER) as u8 + 2).await);
         }
         // Let the listener accept the whole first batch while none of the
         // clients sends a TLS ClientHello.
@@ -1646,6 +1812,37 @@ mod tests {
         .expect("a valid peer can use a slot released by TLS timeouts");
         assert!(response.starts_with("HTTP/1.1 200 OK"));
         handler.abort();
+    }
+
+    #[tokio::test]
+    async fn stalled_source_cannot_exhaust_tls_handshakes() {
+        let fixture = TempDir::new().unwrap();
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            None,
+        ));
+        let mut stalled = Vec::new();
+        for _ in 0..super::MAX_CONCURRENT_CONNECTIONS {
+            stalled.push(tcp_from(port, 2).await);
+            tokio::task::yield_now().await;
+        }
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            tls_get(port, &format!("/sub/{credential}/uri")),
+        )
+        .await;
+        handler.abort();
+        assert!(
+            result.unwrap().starts_with("HTTP/1.1 200"),
+            "another source must retain TLS capacity before the handshake timeout"
+        );
     }
 
     #[test]

@@ -264,14 +264,13 @@ fn take_rules_mode(
     let Some(value) = object.remove(RULES_MODE_KEY) else {
         return Ok((json_merge::RulesMode::default(), document));
     };
-    let text = value.as_str().unwrap_or_default().to_owned();
-    match text.as_str() {
-        "" | "prepend" => Ok((json_merge::RulesMode::Prepend, document)),
-        "append" => Ok((json_merge::RulesMode::Append, document)),
-        "replace" => Ok((json_merge::RulesMode::Replace, document)),
+    match value.as_str() {
+        Some("prepend") => Ok((json_merge::RulesMode::Prepend, document)),
+        Some("append") => Ok((json_merge::RulesMode::Append, document)),
+        Some("replace") => Ok((json_merge::RulesMode::Replace, document)),
         _ => Err(OverrideError::RulesMode {
             path: path.to_path_buf(),
-            value: text,
+            value: value.to_string(),
         }),
     }
 }
@@ -291,26 +290,22 @@ fn take_yaml_rules_mode(
             serde_yaml::Value::Mapping(mapping),
         ));
     };
-    let text = match &value {
-        serde_yaml::Value::String(text) => text.clone(),
-        _ => String::new(),
-    };
-    match text.as_str() {
-        "" | "prepend" => Ok((
+    match value.as_str() {
+        Some("prepend") => Ok((
             json_merge::RulesMode::Prepend,
             serde_yaml::Value::Mapping(mapping),
         )),
-        "append" => Ok((
+        Some("append") => Ok((
             json_merge::RulesMode::Append,
             serde_yaml::Value::Mapping(mapping),
         )),
-        "replace" => Ok((
+        Some("replace") => Ok((
             json_merge::RulesMode::Replace,
             serde_yaml::Value::Mapping(mapping),
         )),
         _ => Err(OverrideError::RulesMode {
             path: path.to_path_buf(),
-            value: text,
+            value: format!("{value:?}"),
         }),
     }
 }
@@ -558,6 +553,31 @@ mod tests {
             Overrides::load(root),
             Err(OverrideError::RulesMode { .. })
         ));
+    }
+
+    #[test]
+    fn explicit_rules_mode_requires_a_supported_string_in_json_and_yaml() {
+        let path = Path::new("override");
+        for invalid in [
+            json!(null),
+            json!(true),
+            json!(1),
+            json!([]),
+            json!({}),
+            json!(""),
+            json!("sideways"),
+        ] {
+            let document = json!({"rules_mode": invalid});
+            assert!(
+                take_rules_mode(document.clone(), path).is_err(),
+                "JSON must reject {document}"
+            );
+            let yaml = serde_yaml::to_value(document.clone()).unwrap();
+            assert!(
+                take_yaml_rules_mode(yaml, path).is_err(),
+                "YAML must reject {document}"
+            );
+        }
     }
 
     #[test]

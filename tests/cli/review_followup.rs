@@ -15,6 +15,51 @@ fn seed() -> TempDir {
     fixture
 }
 
+#[test]
+fn invalid_rules_mode_does_not_publish_artifacts_or_change_active_configuration() {
+    let fixture = seed();
+    let root = fixture.path();
+    let paths: Vec<_> = fs::read_dir(root.join("var/lib/sbctl/artifacts"))
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .chain([
+            root.join("etc/sbctl/config.toml"),
+            root.join("etc/sing-box/config.json"),
+        ])
+        .filter(|path| path.is_file())
+        .collect();
+    let before: Vec<_> = paths.iter().map(|path| fs::read(path).unwrap()).collect();
+    for (name, text) in [
+        (
+            "sing-box-override.json",
+            r#"{"rules_mode": false, "route":{"rules":[]}}"#,
+        ),
+        ("clash-override.yaml", "rules_mode: false\nrules: []\n"),
+        (
+            "sing-box-server.json",
+            r#"{"rules_mode": null, "route":{"rules":[]}}"#,
+        ),
+    ] {
+        let relative = format!("etc/sbctl/overrides/{name}");
+        write_managed_file(&fixture, &relative, text.as_bytes());
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root.to_str().unwrap(), "regenerate"])
+            .assert()
+            .code(2)
+            .stderr(predicates::str::contains("rules_mode"));
+        for (path, bytes) in paths.iter().zip(&before) {
+            assert_eq!(
+                &fs::read(path).unwrap(),
+                bytes,
+                "failed generation changed {}",
+                path.display()
+            );
+        }
+        fs::remove_file(root.join(relative)).unwrap();
+    }
+}
+
 #[cfg(unix)]
 fn script(root: &Path, name: &str, body: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt;

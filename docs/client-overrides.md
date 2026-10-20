@@ -45,7 +45,7 @@ sudo sbctl regenerate
 ## 合并和版本边界
 
 - 对象递归合并，只写需要改的字段。
-- `rules` 默认前插；顶层 `rules_mode` 可选 `prepend`、`append` 或 `replace`。`replace` 同时作用于该文件中所有名为 `rules` 的数组，使用时应提供完整规则。
+- `rules` 默认前插；顶层 `rules_mode` 可选字符串 `prepend`、`append` 或 `replace`。省略时使用 `prepend`；显式空字符串、布尔值、数字和 `null` 均视为错误，生成失败并保留原工件。`replace` 同时作用于该文件中所有名为 `rules` 的数组，使用时应提供完整规则。
 - sing-box `outbounds` 按 `tag`、Mihomo `proxies` 和 `proxy-groups` 按 `name` 合并，避免重写自动生成的节点。
 - 其他数组整体替换，包括 DNS `servers`、`nameserver`、Fake-IP 过滤列表和客户端 `inbounds`。调整时保留仍需要的全部元素。
 - 覆写在各版本适配之后合并。同一份 sing-box 覆写会作用于所有完整版本；1.12+ 的 typed DNS `servers` 不能直接放进全版本共用覆写，1.10 也不支持 `action: sniff`。示例只用跨版本字段；需要这些设置时优先使用程序已有的 DNS 模式、规则列表和模板配置选项。
