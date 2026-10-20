@@ -223,7 +223,9 @@ fn restore_replaced(
                 let _ = store.write_artifact_locked(name, prior);
             }
             None => {
-                let _ = fs::remove_file(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name));
+                let _ = crate::managed_fs::remove_file(
+                    store.root().join(ARTIFACTS_RELATIVE_DIR).join(name),
+                );
             }
         }
     }
@@ -233,7 +235,7 @@ fn restore_replaced(
             let _ = store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, prior_active);
         }
         ActiveConfigRollback::Restore(None) => {
-            let _ = fs::remove_file(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH));
+            let _ = crate::managed_fs::remove_file(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH));
         }
     }
 }
@@ -429,7 +431,7 @@ fn remove_stale_artifacts_in_scope(
     clients_only: bool,
 ) -> Result<(), std::io::Error> {
     for name in stale_artifact_names(store, current, clients_only)? {
-        fs::remove_file(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name))?;
+        crate::managed_fs::remove_file(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name))?;
     }
     Ok(())
 }
@@ -481,7 +483,9 @@ pub fn restore_config_transaction_locked(
         match prior {
             Some(prior) => store.write_artifact_locked(name, prior)?,
             None => {
-                let _ = fs::remove_file(store.root().join(ARTIFACTS_RELATIVE_DIR).join(name));
+                let _ = crate::managed_fs::remove_file(
+                    store.root().join(ARTIFACTS_RELATIVE_DIR).join(name),
+                );
             }
         }
     }
@@ -491,7 +495,7 @@ pub fn restore_config_transaction_locked(
         }
         None => {
             let path = store.root().join(ACTIVE_CONFIG_RELATIVE_PATH);
-            match fs::remove_file(path) {
+            match crate::managed_fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(SubscriptionError::Storage(error.into())),
@@ -504,7 +508,7 @@ pub fn restore_config_transaction_locked(
         }
         None => {
             let path = store.root().join(crate::config::CONFIG_RELATIVE_PATH);
-            match fs::remove_file(path) {
+            match crate::managed_fs::remove_file(path) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(error) => return Err(SubscriptionError::Storage(error.into())),
@@ -2757,6 +2761,22 @@ ot-a-sing-box.bin"
             admin.exists(),
             "pruning must stay inside the names this generator owns"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_artifact_cleanup_cannot_delete_through_a_replaced_parent_link() {
+        use std::os::unix::fs::symlink;
+        let fixture = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("subscription-stale.txt");
+        fs::write(&victim, b"private sentinel").unwrap();
+        let directory = fixture.path().join("var/lib/sbctl");
+        fs::create_dir_all(&directory).unwrap();
+        symlink(outside.path(), directory.join("artifacts")).unwrap();
+        let store = DeploymentStore::new(fixture.path());
+        assert!(super::remove_stale_artifacts(&store, &[]).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"private sentinel");
     }
 
     #[test]

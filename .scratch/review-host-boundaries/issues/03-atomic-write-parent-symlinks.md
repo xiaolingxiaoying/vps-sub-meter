@@ -1,5 +1,5 @@
 # 继续检查原子写入的父目录链接边界
-Status: needs-triage
+Status: claimed
 Type: research
 
 源码线索：config.rs 的 atomic_write 通过路径创建临时文件并 rename；读取和属主变更则用 open_managed_path_no_follow 逐级拒绝链接。需确认二者是否存在边界差异，特别是由 sbctl 服务账号拥有、可改名的 artifacts 目录。

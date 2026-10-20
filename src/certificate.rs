@@ -420,84 +420,71 @@ pub fn pin(
     validated: &ValidatedCertificate,
 ) -> Result<(), CertificateError> {
     let directory = pinned_directory(store, config);
-    fs::create_dir_all(&directory).map_err(|error| CertificateError::Storage(error.to_string()))?;
-    atomic_write_certificate(&directory, "fullchain.pem", &validated.fullchain_pem)?;
-    atomic_write_certificate(&directory, "privkey.pem", &validated.privkey_pem)?;
-    restrict_certificate_permissions(store, &directory)
-}
-
-fn atomic_write_certificate(
-    directory: &Path,
-    name: &str,
-    contents: &[u8],
-) -> Result<(), CertificateError> {
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let temporary = directory.join(format!(".{name}.{}.tmp", std::process::id()));
-        let mut file = fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&temporary)
+    if store.root() == Path::new("/") && !shared_group_is_present(store.root()) {
+        return Err(CertificateError::Storage(
+            "certificate service group is missing".into(),
+        ));
+    }
+    prepare_private_directory(store.root(), &directory)
+        .map_err(|error| CertificateError::Storage(error.to_string()))?;
+    for (name, contents) in [
+        ("fullchain.pem", validated.fullchain_pem.as_slice()),
+        ("privkey.pem", validated.privkey_pem.as_slice()),
+    ] {
+        write_private_material(store.root(), &directory.join(name), contents)
             .map_err(|error| CertificateError::Storage(error.to_string()))?;
-        let result = (|| {
-            file.write_all(contents)
-                .map_err(|error| CertificateError::Storage(error.to_string()))?;
-            file.sync_all()
-                .map_err(|error| CertificateError::Storage(error.to_string()))?;
-            drop(file);
-            fs::set_permissions(&temporary, fs::Permissions::from_mode(0o640))
-                .map_err(|error| CertificateError::Storage(error.to_string()))?;
-            fs::rename(&temporary, directory.join(name))
-                .map_err(|error| CertificateError::Storage(error.to_string()))?;
-            Ok(())
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(&temporary);
-        }
-        result
     }
-    #[cfg(not(unix))]
-    {
-        fs::write(directory.join(name), contents)
-            .map_err(|error| CertificateError::Storage(error.to_string()))
-    }
-}
-
-/// Restricts the pinned certificate files to the service accounts: the host
-/// directory is group-only and the files are group-readable. The group
-/// ownership is applied only on the live host where the real `sbctl-cert`
-/// group exists; fixture roots keep the writing user's ownership.
-fn restrict_certificate_permissions(
-    store: &DeploymentStore,
-    directory: &Path,
-) -> Result<(), CertificateError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        use std::process::Command;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
-            .map_err(|error| CertificateError::Storage(error.to_string()))?;
-        if store.root() == Path::new("/") {
-            let status = Command::new("chgrp")
-                .args(["-R", CERTIFICATE_GROUP, &directory.to_string_lossy()])
-                .status()
-                .map_err(|error| CertificateError::Storage(error.to_string()))?;
-            if !status.success() {
-                return Err(CertificateError::Storage(format!(
-                    "chgrp {} exited with {status}",
-                    CERTIFICATE_GROUP
-                )));
-            }
-        }
-    }
-    #[cfg(not(unix))]
-    let _ = (store, directory);
     Ok(())
 }
 
+fn shared_group_is_present(root: &Path) -> bool {
+    fs::read_to_string(root.join("etc/group")).is_ok_and(|groups| {
+        groups
+            .lines()
+            .any(|line| line.split(':').next() == Some(CERTIFICATE_GROUP))
+    })
+}
+
+/// Directory and file modes are applied through the opened inode. Bootstrap
+/// generation may precede creation of the shared service group; live pinning
+/// requires that group above before any certificate material is published.
+pub(crate) fn prepare_private_directory(root: &Path, directory: &Path) -> std::io::Result<()> {
+    crate::managed_fs::create_directory(directory)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let file = crate::config::open_managed_path_no_follow(directory)?;
+        if root == Path::new("/") && shared_group_is_present(root) {
+            crate::config::set_open_file_owner_mode(root, &file, "root:sbctl-cert", 0o750)?;
+        } else {
+            file.set_permissions(fs::Permissions::from_mode(0o750))?;
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = root;
+    Ok(())
+}
+
+pub(crate) fn write_private_material(
+    root: &Path,
+    path: &Path,
+    contents: &[u8],
+) -> std::io::Result<()> {
+    crate::managed_fs::atomic_write(path, contents, |file| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if root == Path::new("/") && shared_group_is_present(root) {
+                crate::config::set_open_file_owner_mode(root, file, "root:sbctl-cert", 0o640)?;
+            } else {
+                file.set_permissions(fs::Permissions::from_mode(0o640))?;
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = (root, file);
+        Ok(())
+    })
+}
 /// A redacted summary used by `status --json` and certificate diagnostics. The
 /// summary never includes the private key, the Subscription credential, or a
 /// full deployment path.
@@ -857,6 +844,32 @@ mod tests {
         let pinned_validated = crate::certificate::load_pinned(&store, &config)
             .expect("the pinned copy is independently loadable");
         assert_eq!(pinned_validated.fingerprint, validated.fingerprint);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pin_rejects_linked_directories_without_changing_external_permissions() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        for relative in [
+            "var/lib/sbctl/certificates",
+            "var/lib/sbctl/certificates/sub.example.test",
+        ] {
+            let fixture = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            write_certificate(&fixture, &["sub.example.test"]);
+            let (store, config) = direct_store(&fixture);
+            let validated = load_at(&store, &config, mid_2025()).unwrap();
+            let link = fixture.path().join(relative);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            symlink(outside.path(), &link).unwrap();
+            let mode = fs::metadata(outside.path()).unwrap().permissions().mode();
+            assert!(pin(&store, &config, &validated).is_err());
+            assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+            assert_eq!(
+                fs::metadata(outside.path()).unwrap().permissions().mode(),
+                mode
+            );
+        }
     }
 
     #[test]

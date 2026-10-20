@@ -56,6 +56,7 @@ jobs:
         run: |
           sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
           sudo python3 scripts/dev/check-api-certificate-permissions.py "$GITHUB_WORKSPACE/target/debug/sbctl"
+          sudo python3 scripts/dev/check-managed-fs-boundaries.py "$GITHUB_WORKSPACE/target/debug/sbctl"
       - run: cargo test -p sbctl --no-default-features --test release_trust
 
   # The systemd acceptance suite (`sh tests/acceptance/run.sh`) drives real

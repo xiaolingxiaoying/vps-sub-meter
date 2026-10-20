@@ -1,9 +1,8 @@
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
-use std::io::{self, Read, Write};
+use std::fs::{self, File};
+use std::io::{self, Read};
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::Engine;
 use chrono::{Datelike, LocalResult, TimeZone, Timelike};
@@ -29,7 +28,6 @@ const MAX_PROTOCOL_PORT: u16 = 65_535;
 /// a no-domain (IP) deployment, so the self-signed certificate and the client
 /// handshake agree on a hostname even though the node host is an IP address.
 const DEFAULT_PROTOCOL_SNI: &str = "www.bing.com";
-static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DeploymentConfig {
@@ -1590,8 +1588,8 @@ impl DeploymentStore {
             )?;
         }
         let contents = toml::to_string_pretty(config)?;
-        atomic_write(&path, contents.as_bytes())?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, contents.as_bytes())?;
+        Ok(())
     }
 
     pub fn load(&self) -> Result<DeploymentConfig, ConfigError> {
@@ -1613,8 +1611,8 @@ impl DeploymentStore {
             return Err(ConfigError::Missing);
         }
         let contents = toml::to_string_pretty(config)?;
-        atomic_write(&path, contents.as_bytes())?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, contents.as_bytes())?;
+        Ok(())
     }
 
     /// Replaces the persisted configuration while an operation lock is already
@@ -1627,8 +1625,8 @@ impl DeploymentStore {
             return Err(ConfigError::Missing);
         }
         let contents = toml::to_string_pretty(config)?;
-        atomic_write(&path, contents.as_bytes())?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, contents.as_bytes())?;
+        Ok(())
     }
 
     pub fn write_state(&self, contents: &[u8]) -> Result<(), ConfigError> {
@@ -1661,8 +1659,8 @@ impl DeploymentStore {
             return Ok(());
         }
         let path = self.root.join(STATE_RELATIVE_PATH);
-        atomic_write(&path, &contents)?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, &contents)?;
+        Ok(())
     }
 
     fn read_state_unlocked(&self) -> Result<Option<Vec<u8>>, ConfigError> {
@@ -1725,8 +1723,8 @@ impl DeploymentStore {
         contents: &[u8],
     ) -> Result<(), ConfigError> {
         let path = safe_managed_path(&self.root, relative)?;
-        atomic_write(&path, contents)?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, contents)?;
+        Ok(())
     }
 
     /// Writes a copy that stays root-only. Rollback points contain every
@@ -1740,30 +1738,31 @@ impl DeploymentStore {
         contents: &[u8],
     ) -> Result<(), ConfigError> {
         let path = safe_managed_path(&self.root, relative)?;
-        atomic_write(&path, contents)?;
-        if self.root != Path::new("/") {
-            return Ok(());
-        }
-        set_owner_mode_no_follow(&self.root, &path, "root:root", 0o600)
-            .map_err(ConfigError::Storage)?;
+        crate::managed_fs::atomic_write(&path, contents, |file| {
+            if self.root == Path::new("/") {
+                set_open_file_owner_mode(&self.root, file, "root:root", 0o600)
+            } else {
+                Ok(())
+            }
+        })?;
         Ok(())
     }
 
     fn write_artifact_unlocked(&self, name: &str, contents: &[u8]) -> Result<(), ConfigError> {
-        if name.is_empty() || Path::new(name).components().count() != 1 {
+        if crate::managed_fs::validate_file_name(std::ffi::OsStr::new(name)).is_err() {
             return Err(ConfigError::InvalidValue(
                 "artifact name must be a single file name",
             ));
         }
         let path = self.root.join(ARTIFACTS_RELATIVE_PATH).join(name);
-        atomic_write(&path, contents)?;
-        enforce_live_file_owner(&self.root, &path)
+        atomic_write(&self.root, &path, contents)?;
+        Ok(())
     }
 
     fn atomic_write_managed(&self, path: &Path, contents: &[u8]) -> Result<(), ConfigError> {
         let _lock = self.operation_lock()?;
-        atomic_write(path, contents)?;
-        enforce_live_file_owner(&self.root, path)
+        atomic_write(&self.root, path, contents)?;
+        Ok(())
     }
 
     fn operation_lock(&self) -> Result<OperationLock, ConfigError> {
@@ -1775,8 +1774,7 @@ pub struct OperationLock(File);
 
 impl OperationLock {
     fn acquire(directory: &Path) -> io::Result<Self> {
-        create_private_directory(directory)?;
-        let lock = private_open(&directory.join(".operation.lock"), false)?;
+        let lock = crate::managed_fs::open_lock(directory)?;
         lock.lock_exclusive()?;
         Ok(Self(lock))
     }
@@ -1788,33 +1786,13 @@ impl Drop for OperationLock {
     }
 }
 
-fn atomic_write(path: &Path, contents: &[u8]) -> io::Result<()> {
-    let parent = path.parent().expect("managed path has parent");
-    create_private_directory(parent)?;
-    let temporary = parent.join(format!(
-        ".{}.{}.{}.tmp",
-        path.file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("artifact"),
-        std::process::id(),
-        TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed)
-    ));
-    let mut file = private_open(&temporary, true)?;
-    let result = (|| {
-        file.write_all(contents)?;
-        file.sync_all()?;
-        fs::rename(&temporary, path)?;
-        // The rename is the linearization point: readers now see the complete new
-        // version. A failed directory sync can affect crash durability but cannot
-        // be reported as a failed commit without falsely claiming the old version
-        // remains active.
-        let _ = sync_directory(parent);
+fn atomic_write(root: &Path, path: &Path, contents: &[u8]) -> io::Result<()> {
+    crate::managed_fs::atomic_write(path, contents, |file| {
+        if let Some((owner, mode)) = live_file_policy(root, path)? {
+            set_open_file_owner_mode(root, file, owner, mode)?;
+        }
         Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&temporary);
-    }
-    result
+    })
 }
 
 fn safe_managed_path(root: &Path, relative: &str) -> Result<PathBuf, ConfigError> {
@@ -1836,59 +1814,8 @@ fn safe_managed_path(root: &Path, relative: &str) -> Result<PathBuf, ConfigError
     Ok(root.join(path))
 }
 
-fn private_open(path: &Path, create_new: bool) -> io::Result<File> {
-    let mut options = OpenOptions::new();
-    options.read(true).write(true);
-    if create_new {
-        options.create_new(true);
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options
-            .mode(0o600)
-            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    loop {
-        match options.open(path) {
-            Ok(file) => {
-                if !file.metadata()?.is_file() {
-                    return Err(io::Error::other("private storage must be a regular file"));
-                }
-                return Ok(file);
-            }
-            Err(error) if !create_new && error.kind() == io::ErrorKind::NotFound => {
-                // O_CREAT on an existing service-owned lock is rejected by
-                // fs.protected_regular=2 in our root-owned sticky directory.
-                // Open existing locks without it; create missing locks once.
-                match private_open(path, true) {
-                    Ok(file) => return Ok(file),
-                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
-                    Err(error) => return Err(error),
-                }
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
 fn create_private_directory(directory: &Path) -> io::Result<()> {
-    // Directory permissions on the live host are established by the daemon
-    // storage preparation so the dedicated sbctl and sing-box service accounts
-    // can traverse them. Only a brand-new directory is created private; an
-    // existing directory must never have its mode clobbered back to 0700 by a
-    // later write or the operation lock, which would disconnect the service
-    // accounts from their configuration and certificates.
-    if directory.exists() {
-        return Ok(());
-    }
-    fs::create_dir_all(directory)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
-    }
-    Ok(())
+    crate::managed_fs::create_directory(directory)
 }
 
 /// On the live host a root-run managed write must not leave a file owned only by
@@ -1898,17 +1825,19 @@ fn create_private_directory(directory: &Path) -> io::Result<()> {
 /// change. Fixture roots (a non-"/" configured root) keep the invoking user's
 /// ownership.
 pub(crate) fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), ConfigError> {
+    if let Some((owner, mode)) = live_file_policy(root, path)? {
+        set_owner_mode_no_follow(root, path, owner, mode)?;
+    }
+    Ok(())
+}
+
+fn live_file_policy(root: &Path, path: &Path) -> io::Result<Option<(&'static str, u32)>> {
     if root != Path::new("/") {
-        return Ok(());
+        return Ok(None);
     }
     let relative = path
         .strip_prefix(root)
-        .map_err(|_| {
-            ConfigError::Storage(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "managed path is outside root",
-            ))
-        })?
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "managed path is outside root"))?
         .to_string_lossy()
         .into_owned();
     let (user, owner, mode) = managed_ownership(&relative);
@@ -1918,10 +1847,9 @@ pub(crate) fn enforce_live_file_owner(root: &Path, path: &Path) -> Result<(), Co
     // ownership at the end of the install. Skip so a pre-account write is not
     // an error, and enforce from the first post-install mutation onward.
     if !user_exists(root, user) {
-        return Ok(());
+        return Ok(None);
     }
-    set_owner_mode_no_follow(root, path, owner, mode).map_err(ConfigError::Storage)?;
-    Ok(())
+    Ok(Some((owner, mode)))
 }
 
 /// Open through pinned directory descriptors. Reject symlinks in every path
@@ -1997,6 +1925,24 @@ pub(crate) fn set_owner_mode_no_follow(
 ) -> io::Result<()> {
     #[cfg(unix)]
     {
+        let file = open_managed_path_no_follow(path)?;
+        set_open_file_owner_mode(root, &file, owner, mode)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (root, path, owner, mode);
+        Ok(())
+    }
+}
+
+pub(crate) fn set_open_file_owner_mode(
+    root: &Path,
+    file: &File,
+    owner: &str,
+    mode: u32,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
         use std::os::unix::{fs::PermissionsExt, io::AsRawFd};
         let (user, group) = owner
             .split_once(':')
@@ -2014,7 +1960,6 @@ pub(crate) fn set_owner_mode_no_follow(
         };
         let uid = lookup("etc/passwd", user, 2)?;
         let gid = lookup("etc/group", group, 2)?;
-        let file = open_managed_path_no_follow(path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file() && !metadata.is_dir() {
             return Err(io::Error::other(
@@ -2027,7 +1972,7 @@ pub(crate) fn set_owner_mode_no_follow(
         file.set_permissions(fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = (root, path, owner, mode);
+    let _ = (root, file, owner, mode);
     Ok(())
 }
 
@@ -2078,12 +2023,6 @@ fn user_exists(root: &Path, user: &str) -> bool {
         .unwrap_or_default()
         .lines()
         .any(|line| line.split(':').next() == Some(user))
-}
-
-fn sync_directory(_directory: &Path) -> io::Result<()> {
-    #[cfg(unix)]
-    File::open(_directory)?.sync_all()?;
-    Ok(())
 }
 
 fn validate_host(label: &'static str, value: &str) -> Result<(), ConfigError> {
@@ -2140,6 +2079,70 @@ mod tests {
         AccountingPolicy, CertificateMode, DeploymentConfig, DeploymentOptions, DeploymentStore,
         ManagedProtocol, ProtocolPorts, SubscriptionMode,
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn managed_writes_and_locks_reject_symlink_parents() {
+        use std::os::unix::fs::symlink;
+        for lock in [false, true] {
+            let fixture = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let parent = fixture
+                .path()
+                .join(if lock { "var/lib" } else { "var/lib/sbctl" });
+            fs::create_dir_all(&parent).unwrap();
+            symlink(
+                outside.path(),
+                parent.join(if lock { "sbctl" } else { "artifacts" }),
+            )
+            .unwrap();
+            let store = DeploymentStore::new(fixture.path());
+            if lock {
+                assert!(
+                    store.acquire_operation_lock().is_err(),
+                    "lock must reject linked parent"
+                );
+            } else {
+                assert!(
+                    store
+                        .write_artifact("subscription-uri.txt", b"new bytes")
+                        .is_err(),
+                    "write must reject linked parent"
+                );
+            }
+            assert_eq!(
+                fs::read_dir(outside.path()).unwrap().count(),
+                0,
+                "nothing may be created outside the managed tree"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_names_reject_directory_and_root_components_without_panicking() {
+        let fixture = TempDir::new().unwrap();
+        let store = DeploymentStore::new(fixture.path());
+        for name in [
+            "",
+            ".",
+            "..",
+            "/",
+            "name/",
+            "name\\",
+            "../outside",
+            "/absolute",
+        ] {
+            let result = std::panic::catch_unwind(|| store.write_artifact(name, b"invalid"));
+            assert!(
+                result.is_ok(),
+                "invalid artifact name must not panic: {name:?}"
+            );
+            assert!(
+                matches!(result.unwrap(), Err(super::ConfigError::InvalidValue(_))),
+                "invalid artifact name must be rejected before I/O: {name:?}"
+            );
+        }
+    }
 
     #[cfg(unix)]
     #[test]

@@ -4,6 +4,7 @@ pub mod config;
 pub mod email;
 pub mod index_page;
 pub mod lifecycle;
+mod managed_fs;
 pub mod observe;
 pub mod override_template;
 pub mod preflight;

@@ -1,11 +1,7 @@
-use std::fs;
 use std::path::Path;
 
 use rcgen::{CertificateParams, DnType, KeyPair};
 use serde_json::{Value, json};
-
-#[cfg(unix)]
-use std::io::Write;
 
 use super::{
     AI_DOMAIN_SUFFIXES, AI_TAG, AUTO_TAG, DIRECT_TAG, FAKE_IP_FILTER_SUFFIXES, FALLBACK_TAG,
@@ -884,7 +880,21 @@ fn ensure_self_signed_certificate(
     let directory = self_signed_certificate_directory(root, server_name);
     let certificate_path = directory.join("cert.pem");
     let key_path = directory.join("key.pem");
-    if certificate_path.is_file() && key_path.is_file() {
+    // Reuse must reject links too; following an existing key link would bypass
+    // the write boundary without generating any new material.
+    let regular_file = |path: &Path| -> Result<bool, SubscriptionError> {
+        match crate::config::open_managed_path_no_follow(path) {
+            Ok(file) if file.metadata()?.is_file() => Ok(true),
+            Ok(_) => Err(SubscriptionError::Artifact(std::io::Error::other(
+                "certificate material must be a regular file",
+            ))),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    };
+    let certificate_exists = regular_file(&certificate_path)?;
+    let key_exists = regular_file(&key_path)?;
+    if certificate_exists && key_exists {
         return Ok((
             certificate_path.to_string_lossy().into_owned(),
             key_path.to_string_lossy().into_owned(),
@@ -903,10 +913,17 @@ fn ensure_self_signed_certificate(
     let certificate = params
         .self_signed(&key_pair)
         .map_err(|error| SubscriptionError::Certificate(error.to_string()))?;
-    fs::create_dir_all(&directory).map_err(SubscriptionError::Artifact)?;
-    restrict_directory_permissions(&directory)?;
-    write_private_file(&certificate_path, certificate.pem().as_bytes())?;
-    write_private_file(&key_path, key_pair.serialize_pem().as_bytes())?;
+    crate::certificate::prepare_private_directory(root, &directory)?;
+    crate::certificate::write_private_material(
+        root,
+        &certificate_path,
+        certificate.pem().as_bytes(),
+    )?;
+    crate::certificate::write_private_material(
+        root,
+        &key_path,
+        key_pair.serialize_pem().as_bytes(),
+    )?;
     Ok((
         certificate_path.to_string_lossy().into_owned(),
         key_path.to_string_lossy().into_owned(),
@@ -924,35 +941,6 @@ fn self_signed_certificate_directory(root: &Path, server_name: &str) -> std::pat
         root.join(crate::config::CERTIFICATES_RELATIVE_PATH)
             .join(server_name)
     }
-}
-
-fn restrict_directory_permissions(directory: &Path) -> Result<(), SubscriptionError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(directory, fs::Permissions::from_mode(0o750))
-            .map_err(SubscriptionError::Artifact)?;
-    }
-    #[cfg(not(unix))]
-    let _ = directory;
-    Ok(())
-}
-
-fn write_private_file(path: &Path, contents: &[u8]) -> Result<(), SubscriptionError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        fs::OpenOptions::new()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .mode(0o640)
-            .open(path)
-            .and_then(|mut file| file.write_all(contents))
-            .map_err(SubscriptionError::Artifact)
-    }
-    #[cfg(not(unix))]
-    fs::write(path, contents).map_err(SubscriptionError::Artifact)
 }
 
 fn server_tls(tls_server_name: &str, certificate: &Value, alpn: &[&str]) -> Value {
@@ -1233,6 +1221,39 @@ mod tests {
             typed["route"]["default_domain_resolver"]["server"], "dns-cn",
             "1.14 resolves outbound server domains through default_domain_resolver"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn self_signed_generation_rejects_key_links_without_truncating_private_targets() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let fixture = TempDir::new().unwrap();
+        let outside = TempDir::new().unwrap();
+        let victim = outside.path().join("private");
+        fs::write(&victim, b"private sentinel").unwrap();
+        fs::set_permissions(&victim, fs::Permissions::from_mode(0o600)).unwrap();
+        let directory = fixture
+            .path()
+            .join("var/lib/sbctl/certificates/www.bing.com");
+        fs::create_dir_all(&directory).unwrap();
+        symlink(&victim, directory.join("key.pem")).unwrap();
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::Hysteria2],
+            None,
+        )
+        .unwrap();
+        assert!(generated_artifacts(&config, fixture.path()).is_err());
+        assert_eq!(fs::read(&victim).unwrap(), b"private sentinel");
+        assert_eq!(
+            fs::metadata(&victim).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(!directory.join("cert.pem").exists());
     }
 
     #[test]

@@ -16,6 +16,49 @@ mod linux {
     }
 
     #[test]
+    fn initialization_rejects_parent_links_without_writing_outside_root() {
+        use std::os::unix::fs::symlink;
+        for relative in ["var/lib/sbctl", "var/lib/sbctl/artifacts", "etc/sbctl"] {
+            let fixture = TempDir::new().unwrap();
+            let outside = TempDir::new().unwrap();
+            let target = fixture.path().join(relative);
+            fs::create_dir_all(target.parent().unwrap()).unwrap();
+            symlink(outside.path(), &target).unwrap();
+            let output = Command::new(assert_cmd::cargo::cargo_bin("sbctl"))
+                .args([
+                    "--root",
+                    fixture.path().to_str().unwrap(),
+                    "config",
+                    "init",
+                    "--mode",
+                    "ip-fallback",
+                    "--subscription-host",
+                    "127.0.0.1",
+                    "--http-port",
+                    "2080",
+                    "--interface",
+                    "ens3",
+                    "--protocol",
+                    "vless-reality",
+                    "--reality-decoy-sni",
+                    "www.cloudflare.com",
+                ])
+                .output()
+                .unwrap();
+            assert_eq!(
+                output.status.code(),
+                Some(2),
+                "parent link {relative} must fail initialization"
+            );
+            assert_eq!(
+                fs::read_dir(outside.path()).unwrap().count(),
+                0,
+                "outside directory changed through {relative}"
+            );
+        }
+    }
+
+    #[test]
     fn isolated_root_cannot_restart_the_host_or_apply_host_sysctl_without_fixtures() {
         for system in [false, true] {
             let fixture = TempDir::new().unwrap();
