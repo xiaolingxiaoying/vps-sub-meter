@@ -13,4 +13,8 @@
 
 还包含上一轮已完成但尚未发布的修复：过期配置向导不能恢复旧订阅凭据；SRS/MRS 远程规则集按客户端隔离；fake-ip 精确域名和关键词例外不再遗漏；非法或溢出的规则集刷新间隔在写入前拒绝。
 
-验证记录将在验收完成后补充。
+验证：fmt、Clippy、481 个常规测试、真实内核矩阵和三发行版 systemd 验收通过；Actions 生产构建在 VPS 完成真实 API 启停、覆写编辑/清除、证书权限、公网 12 个订阅与二维码解码、五协议 HTTPS 204 转发。测试后恢复 VPS 原部署和定时器，保留 root-only 备份。
+
+测试与发布的 amd64 二进制 SHA-256：`48ced52eb14628ead81ceaa6424cc67b440935802b557f9f5f3b7154e449ee7e`。
+
+详见[验收记录](../.scratch/review-2026-10-20-followup/verification.md)及[Release Actions](https://github.com/xiaolingxiaoying/vps-sub-meter/actions/runs/39465390004)。

@@ -6,6 +6,8 @@
 
 管理员随后授权修复、Actions 构建、指定 VPS 验收及发布新 Release。五项修复已实现，并增加 4 个 CLI/工件级回归与真实 Linux UID/GID 证书权限检查。fmt、所有目标/特性 Clippy、479 个常规测试和 7 个真实内核测试通过。VPS 验收和发布结果随后补充；以下原始复现记录保留以供追溯。
 
+最终修复还包括 VPS 首次验收发现的 memory 流响应阻塞。最终代码为 `cb53a18`，481 个常规测试及全部 Actions 发布门禁通过；Actions 生产产物完成 VPS 与外部五协议验收，结束后恢复原部署。完整证据见 [verification.md](verification.md)。
+
 ## 已确认问题
 
 1. [P1：观测接口失败恢复重新启用旧订阅凭据](issues/01-api-rollback-restores-credential.md)
