@@ -4,4 +4,4 @@
 
 增强偶发观测测试失败时的诊断信息；未把未复现的问题宣称为已修复。
 
-发布验证包含本地 Linux 测试、GitHub Actions 的三发行版 systemd 和真实内核兼容性门禁，以及 Actions 生产产物在授权 VPS 上的隔离故障注入、订阅和五协议转发。验证细节见仓库 `.scratch/review-host-boundaries/verification.md`。
+491 项常规 Rust 测试、生产验签边界测试与安装脚本测试通过；GitHub Actions 的三发行版 systemd 和真实内核兼容性门禁通过。Actions 生产产物在授权 VPS 上完成隔离故障注入、真实服务回归、订阅及五协议 HTTPS 转发验证；VPS 已通过签名更新部署到 0.0.17，保留配置、凭据、流量状态和升级前备份。详见[完整验收记录](https://github.com/xiaolingxiaoying/vps-sub-meter/blob/dev/.scratch/review-host-boundaries/verification.md)。
