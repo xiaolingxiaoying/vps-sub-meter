@@ -17,4 +17,28 @@
 - 新增 Mihomo 运行测试实际把域名列表编译成 MRS，使用生成的 provider 格式与行为启动内核，通过 `/providers/rules` API 确认规则数量大于零。该测试由既有 Mihomo CI job 自动运行；仅 `mihomo -t` 无法证明规则集已加载。
 - 新增并发回归覆盖向导暂停期间默认订阅凭据轮换、命名凭据撤销；失败恢复回归核对配置和全部原工件字节；四模板全部订阅工件覆盖 SRS/MRS 隔离；间隔非法输入验证退出码及配置/工件不变。
 
-未执行本轮真实 systemd、Docker 发布验收或公网 VPS 部署；上述结果不替代生产发布门禁。未创建 Git commit 或发布版本。
+以上为修复完成时的本地验证；后续按管理员授权提交并执行下述 VPS 测试。本轮未运行三发行版 Docker 发布验收，也未发布版本。
+
+## 授权 VPS 验证（2026-10-20）
+
+代码提交：`8f614c62fff7124fda45ffcf31986bcaf82050bf`。通过 `git archive` 从该提交导出源码，在 WSL Ubuntu 22.04 构建无 test-signing 特性的 Linux amd64 release，编译时使用仓库生产公钥变量。release 签名信任测试及 `release-trust-anchor-check.sh` 均通过。上传前、上传后及运行中二进制 SHA-256 一致：
+
+```text
+ab556ff7e99ff5c17c5682f3774ea51a061ce9836ea42f27edade64c9486b6fb
+```
+
+VPS 为 Ubuntu 22.04.5 LTS，原程序 sbctl 0.0.14、sing-box 1.14.2，Direct HTTPS。测试前持操作锁创建 root-only 备份 `/root/sbctl-review-8f614c6-sfWUMKdL/deployment.tgz`，归档 SHA-256 为 `adc7d38637c6be3c0545b5801d2d537205b228a23bd1eb19c5cd9d89b58b3811`。备份包含私密配置，仅保留在 VPS，未下载或提交。
+
+| 验证项目 | 结果 |
+| --- | --- |
+| 配置向导与并发凭据操作 | 在 VPS 临时根目录暂停向导，分别执行默认凭据轮换和命名凭据撤销；向导提交均退出 2，保留最新配置字节。systemctl 使用隔离桩，未轮换或撤销真实订阅凭据。 |
+| fake-ip 例外 | 精确域名、关键词、后缀进入所有 sing-box 完整版本产物；现网 sing-box 1.14.2 检查通过；IP-CIDR 拒绝且源列表不变。 |
+| 远程规则集 | SRS 仅进入 sing-box，MRS 仅进入现行 Mihomo；旧版 Mihomo 无远程集引用。此项在 VPS 验证生成隔离；真实 MRS 加载另由前述 WSL 内核测试覆盖。 |
+| 间隔边界 | 超大值、Go Duration 越界值、零及 Unicode 非法单位均退出 2；配置和全部工件字节不变。 |
+| 现网配置副本生成 | 12 个客户端工件与现网逐字节一致；服务端唯一差异为隔离根目录的证书路径前缀，归一化后相同。 |
+| 候选临时上线 | 暂停流量写入定时器，原子替换管理程序并重新生成；源配置、所有原工件及权限、sing-box 文件均保持一致。通过现有 systemd 公网 socket 启动候选订阅服务。 |
+| 公网订阅与二维码 | 外部工作站使用正常 TLS 证书校验，12 个订阅及各自 QR 均返回 200；订阅体与 VPS 工件逐字节一致，流量头存在，总览 200，非法路径及 query 返回 404。QR 覆盖 HTTP/SVG 检查，未重复手机扫码或 GUI 导入。 |
+| 五协议实际转发 | 独立 WSL sing-box 客户端使用真实订阅节点，VLESS Reality、VMess WebSocket、Hysteria2、TUIC、AnyTLS 均通过 SOCKS 完成外部 HTTPS 请求，全部返回 204。 |
+| 恢复与清理 | 恢复原管理程序、工件和权限，重新验证所有订阅/QR 与服务；流量写入定时器恢复，临时候选与自动回滚定时器已移除。sing-box 主进程 PID 始终未变。 |
+
+恢复后的 sbctl SHA-256 为 `4ab0e9b977dbc4996f8e351be2e1b2661aa76f142553d049b74474cd8e744bcb`，与测试前一致。真实订阅凭据、节点凭据、账期、流量修正及代理配置未更换；VPS 当前继续运行原线上版本。本轮测试的候选未作为永久升级留在 VPS，也未创建 Release。

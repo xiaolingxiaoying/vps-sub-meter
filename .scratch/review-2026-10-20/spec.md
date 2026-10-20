@@ -24,3 +24,7 @@ wsl -d Ubuntu-22.04 -- python3 /mnt/c/Users/ranly/Documents/ChatGPT/vps-sub-mete
 ## 修复完成（2026-10-20）
 
 四张问题单均已解决；实现和测试说明见 `docs/project-review-fixes-2026-10-20.md`。`reproduce.py` 已改为断言修复后的行为，并保留 SRS-as-MRS 的真实内核负例。WSL gate：475 个常规测试通过；普通构建签名信任测试 1 个通过；真实内核 gate 的 7 个测试全部通过，包括新增 fake-ip 兼容性矩阵和 MRS 运行时加载测试。
+
+## 提交与 VPS 核验
+
+按管理员授权提交 `8f614c6`，再以该提交的带生产验签公钥 release 构建验证指定 VPS。四项隔离回归、公网 12 个订阅与二维码、五协议真实 HTTPS 转发均通过。测试后恢复原线上程序、工件及权限，恢复流量定时器；保留 root-only 备份，移除临时候选及回滚定时器。详细结果见上述修复文档的“授权 VPS 验证”一节；没有发布 Release 或永久升级 VPS。

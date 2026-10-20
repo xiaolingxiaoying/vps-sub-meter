@@ -110,4 +110,3 @@ with tempfile.TemporaryDirectory(prefix='sbctl-rule-binary-review-') as director
         runtime.terminate()
         logs, _ = runtime.communicate(timeout=5)
     print('real mihomo provider runtime diagnostic:', logs.decode().strip()[-1800:])
-
