@@ -13,6 +13,7 @@
 3. [P2：覆写 rules_mode 未作用于生成配置](issues/03-override-rules-mode-ignored.md)
 4. [P2：失败的覆写编辑仍可被并发生成发布](issues/04-override-editor-publishes-uncommitted-source.md)
 5. [P2：清除服务端覆写没有激活新配置](issues/05-clear-server-override-skips-restart.md)
+6. [P1：VPS 验收发现 memory 流响应使观测命令不结束](issues/06-memory-stream-does-not-complete.md)
 
 ## 验证与复现
 

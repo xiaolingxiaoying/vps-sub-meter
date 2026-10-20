@@ -1,6 +1,6 @@
 # P2：覆写 rules_mode 未作用于生成配置
 
-Status: needs-triage
+Status: resolved
 
 位置：`src/override_template.rs:197–205`、`:234–242`；最终应用位于 `src/subscription/artifacts.rs:1145–1177` 及服务端覆写合并路径。
 
@@ -15,3 +15,7 @@ Status: needs-triage
 ## 修复方向
 
 保留各层策略并按顺序应用于生成配置，避免先压平文档后丢失 append/replace 语义；增加最终工件级回归。
+
+## Comments
+
+由 `60c61d1` 修复：各文档保留独立 RulesMode，直接依次作用于生成配置。工件级回归覆盖所有 sing-box 完整版本、两份 Clash、服务端以及混合分层顺序。Actions 候选程序在 VPS 的 append/replace 回归通过。

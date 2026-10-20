@@ -1,6 +1,6 @@
 # P1：观测接口启停破坏 Direct HTTPS 证书权限
 
-Status: needs-triage
+Status: resolved
 
 位置：`src/cli/commands/update.rs:340`；后续调用 `src/lifecycle.rs` 的 `grant_self_signed_certificate_access`。
 
@@ -15,3 +15,7 @@ Status: needs-triage
 ## 修复方向
 
 按当前订阅模式传入 direct 标志；失败恢复也覆盖存储权限。现有非根 `--root` 测试会跳过权限准备，不能覆盖这一缺陷。
+
+## Comments
+
+由 `60c61d1` 修复：共享激活/恢复路径根据真实模式准备存储，并在恢复时重申权限。新增真实 Linux UID/GID 检查纳入 CI；本地和 Actions 候选程序在 VPS 的一次性 chroot 检查均通过。

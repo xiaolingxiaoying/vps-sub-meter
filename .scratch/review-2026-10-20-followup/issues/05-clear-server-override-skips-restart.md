@@ -1,6 +1,6 @@
 # P2：清除服务端覆写没有激活新配置
 
-Status: needs-triage
+Status: resolved
 
 位置：`src/cli/commands/config.rs:464`。
 
@@ -13,3 +13,7 @@ Status: needs-triage
 ## 修复方向
 
 清除 server/all 时复用服务端编辑的激活、健康检查与恢复事务，并将覆写源文件备份纳入同一把操作锁；纯客户端清理可以继续只重新生成。
+
+## Comments
+
+由 `60c61d1` 修复：清除事务从移动源文件前持锁到恢复结束；清除 server/all 使用服务激活与健康检查。CLI 回归覆盖重启成功及故障恢复全部源文件/工件；Actions 候选程序在 VPS 的隔离检查通过。

@@ -1,6 +1,6 @@
 # P1：观测接口失败恢复重新启用旧订阅凭据
 
-Status: needs-triage
+Status: resolved
 
 位置：`src/cli/commands/update.rs:327–343`，`sing_box_api` / `apply_and_restart`。
 
@@ -13,3 +13,7 @@ Status: needs-triage
 ## 修复方向
 
 在读取当前配置前获取操作锁，保持到激活和恢复结束，改用持锁事务接口。此处与 ADR-0033 的凭据失效及配置事务约束冲突；上一轮只修复了向导路径，没有覆盖这个入口。
+
+## Comments
+
+由 `60c61d1` 修复：观测接口启停持锁完成整个读写、服务激活和恢复。CLI 回归覆盖并发默认凭据轮换和命名凭据撤销。Actions 构建的候选程序在 VPS 的隔离回归通过。

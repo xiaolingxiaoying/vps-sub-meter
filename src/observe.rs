@@ -7,11 +7,11 @@
 //! exactly like `lifecycle`'s systemctl helper, so the parsing logic is
 //! unit-tested against captured output instead of a live unit manager.
 
-use std::io::{Read, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// The full version string the installed kernel reports, e.g. `1.14.1`.
 ///
@@ -309,23 +309,124 @@ pub fn clash_api_request(
         .write_all(request.as_bytes())
         .map_err(|error| error.to_string())?;
     stream.flush().map_err(|error| error.to_string())?;
-    let mut response = Vec::new();
-    stream
-        .read_to_end(&mut response)
-        .map_err(|error| error.to_string())?;
-    let text = String::from_utf8_lossy(&response).into_owned();
-    let (head, body) = text
-        .split_once("\r\n\r\n")
-        .ok_or_else(|| "观测接口返回了不完整的响应".to_owned())?;
-    if !head
-        .lines()
-        .next()
-        .is_some_and(|line| line.contains(" 200 "))
-    {
-        let status = head.lines().next().unwrap_or_default().to_owned();
-        return Err(format!("观测接口返回 {status}"));
+    // /memory is an HTTP chunked stream that stays open and emits snapshots.
+    // Read one complete JSON value, not EOF, and bound the whole read rather
+    // than letting each successive sample renew a socket inactivity timeout.
+    let timed = DeadlineStream {
+        stream,
+        deadline: Instant::now() + timeout,
+    };
+    let mut reader = BufReader::new(timed.take(8 * 1024 * 1024));
+    let mut status = String::new();
+    reader.read_line(&mut status).map_err(|e| e.to_string())?;
+    if status.split_whitespace().nth(1) != Some("200") {
+        return Err(format!("观测接口返回 {}", status.trim()));
     }
-    serde_json::from_str(body.trim()).map_err(|error| format!("观测接口 JSON 解析失败: {error}"))
+    let mut header_bytes = status.len();
+    let mut chunked = false;
+    let mut content_length = None;
+    loop {
+        let mut line = String::new();
+        let count = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        header_bytes += count;
+        if count == 0 || header_bytes > 16 * 1024 {
+            return Err("观测接口响应头不完整或过大".into());
+        }
+        if line == "\r\n" {
+            break;
+        }
+        if let Some((name, value)) = line.split_once(':') {
+            if name.eq_ignore_ascii_case("transfer-encoding") {
+                chunked = value
+                    .split(',')
+                    .any(|word| word.trim().eq_ignore_ascii_case("chunked"));
+            } else if name.eq_ignore_ascii_case("content-length") {
+                content_length = value.trim().parse::<u64>().ok();
+            }
+        }
+    }
+    let value = if chunked {
+        read_api_json(ChunkedBody {
+            reader,
+            remaining: 0,
+            started: false,
+            done: false,
+        })
+    } else if let Some(length) = content_length {
+        read_api_json(reader.take(length))
+    } else {
+        read_api_json(reader)
+    };
+    value.map_err(|error| format!("观测接口 JSON 解析失败: {error}"))
+}
+
+struct DeadlineStream {
+    stream: TcpStream,
+    deadline: Instant,
+}
+
+impl Read for DeadlineStream {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "observation response timed out",
+            ));
+        }
+        self.stream.set_read_timeout(Some(remaining))?;
+        self.stream.read(buffer)
+    }
+}
+
+struct ChunkedBody<R> {
+    reader: R,
+    remaining: usize,
+    started: bool,
+    done: bool,
+}
+
+impl<R: BufRead> Read for ChunkedBody<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() || self.done {
+            return Ok(0);
+        }
+        if self.remaining == 0 {
+            if self.started {
+                let mut crlf = [0; 2];
+                self.reader.read_exact(&mut crlf)?;
+                if crlf != *b"\r\n" {
+                    return Err(std::io::Error::other("invalid HTTP chunk separator"));
+                }
+            }
+            let mut size = String::new();
+            self.reader.read_line(&mut size)?;
+            if size.len() > 128 {
+                return Err(std::io::Error::other("HTTP chunk header too large"));
+            }
+            self.remaining =
+                usize::from_str_radix(size.split(';').next().unwrap_or_default().trim(), 16)
+                    .map_err(|_| std::io::Error::other("invalid HTTP chunk length"))?;
+            self.started = true;
+            if self.remaining == 0 {
+                self.done = true;
+                return Ok(0);
+            }
+        }
+        let length = buffer.len().min(self.remaining);
+        let count = self.reader.read(&mut buffer[..length])?;
+        if count == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        self.remaining -= count;
+        Ok(count)
+    }
+}
+
+fn read_api_json(reader: impl Read) -> Result<serde_json::Value, serde_json::Error> {
+    // Deserializing one value deliberately does not check for EOF: a streaming
+    // memory endpoint is expected to send more values after this snapshot.
+    serde::Deserialize::deserialize(&mut serde_json::Deserializer::from_reader(reader))
 }
 
 /// Live memory of the data plane, in bytes, when the observation API is on.
@@ -634,6 +735,58 @@ mod api_tests {
             error.contains("sbctl sing-box api enable"),
             "the failure must say how to fix it: {error}"
         );
+    }
+
+    #[test]
+    fn a_streaming_chunked_memory_snapshot_returns_without_waiting_for_eof() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release, wait) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            let payload = b"{\"inuse\":1234}\n";
+            for chunk in [&payload[..5], &payload[5..]] {
+                write!(stream, "{:x};snapshot=yes\r\n", chunk.len()).unwrap();
+                stream.write_all(chunk).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+            }
+            stream.flush().unwrap();
+            // Keep the stream open until the client has parsed its first value.
+            let _ = wait.recv_timeout(Duration::from_secs(3));
+        });
+        let result = clash_api_request(&api(port), "/memory", Duration::from_secs(1));
+        release.send(()).unwrap();
+        server.join().unwrap();
+        assert_eq!(result.unwrap()["inuse"], 1234);
+    }
+
+    #[test]
+    fn a_trickling_response_cannot_extend_the_observation_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\n\r\n{\"inuse\":")
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b" ").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        });
+        let started = std::time::Instant::now();
+        assert!(clash_api_request(&api(port), "/memory", Duration::from_millis(100)).is_err());
+        assert!(started.elapsed() < Duration::from_millis(800));
+        server.join().unwrap();
     }
 
     #[test]
