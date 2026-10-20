@@ -17,9 +17,11 @@
 | `ci` | 调用本次提交的 `ci.yml`，运行测试、clippy、systemd 验收和真实内核矩阵 | 任一检查失败，`package` 不执行 |
 | `build` | 带锚点编译，跑 `scripts/dev/release-trust-anchor-check.sh` 与 `--test release_trust` | 二进制信任开发密钥、或没配锚点，拒绝上传 |
 | `runtime` | 按 [`scripts/release-runtime-pins.txt`](../scripts/release-runtime-pins.txt) 下载随包 sing-box，校验钉住的 sha256，再与 GitHub API 的 `digest` 交叉核对；只解出 `sing-box-<版本>-linux-<arch>/sing-box` 一个成员 | 摘要缺失/不符、pin 过期、成员名危险，拒绝签名 |
-| `package` | 渲染 `install.sh`，逐架构 `generate-manifest.sh` 签名并用发布二进制回验，生成 `SHA256SUMS`，以**草稿**发布、上传全部资产、再 `--draft=false` | 半途失败只留下可删除重跑的草稿；已发布的 tag 拒绝覆盖 |
+| `package` | 渲染 `install.sh`，逐架构 `generate-manifest.sh` 签名并用发布二进制回验，生成 `SHA256SUMS`，创建**草稿**并上传全部资产，等待 VPS 验收后发布 | 半途失败只留下可删除重跑的草稿；已发布的 tag 拒绝覆盖 |
 
 `scripts/generate-manifest.sh` 从同一个 pin 文件读取版本与兼容区间：传入的 sing-box 版本必须等于 `sing_box_version`，否则拒绝签名，避免清单声明一个没有随包发布的运行时。
+
+标签触发和默认手动运行都保留草稿。使用 `gh release download <tag>` 获取 Actions 产物，在 VPS 上核对 SHA-256 并完成验收后，再运行 `gh release edit <tag> --draft=false --latest`。测试和发布使用同一批字节。确实需要流水线直接发布时，手动触发可显式传入 `-f publish=true`；此选项不会跳过任何 CI 或签名门禁。
 
 ### 更新现有 Release（不新增版本）
 

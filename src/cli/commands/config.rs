@@ -134,57 +134,67 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
-            if let Err(error) = prepare_override_edit_path(&path, sample) {
-                eprintln!("override 编辑失败：{error}");
-                return ExitCode::from(2);
-            }
-            let prior = match fs::read(&path) {
+            let prior = match read_override_source(&path) {
                 Ok(prior) => prior,
                 Err(error) => {
                     eprintln!("无法备份覆写文件：{error}");
                     return ExitCode::from(2);
                 }
             };
-            let result = (|| {
+            let result = (|| -> Result<(), String> {
+                // The editor never writes a live source. Other commands can
+                // safely regenerate while this private draft is open.
+                let draft_directory = tempfile::tempdir().map_err(|e| e.to_string())?;
+                let draft = draft_directory.path().join(path.file_name().unwrap());
+                prepare_override_edit_path(&draft, sample)?;
+                if let Some(bytes) = &prior {
+                    fs::write(&draft, bytes).map_err(|e| e.to_string())?;
+                }
                 match crate::cli::editor::run_editor(
                     &crate::cli::editor::editor_candidates(),
-                    &path,
+                    &draft,
                 ) {
                     Ok(status) if status.success() => {}
                     Ok(status) => {
-                        eprintln!("编辑器退出码 {status}");
-                        return ExitCode::from(2);
+                        return Err(format!("编辑器退出码 {status}"));
                     }
-                    Err(message) => {
-                        eprintln!("{message}");
-                        return ExitCode::from(2);
-                    }
+                    Err(message) => return Err(message),
                 }
-                if let Err(error) = sbctl::override_template::Overrides::load(root) {
-                    eprintln!("override 校验失败：{error}");
-                    return ExitCode::from(2);
-                }
+                let contents = sbctl::config::read_managed_file_no_follow(&draft)
+                    .map_err(|e| e.to_string())?;
                 let store = sbctl::config::DeploymentStore::new(root);
-                if root == Path::new("/") || root.join("var/lib/sbctl/ownership").is_file() {
-                    match store.load() {
-                        Ok(config) => {
-                            commit_config_change(root, &store, Some(&config), &config, sing_box_bin)
-                        }
-                        Err(error) => {
-                            eprintln!("读取部署失败：{error}");
-                            ExitCode::from(2)
+                let _lock = store.acquire_operation_lock().map_err(|e| e.to_string())?;
+                if read_override_source(&path).map_err(|e| e.to_string())? != prior {
+                    return Err("覆写文件已变化，请重新打开编辑器".into());
+                }
+                let relative = path
+                    .strip_prefix(root)
+                    .map_err(|e| e.to_string())?
+                    .to_str()
+                    .ok_or("覆写路径不是 UTF-8")?;
+                store
+                    .write_root_only_locked(relative, &contents)
+                    .map_err(|e| e.to_string())?;
+                let result = commit_override_artifacts_locked(root, &store, sing_box_bin, true);
+                if result.is_err() {
+                    match &prior {
+                        Some(bytes) => store
+                            .write_root_only_locked(relative, bytes)
+                            .map_err(|e| format!("覆写文件恢复失败：{e}"))?,
+                        None => {
+                            fs::remove_file(&path).map_err(|e| format!("覆写文件恢复失败：{e}"))?
                         }
                     }
-                } else {
-                    regenerate(root, sing_box_bin)
                 }
+                result
             })();
-            if result != ExitCode::SUCCESS
-                && let Err(error) = fs::write(&path, prior)
-            {
-                eprintln!("覆写文件恢复失败：{error}");
+            match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(error) => {
+                    eprintln!("override 编辑失败：{error}");
+                    ExitCode::from(2)
+                }
             }
-            result
         }
         OverrideCommand::Clear { target } => {
             let selected = match target {
@@ -199,6 +209,66 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
             clear_override_targets(root, &selected)
         }
     }
+}
+
+fn read_override_source(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match sbctl::config::read_managed_file_no_follow(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn commit_override_artifacts_locked(
+    root: &Path,
+    store: &sbctl::config::DeploymentStore,
+    sing_box_bin: Option<PathBuf>,
+    activate: bool,
+) -> Result<(), String> {
+    let config = store.load().map_err(|e| e.to_string())?;
+    let binary = sing_box_bin.unwrap_or_else(|| root.join("usr/local/bin/sing-box"));
+    let managed = root == Path::new("/") || root.join("var/lib/sbctl/ownership").is_file();
+    apply_and_activate_locked(root, store, &config, Some(&binary), activate && managed)
+}
+
+/// Caller keeps the operation lock from reading the current configuration
+/// through publication, activation and complete recovery.
+pub(crate) fn apply_and_activate_locked(
+    root: &Path,
+    store: &sbctl::config::DeploymentStore,
+    config: &sbctl::config::DeploymentConfig,
+    binary: Option<&Path>,
+    activate: bool,
+) -> Result<(), String> {
+    let snapshot = sbctl::subscription::apply_config_transaction_locked(store, config, binary)
+        .map_err(|e| e.to_string())?;
+    let direct = config.subscription_mode == sbctl::config::SubscriptionMode::Direct;
+    let result = (|| {
+        if root == Path::new("/") {
+            sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)?;
+        }
+        sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
+        if activate {
+            sbctl::lifecycle::restart_services(root)?;
+        }
+        Ok::<_, String>(())
+    })();
+    if let Err(error) = result {
+        let recovery = (|| -> Result<(), String> {
+            sbctl::subscription::restore_config_transaction_locked(store, &snapshot)
+                .map_err(|e| e.to_string())?;
+            sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
+            if activate {
+                sbctl::lifecycle::restart_services(root)?;
+            }
+            Ok(())
+        })();
+        return Err(match recovery {
+            Ok(()) => error,
+            Err(recovery) => format!("{error}; rollback failed: {recovery}"),
+        });
+    }
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
@@ -377,6 +447,14 @@ fn prepare_override_edit_path(path: &Path, sample: &str) -> Result<(), String> {
 }
 
 fn clear_override_targets(root: &Path, targets: &[CliOverrideTarget]) -> ExitCode {
+    let store = sbctl::config::DeploymentStore::new(root);
+    let _lock = match store.acquire_operation_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("override 清理失败：{error}");
+            return ExitCode::from(2);
+        }
+    };
     let overrides_dir = root.join("etc/sbctl/overrides");
     let mut sources = Vec::new();
     for target in targets {
@@ -461,7 +539,17 @@ fn clear_override_targets(root: &Path, targets: &[CliOverrideTarget]) -> ExitCod
     } else {
         println!("未发现已启用的覆写文件，正在检查并重新生成工件……");
     }
-    restore_clear_backup(backup, &moved, regenerate(root, None))
+    let activate = targets
+        .iter()
+        .any(|target| matches!(target, CliOverrideTarget::Server));
+    let result = match commit_override_artifacts_locked(root, &store, None, activate) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("override 清理失败：{error}");
+            ExitCode::from(2)
+        }
+    };
+    restore_clear_backup(backup, &moved, result)
 }
 
 fn override_layer_sources_for_clear(
@@ -979,26 +1067,6 @@ fn accounting_schedule_changed(
         || prior.accounting_timezone != new.accounting_timezone
         || prior.anchored_reset_at != new.anchored_reset_at
         || prior.interface != new.interface
-}
-
-/// Restarts the managed services after a configuration commit. If the health
-/// check fails, the rollback closure restores the previous known-good files,
-/// the services are restarted again, and the failure is reported.
-pub(crate) fn restart_services_with_rollback(
-    root: &Path,
-    rollback: impl FnOnce(),
-) -> Result<(), sbctl::config::ConfigError> {
-    if let Err(error) = sbctl::lifecycle::restart_services(root) {
-        rollback();
-        if let Err(rollback_error) = sbctl::lifecycle::restart_services(root) {
-            eprintln!(
-                "warning: the rollback restart failed too ({rollback_error}); inspect \
-                 `systemctl status sing-box.service sbctl.service` before retrying"
-            );
-        }
-        return Err(sbctl::config::ConfigError::StateContent(error));
-    }
-    Ok(())
 }
 
 fn configuration_artifact(root: &Path, format: &str, output: Option<&Path>) -> ExitCode {

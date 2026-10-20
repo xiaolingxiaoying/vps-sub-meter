@@ -84,9 +84,47 @@ pub enum OverrideError {
 /// The parsed override documents for one deployment; empty when none exist.
 #[derive(Debug, Default)]
 pub struct Overrides {
-    pub sing_box: Option<serde_json::Value>,
-    pub clash: Option<serde_yaml::Value>,
-    pub sing_box_server: Option<serde_json::Value>,
+    pub sing_box: Option<JsonLayers>,
+    pub clash: Option<YamlLayers>,
+    pub sing_box_server: Option<JsonLayers>,
+}
+
+/// Keep each document's merge policy until it is applied to the generated
+/// configuration. Flattening first loses replace/append relative to that base.
+#[derive(Debug)]
+pub struct JsonLayers(Vec<(json_merge::RulesMode, serde_json::Value)>);
+
+impl JsonLayers {
+    pub fn apply_to(&self, base: &mut serde_json::Value, policy: &json_merge::MergePolicy<'_>) {
+        for (rules, document) in &self.0 {
+            json_merge::deep_merge_with(
+                base,
+                document,
+                &json_merge::MergePolicy {
+                    rules: *rules,
+                    ..*policy
+                },
+            );
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct YamlLayers(Vec<(json_merge::RulesMode, serde_yaml::Value)>);
+
+impl YamlLayers {
+    pub fn apply_to(&self, base: &mut serde_yaml::Value, policy: &json_merge::MergePolicy<'_>) {
+        for (rules, document) in &self.0 {
+            json_merge::deep_merge_yaml_with(
+                base,
+                document,
+                &json_merge::MergePolicy {
+                    rules: *rules,
+                    ..*policy
+                },
+            );
+        }
+    }
 }
 
 impl Overrides {
@@ -99,27 +137,14 @@ impl Overrides {
             root,
             SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH,
             SING_BOX_SERVER_OVERRIDE_DIRECTORY,
-            &server_merge_policy(),
         )?;
-        if let Some(document) = sing_box_server.as_ref() {
-            reject_protected_server_inbounds(
-                document,
-                &root.join(SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH),
-            )?;
-        }
         Ok(Self {
             sing_box: load_json_layered(
                 root,
                 SING_BOX_OVERRIDE_RELATIVE_PATH,
                 SING_BOX_OVERRIDE_DIRECTORY,
-                &client_policy(),
             )?,
-            clash: load_yaml_layered(
-                root,
-                CLASH_OVERRIDE_RELATIVE_PATH,
-                CLASH_OVERRIDE_DIRECTORY,
-                &clash_policy(),
-            )?,
+            clash: load_yaml_layered(root, CLASH_OVERRIDE_RELATIVE_PATH, CLASH_OVERRIDE_DIRECTORY)?,
             sing_box_server,
         })
     }
@@ -178,8 +203,7 @@ fn load_json_layered(
     root: &Path,
     base_relative: &str,
     directory_relative: &str,
-    policy: &json_merge::MergePolicy<'_>,
-) -> Result<Option<serde_json::Value>, OverrideError> {
+) -> Result<Option<JsonLayers>, OverrideError> {
     let mut documents: Vec<(PathBuf, serde_json::Value)> = Vec::new();
     if let Some(value) = load_json_if_present(&root.join(base_relative))? {
         documents.push((root.join(base_relative), value));
@@ -189,37 +213,24 @@ fn load_json_layered(
             .ok_or_else(|| OverrideError::NotMapping { path: path.clone() })?;
         documents.push((path, value));
     }
-    let mut merged: Option<serde_json::Value> = None;
+    let mut layers = Vec::new();
     for (path, document) in documents {
         if base_relative == SING_BOX_SERVER_OVERRIDE_RELATIVE_PATH {
             reject_protected_server_inbounds(&document, &path)?;
         }
         let (rules_mode, document) = take_rules_mode(document, &path)?;
-        if let Some(existing) = merged.as_mut() {
-            let scoped = json_merge::MergePolicy {
-                rules: rules_mode,
-                ..*policy
-            };
-            json_merge::deep_merge_with(existing, &document, &scoped);
-        } else {
-            merged = Some(document);
+        if !document.as_object().is_some_and(serde_json::Map::is_empty) {
+            layers.push((rules_mode, document));
         }
     }
-    if merged
-        .as_ref()
-        .is_some_and(|value| value.as_object().is_some_and(serde_json::Map::is_empty))
-    {
-        return Ok(None);
-    }
-    Ok(merged)
+    Ok((!layers.is_empty()).then_some(JsonLayers(layers)))
 }
 
 fn load_yaml_layered(
     root: &Path,
     base_relative: &str,
     directory_relative: &str,
-    policy: &json_merge::MergePolicy<'_>,
-) -> Result<Option<serde_yaml::Value>, OverrideError> {
+) -> Result<Option<YamlLayers>, OverrideError> {
     let mut documents: Vec<(PathBuf, serde_yaml::Value)> = Vec::new();
     if let Some(value) = load_yaml_if_present(&root.join(base_relative))? {
         documents.push((root.join(base_relative), value));
@@ -229,20 +240,17 @@ fn load_yaml_layered(
             .ok_or_else(|| OverrideError::NotMapping { path: path.clone() })?;
         documents.push((path, value));
     }
-    let mut merged: Option<serde_yaml::Value> = None;
+    let mut layers = Vec::new();
     for (path, document) in documents {
         let (rules_mode, document) = take_yaml_rules_mode(document, &path)?;
-        if let Some(existing) = merged.as_mut() {
-            let scoped = json_merge::MergePolicy {
-                rules: rules_mode,
-                ..*policy
-            };
-            json_merge::deep_merge_yaml_with(existing, &document, &scoped);
-        } else {
-            merged = Some(document);
+        if !document
+            .as_mapping()
+            .is_some_and(serde_yaml::Mapping::is_empty)
+        {
+            layers.push((rules_mode, document));
         }
     }
-    Ok(merged)
+    Ok((!layers.is_empty()).then_some(YamlLayers(layers)))
 }
 
 /// Reads and removes the per-document `rules_mode` key.
@@ -504,7 +512,11 @@ mod tests {
 
         let overrides = Overrides::load(root).expect("layered overrides load");
         assert!(!overrides.is_empty());
-        let sing_box = overrides.sing_box.expect("sing-box override present");
+        let mut sing_box = json!({});
+        overrides
+            .sing_box
+            .expect("sing-box override present")
+            .apply_to(&mut sing_box, &client_policy());
         // 05- sorts before 10-, so `warn` wins over the later layer's absence.
         assert_eq!(sing_box["log"]["level"], "warn");
         assert_eq!(sing_box["log"]["timestamp"], true);
@@ -525,21 +537,9 @@ mod tests {
 
         let loaded = Overrides::load(root).expect("override loads");
         let document = loaded.sing_box.expect("override present");
-        assert!(
-            document.get(RULES_MODE_KEY).is_none(),
-            "the control key must be stripped before it reaches sing-box"
-        );
-
-        // The stripped policy still governs how a generated profile merges.
         let mut base = json!({"route": {"rules": [{"action": "sniff"}]}});
-        json_merge::deep_merge_with(
-            &mut base,
-            &document,
-            &json_merge::MergePolicy {
-                rules: json_merge::RulesMode::Append,
-                ..client_policy()
-            },
-        );
+        document.apply_to(&mut base, &client_policy());
+        assert!(base.get(RULES_MODE_KEY).is_none());
         assert_eq!(base["route"]["rules"][0], json!({"action": "sniff"}));
         assert_eq!(base["route"]["rules"].as_array().unwrap().len(), 2);
     }

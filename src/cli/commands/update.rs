@@ -259,6 +259,14 @@ fn humantime_like(duration: std::time::Duration) -> String {
 /// configuration wizard uses.
 fn sing_box_api(root: &Path, command: ApiCommand) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
+    // Keep the read, publication and service recovery in the same transaction.
+    let _lock = match store.acquire_operation_lock() {
+        Ok(lock) => lock,
+        Err(error) => {
+            eprintln!("sing-box 观测接口操作失败: {error}");
+            return ExitCode::from(2);
+        }
+    };
     let result = match command {
         ApiCommand::Status => store.load().map(|config| (config, None)),
         ApiCommand::Enable { port } => store
@@ -324,24 +332,14 @@ fn apply_and_restart(
     config: &sbctl::config::DeploymentConfig,
 ) -> Result<(), sbctl::config::ConfigError> {
     let binary = root.join("usr/local/bin/sing-box");
-    let snapshot = sbctl::subscription::apply_config_transaction(
+    super::config::apply_and_activate_locked(
+        root,
         store,
         config,
         binary.is_file().then_some(binary.as_path()),
+        true,
     )
-    .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-    if root == Path::new("/") {
-        sbctl::lifecycle::prepare_daemon_prerequisites(
-            root,
-            config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
-        )
-        .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-    }
-    sbctl::lifecycle::prepare_daemon_storage(root, false)
-        .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-    super::config::restart_services_with_rollback(root, || {
-        let _ = sbctl::subscription::restore_config_transaction(store, &snapshot);
-    })
+    .map_err(sbctl::config::ConfigError::StateContent)
 }
 
 /// `sbctl sing-box connections`: the live proxied connections, when the

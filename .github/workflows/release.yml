@@ -14,9 +14,9 @@ name: Release
 #      rather than whatever the network returned.
 #   3. `package` signs each manifest with the Environment-held private seed and
 #      immediately re-verifies it with the release binary that will ship.
-#   4. The release is created as a draft, all assets are uploaded, and only then
-#      is it published: a half-finished run leaves a draft to delete and re-run
-#      instead of a published release that cannot be repaired in place.
+#   4. The release stays a draft for VPS acceptance. Manual publish=true can
+#      publish after uploading; the default publishes the same tested bytes
+#      separately with `gh release edit --draft=false --latest`.
 
 on:
   push:
@@ -30,6 +30,11 @@ on:
         type: string
       update_existing:
         description: 'Replace assets on the existing published release without creating a new release'
+        required: false
+        default: false
+        type: boolean
+      publish:
+        description: 'Publish after validation; otherwise keep a draft for VPS acceptance'
         required: false
         default: false
         type: boolean
@@ -252,6 +257,7 @@ jobs:
           UPDATE_EXISTING: ${{ inputs.update_existing || false }}
           ORIGINAL_TAG_COMMIT: ${{ needs.validate.outputs.original_tag_commit }}
           RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          PUBLISH: ${{ inputs.publish || false }}
         run: |
           set -euo pipefail
           [ -n "${SIGNING_SEED:-}" ] || { echo 'the release Environment has no SBCTL_SIGNING_SEED secret' >&2; exit 1; }
@@ -308,7 +314,7 @@ jobs:
             dist/sing-box-linux-amd64 dist/sing-box-linux-arm64 \
             dist/manifest-amd64.json dist/manifest-arm64.json \
             dist/install.sh dist/SHA256SUMS --clobber
-          if [ "$UPDATE_EXISTING" != true ]; then
+          if [ "$UPDATE_EXISTING" != true ] && [ "$PUBLISH" = true ]; then
             gh release edit "$TAG" --draft=false --latest
           fi
           gh release view "$TAG" --json assets --jq '.assets[].name'

@@ -1152,7 +1152,7 @@ fn apply_client_overrides(
             }
             let mut value: serde_json::Value = serde_json::from_str(contents)
                 .map_err(|error| SubscriptionError::Override(error.to_string()))?;
-            json_merge::deep_merge_with(&mut value, sing_box_override, &policy);
+            sing_box_override.apply_to(&mut value, &policy);
             *contents = serde_json::to_string_pretty(&value)
                 .map_err(|error| SubscriptionError::Override(error.to_string()))?;
         }
@@ -1168,7 +1168,7 @@ fn apply_client_overrides(
             }
             let mut value: serde_yaml::Value = serde_yaml::from_str(contents)
                 .map_err(|error| SubscriptionError::Override(error.to_string()))?;
-            json_merge::deep_merge_yaml_with(&mut value, clash_override, &policy);
+            clash_override.apply_to(&mut value, &policy);
             *contents = serde_yaml::to_string(&value)
                 .map_err(|error| SubscriptionError::Override(error.to_string()))?;
         }
@@ -1188,11 +1188,7 @@ pub fn apply_server_override(root: &Path, generated: &str) -> Result<String, Sub
     };
     let mut value: serde_json::Value = serde_json::from_str(generated)
         .map_err(|error| SubscriptionError::Override(error.to_string()))?;
-    json_merge::deep_merge_with(
-        &mut value,
-        &document,
-        &crate::override_template::server_merge_policy(),
-    );
+    document.apply_to(&mut value, &crate::override_template::server_merge_policy());
     serde_json::to_string_pretty(&value)
         .map_err(|error| SubscriptionError::Override(error.to_string()))
 }

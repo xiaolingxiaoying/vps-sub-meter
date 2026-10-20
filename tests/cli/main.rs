@@ -8,6 +8,7 @@ mod management;
 mod menu;
 mod observe;
 mod review_fixes;
+mod review_followup;
 mod subscription_formats;
 mod traffic;
 mod update_release;

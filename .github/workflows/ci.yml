@@ -53,7 +53,9 @@ jobs:
           python3 tests/acceptance/verify-menu.py target/debug/sbctl
           python3 tests/acceptance/verify-onboarding.py --cli target/debug/sbctl
       - name: Verify private mail and daemon storage with real Linux UIDs
-        run: sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
+        run: |
+          sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
+          sudo python3 scripts/dev/check-api-certificate-permissions.py "$GITHUB_WORKSPACE/target/debug/sbctl"
       - run: cargo test -p sbctl --no-default-features --test release_trust
 
   # The systemd acceptance suite (`sh tests/acceptance/run.sh`) drives real
