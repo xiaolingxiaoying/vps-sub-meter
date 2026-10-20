@@ -167,7 +167,9 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
                 let store = sbctl::config::DeploymentStore::new(root);
                 if root == Path::new("/") || root.join("var/lib/sbctl/ownership").is_file() {
                     match store.load() {
-                        Ok(config) => commit_config_change(root, &store, &config, sing_box_bin),
+                        Ok(config) => {
+                            commit_config_change(root, &store, Some(&config), &config, sing_box_bin)
+                        }
                         Err(error) => {
                             eprintln!("读取部署失败：{error}");
                             ExitCode::from(2)
@@ -751,29 +753,7 @@ pub(crate) fn commit_client_template(
         let store = sbctl::config::DeploymentStore::new(root);
         let _lock = store.acquire_operation_lock().map_err(|e| e.to_string())?;
         let mut config = store.load().map_err(|e| e.to_string())?;
-        if config.client_template == template {
-            println!("模板未变化：{template}");
-            return Ok(());
-        }
-        config.client_template = template;
-        let binary = resolve_sing_box_bin(root, sing_box_bin)
-            .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?;
-        let snapshot =
-            sbctl::subscription::apply_client_template_transaction_locked(&store, &config, &binary)
-                .map_err(|e| e.to_string())?;
-        if let Err(error) = sbctl::lifecycle::prepare_daemon_storage(
-            root,
-            config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
-        ) {
-            sbctl::subscription::restore_config_transaction_locked(&store, &snapshot)
-                .map_err(|recovery| format!("{error}; rollback failed: {recovery}"))?;
-            return Err(error);
-        }
-        println!(
-            "客户端模板已切换为 {}；现有覆写保留，VPS 代理服务未重启。请刷新客户端订阅。",
-            config.client_template
-        );
-        Ok(())
+        commit_client_template_locked(root, &store, &mut config, template, sing_box_bin)
     })();
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -782,6 +762,38 @@ pub(crate) fn commit_client_template(
             ExitCode::from(2)
         }
     }
+}
+
+fn commit_client_template_locked(
+    root: &Path,
+    store: &sbctl::config::DeploymentStore,
+    config: &mut sbctl::config::DeploymentConfig,
+    template: sbctl::subscription::ClientTemplate,
+    sing_box_bin: Option<PathBuf>,
+) -> Result<(), String> {
+    if config.client_template == template {
+        println!("模板未变化：{template}");
+        return Ok(());
+    }
+    config.client_template = template;
+    let binary = resolve_sing_box_bin(root, sing_box_bin)
+        .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?;
+    let snapshot =
+        sbctl::subscription::apply_client_template_transaction_locked(store, config, &binary)
+            .map_err(|e| e.to_string())?;
+    if let Err(error) = sbctl::lifecycle::prepare_daemon_storage(
+        root,
+        config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+    ) {
+        sbctl::subscription::restore_config_transaction_locked(store, &snapshot)
+            .map_err(|recovery| format!("{error}; rollback failed: {recovery}"))?;
+        return Err(error);
+    }
+    println!(
+        "客户端模板已切换为 {}；现有覆写保留，VPS 代理服务未重启。请刷新客户端订阅。",
+        config.client_template
+    );
+    Ok(())
 }
 
 pub(crate) fn run_config_wizard(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
@@ -817,7 +829,7 @@ pub(crate) fn run_config_wizard(root: &Path, sing_box_bin: Option<PathBuf>) -> E
             ExitCode::SUCCESS
         }
         sbctl::wizard::WizardOutcome::Changed(config) => {
-            commit_config_change(root, &store, &config, sing_box_bin)
+            commit_config_change(root, &store, existing.as_ref(), &config, sing_box_bin)
         }
     }
 }
@@ -830,25 +842,39 @@ pub(crate) fn run_config_wizard(root: &Path, sing_box_bin: Option<PathBuf>) -> E
 pub(crate) fn commit_config_change(
     root: &Path,
     store: &sbctl::config::DeploymentStore,
+    expected: Option<&sbctl::config::DeploymentConfig>,
     new: &sbctl::config::DeploymentConfig,
     sing_box_bin: Option<PathBuf>,
 ) -> ExitCode {
-    let existing = match store.load() {
-        Ok(config) => Some(config),
-        Err(sbctl::config::ConfigError::Missing) => None,
-        Err(error) => {
-            eprintln!("configuration wizard failed: {error}");
-            return ExitCode::from(2);
-        }
-    };
-    if let Some(prior) = existing.as_ref() {
-        let mut template_only = prior.clone();
-        template_only.client_template = new.client_template.clone();
-        if template_only == *new && prior.client_template != new.client_template {
-            return commit_client_template(root, new.client_template.clone(), sing_box_bin);
-        }
-    }
     let result = (|| -> Result<(), sbctl::config::ConfigError> {
+        // A prompt may stay open while a timer or another terminal changes the
+        // deployment. Never publish that prompt's stale credentials or restore
+        // its snapshot over a later writer during service recovery.
+        let _lock = store.acquire_operation_lock()?;
+        let existing = match store.load() {
+            Ok(config) => Some(config),
+            Err(sbctl::config::ConfigError::Missing) => None,
+            Err(error) => return Err(error),
+        };
+        if existing.as_ref() != expected {
+            return Err(sbctl::config::ConfigError::InvalidValue(
+                "configuration changed while editing; reopen the wizard and retry（配置已变化，请重新打开向导）",
+            ));
+        }
+        if let Some(prior) = existing.as_ref() {
+            let mut template_only = prior.clone();
+            template_only.client_template = new.client_template.clone();
+            if template_only == *new && prior.client_template != new.client_template {
+                return commit_client_template_locked(
+                    root,
+                    store,
+                    &mut prior.clone(),
+                    new.client_template.clone(),
+                    sing_box_bin,
+                )
+                .map_err(sbctl::config::ConfigError::StateContent);
+            }
+        }
         if !sbctl::traffic::interface_exists(root, &new.interface) {
             return Err(sbctl::config::ConfigError::InvalidValue(
                 "the selected traffic interface does not exist on this host",
@@ -881,11 +907,11 @@ pub(crate) fn commit_config_change(
                     .iter()
                     .map(|(name, contents)| (name.clone(), contents.as_bytes()))
                     .collect::<Vec<_>>();
-                store.initialize_with_artifacts(new, &references)?;
+                store.initialize_with_artifacts_locked(new, &references)?;
                 Ok(())
             }
             Some(prior) => {
-                let snapshot = sbctl::subscription::apply_config_transaction(
+                let snapshot = sbctl::subscription::apply_config_transaction_locked(
                     store,
                     new,
                     binary.is_file().then_some(binary.as_path()),
@@ -897,17 +923,29 @@ pub(crate) fn commit_config_change(
                 // this, the rewritten /etc/sing-box/config.json stays 0600
                 // root:root and the service cannot start (deployment issue #5).
                 let direct = new.subscription_mode == sbctl::config::SubscriptionMode::Direct;
-                if root == Path::new("/") {
-                    sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)
-                        .map_err(sbctl::config::ConfigError::StateContent)?;
+                let activation = (|| -> Result<(), String> {
+                    if root == Path::new("/") {
+                        sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)?;
+                    }
+                    sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
+                    sbctl::lifecycle::restart_services(root)
+                })();
+                if let Err(error) = activation {
+                    sbctl::subscription::restore_config_transaction_locked(store, &snapshot)
+                        .map_err(|recovery| {
+                            sbctl::config::ConfigError::StateContent(format!(
+                                "{error}; rollback failed: {recovery}"
+                            ))
+                        })?;
+                    if let Err(recovery) = sbctl::lifecycle::restart_services(root) {
+                        return Err(sbctl::config::ConfigError::StateContent(format!(
+                            "{error}; rollback restart failed: {recovery}"
+                        )));
+                    }
+                    return Err(sbctl::config::ConfigError::StateContent(error));
                 }
-                sbctl::lifecycle::prepare_daemon_storage(root, direct)
-                    .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-                restart_services_with_rollback(root, || {
-                    let _ = sbctl::subscription::restore_config_transaction(store, &snapshot);
-                })?;
                 if accounting_schedule_changed(&prior, new)
-                    && let Err(error) = sbctl::traffic::reset(store, new)
+                    && let Err(error) = sbctl::traffic::reset_locked(store, new)
                 {
                     eprintln!(
                         "warning: could not establish the new accounting state now ({error}); the next accounting reset timer run will establish it"

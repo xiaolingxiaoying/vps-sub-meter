@@ -31,12 +31,18 @@ decisions without restating generated ones.
 - **Rule lists.** `etc/sbctl/rules/{direct,proxy,reject,fakeip-filter}.list`
   take the `TYPE,value[,policy]` line format shared rule collections publish.
   They are injected as generated rules — ahead of the generated verdicts, reject
-  first — and fake-ip exceptions join the generated DNS rule in place rather
-  than forking it, which keeps the behaviour identical across sing-box 1.10–1.14
+  first — and fake-ip suffix exceptions extend the generated DNS rule in place.
+  Exact domains and keywords use separate DNS rules before the fake-IP catch-all
+  so they match independently. IP-CIDR is rejected for fake-IP exceptions. This
+  keeps the behaviour identical across sing-box 1.10–1.14
   and both clash shapes.
 - **Two ways to bring outside lists in.** `sbctl rule-set add` registers a
   *compiled* rule-set URL (`.srs`/`.mrs`, https only) that each subscriber's own
-  core downloads, so the server never becomes a bandwidth proxy for other
+  core downloads. Registrations are client-specific: `.srs` is emitted only for
+  sing-box and `.mrs` only for current mihomo; they are incompatible binary
+  formats. Operators register separate names/URLs when they need both. Minimal
+  profiles and legacy mihomo continue to omit remote sets. The server never
+  becomes a bandwidth proxy for other
   people's rules and a plain-http mirror cannot downgrade a subscription's
   integrity. `sbctl rule-set import-list --url … --into …` is the other branch:
   it fetches a text list here, size-capped and never piped to a shell, and appends

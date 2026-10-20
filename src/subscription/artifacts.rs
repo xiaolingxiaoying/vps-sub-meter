@@ -3380,14 +3380,21 @@ ot-a-sing-box.bin"
     }
 
     #[test]
-    fn a_registered_rule_set_reaches_both_formats_and_stays_out_of_minimal() {
+    fn registered_rule_sets_reach_only_their_client_format_and_stay_out_of_minimal() {
         let fixture = TempDir::new().expect("temporary root is created");
         let (_store, mut config, _) = seed_direct_subscription(&fixture);
-        config.client_extra_rule_sets = vec![crate::config::ExtraRuleSet {
-            name: "game".to_owned(),
-            url: "https://cdn.example/geo/game.srs".to_owned(),
-            outbound: "reject".to_owned(),
-        }];
+        config.client_extra_rule_sets = vec![
+            crate::config::ExtraRuleSet {
+                name: "game".to_owned(),
+                url: "https://cdn.example/geo/game.srs".to_owned(),
+                outbound: "reject".to_owned(),
+            },
+            crate::config::ExtraRuleSet {
+                name: "game-mihomo".to_owned(),
+                url: "https://cdn.example/geo/game.mrs".to_owned(),
+                outbound: "reject".to_owned(),
+            },
+        ];
 
         let standard =
             generated_artifacts(&config, fixture.path()).expect("registered rule-set generates");
@@ -3435,11 +3442,11 @@ ot-a-sing-box.bin"
             serde_yaml::from_str(&artifact_text(&standard, "subscription-clash.yaml"))
                 .expect("clash artifact is YAML");
         assert_eq!(
-            clash["rule-providers"]["game"]["url"].as_str(),
-            Some("https://cdn.example/geo/game.srs")
+            clash["rule-providers"]["game-mihomo"]["url"].as_str(),
+            Some("https://cdn.example/geo/game.mrs")
         );
         assert_eq!(
-            clash["rule-providers"]["game"]["interval"].as_i64(),
+            clash["rule-providers"]["game-mihomo"]["interval"].as_i64(),
             Some(86_400)
         );
         assert!(
@@ -3447,9 +3454,11 @@ ot-a-sing-box.bin"
                 .as_sequence()
                 .expect("rules")
                 .iter()
-                .any(|line| line.as_str() == Some("RULE-SET,game,REJECT")),
-            "the clash artifact routes the same set"
+                .any(|line| line.as_str() == Some("RULE-SET,game-mihomo,REJECT")),
+            "the clash artifact routes its MRS set"
         );
+        assert!(clash["rule-providers"].get("game").is_none());
+        assert!(!full.to_string().contains("game-mihomo"));
 
         // `minimal` exists to keep clients off a rule CDN; a registered set must
         // not quietly defeat that contract.
@@ -3463,7 +3472,7 @@ ot-a-sing-box.bin"
         );
         let minimal_clash = artifact_text(&minimal, "subscription-clash.yaml");
         assert!(
-            !minimal_clash.contains("game.srs"),
+            !minimal_clash.contains("game.srs") && !minimal_clash.contains("game.mrs"),
             "nor in the clash artifact"
         );
     }
@@ -3472,11 +3481,18 @@ ot-a-sing-box.bin"
     fn a_custom_refresh_interval_reaches_both_formats() {
         let fixture = TempDir::new().expect("temporary root is created");
         let (_store, mut config, _) = seed_direct_subscription(&fixture);
-        config.client_extra_rule_sets = vec![crate::config::ExtraRuleSet {
-            name: "game".to_owned(),
-            url: "https://cdn.example/geo/game.srs".to_owned(),
-            outbound: "proxy".to_owned(),
-        }];
+        config.client_extra_rule_sets = vec![
+            crate::config::ExtraRuleSet {
+                name: "game".to_owned(),
+                url: "https://cdn.example/geo/game.srs".to_owned(),
+                outbound: "proxy".to_owned(),
+            },
+            crate::config::ExtraRuleSet {
+                name: "game-mihomo".to_owned(),
+                url: "https://cdn.example/geo/game.mrs".to_owned(),
+                outbound: "proxy".to_owned(),
+            },
+        ];
         config.client_rule_set_update_interval = "12h".to_owned();
 
         let artifacts = generated_artifacts(&config, fixture.path()).expect("generates");
@@ -3506,9 +3522,60 @@ ot-a-sing-box.bin"
             serde_yaml::from_str(&artifact_text(&artifacts, "subscription-clash.yaml"))
                 .expect("clash is YAML");
         assert_eq!(
-            clash["rule-providers"]["game"]["interval"].as_i64(),
+            clash["rule-providers"]["game-mihomo"]["interval"].as_i64(),
             Some(43_200),
             "mihomo takes seconds, so 12h must convert"
         );
+    }
+
+    #[test]
+    fn all_templates_keep_srs_and_mrs_in_their_own_client_artifacts() {
+        let fixture = TempDir::new().unwrap();
+        let (_, mut config, _) = seed_direct_subscription(&fixture);
+        config.client_extra_rule_sets = vec![
+            crate::config::ExtraRuleSet {
+                name: "review-srs".into(),
+                url: "https://cdn.example/review.srs".into(),
+                outbound: "reject".into(),
+            },
+            crate::config::ExtraRuleSet {
+                name: "review-mrs".into(),
+                url: "https://cdn.example/review.mrs".into(),
+                outbound: "reject".into(),
+            },
+        ];
+        for template in [
+            ClientTemplate::Standard,
+            ClientTemplate::Compact,
+            ClientTemplate::Global,
+            ClientTemplate::Split,
+        ] {
+            config.client_template = template;
+            for profile in [
+                crate::config::ClientRuleProfile::Standard,
+                crate::config::ClientRuleProfile::Minimal,
+            ] {
+                config.client_rule_profile = profile.clone();
+                let artifacts = generated_artifacts(&config, fixture.path()).unwrap();
+                for (name, text) in artifacts {
+                    if name.starts_with("subscription-sing-box-") {
+                        assert!(!text.contains("review-mrs"), "{name}");
+                        assert_eq!(
+                            text.contains("review.srs"),
+                            profile == crate::config::ClientRuleProfile::Standard,
+                            "{name}"
+                        );
+                    } else if name.starts_with("subscription-clash") {
+                        assert!(!text.contains("review-srs"), "{name}");
+                        assert_eq!(
+                            text.contains("review.mrs"),
+                            name == "subscription-clash.yaml"
+                                && profile == crate::config::ClientRuleProfile::Standard,
+                            "{name}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

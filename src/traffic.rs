@@ -340,10 +340,27 @@ pub fn reset_with_runtime<C: crate::runtime::Clock>(
     config: &DeploymentConfig,
     runtime: &Runtime<C>,
 ) -> Result<TrafficReport, TrafficError> {
+    let _lock = store.acquire_operation_lock()?;
+    reset_with_runtime_locked(store, config, runtime)
+}
+
+/// Re-establish accounting while a configuration transaction holds the lock.
+pub fn reset_locked(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Result<TrafficReport, TrafficError> {
+    reset_with_runtime_locked(store, config, &Runtime::live(store.root()))
+}
+
+fn reset_with_runtime_locked<C: crate::runtime::Clock>(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+    runtime: &Runtime<C>,
+) -> Result<TrafficReport, TrafficError> {
     let period = accounting_period(config, runtime.now_utc())?;
     let measurements = read_measurements(runtime, &config.interface)?;
     let mut reconciled = None;
-    store.update_state(|prior| {
+    store.update_state_locked(|prior| {
         let state = match prior {
             Some(contents) => decode_state(&contents)?,
             None => TrafficState::new(

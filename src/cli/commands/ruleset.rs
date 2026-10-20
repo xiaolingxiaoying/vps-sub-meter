@@ -127,7 +127,15 @@ pub(crate) fn add(
     commit_rule_set_change(
         root,
         sing_box_bin,
-        &format!("已注册规则集 {name} -> {}", target.word()),
+        &format!(
+            "已注册规则集 {name} -> {}（仅用于 {}）",
+            target.word(),
+            if url.ends_with(".srs") {
+                "sing-box"
+            } else {
+                "Mihomo"
+            }
+        ),
         |config| {
             let entry = sbctl::config::ExtraRuleSet {
                 name: name.to_owned(),

@@ -214,7 +214,11 @@ fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> Stri
     // a domain set: mihomo only mis-sorts a domain list, never mis-routes an IP
     // one, and `rule-set add` documents that a CIDR list belongs in
     // `etc/sbctl/rules/direct.list` instead, where it is parsed as one.
-    for set in &config.client_extra_rule_sets {
+    for set in config
+        .client_extra_rule_sets
+        .iter()
+        .filter(|set| set.is_mihomo())
+    {
         providers.push_str(&format!(
             "  {tag}:\n    type: http\n    behavior: domain\n    format: mrs\n    url: {url}\n    path: ./ruleset/{tag}.mrs\n    interval: {interval}\n",
             tag = set.name,
@@ -232,19 +236,22 @@ fn clash_interval(config: &DeploymentConfig) -> u64 {
 
 /// Parses the Go-ish duration shape sbctl stores (`30m`, `12h`, `1d`, `3600s`).
 pub(crate) fn extra_rule_set_seconds(text: &str) -> Option<u64> {
-    let text = text.trim();
-    if text.is_empty() {
+    if text.is_empty() || text.contains(char::is_whitespace) {
         return None;
     }
-    let (digits, unit) = text.split_at(text.len() - 1);
+    let unit = text.chars().last()?;
+    let digits = text.strip_suffix(unit)?;
     let amount = digits.parse::<u64>().ok()?;
-    Some(match unit {
-        "s" => amount,
-        "m" => amount * 60,
-        "h" => amount * 3_600,
-        "d" => amount * 86_400,
+    let multiplier = match unit {
+        's' => 1,
+        'm' => 60,
+        'h' => 3_600,
+        'd' => 86_400,
         _ => return None,
-    })
+    };
+    let seconds = amount.checked_mul(multiplier)?;
+    // sing-box parses a signed 64-bit count of nanoseconds (Go time.Duration).
+    (seconds > 0 && seconds <= i64::MAX as u64 / 1_000_000_000).then_some(seconds)
 }
 
 /// The clash target for a registered rule-set's verdict.
@@ -260,7 +267,11 @@ fn clash_extra_rule_target(outbound: &str) -> &'static str {
 /// rules so an explicit registration beats a generic geo verdict.
 fn clash_extra_rules(config: &DeploymentConfig) -> String {
     let mut lines = String::new();
-    for set in &config.client_extra_rule_sets {
+    for set in config
+        .client_extra_rule_sets
+        .iter()
+        .filter(|set| set.is_mihomo())
+    {
         lines.push_str(&format!(
             "  - RULE-SET,{name},{target}\n",
             name = set.name,
@@ -329,4 +340,43 @@ pub(crate) fn clash_legacy(
         false,
         spec.dns.direct_rule_set.is_some(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::extra_rule_set_seconds;
+
+    #[test]
+    fn rule_set_intervals_reject_overflow_zero_and_invalid_text() {
+        for (text, expected) in [
+            ("30m", 1800),
+            ("12h", 43200),
+            ("7d", 604800),
+            ("9223372036s", 9223372036),
+            ("153722867m", 9223372020),
+        ] {
+            assert_eq!(extra_rule_set_seconds(text), Some(expected), "{text}");
+        }
+        for text in [
+            "",
+            "0s",
+            "0d",
+            "-1h",
+            "1秒",
+            "秒",
+            " 12h",
+            "12h ",
+            "soon",
+            "1.5h",
+            "9223372037s",
+            "153722868m",
+            "2562048h",
+            "106752d",
+            "18446744073709551615d",
+            "18446744073709551615m",
+            "18446744073709551615h",
+        ] {
+            assert_eq!(extra_rule_set_seconds(text), None, "{text}");
+        }
+    }
 }

@@ -52,6 +52,24 @@ sudo sbctl regenerate
 - 不要把完整参考模板连同占位 `proxies`/`outbounds` 当作覆写直接粘贴，否则会追加示例节点或替换生成内容。参考模板中需要调整的基础设置可拆成覆写片段。
 - 裸节点 `sing-box.json` 和 URI/Shadowrocket 格式不应用客户端覆写。
 
+## 本地例外与远程规则集
+
+fake-ip 例外支持精确域名、域名后缀和关键词；不接受 IP-CIDR：
+
+```bash
+sudo sbctl rule add fakeip-filter DOMAIN,music.example DOMAIN-SUFFIX,example.net DOMAIN-KEYWORD,stream
+```
+
+远程二进制规则集按客户端格式分别注册。`.srs` 仅写入 sing-box 完整订阅，`.mrs` 仅写入现行 Mihomo 订阅，两种二进制不能互换。需要两端覆盖同一策略时，使用两个名称及对应的两个 URL。minimal 档与 Mihomo 1.18 兼容订阅不加载远程规则集。
+
+```bash
+sudo sbctl rule-set add game-sing --url https://example.com/game.srs --outbound proxy
+sudo sbctl rule-set add game-mihomo --url https://example.com/game.mrs --outbound proxy
+sudo sbctl rule-set interval 12h
+```
+
+刷新间隔支持正整数加 `s`、`m`、`h`、`d`，必须在内核可表示的时长范围内；零、溢出和非法输入会在写入前被拒绝。
+
 ## VPS 更新和源码推送的区别
 
 `git push` 只更新源码。`sbctl update` 从 GitHub Release 的签名清单下载发布工件，不能直接安装 dev 分支提交；Release 发布完成后才有对应的二进制可更新。

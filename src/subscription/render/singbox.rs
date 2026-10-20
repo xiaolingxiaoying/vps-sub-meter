@@ -401,7 +401,7 @@ pub(crate) fn sing_box_full(
             && config
                 .client_extra_rule_sets
                 .iter()
-                .any(|set| set.outbound == "reject")
+                .any(|set| set.is_sing_box() && set.outbound == "reject")
         {
             needs_block_outbound = true;
         }
@@ -617,7 +617,7 @@ fn standard_full(
         if config
             .client_extra_rule_sets
             .iter()
-            .any(|s| s.outbound == "reject")
+            .any(|s| s.is_sing_box() && s.outbound == "reject")
         {
             outbounds.push(json!({"type": "block", "tag": LEGACY_BLOCK_TAG}));
         }
@@ -686,7 +686,11 @@ fn extra_rule_set_verdict(target: &str, legacy_route: bool) -> Value {
 fn extra_rule_sets(config: &DeploymentConfig, legacy_route: bool) -> (Vec<Value>, Vec<Value>) {
     let mut entries = Vec::new();
     let mut rules = Vec::new();
-    for set in &config.client_extra_rule_sets {
+    for set in config
+        .client_extra_rule_sets
+        .iter()
+        .filter(|set| set.is_sing_box())
+    {
         entries.push(json!({
             "type": "remote",
             "tag": set.name,

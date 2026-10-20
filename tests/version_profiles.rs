@@ -129,6 +129,42 @@ fn shipped_override_example_passes_every_supported_core() {
     );
 }
 
+#[test]
+#[ignore = "requires real sing-box cores; run by the CI sing-box-profiles job"]
+fn fake_ip_domain_exceptions_pass_every_supported_core() {
+    let root = tempfile::tempdir().unwrap();
+    let rules = root.path().join("etc/sbctl/rules");
+    std::fs::create_dir_all(&rules).unwrap();
+    std::fs::write(
+        rules.join("fakeip-filter.list"),
+        "DOMAIN,exact.example\nDOMAIN-KEYWORD,music\nDOMAIN-SUFFIX,suffix.example\n",
+    )
+    .unwrap();
+    let mut config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "127.0.0.1".into(),
+        None,
+        Some(2080),
+        "ens3".into(),
+        vec![ManagedProtocol::VlessReality],
+        Some("www.cloudflare.com".into()),
+    )
+    .unwrap();
+    for template in [
+        ClientTemplate::Standard,
+        ClientTemplate::Global,
+        ClientTemplate::Split,
+        ClientTemplate::Compact,
+    ] {
+        config.client_template = template.clone();
+        let artifacts = generated_artifacts(&config, root.path()).unwrap();
+        assert_eq!(
+            check_against_cores(&format!("{template}/fake-ip exceptions"), &artifacts),
+            SING_BOX_VERSION_PROFILES.len()
+        );
+    }
+}
+
 /// The registry's newest minor has to be the newest *stable* upstream release.
 ///
 /// `sing-box-full.json` targets `SING_BOX_VERSION_PROFILES.last()`, so the

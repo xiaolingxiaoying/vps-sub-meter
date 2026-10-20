@@ -221,7 +221,7 @@ fn run_topic_wizard(root: &Path, topic: sbctl::wizard::ConfigurationTopic) {
             println!("配置未发生变化");
         }
         Ok(sbctl::wizard::WizardOutcome::Changed(new)) => {
-            let _ = commit_config_change(root, &store, &new, None);
+            let _ = commit_config_change(root, &store, Some(&config), &new, None);
         }
         Err(error) => eprintln!("配置失败: {error}"),
     }

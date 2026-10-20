@@ -371,9 +371,17 @@ pub struct ExtraRuleSet {
 }
 
 impl ExtraRuleSet {
+    pub fn is_sing_box(&self) -> bool {
+        self.url.ends_with(".srs")
+    }
+
+    pub fn is_mihomo(&self) -> bool {
+        self.url.ends_with(".mrs")
+    }
+
     /// sing-box takes `.srs`, mihomo takes `.mrs`.
     pub fn format_is_expected(&self) -> bool {
-        self.url.ends_with(".srs") || self.url.ends_with(".mrs")
+        self.is_sing_box() || self.is_mihomo()
     }
 }
 
@@ -868,13 +876,11 @@ impl DeploymentConfig {
                 ));
             }
         }
-        if self.client_rule_set_update_interval.is_empty()
-            || self
-                .client_rule_set_update_interval
-                .contains(char::is_whitespace)
+        if crate::subscription::rule_set_interval_seconds(&self.client_rule_set_update_interval)
+            .is_none()
         {
             return Err(ConfigError::InvalidValue(
-                "client_rule_set_update_interval must be a Go duration like 1d or 12h",
+                "client_rule_set_update_interval must be a positive duration like 1d or 12h within the Go duration range",
             ));
         }
         Ok(())
@@ -1557,9 +1563,18 @@ impl DeploymentStore {
         config: &DeploymentConfig,
         artifacts: &[(String, &[u8])],
     ) -> Result<(), ConfigError> {
+        let _lock = self.operation_lock()?;
+        self.initialize_with_artifacts_locked(config, artifacts)
+    }
+
+    /// Caller holds the operation lock from the initial configuration read.
+    pub fn initialize_with_artifacts_locked(
+        &self,
+        config: &DeploymentConfig,
+        artifacts: &[(String, &[u8])],
+    ) -> Result<(), ConfigError> {
         config.validate()?;
         let path = self.root.join(CONFIG_RELATIVE_PATH);
-        let _lock = self.operation_lock()?;
         if path.exists() {
             return Err(ConfigError::AlreadyExists);
         }
@@ -1632,6 +1647,14 @@ impl DeploymentStore {
         update: impl FnOnce(Option<Vec<u8>>) -> Result<Vec<u8>, ConfigError>,
     ) -> Result<(), ConfigError> {
         let _lock = self.operation_lock()?;
+        self.update_state_locked(update)
+    }
+
+    /// Caller holds the operation lock through configuration and state changes.
+    pub fn update_state_locked(
+        &self,
+        update: impl FnOnce(Option<Vec<u8>>) -> Result<Vec<u8>, ConfigError>,
+    ) -> Result<(), ConfigError> {
         let prior = self.read_state_unlocked()?;
         let contents = update(prior.clone())?;
         if prior.as_deref() == Some(contents.as_slice()) {

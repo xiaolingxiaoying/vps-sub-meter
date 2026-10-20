@@ -1550,9 +1550,43 @@ fn rule_set_add_persists_renders_and_refuses_an_uncompilable_url() {
     )
     .expect("the clash artifact regenerated too");
     assert!(
-        clash.contains("RULE-SET,game,REJECT"),
-        "the clash side must route the same set"
+        !clash.contains("RULE-SET,game,REJECT") && !clash.contains("game.srs"),
+        "the clash side must never try to load a sing-box binary set"
     );
+
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule-set",
+            "add",
+            "game-mihomo",
+            "--url",
+            "https://cdn.example/geo/game.mrs",
+            "--outbound",
+            "reject",
+            "--sing-box-bin",
+            checker_path,
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("仅用于 Mihomo"));
+    let clash = fs::read_to_string(
+        fixture
+            .path()
+            .join("var/lib/sbctl/artifacts/subscription-clash.yaml"),
+    )
+    .unwrap();
+    assert!(clash.contains("RULE-SET,game-mihomo,REJECT"));
+    assert!(clash.contains("game.mrs"));
+    let full = fs::read_to_string(
+        fixture
+            .path()
+            .join("var/lib/sbctl/artifacts/subscription-sing-box-full.json"),
+    )
+    .unwrap();
+    assert!(!full.contains("game.mrs") && !full.contains("game-mihomo"));
 
     Command::cargo_bin("sbctl")
         .expect("sbctl binary is built")
@@ -1633,4 +1667,211 @@ fn rule_set_add_persists_renders_and_refuses_an_uncompilable_url() {
     let config = fs::read_to_string(fixture.path().join("etc/sbctl/config.toml"))
         .expect("configuration is readable");
     assert!(!config.contains("game.srs"), "{config}");
+}
+
+#[test]
+fn invalid_rule_set_intervals_leave_configuration_and_artifacts_untouched() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let config_path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&config_path).unwrap();
+    let artifact = fixture
+        .path()
+        .join("var/lib/sbctl/artifacts/subscription-clash.yaml");
+    let artifact_before = fs::read(&artifact).unwrap();
+    for input in ["18446744073709551615d", "9223372037s", "0s", "1秒"] {
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root, "rule-set", "interval", input])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("不是合法时长"));
+        assert_eq!(fs::read(&config_path).unwrap(), before);
+        assert_eq!(fs::read(&artifact).unwrap(), artifact_before);
+    }
+    // A manually edited value follows the same validation path as CLI input.
+    let text = String::from_utf8(before).unwrap().replace(
+        "client_rule_set_update_interval = \"1d\"",
+        "client_rule_set_update_interval = \"18446744073709551615d\"",
+    );
+    fs::write(&config_path, text).unwrap();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args(["--root", root, "config", "validate"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("positive duration"));
+}
+
+#[test]
+fn fake_ip_filter_add_honours_all_domain_matchers_and_rejects_cidr() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule",
+            "add",
+            "fakeip-filter",
+            "DOMAIN,exact.example",
+            "DOMAIN-KEYWORD,music",
+            "DOMAIN-SUFFIX,suffix.example",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .assert()
+        .success();
+    let artifacts = fixture.path().join("var/lib/sbctl/artifacts");
+    for entry in fs::read_dir(&artifacts).unwrap() {
+        let path = entry.unwrap().path();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        if name.starts_with("subscription-sing-box-") && name.ends_with(".json") {
+            let config: serde_json::Value =
+                serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            let dns = config["dns"].to_string();
+            for expected in ["exact.example", "music", "suffix.example"] {
+                assert!(dns.contains(expected), "{name} misses {expected}");
+            }
+        }
+    }
+    let source = fixture.path().join("etc/sbctl/rules/fakeip-filter.list");
+    let before = fs::read(&source).unwrap();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "rule",
+            "add",
+            "fakeip-filter",
+            "IP-CIDR,10.0.0.0/8",
+        ])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("fake-ip"));
+    assert_eq!(fs::read(source).unwrap(), before);
+}
+
+#[cfg(unix)]
+#[test]
+fn an_open_wizard_cannot_restore_rotated_or_revoked_subscription_credentials() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    use std::process::{Command as ProcessCommand, Stdio};
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
+    for revoke_named in [false, true] {
+        let fixture = TempDir::new().unwrap();
+        let root = fixture.path().to_str().unwrap();
+        seed_ip_fallback(root);
+        write_systemctl_fixture(&fixture, true);
+        if revoke_named {
+            Command::cargo_bin("sbctl")
+                .unwrap()
+                .args(["--root", root, "credential", "add", "--name", "phone"])
+                .assert()
+                .success();
+        }
+        let mut wizard = ProcessCommand::new(assert_cmd::cargo::cargo_bin("sbctl"))
+            .args(["--root", root, "config", "wizard"])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let stdout = wizard.stdout.take().unwrap();
+        let (ready, received) = mpsc::channel();
+        let reader = thread::spawn(move || {
+            let mut reader = BufReader::new(stdout);
+            let mut output = String::new();
+            reader.read_line(&mut output).unwrap();
+            ready.send(()).unwrap();
+            reader.read_to_string(&mut output).unwrap();
+            output
+        });
+        received
+            .recv_timeout(Duration::from_secs(10))
+            .expect("wizard reads its initial snapshot");
+        let operation = if revoke_named {
+            vec!["credential", "revoke", "phone"]
+        } else {
+            vec!["credential", "rotate"]
+        };
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args(["--root", root])
+            .args(operation)
+            .assert()
+            .success();
+        let config_path = fixture.path().join("etc/sbctl/config.toml");
+        let latest = fs::read(&config_path).unwrap();
+        let mut answers = vec![""; 17];
+        answers[14] = "Asia/Tokyo";
+        answers.push("y");
+        wizard
+            .stdin
+            .take()
+            .unwrap()
+            .write_all((answers.join("\n") + "\n").as_bytes())
+            .unwrap();
+        let result = wizard.wait_with_output().unwrap();
+        assert_eq!(result.status.code(), Some(2));
+        assert!(
+            String::from_utf8_lossy(&result.stderr).contains("configuration changed while editing")
+        );
+        assert_eq!(
+            fs::read(config_path).unwrap(),
+            latest,
+            "the latest credential state must survive"
+        );
+        reader.join().unwrap();
+    }
+}
+
+#[test]
+fn wizard_service_failure_restores_configuration_and_generated_artifacts() {
+    let fixture = TempDir::new().unwrap();
+    let root = fixture.path().to_str().unwrap();
+    seed_ip_fallback(root);
+    write_traffic_fixture(&fixture, 100, 200, "boot-a");
+    write_systemctl_fixture(&fixture, false);
+    let checker = sing_box_check_fixture(&fixture, true, &["vless"]);
+    let config_path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&config_path).unwrap();
+    let artifact_dir = fixture.path().join("var/lib/sbctl/artifacts");
+    let artifacts: Vec<_> = fs::read_dir(&artifact_dir)
+        .unwrap()
+        .map(|entry| {
+            let path = entry.unwrap().path();
+            let bytes = fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect();
+    let mut answers = vec![""; 17];
+    answers[2] = "203.0.113.8";
+    answers.push("y");
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .args([
+            "--root",
+            root,
+            "config",
+            "wizard",
+            "--sing-box-bin",
+            checker.to_str().unwrap(),
+        ])
+        .write_stdin(answers.join("\n") + "\n")
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("configuration wizard failed"));
+    assert_eq!(fs::read(config_path).unwrap(), before);
+    for (path, bytes) in artifacts {
+        assert_eq!(fs::read(path).unwrap(), bytes);
+    }
 }

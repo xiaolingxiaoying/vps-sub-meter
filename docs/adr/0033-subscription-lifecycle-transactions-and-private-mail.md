@@ -13,6 +13,12 @@ also saved configuration without changing the running service.
 - Credential operations hold the operation lock through reading, writing, restart,
   health checks and recovery. Recovery restores the complete original configuration;
   successful links are printed only after the running deployment commits.
+- Interactive configuration commits compare the configuration from the start of
+  the prompt with the current deployment under the operation lock. A conflicting
+  change aborts before publication and asks the administrator to reopen the
+  wizard. The same lock covers validation, service activation, recovery, and any
+  accounting reset, so neither a stale prompt nor its rollback can restore a
+  credential invalidated by another terminal or a scheduled rotation.
 - Revoking a name applies to every still-active credential for that name,
   including historical links retained by rotation. A revocation grace window
   never extends an earlier expiry; already-expired records stay unchanged.

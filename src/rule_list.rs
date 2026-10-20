@@ -107,7 +107,7 @@ impl RuleLists {
         let directory = root.join("etc/sbctl/rules");
         let mut lists = RuleLists::default();
         for kind in RuleKind::ALL {
-            let entries = load_list(&directory.join(kind.file_name()))?;
+            let entries = load_list(&directory.join(kind.file_name()), kind)?;
             match kind {
                 RuleKind::Direct => lists.direct = entries,
                 RuleKind::Proxy => lists.proxy = entries,
@@ -223,7 +223,7 @@ impl RuleLists {
         };
         // Rich catalogs carry LAN exceptions; the supplied standard template
         // carries portal exceptions resolved by the local DNS server instead.
-        let Some(target) = rules.iter_mut().find(|rule| {
+        let Some(index) = rules.iter().position(|rule| {
             rule.get("domain_suffix")
                 .and_then(Value::as_array)
                 .is_some_and(|list| {
@@ -233,7 +233,7 @@ impl RuleLists {
         }) else {
             return false;
         };
-        let Value::Object(target) = target else {
+        let Value::Object(target) = &mut rules[index] else {
             return false;
         };
         let existing = target
@@ -253,6 +253,25 @@ impl RuleLists {
             }
         }
         target.insert("domain_suffix".to_owned(), Value::Array(merged));
+        // Different matcher fields in one DNS rule can intersect. Keep exact
+        // domains and keywords in separate rules so every exception can match
+        // independently, before the catch-all fake-IP rule.
+        let mut additions = Vec::new();
+        for (matcher, field) in [("DOMAIN", "domain"), ("DOMAIN-KEYWORD", "domain_keyword")] {
+            let values: Vec<_> = self
+                .fake_ip_filter
+                .iter()
+                .filter(|entry| entry.matcher == matcher)
+                .map(|entry| json!(entry.value))
+                .collect();
+            if !values.is_empty() {
+                let mut rule = target.clone();
+                rule.remove("domain_suffix");
+                rule.insert(field.to_owned(), json!(values));
+                additions.push(Value::Object(rule));
+            }
+        }
+        rules.splice(index + 1..index + 1, additions);
         true
     }
 
@@ -270,7 +289,7 @@ impl RuleLists {
     }
 }
 
-fn load_list(path: &Path) -> Result<Vec<RuleEntry>, RuleListError> {
+fn load_list(path: &Path, kind: RuleKind) -> Result<Vec<RuleEntry>, RuleListError> {
     let text = match fs::read_to_string(path) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -329,6 +348,14 @@ fn load_list(path: &Path) -> Result<Vec<RuleEntry>, RuleListError> {
                 file,
                 line: index + 1,
                 message: format!("{value:?} is not an IPv4 or IPv6 CIDR prefix"),
+            });
+        }
+        if kind == RuleKind::FakeIpFilter && matcher == "IP-CIDR" {
+            return Err(RuleListError::Invalid {
+                file,
+                line: index + 1,
+                message: "fake-ip exceptions must use DOMAIN, DOMAIN-SUFFIX or DOMAIN-KEYWORD"
+                    .to_owned(),
             });
         }
         let entry = RuleEntry {
@@ -571,6 +598,52 @@ mod tests {
             !lists.extend_fake_ip_dns_rule(&mut profile),
             "no matching rule means no silent rewrite of the operator's intent"
         );
+    }
+
+    #[test]
+    fn fake_ip_exact_domains_and_keywords_have_independent_dns_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        write_list(
+            directory.path(),
+            RuleKind::FakeIpFilter,
+            "DOMAIN,exact.example\nDOMAIN-KEYWORD,music\nDOMAIN-SUFFIX,suffix.example\n",
+        );
+        let lists = RuleLists::load(directory.path()).unwrap();
+        for server in ["dns-local", "dns-direct"] {
+            let mut profile = json!({"dns": {"rules": [
+                {"domain_suffix": ["lan"], "server": server},
+                {"query_type": ["A", "AAAA"], "server": "dns-fakeip"}
+            ]}});
+            assert!(lists.extend_fake_ip_dns_rule(&mut profile));
+            let rules = profile["dns"]["rules"].as_array().unwrap();
+            assert_eq!(rules[0]["domain_suffix"], json!(["lan", "suffix.example"]));
+            assert_eq!(
+                rules[1],
+                json!({"domain": ["exact.example"], "server": server})
+            );
+            assert_eq!(
+                rules[2],
+                json!({"domain_keyword": ["music"], "server": server})
+            );
+            assert_eq!(rules[3]["server"], "dns-fakeip");
+        }
+        assert_eq!(
+            lists.clash_fake_ip_filter(),
+            ["exact.example", "*music*", "+.suffix.example"]
+        );
+    }
+
+    #[test]
+    fn fake_ip_filter_rejects_ip_cidr_with_file_and_line() {
+        let directory = tempfile::tempdir().unwrap();
+        write_list(
+            directory.path(),
+            RuleKind::FakeIpFilter,
+            "# exceptions\nIP-CIDR,10.0.0.0/8\n",
+        );
+        let error = RuleLists::load(directory.path()).unwrap_err().to_string();
+        assert!(error.contains("fakeip-filter.list line 2"), "{error}");
+        assert!(error.contains("fake-ip exceptions"), "{error}");
     }
 
     #[test]

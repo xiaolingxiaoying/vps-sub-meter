@@ -159,6 +159,10 @@ fn add(root: &Path, kind: RuleKind, texts: &[String], sing_box_bin: Option<PathB
     let mut added = Vec::new();
     for text in texts {
         match parse_entry(text) {
+            Ok((_, entry)) if kind == RuleKind::FakeIpFilter && entry.matcher == "IP-CIDR" => {
+                eprintln!("fake-ip 例外仅支持 DOMAIN、DOMAIN-SUFFIX、DOMAIN-KEYWORD");
+                return ExitCode::from(2);
+            }
             Ok((_, entry)) if !entries.contains(&entry) => {
                 entries.push(entry.clone());
                 added.push(entry);
