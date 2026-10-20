@@ -146,7 +146,7 @@ fn regenerate_locked(
     };
     for (name, contents) in &artifacts {
         if let Err(error) = store.write_artifact_locked(name, contents.as_bytes()) {
-            restore_replaced(store, &prior_artifacts, prior_active.as_deref());
+            restore_replaced(store, &prior_artifacts, ActiveConfigRollback::Untouched);
             return Err(SubscriptionError::Storage(error));
         }
     }
@@ -155,7 +155,11 @@ fn regenerate_locked(
         if let Err(error) =
             store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, server.as_bytes())
         {
-            restore_replaced(store, &prior_artifacts, prior_active.as_deref());
+            restore_replaced(
+                store,
+                &prior_artifacts,
+                ActiveConfigRollback::Restore(prior_active.as_deref()),
+            );
             return Err(SubscriptionError::Storage(error));
         }
     }
@@ -197,13 +201,21 @@ fn read_artifact(
     read_optional_file(&store.root().join(ARTIFACTS_RELATIVE_DIR).join(name))
 }
 
-/// Best-effort rollback of already-replaced artifacts and the active
-/// configuration after a mid-transaction write failure. Each write is atomic,
-/// so a failed write leaves its own target on the previous complete version.
+/// An absent snapshot must not mean deletion when the active configuration
+/// did not participate in the attempted writes.
+enum ActiveConfigRollback<'a> {
+    /// No active-file write was attempted; do not even open that path.
+    Untouched,
+    /// A write was attempted; None means the active file did not exist before.
+    Restore(Option<&'a [u8]>),
+}
+
+/// Best-effort rollback after a mid-transaction write failure. Each write is
+/// atomic, so a failed write leaves its target on the previous complete version.
 fn restore_replaced(
     store: &DeploymentStore,
     prior_artifacts: &[(String, Option<Vec<u8>>)],
-    prior_active: Option<&[u8]>,
+    active: ActiveConfigRollback<'_>,
 ) {
     for (name, prior) in prior_artifacts.iter().rev() {
         match prior {
@@ -215,11 +227,12 @@ fn restore_replaced(
             }
         }
     }
-    match prior_active {
-        Some(prior_active) => {
+    match active {
+        ActiveConfigRollback::Untouched => {}
+        ActiveConfigRollback::Restore(Some(prior_active)) => {
             let _ = store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, prior_active);
         }
-        None => {
+        ActiveConfigRollback::Restore(None) => {
             let _ = fs::remove_file(store.root().join(ACTIVE_CONFIG_RELATIVE_PATH));
         }
     }
@@ -359,7 +372,7 @@ fn apply_transaction_locked(
         }
         for (name, contents) in &artifacts {
             if let Err(error) = store.write_artifact_locked(name, contents.as_bytes()) {
-                restore_replaced(store, &prior_artifacts, prior_active.as_deref());
+                restore_replaced(store, &prior_artifacts, ActiveConfigRollback::Untouched);
                 return Err(SubscriptionError::Storage(error));
             }
         }
@@ -367,12 +380,24 @@ fn apply_transaction_locked(
             && let Err(error) =
                 store.write_relative_locked(ACTIVE_CONFIG_RELATIVE_PATH, server.as_bytes())
         {
-            restore_replaced(store, &prior_artifacts, prior_active.as_deref());
+            restore_replaced(
+                store,
+                &prior_artifacts,
+                ActiveConfigRollback::Restore(prior_active.as_deref()),
+            );
             return Err(SubscriptionError::Storage(error));
         }
     }
     if let Err(error) = store.replace_locked(config) {
-        restore_replaced(store, &prior_artifacts, prior_active.as_deref());
+        restore_replaced(
+            store,
+            &prior_artifacts,
+            if need_active_sync {
+                ActiveConfigRollback::Restore(prior_active.as_deref())
+            } else {
+                ActiveConfigRollback::Untouched
+            },
+        );
         return Err(SubscriptionError::Storage(error));
     }
     if let Err(error) = remove_stale_artifacts_in_scope(store, &artifacts, clients_only) {

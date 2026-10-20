@@ -3,8 +3,11 @@
 `verify.sh` is a black-box acceptance flow: it invokes only the administrator-visible
 `sbctl` CLI and the subscription HTTP endpoint. `fixture.sh` supplies isolated host
 state under `$work/<name>` for `/etc`, `/proc`, `/sys`, systemd command shims and
-certificates. A fixture command is rooted below `usr/bin` and never falls back to the
-container's real command.
+certificates. Host-control commands are rooted below `usr/bin` or `usr/sbin` and
+never fall back to the container's real command for a non-`/` root. Missing shims
+fail explicitly. Runtime owns this boundary for lifecycle, account, certificate,
+firewall, sysctl and observation commands. Archive utilities still receive an
+explicit target root; an alternate root is an adapter, not a chroot sandbox.
 
 `verify-menu.py` exercises the six sections, invalid input, deployed/fresh views,
 template success/cancellation/rollback, and refusal of destructive confirmations in

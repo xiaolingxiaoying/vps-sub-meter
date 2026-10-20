@@ -72,7 +72,7 @@ pub fn require_certbot(root: &Path) -> Result<(), CertificateError> {
         // CLI acceptance fixtures resolve host commands beneath their fake
         // root through Runtime; use the same path here instead of the runner's
         // real PATH.
-        root.join("usr/bin/certbot").is_file()
+        Runtime::live(root).command("certbot", &[]).is_ok()
     } else {
         std::env::var_os("PATH")
             .into_iter()

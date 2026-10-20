@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::TcpStream;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
@@ -168,58 +168,38 @@ fn non_empty(value: &str) -> Option<String> {
 /// inherited so `--follow` behaves as an interactive tail.
 pub fn run_journalctl(root: &Path, args: &[String]) -> Result<std::process::ExitStatus, String> {
     let arg_refs = args.iter().map(String::as_str).collect::<Vec<_>>();
-    let program = rooted_command(root, "journalctl")?;
-    Command::new(program)
-        .args(&arg_refs)
-        .status()
+    crate::runtime::Runtime::live(root)
+        .run_command("journalctl", &arg_refs)
         .map_err(|error| format!("{error}"))
 }
 
-/// Resolves a host command the way `lifecycle`'s systemctl helper does: the
-/// fixture root's copy wins, otherwise the command comes from `PATH`.
-fn rooted_command(root: &Path, program: &str) -> Result<PathBuf, String> {
-    let rooted = root.join("usr/bin").join(program);
-    #[cfg(windows)]
-    let rooted = if rooted.is_file() {
-        rooted
-    } else {
-        root.join("usr/bin").join(format!("{program}.cmd"))
-    };
-    if rooted.is_file() {
-        return Ok(rooted);
-    }
-    if root != Path::new("/") {
-        // A fixture root must provide its own host commands; falling back to
-        // the live binary would let a test pass against the developer's host.
-        return Err(format!("fixture command is missing: {program}"));
-    }
-    Ok(PathBuf::from(program))
-}
-
 fn systemctl_show(root: &Path) -> Result<String, String> {
-    let program = rooted_command(root, "systemctl")?;
-    let output = Command::new(program)
-        .args([
-            "show",
-            "--no-pager",
-            SING_BOX_UNIT,
-            "-p",
-            "ActiveState",
-            "-p",
-            "SubState",
-            "-p",
-            "MainPID",
-            "-p",
-            "NRestarts",
-            "-p",
-            "MemoryCurrent",
-            "-p",
-            "CPUUsageNSec",
-            "-p",
-            "TasksCurrent",
-            "-p",
-            "ActiveEnterTimestamp",
-        ])
+    let output = crate::runtime::Runtime::live(root)
+        .command(
+            "systemctl",
+            &[
+                "show",
+                "--no-pager",
+                SING_BOX_UNIT,
+                "-p",
+                "ActiveState",
+                "-p",
+                "SubState",
+                "-p",
+                "MainPID",
+                "-p",
+                "NRestarts",
+                "-p",
+                "MemoryCurrent",
+                "-p",
+                "CPUUsageNSec",
+                "-p",
+                "TasksCurrent",
+                "-p",
+                "ActiveEnterTimestamp",
+            ],
+        )
+        .map_err(|e| e.to_string())?
         .output()
         .map_err(|error| format!("systemd query failed: {error}"))?;
     if !output.status.success() {
@@ -592,9 +572,17 @@ mod tests {
 
         let observation = observe_sing_box_process(fixture.path(), now);
 
-        assert_eq!(observation.main_pid, Some(7));
+        assert!(
+            observation.error.is_none(),
+            "observation failed: {:?}",
+            observation.error
+        );
+        assert_eq!(
+            observation.main_pid,
+            Some(7),
+            "observation: {observation:?}"
+        );
         assert_eq!(observation.memory_bytes, Some(2_097_152));
-        assert!(observation.error.is_none());
     }
 
     #[test]

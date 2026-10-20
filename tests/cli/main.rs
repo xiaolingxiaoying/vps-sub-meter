@@ -7,6 +7,7 @@ mod lifecycle;
 mod management;
 mod menu;
 mod observe;
+mod review_boundaries;
 mod review_fixes;
 mod review_followup;
 mod subscription_formats;

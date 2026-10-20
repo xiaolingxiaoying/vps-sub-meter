@@ -584,14 +584,9 @@ fn system_service_from_cgroup(contents: &str) -> Option<String> {
 }
 
 fn systemctl_output(root: &Path, args: &[&str]) -> Result<String, String> {
-    let local = root.join("usr/bin/systemctl");
-    let program = if local.is_file() {
-        local
-    } else {
-        "systemctl".into()
-    };
-    let output = Command::new(program)
-        .args(args)
+    let output = crate::runtime::Runtime::live(root)
+        .command("systemctl", args)
+        .map_err(|e| e.to_string())?
         .output()
         .map_err(|e| e.to_string())?;
     if !output.status.success() {
@@ -751,15 +746,8 @@ fn restore_previous_services(root: &Path, services: &[PreviousServiceState]) -> 
 }
 
 fn systemctl_probe(root: &Path, args: &[&str]) -> bool {
-    let command = root.join("usr/bin/systemctl");
-    let program = if command.is_file() {
-        command
-    } else {
-        "systemctl".into()
-    };
-    Command::new(program)
-        .args(args)
-        .status()
+    crate::runtime::Runtime::live(root)
+        .run_command("systemctl", args)
         .is_ok_and(|status| status.success())
 }
 
@@ -1451,21 +1439,8 @@ fn set_root_readable_file_permissions(path: &Path) -> Result<(), String> {
 }
 
 fn systemctl(root: &Path, args: &[&str]) -> Result<(), String> {
-    let command = root.join("usr/bin/systemctl");
-    #[cfg(windows)]
-    let command = if command.is_file() {
-        command
-    } else {
-        root.join("usr/bin/systemctl.cmd")
-    };
-    let program = if command.is_file() {
-        command
-    } else {
-        "systemctl".into()
-    };
-    let status = Command::new(program)
-        .args(args)
-        .status()
+    let status = crate::runtime::Runtime::live(root)
+        .run_command("systemctl", args)
         .map_err(|error| error.to_string())?;
     status
         .success()
@@ -1489,21 +1464,17 @@ fn ensure_daemon_account(root: &Path, account: &str) -> Result<(), String> {
     }) {
         return Ok(());
     }
-    let candidate = root.join("usr/sbin/useradd");
-    let program = if candidate.is_file() {
-        candidate
-    } else {
-        "useradd".into()
-    };
-    let status = Command::new(program)
-        .args([
-            "--system",
-            "--no-create-home",
-            "--shell",
-            "/usr/sbin/nologin",
-            account,
-        ])
-        .status()
+    let status = crate::runtime::Runtime::live(root)
+        .run_command(
+            "useradd",
+            &[
+                "--system",
+                "--no-create-home",
+                "--shell",
+                "/usr/sbin/nologin",
+                account,
+            ],
+        )
         .map_err(|error| format!("could not create {account} service account: {error}"))?;
     status.success().then_some(()).ok_or_else(|| {
         format!("could not create {account} service account: useradd exited with {status}")
@@ -1541,15 +1512,8 @@ fn ensure_certificate_group(root: &Path) -> Result<(), String> {
 }
 
 fn run_account_command(root: &Path, program: &str, args: &[&str]) -> Result<(), String> {
-    let candidate = root.join("usr/sbin").join(program);
-    let executable = if candidate.is_file() {
-        candidate
-    } else {
-        program.into()
-    };
-    let status = Command::new(executable)
-        .args(args)
-        .status()
+    let status = crate::runtime::Runtime::live(root)
+        .run_command(program, args)
         .map_err(|error| format!("could not run {program}: {error}"))?;
     status
         .success()

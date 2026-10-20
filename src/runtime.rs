@@ -44,7 +44,7 @@ impl Runtime<SystemClock> {
         Self {
             root: root.to_owned(),
             clock: SystemClock,
-            allow_live_commands: true,
+            allow_live_commands: root == Path::new("/"),
         }
     }
 }
@@ -74,8 +74,8 @@ impl<C: Clock> Runtime<C> {
         fs::read_to_string(self.host_path(relative)?)
     }
 
-    /// Run a host command. A fixture can provide `usr/bin/<program>` under its
-    /// root; live operation falls back to the system command when absent.
+    /// Run a host command. Alternate roots provide `usr/bin/<program>` or
+    /// `usr/sbin/<program>` themselves; only root `/` may fall back to PATH.
     pub fn run_command(&self, program: &str, args: &[&str]) -> io::Result<ExitStatus> {
         self.command(program, args)?.status()
     }
@@ -95,28 +95,45 @@ impl<C: Clock> Runtime<C> {
         Ok((output.status, combined))
     }
 
-    fn command(&self, program: &str, args: &[&str]) -> io::Result<Command> {
+    /// Shared process boundary for commands that affect host state. Alternate
+    /// roots must supply their own command, even when using the real clock.
+    pub(crate) fn command(&self, program: &str, args: &[&str]) -> io::Result<Command> {
         if program.is_empty()
             || Path::new(program).is_absolute()
-            || Path::new(program)
-                .components()
-                .any(|component| matches!(component, Component::ParentDir | Component::Prefix(_)))
+            || program.contains(['/', '\\'])
+            || !matches!(
+                Path::new(program).components().next(),
+                Some(Component::Normal(_))
+            )
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "runtime command must be a simple program name",
             ));
         }
-        let rooted = self.root.join("usr/bin").join(program);
-        let executable = if rooted.is_file() {
-            rooted
-        } else if self.allow_live_commands {
-            PathBuf::from(program)
-        } else {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("fixture command is missing: {program}"),
-            ));
+        let rooted = ["usr/bin", "usr/sbin"].into_iter().find_map(|directory| {
+            let candidate = self.root.join(directory).join(program);
+            if candidate.is_file() {
+                return Some(candidate);
+            }
+            #[cfg(windows)]
+            {
+                let candidate = candidate.with_file_name(format!("{program}.cmd"));
+                if candidate.is_file() {
+                    return Some(candidate);
+                }
+            }
+            None
+        });
+        let executable = match rooted {
+            Some(path) => path,
+            None if self.allow_live_commands => PathBuf::from(program),
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("fixture command is missing: {program}"),
+                ));
+            }
         };
         let mut command = Command::new(executable);
         command.args(args);
@@ -178,18 +195,19 @@ mod tests {
     #[cfg(unix)]
     fn fixture_runtime_executes_a_rooted_command_without_touching_the_live_host() {
         let fixture = TempDir::new().unwrap();
-        let command = fixture.path().join("usr/bin/systemctl");
-        fs::create_dir_all(command.parent().unwrap()).unwrap();
-        fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
-        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
         let runtime = Runtime::fixture(fixture.path(), Utc::now());
-
-        assert!(
-            runtime
-                .run_command("systemctl", &["is-active"])
-                .unwrap()
-                .success()
-        );
+        for (directory, program) in [("usr/bin", "systemctl"), ("usr/sbin", "useradd")] {
+            let command = fixture.path().join(directory).join(program);
+            fs::create_dir_all(command.parent().unwrap()).unwrap();
+            fs::write(&command, "#!/bin/sh\nexit 0\n").unwrap();
+            fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(
+                runtime
+                    .run_command(program, &["--fixture-only"])
+                    .unwrap()
+                    .success()
+            );
+        }
         assert!(!fixture.path().join("command-output").exists());
     }
 
@@ -201,6 +219,38 @@ mod tests {
         assert!(runtime.read_to_string("../outside").is_err());
         assert!(runtime.read_to_string("/etc/passwd").is_err());
         assert!(runtime.run_command("missing-systemctl", &[]).is_err());
+        for invalid in [
+            ".",
+            "..",
+            "../systemctl",
+            "usr/bin/systemctl",
+            "usr\\bin\\systemctl",
+        ] {
+            assert_eq!(
+                runtime.command(invalid, &[]).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidInput
+            );
+        }
+    }
+
+    #[test]
+    fn live_runtime_with_an_alternate_root_requires_its_own_host_commands() {
+        let fixture = TempDir::new().unwrap();
+        let runtime = Runtime::live(fixture.path());
+        for program in [
+            "systemctl",
+            "sysctl",
+            "certbot",
+            "ufw",
+            "useradd",
+            "groupadd",
+            "usermod",
+        ] {
+            assert_eq!(
+                runtime.command(program, &[]).unwrap_err().kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
     }
 
     #[test]
