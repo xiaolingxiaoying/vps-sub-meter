@@ -198,13 +198,20 @@ mod implementation {
         }
     }
 
-    pub(crate) fn replace_files(
+    pub(crate) fn replace_files_with_marker(
         directory: &Path,
         files: &[(&str, &[u8])],
+        marker: Option<&str>,
         directory_policy: impl Fn(&File) -> io::Result<()>,
         file_policy: impl Fn(&File) -> io::Result<()>,
     ) -> io::Result<()> {
         validate_replacements(files)?;
+        if let Some(marker) = marker {
+            super::super::validate_file_name(OsStr::new(marker))?;
+            if files.iter().any(|(name, _)| *name == marker) {
+                return Err(io::Error::other("refresh marker overlaps material"));
+            }
+        }
         let (parent_path, name) = super::super::split_file(directory)?;
         // This lock is separate from the deployment operation lock, which
         // callers such as installation and mode switching may already hold.
@@ -223,7 +230,9 @@ mod implementation {
                     .any(|(name, _)| OsStr::new(name) == entry.as_os_str())
             })
             .count();
-        if retained + files.len() > MAX_ENTRIES {
+        let extra_marker =
+            usize::from(marker.is_some_and(|marker| !entries.iter().any(|name| name == marker)));
+        if retained + files.len() + extra_marker > MAX_ENTRIES {
             return Err(io::Error::other(
                 "certificate generation has too many entries",
             ));
@@ -267,7 +276,55 @@ mod implementation {
             file.sync_all()?;
         }
         directory_policy(&staged.directory)?;
+        let same_metadata = |left: &File, right: &File| -> io::Result<bool> {
+            let left = left.metadata()?;
+            let right = right.metadata()?;
+            Ok((left.uid(), left.gid(), left.mode()) == (right.uid(), right.gid(), right.mode()))
+        };
+        let mut unchanged = same_metadata(&previous, &staged.directory)?;
+        for (name, bytes) in files {
+            let name = c_name(OsStr::new(name))?;
+            let old = match regular_file(&previous, &name) {
+                Ok(file) => file,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    unchanged = false;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            let new = regular_file(&staged.directory, &name)?;
+            unchanged &=
+                same_metadata(&old, &new)? && read_material(old).is_ok_and(|old| old == *bytes);
+        }
+        if unchanged {
+            return Ok(());
+        }
+        if let Some(marker) = marker {
+            let marker = c_name(OsStr::new(marker))?;
+            if unsafe { libc::unlinkat(staged.directory.as_raw_fd(), marker.as_ptr(), 0) } != 0 {
+                let error = io::Error::last_os_error();
+                if error.kind() != io::ErrorKind::NotFound {
+                    return Err(error);
+                }
+            }
+            let file = open_at(
+                &staged.directory,
+                &marker,
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            file.sync_all()?;
+        }
         staged.commit(&name, previous)
+    }
+
+    #[cfg(test)]
+    fn replace_files(
+        directory: &Path,
+        files: &[(&str, &[u8])],
+        directory_policy: impl Fn(&File) -> io::Result<()>,
+        file_policy: impl Fn(&File) -> io::Result<()>,
+    ) -> io::Result<()> {
+        replace_files_with_marker(directory, files, None, directory_policy, file_policy)
     }
 
     pub(crate) fn read_pair(
@@ -393,6 +450,50 @@ mod implementation {
                 0o640
             );
             assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 2);
+        }
+
+        #[test]
+        fn unchanged_material_and_policy_keep_directory_and_watchers_in_place() {
+            let (fixture, directory) = seed();
+            let files = [("cert", b"new".as_slice()), ("key", b"new".as_slice())];
+            let directory_policy =
+                |file: &File| file.set_permissions(fs::Permissions::from_mode(0o750));
+            let file_policy = |file: &File| file.set_permissions(fs::Permissions::from_mode(0o640));
+            replace_files(&directory, &files, directory_policy, file_policy).unwrap();
+            let inode = fs::metadata(&directory).unwrap().ino();
+            replace_files(&directory, &files, directory_policy, file_policy).unwrap();
+            assert_eq!(fs::metadata(&directory).unwrap().ino(), inode);
+            assert_eq!(fs::read_dir(fixture.path()).unwrap().count(), 2);
+        }
+
+        #[test]
+        fn pending_refresh_is_committed_with_the_pair_and_survives_unchanged_retries() {
+            let (_fixture, directory) = seed();
+            let files = [("cert", b"new".as_slice()), ("key", b"new".as_slice())];
+            let publish = || {
+                replace_files_with_marker(
+                    &directory,
+                    &files,
+                    Some(".pending"),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+            };
+            publish().unwrap();
+            let inode = fs::metadata(&directory).unwrap().ino();
+            assert_eq!(
+                fs::metadata(directory.join(".pending")).unwrap().mode() & 0o777,
+                0o600
+            );
+            publish().unwrap();
+            assert!(directory.join(".pending").is_file());
+            assert_eq!(fs::metadata(&directory).unwrap().ino(), inode);
+            fs::remove_file(directory.join(".pending")).unwrap();
+            publish().unwrap();
+            assert!(
+                !directory.join(".pending").exists(),
+                "acknowledged unchanged material needs no new refresh"
+            );
         }
 
         #[test]
@@ -563,9 +664,10 @@ mod implementation {
         }
     }
 
-    pub(crate) fn replace_files(
+    pub(crate) fn replace_files_with_marker(
         directory: &Path,
         files: &[(&str, &[u8])],
+        marker: Option<&str>,
         directory_policy: impl Fn(&File) -> io::Result<()>,
         file_policy: impl Fn(&File) -> io::Result<()>,
     ) -> io::Result<()> {
@@ -636,6 +738,26 @@ mod implementation {
         directory_policy(&File::open(&staged.0)?)?;
         #[cfg(not(unix))]
         let _ = directory_policy;
+        if let Some(marker) = marker {
+            super::super::validate_file_name(OsStr::new(marker))?;
+            if files.iter().any(|(name, _)| *name == marker) {
+                return Err(io::Error::other("refresh marker overlaps material"));
+            }
+            let path = staged.0.join(marker);
+            match fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            let mut options = OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            options.open(path)?.sync_all()?;
+        }
         let backup = staged.0.with_extension("previous");
         if backup.exists() {
             return Err(io::Error::other("certificate backup already exists"));
@@ -669,4 +791,4 @@ mod implementation {
     }
 }
 
-pub(crate) use implementation::{read_pair, replace_files};
+pub(crate) use implementation::{read_pair, replace_files_with_marker as replace_files};

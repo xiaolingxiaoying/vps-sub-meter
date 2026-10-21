@@ -32,6 +32,7 @@ use crate::runtime::Runtime;
 /// The system group granted read access to the pinned certificate copy. Only
 /// the sbctl daemon and the sing-box data plane are members.
 pub const CERTIFICATE_GROUP: &str = "sbctl-cert";
+const REFRESH_PENDING_FILE: &str = ".sbctl-refresh-pending";
 
 #[derive(Debug, Error)]
 pub enum CertificateError {
@@ -467,6 +468,7 @@ pub fn pin(
             ("fullchain.pem", validated.fullchain_pem.as_slice()),
             ("privkey.pem", validated.privkey_pem.as_slice()),
         ],
+        Some(REFRESH_PENDING_FILE),
     )
     .map_err(|error| CertificateError::Storage(error.to_string()))?;
     Ok(())
@@ -511,6 +513,7 @@ pub(crate) fn write_private_pair(
     root: &Path,
     directory: &Path,
     files: &[(&str, &[u8])],
+    refresh_marker: Option<&str>,
 ) -> std::io::Result<()> {
     prepare_private_directory(root, directory)?;
     let policy = |file: &fs::File, mode| {
@@ -530,9 +533,38 @@ pub(crate) fn write_private_pair(
     crate::managed_fs::replace_files(
         directory,
         files,
+        refresh_marker,
         |file| policy(file, 0o750),
         |file| policy(file, 0o640),
     )
+}
+
+pub fn refresh_pending(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Result<bool, CertificateError> {
+    match fs::symlink_metadata(pinned_directory(store, config).join(REFRESH_PENDING_FILE)) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(CertificateError::Storage(
+            "invalid certificate refresh marker".into(),
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(CertificateError::Storage(error.to_string())),
+    }
+}
+
+pub fn clear_refresh_pending(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Result<(), CertificateError> {
+    match crate::managed_fs::remove_file(pinned_directory(store, config).join(REFRESH_PENDING_FILE))
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(CertificateError::Storage(format!(
+            "certificate refreshed but pending marker could not be cleared: {error}"
+        ))),
+    }
 }
 /// A redacted summary used by `status --json` and certificate diagnostics. The
 /// summary never includes the private key, the Subscription credential, or a
@@ -928,8 +960,8 @@ mod tests {
         write_certificate(&fixture, &["sub.example.test"]);
         let (store, config) = direct_store(&fixture);
         let validated = load_at(&store, &config, mid_2025()).unwrap();
-        let pin_with_same_timestamps = || {
-            pin(&store, &config, &validated).unwrap();
+        let pin_with_same_timestamps = |validated| {
+            pin(&store, &config, validated).unwrap();
             for name in ["fullchain.pem", "privkey.pem"] {
                 fs::File::open(store.certificate_directory("sub.example.test").join(name))
                     .unwrap()
@@ -938,8 +970,10 @@ mod tests {
             }
             super::pinned_material_stamp(&store, &config)
         };
-        let before = pin_with_same_timestamps();
-        let after = pin_with_same_timestamps();
+        let before = pin_with_same_timestamps(&validated);
+        write_certificate(&fixture, &["sub.example.test"]);
+        let replacement = load_at(&store, &config, mid_2025()).unwrap();
+        let after = pin_with_same_timestamps(&replacement);
         assert_eq!((before.1, before.2), (after.1, after.2));
         assert_ne!(
             before, after,

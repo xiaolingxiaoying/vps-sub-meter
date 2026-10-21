@@ -136,6 +136,10 @@ jobs:
           SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
           SBCTL_UPSTREAM_LATEST: ${{ steps.upstream.outputs.tag }}
         run: cargo test --test version_profiles -- --ignored --nocapture
+      - name: Verify certificate generation refresh with a real sing-box core
+        run: |
+          cargo build --locked -p sbctl
+          sudo unshare --net python3 scripts/dev/check-certificate-generation.py "$GITHUB_WORKSPACE/target/debug/sbctl" --serve --core "$GITHUB_WORKSPACE/sing-box-1.14.1/sing-box"
 
   mihomo-profiles:
     runs-on: ubuntu-24.04

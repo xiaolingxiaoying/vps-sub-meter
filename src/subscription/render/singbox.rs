@@ -922,6 +922,7 @@ fn ensure_self_signed_certificate(
             ("cert.pem", certificate_pem.as_bytes()),
             ("key.pem", key_pem.as_bytes()),
         ],
+        None,
     )?;
     Ok((
         certificate_path.to_string_lossy().into_owned(),

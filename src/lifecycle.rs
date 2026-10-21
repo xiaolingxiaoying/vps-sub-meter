@@ -251,7 +251,9 @@ pub fn restart_sing_box_service(root: &Path) -> Result<(), String> {
 }
 
 pub fn remove_managed_sing_box(root: &Path) -> Result<(), String> {
-    if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)? {
+    if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER).map_err(|error| {
+        format!("certificate published but data-plane unit check failed: {error}")
+    })? {
         return Err("sing-box is not an sbctl-managed deployment".to_owned());
     }
     systemctl(root, &["disable", "--now", "sing-box.service"])?;
@@ -1077,6 +1079,22 @@ fn unit_has_marker(root: &Path, relative: &str, marker: &str) -> Result<bool, St
     }
 }
 
+/// Directory publication replaces sing-box's watched inode. Only the managed
+/// data plane needs refreshing; try-restart preserves an administrator's stop.
+pub fn refresh_certificate_consumer(root: &Path) -> Result<(), String> {
+    if !root.join(OWNERSHIP_MARKER).is_file() {
+        return Ok(());
+    }
+    if fs::read(root.join(OWNERSHIP_MARKER)).map_err(|e| e.to_string())? != b"sbctl-managed-v1\n" {
+        return Err("certificate published but deployment ownership is not recognized".into());
+    }
+    if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)? {
+        return Err("certificate published but sing-box.service is not sbctl-managed; refusing to restart it".into());
+    }
+    systemctl(root, &["try-restart", "sing-box.service"])
+        .map_err(|error| format!("certificate published but data-plane refresh failed: {error}"))
+}
+
 pub fn restart_services(root: &Path) -> Result<(), String> {
     migrate_credential_rotate_service(root)?;
     // Isolated deployment roots used by CLI tests and image builders do not
@@ -1673,6 +1691,9 @@ fn grant_self_signed_certificate_access(root: &Path) -> Result<(), String> {
                 "!",
                 "-name",
                 ".operation.lock",
+                "!",
+                "-name",
+                ".sbctl-refresh-pending",
                 "-exec",
                 "chmod",
                 "0640",
@@ -1733,6 +1754,51 @@ pub(crate) fn grant_pinned_certificate_group(root: &Path) -> Result<(), String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn certificate_refresh_only_targets_owned_data_plane_and_reports_a_failed_refresh() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = tempfile::tempdir().unwrap();
+        let root = fixture.path();
+        let calls = root.join("calls");
+        refresh_certificate_consumer(root).unwrap();
+        let ownership = root.join(OWNERSHIP_MARKER);
+        fs::create_dir_all(ownership.parent().unwrap()).unwrap();
+        fs::write(&ownership, b"unknown owner").unwrap();
+        assert!(refresh_certificate_consumer(root).is_err());
+        fs::write(&ownership, b"sbctl-managed-v1\n").unwrap();
+        let unit = root.join(SING_BOX_UNIT);
+        fs::create_dir_all(unit.parent().unwrap()).unwrap();
+        fs::write(&unit, "[Unit]\nDescription=another administrator's unit\n").unwrap();
+        assert!(refresh_certificate_consumer(root).is_err());
+        fs::write(&unit, format!("[Unit]\n{SING_BOX_UNIT_MARKER}\n")).unwrap();
+        let error = refresh_certificate_consumer(root).unwrap_err();
+        assert!(error.contains("fixture command is missing: systemctl"));
+        assert!(!calls.exists());
+        let command = root.join("usr/bin/systemctl");
+        fs::create_dir_all(command.parent().unwrap()).unwrap();
+        fs::write(
+            &command,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> '{}'\n",
+                calls.display()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&command, fs::Permissions::from_mode(0o700)).unwrap();
+        refresh_certificate_consumer(root).unwrap();
+        assert_eq!(
+            fs::read_to_string(&calls).unwrap(),
+            "try-restart sing-box.service\n"
+        );
+        fs::write(&command, "#!/bin/sh\nexit 1\n").unwrap();
+        assert!(
+            refresh_certificate_consumer(root)
+                .unwrap_err()
+                .contains("certificate published but data-plane refresh failed")
+        );
+    }
 
     #[test]
     fn port_owner_parsing_handles_ipv6_workers_and_system_cgroups() {

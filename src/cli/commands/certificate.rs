@@ -59,6 +59,7 @@ pub(crate) fn run_certificate(root: &Path, command: CertificateCommand) -> ExitC
         None
     };
     let result = store.load().and_then(|config| {
+        let before = sbctl::certificate::pinned_material_stamp(&store, &config);
         match &command {
             CertificateCommand::Obtain { .. } => {
                 if config.subscription_mode == sbctl::config::SubscriptionMode::Direct {
@@ -74,7 +75,14 @@ pub(crate) fn run_certificate(root: &Path, command: CertificateCommand) -> ExitC
             // this closure is only reached for the remaining commands.
             CertificateCommand::Status => unreachable!("handled before the operation match"),
         }
-        .map(|validated| {
+        .and_then(|validated| {
+            if sbctl::certificate::pinned_material_stamp(&store, &config) != before
+                || sbctl::certificate::refresh_pending(&store, &config)?
+            {
+                sbctl::lifecycle::refresh_certificate_consumer(root)
+                    .map_err(sbctl::certificate::CertificateError::Storage)?;
+                sbctl::certificate::clear_refresh_pending(&store, &config)?;
+            }
             println!(
                 "certificate for {} is valid until {}",
                 validated.host,
@@ -83,6 +91,7 @@ pub(crate) fn run_certificate(root: &Path, command: CertificateCommand) -> ExitC
                     .unwrap_or_else(|| "unknown".to_owned())
             );
             println!("fingerprint: {}", validated.fingerprint);
+            Ok(())
         })
         .map_err(|error| {
             sbctl::config::ConfigError::StateContent(sbctl::subscription::redact_secret(

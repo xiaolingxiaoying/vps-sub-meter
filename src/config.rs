@@ -1994,6 +1994,11 @@ fn managed_ownership(relative: &str) -> (&'static str, &'static str, u32) {
         // A service with read access to a lock can hold flock and block root
         // certificate publication even though it cannot write certificate data.
         "var/lib/sbctl/certificates/.operation.lock" => ("root", "root:root", 0o600u32),
+        _ if relative.starts_with("var/lib/sbctl/certificates/")
+            && relative.ends_with("/.sbctl-refresh-pending") =>
+        {
+            ("root", "root:root", 0o600u32)
+        }
         "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
         // The managed service binaries must stay root-owned and executable:
         // sbctl.service and sing-box.service run under their own accounts and
