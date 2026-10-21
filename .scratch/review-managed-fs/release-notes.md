@@ -6,4 +6,4 @@
 
 兼容性：托管存储的父目录不再允许符号链接；使用过这类链接的部署需先换成实际目录。现有真实目录的权限、订阅与代理凭据及配置格式保持原有策略。
 
-验证记录见仓库 `.scratch/review-managed-fs/verification.md`；发布前须完成 Actions 构建、三发行版 systemd 门禁及授权 VPS 的生产产物实测。
+验证：501 项 Rust 测试、Clippy、双架构生产构建、三发行版 systemd 门禁均通过。授权 VPS 使用 Actions 产物通过真实 UID 边界检查、覆写与回滚、12 种订阅及二维码、五协议外部 HTTPS 204 验收。正式签名升级后再次通过外部验收，定时器已恢复，自动恢复任务已停止。详见[验收记录](https://github.com/xiaolingxiaoying/vps-sub-meter/blob/dev/.scratch/review-managed-fs/verification.md)。

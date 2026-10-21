@@ -1,5 +1,5 @@
 # 继续检查原子写入的父目录链接边界
-Status: claimed
+Status: resolved
 Type: research
 
 源码线索：config.rs 的 atomic_write 通过路径创建临时文件并 rename；读取和属主变更则用 open_managed_path_no_follow 逐级拒绝链接。需确认二者是否存在边界差异，特别是由 sbctl 服务账号拥有、可改名的 artifacts 目录。
@@ -9,3 +9,7 @@ Type: research
 ## Comments
 
 2026-10-20 已在 WSL 的两个临时目录复现：将部署目录中的 artifacts 链接到另一个临时目录，v0.0.17 的 config init 返回 0，并在部署目录之外创建 13 个工件文件。没有修改系统目录。此证据证明初始化写入会跟随父目录链接，尚未证明真实部署中服务账号能利用竞态达到提权；后续需覆盖持有目录描述符的写入方案和真实 UID 的隔离实验。
+
+## Answer
+
+v0.0.19 经 managed_fs 在 Unix 上固定目录句柄，创建、提交与失败清理均不再按原路径重新解析父目录；锁及工件删除同样采用相对句柄操作。权限作用于暂存文件，在原子提交前完成。VPS 真实 UID 临时树确认旧版会修改不可访问的 root 哨兵，新版拒绝；确定性交错测试确认父目录改名并替换为链接后仍只影响原目录。未把该隔离证据夸大为远程执行或完整提权链。详见 [验收记录](../../review-managed-fs/verification.md)。
