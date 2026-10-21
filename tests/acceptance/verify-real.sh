@@ -197,6 +197,16 @@ for scheme in 'vless://' 'vmess://' 'hysteria2://' 'tuic://' 'anytls://'; do
   contains "$response" "$scheme"
 done
 
+# Certificate readers cannot hold the root publication lock after storage grants.
+publication_lock=/var/lib/sbctl/certificates/.operation.lock
+[ "$(stat -c '%u:%a' "$publication_lock")" = '0:600' ] \
+  || fail 'self-signed publication lock must remain root-owned 0600'
+for reader in sbctl sing-box; do
+  if runuser -u "$reader" -- test -r "$publication_lock"; then
+    fail 'a service account can read the certificate publication lock'
+  fi
+done
+
 # Direct mode: systemd itself owns TCP 80/443 through sbctl-http.socket and
 # passes both listeners to the non-root sbctl service via LISTEN_FDS.
 $sbctl uninstall --purge >/dev/null
@@ -346,6 +356,13 @@ hook_after=$(stat -c '%a %U:%G' "$deploy_hook")
 [ "$hook_before" = "$hook_after" ] \
   || fail "the update rollback changed the deploy hook ($hook_before -> $hook_after)"
 [ -x "$deploy_hook" ] || fail 'the update rollback removed the deploy hook executable bit'
+[ "$(stat -c '%u:%a' "$publication_lock")" = '0:600' ] \
+  || fail 'update recovery exposed the certificate publication lock'
+for reader in sbctl sing-box; do
+  if runuser -u "$reader" -- test -r "$publication_lock"; then
+    fail 'update recovery exposed the certificate publication lock to a service account'
+  fi
+done
 
 $sbctl uninstall --purge >/dev/null
 

@@ -1669,6 +1669,10 @@ fn grant_self_signed_certificate_access(root: &Path) -> Result<(), String> {
                 &certificates.to_string_lossy(),
                 "-type",
                 "f",
+                // Certificate readers must not open/flock the publication lock.
+                "!",
+                "-name",
+                ".operation.lock",
                 "-exec",
                 "chmod",
                 "0640",

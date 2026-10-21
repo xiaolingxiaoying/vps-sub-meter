@@ -656,7 +656,7 @@ struct CertificateReloadBackoff {
     failed: Option<(CertificateStamp, std::time::Instant)>,
 }
 
-type CertificateStamp = (Option<std::time::SystemTime>, Option<std::time::SystemTime>);
+type CertificateStamp = crate::certificate::PinnedMaterialStamp;
 
 impl CertificateReloadBackoff {
     fn should_retry(&self, stamp: CertificateStamp, now: std::time::Instant) -> bool {
@@ -1849,10 +1849,12 @@ mod tests {
     fn certificate_reload_failure_backs_off_for_the_same_material_stamp() {
         let start = std::time::Instant::now();
         let first_stamp = (
+            None,
             Some(std::time::UNIX_EPOCH + Duration::from_secs(1)),
             Some(std::time::UNIX_EPOCH + Duration::from_secs(2)),
         );
         let changed_stamp = (
+            None,
             Some(std::time::UNIX_EPOCH + Duration::from_secs(3)),
             Some(std::time::UNIX_EPOCH + Duration::from_secs(4)),
         );

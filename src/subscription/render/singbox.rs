@@ -913,16 +913,15 @@ fn ensure_self_signed_certificate(
     let certificate = params
         .self_signed(&key_pair)
         .map_err(|error| SubscriptionError::Certificate(error.to_string()))?;
-    crate::certificate::prepare_private_directory(root, &directory)?;
-    crate::certificate::write_private_material(
+    let certificate_pem = certificate.pem();
+    let key_pem = key_pair.serialize_pem();
+    crate::certificate::write_private_pair(
         root,
-        &certificate_path,
-        certificate.pem().as_bytes(),
-    )?;
-    crate::certificate::write_private_material(
-        root,
-        &key_path,
-        key_pair.serialize_pem().as_bytes(),
+        &directory,
+        &[
+            ("cert.pem", certificate_pem.as_bytes()),
+            ("key.pem", key_pem.as_bytes()),
+        ],
     )?;
     Ok((
         certificate_path.to_string_lossy().into_owned(),

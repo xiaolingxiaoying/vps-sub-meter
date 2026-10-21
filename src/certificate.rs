@@ -185,25 +185,51 @@ pub fn load_pinned(
     store: &DeploymentStore,
     config: &DeploymentConfig,
 ) -> Result<ValidatedCertificate, CertificateError> {
-    load_directory_at(&pinned_directory(store, config), config, Utc::now())
+    require_direct(config)?;
+    let (fullchain_pem, privkey_pem) = crate::managed_fs::read_pair(
+        &pinned_directory(store, config),
+        "fullchain.pem",
+        "privkey.pem",
+    )
+    .map_err(|error| CertificateError::Unreadable {
+        host: config.subscription_host.clone(),
+        detail: error.to_string(),
+    })?;
+    validate_material(config, Utc::now(), fullchain_pem, privkey_pem)
 }
 
-/// The modification times of the pinned certificate material. The TLS listener
-/// compares this pair to reload only when Certbot actually replaced the files,
+pub type PinnedMaterialStamp = (
+    Option<(u64, u64)>,
+    Option<std::time::SystemTime>,
+    Option<std::time::SystemTime>,
+);
+
+/// The directory generation and modification times of pinned material. The TLS listener
+/// compares these to reload only when Certbot actually replaced the files,
 /// instead of reading, parsing and rebuilding a server configuration for every
 /// accepted connection. Each element is `None` when that file is missing, which
 /// keeps "deleted" distinguishable from "unchanged".
 pub fn pinned_material_stamp(
     store: &DeploymentStore,
     config: &DeploymentConfig,
-) -> (Option<std::time::SystemTime>, Option<std::time::SystemTime>) {
+) -> PinnedMaterialStamp {
     let directory = pinned_directory(store, config);
+    #[cfg(unix)]
+    let generation = {
+        use std::os::unix::fs::MetadataExt;
+        fs::symlink_metadata(&directory)
+            .ok()
+            .filter(|m| m.is_dir())
+            .map(|m| (m.dev(), m.ino()))
+    };
+    #[cfg(not(unix))]
+    let generation = None;
     let stamp = |name: &str| {
         fs::metadata(directory.join(name))
             .and_then(|metadata| metadata.modified())
             .ok()
     };
-    (stamp("fullchain.pem"), stamp("privkey.pem"))
+    (generation, stamp("fullchain.pem"), stamp("privkey.pem"))
 }
 
 fn load_directory_at(
@@ -224,6 +250,16 @@ fn load_directory_at(
             host: host.clone(),
             detail: error.to_string(),
         })?;
+    validate_material(config, now, fullchain_pem, privkey_pem)
+}
+
+fn validate_material(
+    config: &DeploymentConfig,
+    now: DateTime<Utc>,
+    fullchain_pem: Vec<u8>,
+    privkey_pem: Vec<u8>,
+) -> Result<ValidatedCertificate, CertificateError> {
+    let host = config.subscription_host.clone();
     let mut chain_reader = BufReader::new(&fullchain_pem[..]);
     let chain = rustls_pemfile::certs(&mut chain_reader)
         .collect::<Result<Vec<_>, _>>()
@@ -411,9 +447,8 @@ fn publish(
 }
 
 /// Copies the validated certificate into the sbctl-owned pinned directory. The
-/// copy is atomic (temporary file + rename) and created private, so a renewal
-/// interrupted mid-write never exposes a truncated private key or a file the
-/// service accounts cannot read.
+/// generation is fully staged before Linux atomically exchanges directories,
+/// so a failed key write cannot leave the newly published certificate behind.
 pub fn pin(
     store: &DeploymentStore,
     config: &DeploymentConfig,
@@ -425,15 +460,15 @@ pub fn pin(
             "certificate service group is missing".into(),
         ));
     }
-    prepare_private_directory(store.root(), &directory)
-        .map_err(|error| CertificateError::Storage(error.to_string()))?;
-    for (name, contents) in [
-        ("fullchain.pem", validated.fullchain_pem.as_slice()),
-        ("privkey.pem", validated.privkey_pem.as_slice()),
-    ] {
-        write_private_material(store.root(), &directory.join(name), contents)
-            .map_err(|error| CertificateError::Storage(error.to_string()))?;
-    }
+    write_private_pair(
+        store.root(),
+        &directory,
+        &[
+            ("fullchain.pem", validated.fullchain_pem.as_slice()),
+            ("privkey.pem", validated.privkey_pem.as_slice()),
+        ],
+    )
+    .map_err(|error| CertificateError::Storage(error.to_string()))?;
     Ok(())
 }
 
@@ -448,7 +483,7 @@ fn shared_group_is_present(root: &Path) -> bool {
 /// Directory and file modes are applied through the opened inode. Bootstrap
 /// generation may precede creation of the shared service group; live pinning
 /// requires that group above before any certificate material is published.
-pub(crate) fn prepare_private_directory(root: &Path, directory: &Path) -> std::io::Result<()> {
+fn prepare_private_directory(root: &Path, directory: &Path) -> std::io::Result<()> {
     crate::managed_fs::create_directory(directory)?;
     #[cfg(unix)]
     {
@@ -472,25 +507,32 @@ pub(crate) fn prepare_private_directory(root: &Path, directory: &Path) -> std::i
     Ok(())
 }
 
-pub(crate) fn write_private_material(
+pub(crate) fn write_private_pair(
     root: &Path,
-    path: &Path,
-    contents: &[u8],
+    directory: &Path,
+    files: &[(&str, &[u8])],
 ) -> std::io::Result<()> {
-    crate::managed_fs::atomic_write(path, contents, |file| {
+    prepare_private_directory(root, directory)?;
+    let policy = |file: &fs::File, mode| {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
             if root == Path::new("/") && shared_group_is_present(root) {
-                crate::config::set_open_file_owner_mode(root, file, "root:sbctl-cert", 0o640)?;
+                crate::config::set_open_file_owner_mode(root, file, "root:sbctl-cert", mode)?;
             } else {
-                file.set_permissions(fs::Permissions::from_mode(0o640))?;
+                file.set_permissions(fs::Permissions::from_mode(mode))?;
             }
         }
         #[cfg(not(unix))]
-        let _ = (root, file);
+        let _ = (root, file, mode);
         Ok(())
-    })
+    };
+    crate::managed_fs::replace_files(
+        directory,
+        files,
+        |file| policy(file, 0o750),
+        |file| policy(file, 0o640),
+    )
 }
 /// A redacted summary used by `status --json` and certificate diagnostics. The
 /// summary never includes the private key, the Subscription credential, or a
@@ -877,6 +919,32 @@ mod tests {
                 mode
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn directory_generation_detects_a_new_pin_even_with_identical_file_timestamps() {
+        let fixture = TempDir::new().unwrap();
+        write_certificate(&fixture, &["sub.example.test"]);
+        let (store, config) = direct_store(&fixture);
+        let validated = load_at(&store, &config, mid_2025()).unwrap();
+        let pin_with_same_timestamps = || {
+            pin(&store, &config, &validated).unwrap();
+            for name in ["fullchain.pem", "privkey.pem"] {
+                fs::File::open(store.certificate_directory("sub.example.test").join(name))
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(std::time::UNIX_EPOCH))
+                    .unwrap();
+            }
+            super::pinned_material_stamp(&store, &config)
+        };
+        let before = pin_with_same_timestamps();
+        let after = pin_with_same_timestamps();
+        assert_eq!((before.1, before.2), (after.1, after.2));
+        assert_ne!(
+            before, after,
+            "a directory swap invalidates the TLS cache despite equal mtimes"
+        );
     }
 
     #[test]

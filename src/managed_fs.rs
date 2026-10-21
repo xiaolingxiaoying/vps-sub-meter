@@ -47,13 +47,13 @@ mod platform {
         io::{AsRawFd, FromRawFd},
     };
 
-    fn c_name(name: &OsStr) -> io::Result<CString> {
+    pub(super) fn c_name(name: &OsStr) -> io::Result<CString> {
         validate_file_name(name)?;
         CString::new(name.as_bytes())
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "managed name contains NUL"))
     }
 
-    fn open_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
+    pub(super) fn open_at(directory: &File, name: &CStr, flags: libc::c_int) -> io::Result<File> {
         let fd = unsafe {
             libc::openat(
                 directory.as_raw_fd(),
@@ -196,13 +196,17 @@ mod platform {
 
     pub(crate) fn open_lock(path: &Path) -> io::Result<File> {
         let directory = open_directory(path, true)?;
+        open_lock_in(&directory)
+    }
+
+    pub(super) fn open_lock_in(directory: &File) -> io::Result<File> {
         let name = c_name(OsStr::new(".operation.lock"))?;
         let flags = libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK;
         loop {
-            let file = match open_at(&directory, &name, flags) {
+            let file = match open_at(directory, &name, flags) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    match open_at(&directory, &name, flags | libc::O_CREAT | libc::O_EXCL) {
+                    match open_at(directory, &name, flags | libc::O_CREAT | libc::O_EXCL) {
                         Ok(file) => file,
                         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
                         Err(error) => return Err(error),
@@ -455,3 +459,7 @@ mod platform {
 }
 
 pub(crate) use platform::{atomic_write, create_directory, open_lock, remove_file};
+
+#[path = "managed_directory.rs"]
+mod directory;
+pub(crate) use directory::{read_pair, replace_files};

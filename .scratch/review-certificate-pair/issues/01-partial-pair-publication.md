@@ -1,5 +1,5 @@
 # 第二个文件写入失败会留下混合代证书
-Status: needs-triage
+Status: claimed
 Type: research
 
 certificate::pin 分别提交 fullchain.pem 和 privkey.pem。单文件原子性不能保证二者同一代。待使用只影响隔离 CLI 的 RLIMIT_FSIZE 在首个证书提交后使第二个密钥写入失败，检查是否保留旧可用对；复现后再设计成对发布和恢复，避免仅将错误吞掉或靠重试掩盖。
