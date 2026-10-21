@@ -453,11 +453,18 @@ pub(crate) fn prepare_private_directory(root: &Path, directory: &Path) -> std::i
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let file = crate::config::open_managed_path_no_follow(directory)?;
-        if root == Path::new("/") && shared_group_is_present(root) {
-            crate::config::set_open_file_owner_mode(root, &file, "root:sbctl-cert", 0o750)?;
-        } else {
-            file.set_permissions(fs::Permissions::from_mode(0o750))?;
+        // The shared storage parent is also created private by managed_fs.
+        // Both service accounts need traversal before reaching the host copy.
+        for path in [
+            root.join(crate::config::CERTIFICATES_RELATIVE_PATH),
+            directory.to_owned(),
+        ] {
+            let file = crate::config::open_managed_path_no_follow(&path)?;
+            if root == Path::new("/") && shared_group_is_present(root) {
+                crate::config::set_open_file_owner_mode(root, &file, "root:sbctl-cert", 0o750)?;
+            } else {
+                file.set_permissions(fs::Permissions::from_mode(0o750))?;
+            }
         }
     }
     #[cfg(not(unix))]

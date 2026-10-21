@@ -71,35 +71,42 @@ def main():
         assert result.returncode == 0, result.stderr
         write(root, 'etc/sing-box/config.json',
               (root / 'var/lib/sbctl/artifacts/sing-box-server.json').read_text())
+        # Exercise a first real pin. Pre-seeding the pinned directory's modes
+        # hides failures to grant traversal of newly created storage parents.
+        live_dir = root / 'etc/letsencrypt/live/sub.example.test'
+        live_dir.mkdir(parents=True)
+        subprocess.run(['/usr/bin/openssl', 'req', '-x509', '-newkey', 'rsa:2048',
+                        '-nodes', '-days', '1', '-subj', '/CN=sub.example.test',
+                        '-addext', 'subjectAltName=DNS:sub.example.test',
+                        '-keyout', str(live_dir / 'privkey.pem'),
+                        '-out', str(live_dir / 'fullchain.pem')],
+                       check=True, capture_output=True, timeout=30)
+        result = chroot('/usr/local/bin/sbctl', 'certificate', 'verify')
+        assert result.returncode == 0, result.stderr
         cert_dir = root / 'var/lib/sbctl/certificates/sub.example.test'
-        cert_dir.mkdir(parents=True, exist_ok=True)
-        for name in ['fullchain.pem', 'privkey.pem']:
-            path = write(root, f'var/lib/sbctl/certificates/sub.example.test/{name}',
-                         'temporary permission-check sentinel\n')
-            os.chown(path, 0, 65002)
-            path.chmod(0o640)
         for directory in [cert_dir.parent, cert_dir]:
-            os.chown(directory, 0, 65002)
-            directory.chmod(0o750)
+            assert directory.stat().st_gid == 65002, 'fresh pin must grant the shared certificate group'
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o750, 'fresh pin must grant parent traversal'
         result = chroot('/usr/local/bin/sbctl', 'regenerate')
         assert result.returncode == 0, result.stderr
         for directory in [root / 'var', root / 'var/lib']:
             directory.chmod(0o755)
         key = '/var/lib/sbctl/certificates/sub.example.test/privkey.pem'
 
-        def readable():
+        def readable(uid=65000):
             def enter_daemon():
                 os.chroot(root)
                 os.chdir('/')
                 os.setgroups([65002])
-                os.setgid(65000)
-                os.setuid(65000)
+                os.setgid(uid)
+                os.setuid(uid)
             probe = subprocess.run(['/usr/bin/test', '-r', key], preexec_fn=enter_daemon,
                                    capture_output=True, text=True, timeout=5)
             assert not probe.stderr, probe.stderr
             return probe.returncode == 0
 
         assert readable(), 'initial Direct permission policy must permit the subscription daemon'
+        assert readable(65001), 'first pin must permit the sing-box data plane'
         before = (root / key.lstrip('/')).stat()
         result = chroot('/usr/local/bin/sbctl', 'sing-box', 'api', 'enable', '--port', '19090')
         assert result.returncode == 2, result.stderr
@@ -107,7 +114,7 @@ def main():
         assert readable(), 'API recovery must preserve certificate access for the subscription daemon'
         assert before.st_gid == after.st_gid == 65002
         assert stat.S_IMODE(after.st_mode) == 0o640
-        print('Direct API rollback preserved root:sbctl-cert 0640 and actual daemon read access')
+        print('Fresh Direct pin grants both service UIDs access; API rollback preserves root:sbctl-cert 0640')
 
 
 if __name__ == '__main__':
