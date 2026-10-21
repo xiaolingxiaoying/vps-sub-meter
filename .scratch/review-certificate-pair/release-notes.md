@@ -6,4 +6,4 @@
 
 兼容性：固定文件路径不变，另一对自签名文件及常规辅助文件保留原内容、属主、权限和 inode；主机证书目录包含链接、子目录或特殊文件时明确拒绝发布，保留旧代。每份 PEM 上限 1 MiB，目录最多 1024 项。Linux 生产需要支持 RENAME_EXCHANGE 的本地文件系统；不以不完整提交方式降级。
 
-内部保留文件名为 .sbctl-refresh-pending。发布前需通过本地门禁、Actions 构建、三发行版 systemd 和授权 VPS 的故障注入与真实服务验收。
+内部保留文件名为 .sbctl-refresh-pending。512 项 Rust 测试、Clippy、双架构生产构建和三发行版 systemd 门禁通过；Actions 产物在授权 VPS 通过写入故障、刷新失败重试、真实核心证书握手、覆写与回滚、12 种订阅及二维码、五协议外部 HTTPS 204 验收。正式签名升级后再次通过外部验收，定时器已恢复，自动恢复任务已停止。两个特权发布命令并发时的确认代际绑定仍在后续审查范围。详见[验收记录](https://github.com/xiaolingxiaoying/vps-sub-meter/blob/dev/.scratch/review-certificate-pair/verification.md)。
