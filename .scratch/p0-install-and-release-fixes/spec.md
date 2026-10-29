@@ -1,6 +1,6 @@
 # P0 安装与发布修复（spec）
 
-Status: ready-for-agent
+Status: resolved
 
 ## 目标
 
@@ -63,3 +63,7 @@ P1/P2 的其余条目（`switch-mode`、`--bind`、总览页流量口径、manif
 | 06 | `issues/06-installer-decides-before-writing.md` | 已落地 | `verify-bootstrap.sh` 待跑 |
 | 07 | `issues/07-install-bare-invocation.md` | 已落地 | CLI 测试已过 |
 | 08 | `issues/08-server-acceptance-and-release-gate.md` | 已落地 | CI job 待首跑 |
+
+## Resolution
+
+八张工单的实现均在当前工作树，2026-10-28 全量 Linux 门禁通过；剩余发布动作仍受真实签名密钥/Release 流程约束。

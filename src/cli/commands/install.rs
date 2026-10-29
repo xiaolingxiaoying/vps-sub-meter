@@ -30,6 +30,7 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         return ExitCode::from(2);
     }
     let mut installation_started = false;
+    let mut config_committed = false;
     let mut state_before_install = sbctl::lifecycle::PreexistingState::default();
     let mut replacement_backup = None;
     if let Err(error) = sbctl::preflight::require_install_privileges(root) {
@@ -224,6 +225,17 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 }
             },
         };
+        let store = sbctl::config::DeploymentStore::new(root);
+        // Serialize artifact generation and the configuration commit with every
+        // other sbctl writer. A second install that started before the winner
+        // committed must not overwrite the winner's artifacts or binaries just
+        // because its own preflight ran earlier.
+        let operation_lock = store
+            .acquire_operation_lock()
+            .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        if root.join("etc/sbctl/config.toml").exists() {
+            return Err(sbctl::config::ConfigError::AlreadyExists);
+        }
         let mut artifacts = sbctl::subscription::generated_artifacts_for_kernel(
             &config,
             root,
@@ -264,13 +276,16 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             .expect("generated server config");
         sbctl::subscription::check_sing_box_config(&sing_box_bin, server)
             .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-        sbctl::lifecycle::install_checked_sing_box(root, &sing_box_bin)?;
         let references = artifacts
             .iter()
             .map(|(name, contents)| (name.clone(), contents.as_bytes()))
             .collect::<Vec<_>>();
-        let store = sbctl::config::DeploymentStore::new(root);
-        store.initialize_with_artifacts(&config, &references)?;
+        store.initialize_with_artifacts_locked(&config, &references)?;
+        config_committed = true;
+        drop(operation_lock);
+        // Only the winning transaction writes the data-plane binary. A late
+        // install that lost the race above must not replace it.
+        sbctl::lifecycle::install_checked_sing_box(root, &sing_box_bin)?;
         let direct = config.subscription_mode == sbctl::config::SubscriptionMode::Direct;
         if !options.no_start {
             sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)
@@ -336,8 +351,31 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(error) => {
-            if installation_started {
-                sbctl::lifecycle::rollback_fresh_installation(root, state_before_install);
+            // Another transaction may have committed a deployment after this
+            // one sampled `state_before_install`. Its configuration is not ours
+            // to roll back; re-check under the operation lock and leave the
+            // winner untouched.
+            let store = sbctl::config::DeploymentStore::new(root);
+            let concurrent = !config_committed
+                && !state_before_install.config
+                && root.join("etc/sbctl/config.toml").exists();
+            if installation_started && !concurrent {
+                let _lock = store.acquire_operation_lock().ok();
+                let concurrent_now =
+                    !config_committed && root.join("etc/sbctl/config.toml").exists();
+                if concurrent_now {
+                    eprintln!(
+                        "another installation completed while this one was running; \
+                         its deployment was left untouched"
+                    );
+                } else {
+                    sbctl::lifecycle::rollback_fresh_installation(root, state_before_install);
+                }
+            } else if concurrent {
+                eprintln!(
+                    "another installation completed while this one was running; \
+                     its deployment was left untouched"
+                );
             }
             if let Some(backup) = replacement_backup {
                 if let Err(restore_error) =

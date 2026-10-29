@@ -1,6 +1,6 @@
 # 05 官方内核下载 fail-closed，且只解出预期归档成员
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -40,3 +40,7 @@ warning 并继续：以 root `tar -xzf` 整个归档（无成员校验、无 `--
 cargo test --lib -- update::tests::a_missing_upstream_digest_fails_closed_before_any_download
 cargo test --lib -- update::tests::archive_member_names_that_tar_must_never_extract_as_root_are_rejected
 ```
+
+## Resolution
+
+摘要缺失 fail-closed、成员校验与单成员解压已落地；`OfficialChecksumUnavailable`/成员测试通过。

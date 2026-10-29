@@ -322,13 +322,13 @@ pub fn run<C: Prompts>(
         accounting_policy,
         anchored_reset_at,
     ) = if existing.is_some() {
-        let monthly_traffic_limit = ask_value(
+        let monthly_traffic_limit = ask_traffic_limit(
             prompts,
             "每月流量上限（GiB，0 = 不限；可输入 GB）",
-            existing.map(|config| crate::traffic::format_gib(config.monthly_traffic_limit)),
-            crate::traffic::parse_traffic_amount,
-        )?
-        .unwrap_or(0);
+            existing
+                .map(|config| config.monthly_traffic_limit)
+                .unwrap_or(0),
+        )?;
         let accounting_timezone = ask_required(
             prompts,
             "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
@@ -457,13 +457,11 @@ pub fn ask_initial_customization<C: Prompts>(
         "自定义 VPS 流量限额与账期？（默认：不限额、美西自然月刷新、上海显示）",
         false,
     )? {
-        config.monthly_traffic_limit = ask_value(
+        config.monthly_traffic_limit = ask_traffic_limit(
             prompts,
             "每月流量上限（GiB，0 = 不限；可输入 GB）",
-            Some(crate::traffic::format_gib(config.monthly_traffic_limit)),
-            crate::traffic::parse_traffic_amount,
-        )?
-        .unwrap_or(0);
+            config.monthly_traffic_limit,
+        )?;
         config.accounting_timezone = ask_required(
             prompts,
             "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
@@ -706,13 +704,11 @@ pub fn run_topic<C: Prompts>(
             return Ok(WizardOutcome::Changed(new));
         }
         ConfigurationTopic::Traffic => {
-            monthly_traffic_limit = ask_value(
+            monthly_traffic_limit = ask_traffic_limit(
                 prompts,
                 "每月流量上限（GiB，0 = 不限；可输入 GB）",
-                Some(crate::traffic::format_gib(monthly_traffic_limit)),
-                crate::traffic::parse_traffic_amount,
-            )?
-            .unwrap_or(0);
+                monthly_traffic_limit,
+            )?;
             accounting_timezone = ask_required(
                 prompts,
                 "VPS 刷新时区（1 美西 / 2 美东 / 3 中国 / 或直接输入 IANA）",
@@ -869,6 +865,27 @@ fn ask_value<C: Prompts, T>(
         }
         match parse(&answer) {
             Ok(value) => return Ok(Some(value)),
+            Err(message) => prompts.report(&message),
+        }
+    }
+}
+
+/// Asks for a monthly traffic limit while preserving the exact persisted byte
+/// count on an empty answer. Rendering the current value as GiB and reparsing
+/// it would zero a small byte limit (`0.00 GiB`) or round any value that is not
+/// an exact 0.01 GiB multiple.
+fn ask_traffic_limit<C: Prompts>(
+    prompts: &mut C,
+    label: &str,
+    current: u64,
+) -> Result<u64, WizardError> {
+    loop {
+        let answer = prompts.ask(label, Some(&crate::traffic::format_gib(current)))?;
+        if answer.trim().is_empty() {
+            return Ok(current);
+        }
+        match crate::traffic::parse_traffic_amount(&answer) {
+            Ok(value) => return Ok(value),
             Err(message) => prompts.report(&message),
         }
     }
@@ -1320,6 +1337,26 @@ mod tests {
                 .iter()
                 .any(|message| message.contains("新的统计周期")),
             "display-only timezone changes must not warn about resetting accounting"
+        );
+    }
+
+    #[test]
+    fn traffic_topic_keeps_an_exact_byte_limit_on_empty_input() {
+        let mut config = ip_fallback_config();
+        config.monthly_traffic_limit = 1000;
+        // Empty limit, empty refresh zone, a display-zone change, empty policy.
+        let answers = ["", "", "Asia/Tokyo", "", ""];
+        let mut prompts = ScriptPrompts::new(&answers, &[true]);
+
+        let outcome = run_topic(&config, ConfigurationTopic::Traffic, &mut prompts)
+            .expect("traffic topic completes");
+
+        let WizardOutcome::Changed(updated) = outcome else {
+            panic!("changing the display timezone must produce a new configuration");
+        };
+        assert_eq!(
+            updated.monthly_traffic_limit, 1000,
+            "an empty answer must preserve the exact byte limit, not reparse 0.00 GiB"
         );
     }
 

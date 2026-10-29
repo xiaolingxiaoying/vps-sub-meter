@@ -1,6 +1,6 @@
 # 01 发布流水线：本仓库自己生产签名 Release
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -48,3 +48,7 @@ manifest、不生成 `install.sh`、不创建 Release。整条信任链没有生
 
 GitHub 托管 arm64 runner 为 `ubuntu-24.04-arm`；若该 runner 在目标仓库不可用，
 退化为 `cross` 构建并在本工单记录偏差。
+
+## Resolution
+
+`release.yml`、runtime pins、manifest 生成与信任锚门禁已落地；2026-10-28 全量门禁通过，真实 VPS 验收继续使用本地构建而非 Actions。

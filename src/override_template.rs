@@ -243,9 +243,13 @@ fn load_yaml_layered(
     let mut layers = Vec::new();
     for (path, document) in documents {
         let (rules_mode, document) = take_yaml_rules_mode(document, &path)?;
-        if !document
-            .as_mapping()
-            .is_some_and(serde_yaml::Mapping::is_empty)
+        // A comments-only (or `null`) override is how an operator disables a
+        // file without deleting it. serde_yaml parses it as Null; treating it
+        // as a layer would replace the whole generated mapping with null.
+        if !document.is_null()
+            && !document
+                .as_mapping()
+                .is_some_and(serde_yaml::Mapping::is_empty)
         {
             layers.push((rules_mode, document));
         }
@@ -659,6 +663,31 @@ mod tests {
             Overrides::load(root),
             Err(OverrideError::NotMapping { .. })
         ));
+    }
+
+    #[test]
+    fn a_comments_only_yaml_override_is_ignored_instead_of_replacing_artifacts() {
+        let directory = tempfile::tempdir().expect("temporary root");
+        let root = directory.path();
+        let overrides = root.join("etc/sbctl/overrides");
+        fs::create_dir_all(overrides.join("clash.d")).expect("directories are created");
+        fs::write(
+            root.join(CLASH_OVERRIDE_RELATIVE_PATH),
+            "# temporarily disabled\n",
+        )
+        .expect("comments-only override is written");
+        fs::write(overrides.join("clash.d").join("10-null.yaml"), "null\n")
+            .expect("null drop-in is written");
+
+        let loaded = Overrides::load(root).expect("disabled overrides load as empty");
+        assert!(
+            loaded.clash.is_none(),
+            "a disabled override must not become a null merge layer"
+        );
+        assert!(
+            loaded.is_empty(),
+            "comments and null documents must not trigger the merged-profile check"
+        );
     }
 
     #[test]

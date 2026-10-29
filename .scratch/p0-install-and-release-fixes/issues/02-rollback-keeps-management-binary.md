@@ -1,6 +1,6 @@
 # 02 安装回滚不得删除事务外的管理二进制
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -40,3 +40,7 @@ Status: ready-for-agent
 cargo test --lib -- lifecycle::tests::a_rollback_keeps_a_management_binary_that_predates_the_transaction
 cargo test --features sbctl/test-signing --test cli -- a_failed_install
 ```
+
+## Resolution
+
+`PreexistingState.management_binary` 与回滚豁免已落地；`a_rollback_keeps_a_management_binary_that_predates_the_transaction` 通过。

@@ -1,6 +1,6 @@
 # 07 `sbctl install` 早退判据覆盖全部参数
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -37,3 +37,7 @@ Status: ready-for-agent
 cargo test --features sbctl/test-signing --test cli -- install_arguments_that_carry_intent
 cargo test --features sbctl/test-signing --test cli -- install_reports_a_supported_systemd_fixture_as_ready
 ```
+
+## Resolution
+
+`InstallOptions::is_bare` 穷尽解构与早退判据已落地；`install_arguments_that_carry_intent_never_report_a_preflight_as_success` 通过。

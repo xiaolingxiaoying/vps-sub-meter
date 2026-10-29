@@ -1,6 +1,6 @@
 # 03 证书写入必须落在安装事务内
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -35,3 +35,7 @@ existing deployment，所以一次 `sing-box check` 失败就会让**后续每�
 ```bash
 cargo test --features sbctl/test-signing --test cli -- a_failed_install
 ```
+
+## Resolution
+
+`installation_started` 已前移；证书目录失败安装后回滚，`a_failed_install_can_be_retried_without_manual_cleanup` 通过。

@@ -62,10 +62,13 @@ async fn serve_direct_socket_activated(
     let mut acme = None;
     let mut tls = None;
     for (port, listener) in listeners {
-        match crate::socket_activation::direct_listener_role(port) {
-            Some(crate::socket_activation::DirectListenerRole::Acme) => acme = Some(listener),
-            Some(crate::socket_activation::DirectListenerRole::Tls) => tls = Some(listener),
+        let slot = match crate::socket_activation::direct_listener_role(port) {
+            Some(crate::socket_activation::DirectListenerRole::Acme) => &mut acme,
+            Some(crate::socket_activation::DirectListenerRole::Tls) => &mut tls,
             None => return Err(SubscriptionError::UnexpectedDirectListener(port)),
+        };
+        if slot.replace(listener).is_some() {
+            return Err(SubscriptionError::DuplicateDirectListener(port));
         }
     }
     let acme = tokio_listener(acme.ok_or(SubscriptionError::MissingDirectListener(80))?)?;
@@ -118,6 +121,7 @@ const TLS_METRICS_LOG_INTERVAL: Duration = Duration::from_secs(60);
 const MAX_CONCURRENT_CONNECTIONS: usize = 32;
 const MAX_CONNECTIONS_PER_PEER: usize = 8;
 const ACCEPT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(50);
 
 /// Charge before TLS or HTTP parsing: the request budget cannot see a peer
 /// that never finishes its handshake or headers. Track only active sources,
@@ -308,15 +312,48 @@ async fn accept_next(
     listener: &TcpListener,
     max_requests: Option<usize>,
 ) -> Result<Option<tokio::net::TcpStream>, SubscriptionError> {
-    if max_requests.is_none() {
-        let (stream, _) = listener.accept().await.map_err(listener_io)?;
-        return Ok(Some(stream));
+    loop {
+        let accepted = if max_requests.is_none() {
+            listener.accept().await
+        } else {
+            match tokio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
+                Ok(result) => result,
+                Err(_) => return Ok(None),
+            }
+        };
+        match accepted {
+            Ok((stream, _)) => return Ok(Some(stream)),
+            // A client that resets between the TCP handshake and accept makes
+            // Linux return ECONNABORTED. Treating that as fatal would let one
+            // scanner stop the whole subscription service (and Direct mode
+            // would drop both 80 and 443 together). EMFILE/ENFILE are retried
+            // after a short pause so an fd spike does not kill the listener.
+            Err(error) if transient_accept_error(&error) => {
+                tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+            }
+            Err(error) => return Err(listener_io(error)),
+        }
     }
-    match tokio::time::timeout(ACCEPT_POLL_INTERVAL, listener.accept()).await {
-        Ok(Ok((stream, _))) => Ok(Some(stream)),
-        Ok(Err(error)) => Err(listener_io(error)),
-        Err(_) => Ok(None),
-    }
+}
+
+fn transient_accept_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        std::io::ErrorKind::ConnectionAborted | std::io::ErrorKind::Interrupted
+    ) || resource_exhausted(error)
+}
+
+#[cfg(unix)]
+fn resource_exhausted(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EMFILE) | Some(libc::ENFILE)
+    )
+}
+
+#[cfg(not(unix))]
+fn resource_exhausted(_error: &std::io::Error) -> bool {
+    false
 }
 
 fn listener_io(error: std::io::Error) -> SubscriptionError {
@@ -1166,6 +1203,25 @@ mod tests {
 
     fn peer(last: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(203, 0, 113, last))
+    }
+
+    #[test]
+    fn transient_accept_errors_are_retried_instead_of_stopping_the_service() {
+        use std::io::{Error, ErrorKind};
+
+        assert!(super::transient_accept_error(&Error::from(
+            ErrorKind::ConnectionAborted
+        )));
+        assert!(super::transient_accept_error(&Error::from(
+            ErrorKind::Interrupted
+        )));
+        assert!(!super::transient_accept_error(&Error::from(
+            ErrorKind::InvalidInput
+        )));
+        #[cfg(unix)]
+        assert!(super::transient_accept_error(&Error::from_raw_os_error(
+            libc::EMFILE
+        )));
     }
 
     #[tokio::test]

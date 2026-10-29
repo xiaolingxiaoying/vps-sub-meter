@@ -75,3 +75,6 @@ node_modules/
 # Fixed-core binaries and local sbcli smoke stores.
 /.scratch/client-cli/acceptance-artifacts/
 /.scratch/client-cli/smoke-data/
+
+# Local VPS acceptance scripts and downloaded client binaries.
+/.scratch/vps-local/

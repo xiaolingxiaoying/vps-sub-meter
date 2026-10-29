@@ -76,12 +76,14 @@ pub(crate) fn run_certificate(root: &Path, command: CertificateCommand) -> ExitC
             CertificateCommand::Status => unreachable!("handled before the operation match"),
         }
         .and_then(|validated| {
-            if sbctl::certificate::pinned_material_stamp(&store, &config) != before
-                || sbctl::certificate::refresh_pending(&store, &config)?
-            {
+            let after = sbctl::certificate::pinned_material_stamp(&store, &config);
+            if after != before || sbctl::certificate::refresh_pending(&store, &config)? {
                 sbctl::lifecycle::refresh_certificate_consumer(root)
                     .map_err(sbctl::certificate::CertificateError::Storage)?;
-                sbctl::certificate::clear_refresh_pending(&store, &config)?;
+                // A concurrent publisher may have exchanged in a newer
+                // generation while this command refreshed the data plane. Its
+                // marker must survive for that publisher's confirmation.
+                let _ = sbctl::certificate::clear_refresh_pending(&store, &config, after.0)?;
             }
             println!(
                 "certificate for {} is valid until {}",

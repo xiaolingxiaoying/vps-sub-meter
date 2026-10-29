@@ -1,6 +1,6 @@
 # 06 安装器先决策、后落盘
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -30,3 +30,7 @@ Status: ready-for-agent
 ## 实现
 
 `scripts/install.sh`、`tests/acceptance/verify-bootstrap.sh`。
+
+## Resolution
+
+安装器先验签/预检/询问再落盘；“保留并退出”不改二进制；2026-10-28 补了 `--guided` 管道输入重定向。

@@ -38,7 +38,10 @@ pub fn parse_traffic_amount(value: &str) -> Result<u64, String> {
         return Err("流量必须是非负数字".to_owned());
     }
     let bytes = amount * BYTES_PER_GIB;
-    if bytes > u64::MAX as f64 {
+    // `u64::MAX as f64` rounds up to 2^64, so `>` would accept exactly 2^64
+    // and then saturate the cast to u64::MAX. Reject the boundary itself.
+    const TWO_TO_THE_64: f64 = 18_446_744_073_709_551_616.0;
+    if bytes >= TWO_TO_THE_64 {
         return Err("流量数值过大".to_owned());
     }
     Ok(bytes.floor() as u64)
@@ -458,17 +461,22 @@ pub fn set_used_with_runtime<C: crate::runtime::Clock>(
     runtime: &Runtime<C>,
     target: CorrectionTarget,
 ) -> Result<CorrectionPreview, TrafficError> {
-    let period = accounting_period(config, runtime.now_utc())?;
     let _lock = store
         .acquire_operation_lock()
         .map_err(TrafficError::Storage)?;
+    // Read the instant only after the lock: a correction queued across an
+    // accounting boundary must evaluate the new period and fail as stale if
+    // the state still describes the old one, instead of writing a record the
+    // reset immediately discards.
+    let now = runtime.now_utc();
+    let period = accounting_period(config, now)?;
     let prior = store.read_state()?.ok_or(TrafficError::StateMissing)?;
     let state = decode_state(&prior).map_err(TrafficError::Storage)?;
     if state.cycle_key != period.cycle_key() || state.interface != config.interface {
         return Err(TrafficError::StateStale);
     }
     let measurements = read_measurements(runtime, &config.interface)?;
-    let plan = plan_correction(&state, &period, &measurements, runtime.now_utc(), target)?;
+    let plan = plan_correction(&state, &period, &measurements, now, target)?;
     println!("{}", plan.preview.summary());
     let contents = serde_json::to_vec(&plan.state)
         .map_err(|error| ConfigError::StateContent(error.to_string()))?;
@@ -855,6 +863,11 @@ mod tests {
         assert!(parse_traffic_amount("").is_err());
         assert!(parse_traffic_amount("-1").is_err());
         assert!(parse_traffic_amount("not-a-number").is_err());
+        assert!(
+            parse_traffic_amount("17179869184").is_err(),
+            "exactly 2^64 bytes must be rejected, not saturated to u64::MAX"
+        );
+        assert!(parse_traffic_amount("17179869183").is_ok());
     }
 
     #[test]

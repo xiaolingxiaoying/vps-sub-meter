@@ -154,7 +154,7 @@ fn live_directory(store: &DeploymentStore, config: &DeploymentConfig) -> PathBuf
     store
         .root()
         .join("etc/letsencrypt/live")
-        .join(&config.subscription_host)
+        .join(config.subscription_host.to_ascii_lowercase())
 }
 
 /// The sbctl-owned copy that both service accounts read from.
@@ -199,8 +199,13 @@ pub fn load_pinned(
     validate_material(config, Utc::now(), fullchain_pem, privkey_pem)
 }
 
+/// The directory generation identity of the pinned certificate copy. The
+/// identity is `None` on platforms that do not expose a stable directory
+/// inode through the development adapter.
+pub type PinnedGeneration = Option<(u64, u64)>;
+
 pub type PinnedMaterialStamp = (
-    Option<(u64, u64)>,
+    PinnedGeneration,
     Option<std::time::SystemTime>,
     Option<std::time::SystemTime>,
 );
@@ -354,13 +359,14 @@ pub fn obtain_with_runtime<C: crate::runtime::Clock>(
         ))
     })?;
     let webroot = webroot.to_string_lossy();
+    let host = config.subscription_host.to_ascii_lowercase();
     let mut args: Vec<&str> = vec![
         "certonly",
         "--webroot",
         "--webroot-path",
         webroot.as_ref(),
         "--domain",
-        config.subscription_host.as_str(),
+        host.as_str(),
     ];
     match email.map(str::trim).filter(|email| !email.is_empty()) {
         Some(email) => {
@@ -393,15 +399,11 @@ pub fn renew_with_runtime<C: crate::runtime::Clock>(
     config: &DeploymentConfig,
 ) -> Result<ValidatedCertificate, CertificateError> {
     require_direct(config)?;
+    let host = config.subscription_host.to_ascii_lowercase();
     let (status, output) = runtime
         .run_command_output(
             "certbot",
-            &[
-                "renew",
-                "--cert-name",
-                &config.subscription_host,
-                "--non-interactive",
-            ],
+            &["renew", "--cert-name", &host, "--non-interactive"],
         )
         .map_err(|error| CertificateError::Certbot(error.to_string()))?;
     certbot_result(status, output)?;
@@ -553,18 +555,26 @@ pub fn refresh_pending(
     }
 }
 
+/// Acknowledges the refresh only for the generation the caller just refreshed.
+/// Returns `false` when a concurrent publisher exchanged in a newer generation:
+/// its marker belongs to that publisher, whose own command must confirm the
+/// refresh. Removal is relative to the opened generation on Linux, so it cannot
+/// be redirected after the check.
 pub fn clear_refresh_pending(
     store: &DeploymentStore,
     config: &DeploymentConfig,
-) -> Result<(), CertificateError> {
-    match crate::managed_fs::remove_file(pinned_directory(store, config).join(REFRESH_PENDING_FILE))
-    {
-        Ok(()) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(CertificateError::Storage(format!(
+    generation: PinnedGeneration,
+) -> Result<bool, CertificateError> {
+    crate::managed_fs::clear_generation_marker(
+        &pinned_directory(store, config),
+        REFRESH_PENDING_FILE,
+        generation,
+    )
+    .map_err(|error| {
+        CertificateError::Storage(format!(
             "certificate refreshed but pending marker could not be cleared: {error}"
-        ))),
-    }
+        ))
+    })
 }
 /// A redacted summary used by `status --json` and certificate diagnostics. The
 /// summary never includes the private key, the Subscription credential, or a
@@ -979,6 +989,34 @@ mod tests {
             before, after,
             "a directory swap invalidates the TLS cache despite equal mtimes"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn refresh_acknowledgement_is_bound_to_the_published_generation() {
+        let fixture = TempDir::new().unwrap();
+        write_certificate(&fixture, &["sub.example.test"]);
+        let (store, config) = direct_store(&fixture);
+        let validated = load_at(&store, &config, mid_2025()).unwrap();
+        pin(&store, &config, &validated).unwrap();
+        let first = super::pinned_material_stamp(&store, &config).0;
+        assert!(super::refresh_pending(&store, &config).unwrap());
+
+        // A concurrent publisher replaces the generation before this caller
+        // acknowledges its own refresh.
+        write_certificate(&fixture, &["sub.example.test"]);
+        let replacement = load_at(&store, &config, mid_2025()).unwrap();
+        pin(&store, &config, &replacement).unwrap();
+        let second = super::pinned_material_stamp(&store, &config).0;
+        assert_ne!(first, second);
+
+        assert!(
+            !super::clear_refresh_pending(&store, &config, first).unwrap(),
+            "a stale generation must not acknowledge the newer marker"
+        );
+        assert!(super::refresh_pending(&store, &config).unwrap());
+        assert!(super::clear_refresh_pending(&store, &config, second).unwrap());
+        assert!(!super::refresh_pending(&store, &config).unwrap());
     }
 
     #[test]

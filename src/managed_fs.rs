@@ -462,4 +462,4 @@ pub(crate) use platform::{atomic_write, create_directory, open_lock, remove_file
 
 #[path = "managed_directory.rs"]
 mod directory;
-pub(crate) use directory::{read_pair, replace_files};
+pub(crate) use directory::{clear_generation_marker, read_pair, replace_files};

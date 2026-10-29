@@ -1,6 +1,6 @@
 # 04 更新回滚按路径恢复属主、权限与可执行位
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -38,3 +38,7 @@ Status: ready-for-agent
 ```bash
 cargo test --lib -- update::tests::a_rollback_restores_the_certbot_hook_executable_bit
 ```
+
+## Resolution
+
+`managed_ownership`、deploy hook 可执行位与 pinned 组恢复已落地；相关库/CLI 测试通过。

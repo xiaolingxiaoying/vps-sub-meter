@@ -154,14 +154,20 @@ fn official_archive_asset(version: &str) -> String {
     )
 }
 
+/// Normalizes a caller-supplied official version to the dotted form used by
+/// asset names, release URLs, and member paths. `parse_version` accepts `v`
+/// prefixes and shorter forms; the raw string must not leak into any of them.
+fn normalize_official_version(version: &str) -> Result<String, UpdateError> {
+    let [major, minor, patch] = crate::release::parse_version(version, "official sing-box version")
+        .map_err(|error| UpdateError::Operation(error.to_string()))?;
+    Ok(format!("{major}.{minor}.{patch}"))
+}
+
 /// The official release-asset URL for one stable version. The version is
 /// validated with the same strict parser the signed manifest uses, so a
 /// pre-release tag or a malformed string can never reach a download URL.
 pub fn official_sing_box_archive_url(version: &str) -> Result<String, UpdateError> {
-    let parsed = crate::release::parse_version(version, "official sing-box version")
-        .map_err(|error| UpdateError::Operation(error.to_string()))?;
-    let [major, minor, patch] = parsed;
-    let version = format!("{major}.{minor}.{patch}");
+    let version = normalize_official_version(version)?;
     Ok(format!(
         "{SING_BOX_OFFICIAL_PROJECT_URL}/releases/download/v{version}/{}",
         official_archive_asset(&version)
@@ -255,9 +261,10 @@ fn official_release_api_url(version: &str) -> Result<String, UpdateError> {
 }
 
 fn fetch_official_archive_digest(version: &str) -> Result<Option<String>, UpdateError> {
-    let url = official_release_api_url(version)?;
+    let version = normalize_official_version(version)?;
+    let url = official_release_api_url(&version)?;
     let release = fetch_official_release_json(&url)?;
-    parse_official_archive_digest(&release.to_string(), &official_archive_asset(version))
+    parse_official_archive_digest(&release.to_string(), &official_archive_asset(&version))
 }
 
 fn parse_official_archive_digest(
@@ -404,9 +411,10 @@ fn official_archive_members(archive: &Path) -> Result<Vec<String>, UpdateError> 
 /// compromised release account) that could suppress the `digest` field could
 /// get an unverified binary executed as root by `confirm_sing_box_candidate`.
 pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<(), UpdateError> {
-    let url = official_sing_box_archive_url(version)?;
+    let version = normalize_official_version(version)?;
+    let url = official_sing_box_archive_url(&version)?;
     let expected_digest =
-        require_official_archive_digest(version, fetch_official_archive_digest(version)?)?;
+        require_official_archive_digest(&version, fetch_official_archive_digest(&version)?)?;
     let archive = tempfile::Builder::new()
         .suffix(".tar.gz")
         .tempfile()
@@ -444,7 +452,7 @@ pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<()
     let extracted = tempfile::tempdir().map_err(|error| {
         UpdateError::DownloadFailed("sing-box", format!("无法创建解压目录：{error}"))
     })?;
-    let member = official_archive_member(version);
+    let member = official_archive_member(&version);
     let listing = official_archive_members(archive.path())?;
     for listed in &listing {
         // A release archive never legitimately contains absolute paths or `..`
@@ -490,7 +498,7 @@ pub fn download_sing_box_official(version: &str, output_bin: &Path) -> Result<()
     }
     let candidate = extracted.path().join(&member);
     let candidate = candidate.as_path();
-    confirm_sing_box_candidate(version, candidate)?;
+    confirm_sing_box_candidate(&version, candidate)?;
     if let Some(parent) = output_bin.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -786,20 +794,42 @@ struct BackupEntry {
 /// certificate copy for Direct subscription mode, so a rollback point restores
 /// binaries, configuration, artifacts, units, certificate references, and
 /// accounting state together.
+fn pinned_certificate_paths(config: &DeploymentConfig) -> Option<(String, String)> {
+    (config.subscription_mode == crate::config::SubscriptionMode::Direct).then(|| {
+        let directory = format!("var/lib/sbctl/certificates/{}", config.subscription_host);
+        (
+            format!("{directory}/fullchain.pem"),
+            format!("{directory}/privkey.pem"),
+        )
+    })
+}
+
+fn is_pinned_certificate_path(relative: &str) -> bool {
+    relative.starts_with("var/lib/sbctl/certificates/")
+        && (relative.ends_with("/fullchain.pem") || relative.ends_with("/privkey.pem"))
+}
+
 fn rollback_paths(config: &DeploymentConfig) -> Vec<String> {
     let mut paths = MANAGED_PATHS
         .iter()
         .map(|path| (*path).to_owned())
         .collect::<Vec<_>>();
-    if config.subscription_mode == crate::config::SubscriptionMode::Direct {
-        for name in ["fullchain.pem", "privkey.pem"] {
-            paths.push(format!(
-                "var/lib/sbctl/certificates/{}/{}",
-                config.subscription_host, name
-            ));
-        }
+    if let Some((chain, key)) = pinned_certificate_paths(config) {
+        paths.push(chain);
+        paths.push(key);
     }
     paths
+}
+
+fn read_backup_contents(
+    store: &DeploymentStore,
+    relative: &str,
+) -> Result<Option<Vec<u8>>, UpdateError> {
+    match crate::config::read_managed_file_no_follow(&store.root().join(relative)) {
+        Ok(contents) => Ok(Some(contents)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn backup(
@@ -807,11 +837,50 @@ fn backup(
     rollback: &Path,
     config: &DeploymentConfig,
 ) -> Result<Vec<BackupEntry>, UpdateError> {
+    // Read the pinned pair through one directory generation. Two independent
+    // reads could capture fullchain.pem from one generation and privkey.pem
+    // from the next, so a rollback would restore a mixed, unusable pair.
+    let pinned_pair = match pinned_certificate_paths(config) {
+        Some((chain, key)) => {
+            let directory = store
+                .root()
+                .join(&chain)
+                .parent()
+                .expect("pinned certificate path has a parent")
+                .to_owned();
+            if directory.is_dir() {
+                match crate::managed_fs::read_pair(&directory, "fullchain.pem", "privkey.pem") {
+                    Ok((fullchain, privkey)) => Some((chain, key, fullchain, privkey)),
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        return Err(UpdateError::Operation(format!(
+                            "pinned certificate pair under {} is incomplete; run \
+                             `sbctl certificate verify` before retrying the update",
+                            directory.display()
+                        )));
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            } else {
+                None
+            }
+        }
+        None => None,
+    };
     let mut entries = Vec::new();
     for relative in rollback_paths(config) {
-        let source = store.root().join(&relative);
-        let contents = match crate::config::read_managed_file_no_follow(&source) {
-            Ok(contents) => {
+        let contents = if let Some((chain, key, fullchain, privkey)) = &pinned_pair {
+            if relative == *chain {
+                Some(fullchain.clone())
+            } else if relative == *key {
+                Some(privkey.clone())
+            } else {
+                read_backup_contents(store, &relative)?
+            }
+        } else {
+            read_backup_contents(store, &relative)?
+        };
+        let contents = match contents {
+            Some(contents) => {
                 let backup_path = rollback.join(&relative);
                 let backup_relative = backup_path
                     .strip_prefix(store.root())
@@ -821,8 +890,7 @@ fn backup(
                 store.write_root_only_locked(backup_relative, &contents)?;
                 Some(contents)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error.into()),
+            None => None,
         };
         entries.push(BackupEntry { relative, contents });
     }
@@ -834,24 +902,86 @@ fn backup(
 const CERTBOT_DEPLOY_HOOK: &str =
     "etc/letsencrypt/renewal-hooks/deploy/sbctl-certificate-deploy-hook";
 
+fn restore_entry(
+    store: &DeploymentStore,
+    entry: &BackupEntry,
+    restored_certificate: &mut bool,
+) -> Result<(), ConfigError> {
+    let path = store.root().join(&entry.relative);
+    match &entry.contents {
+        Some(contents) => {
+            store.write_relative_locked(&entry.relative, contents)?;
+            if entry.relative.starts_with("usr/local/bin/") || entry.relative == CERTBOT_DEPLOY_HOOK
+            {
+                set_executable(&path)?;
+            }
+            if is_pinned_certificate_path(&entry.relative) {
+                *restored_certificate = true;
+            }
+        }
+        None if path.exists() => fs::remove_file(path)?,
+        None => {}
+    }
+    Ok(())
+}
+
 fn restore(store: &DeploymentStore, backup: &[BackupEntry]) -> Result<(), ConfigError> {
     let mut restored_certificate = false;
-    for entry in backup {
-        let path = store.root().join(&entry.relative);
-        match &entry.contents {
-            Some(contents) => {
-                store.write_relative_locked(&entry.relative, contents)?;
-                if entry.relative.starts_with("usr/local/bin/")
-                    || entry.relative == CERTBOT_DEPLOY_HOOK
-                {
-                    set_executable(&path)?;
-                }
-                if entry.relative.starts_with("var/lib/sbctl/certificates/") {
-                    restored_certificate = true;
+    for entry in backup
+        .iter()
+        .filter(|entry| !is_pinned_certificate_path(&entry.relative))
+    {
+        restore_entry(store, entry, &mut restored_certificate)?;
+    }
+    let pinned = backup
+        .iter()
+        .filter(|entry| is_pinned_certificate_path(&entry.relative))
+        .collect::<Vec<_>>();
+    if pinned.len() == 2 {
+        let fullchain = pinned
+            .iter()
+            .find(|entry| entry.relative.ends_with("/fullchain.pem"))
+            .expect("fullchain entry");
+        let privkey = pinned
+            .iter()
+            .find(|entry| entry.relative.ends_with("/privkey.pem"))
+            .expect("privkey entry");
+        let directory = Path::new(&fullchain.relative)
+            .parent()
+            .expect("pinned certificate path has a parent");
+        match (&fullchain.contents, &privkey.contents) {
+            (Some(fullchain_bytes), Some(privkey_bytes)) => {
+                crate::certificate::write_private_pair(
+                    store.root(),
+                    &store.root().join(directory),
+                    &[
+                        ("fullchain.pem", fullchain_bytes.as_slice()),
+                        ("privkey.pem", privkey_bytes.as_slice()),
+                    ],
+                    None,
+                )
+                .map_err(ConfigError::Storage)?;
+                restored_certificate = true;
+            }
+            (None, None) => {
+                for entry in pinned {
+                    let path = store.root().join(&entry.relative);
+                    if path.exists() {
+                        fs::remove_file(path)?;
+                    }
                 }
             }
-            None if path.exists() => fs::remove_file(path)?,
-            None => {}
+            _ => {
+                // A partial pair was already invalid; preserve the old
+                // per-file restoration rather than inventing a pair.
+                for entry in pinned {
+                    restore_entry(store, entry, &mut restored_certificate)?;
+                }
+            }
+        }
+    } else {
+        for entry in pinned {
+            restore_entry(store, entry, &mut restored_certificate)?;
         }
     }
     // A restored pinned private key is written by root, so the shared group has
@@ -1058,6 +1188,15 @@ mod tests {
     }
 
     #[test]
+    fn official_versions_are_normalized_before_becoming_assets_or_members() {
+        assert_eq!(normalize_official_version("v1.14.2").unwrap(), "1.14.2");
+        assert_eq!(normalize_official_version("1.14").unwrap(), "1.14.0");
+        assert_eq!(normalize_official_version("01.014.002").unwrap(), "1.14.2");
+        let url = official_sing_box_archive_url("v1.14.2").unwrap();
+        assert!(url.contains("/v1.14.2/sing-box-1.14.2-linux-"), "{url}");
+    }
+
+    #[test]
     fn official_archive_member_names_the_expected_kernel_path() {
         let member = official_archive_member("1.14.1");
         assert_eq!(
@@ -1240,6 +1379,64 @@ mod tests {
             0o755,
             "a restored deploy hook must stay executable or Certbot renewals silently \
              stop re-pinning the certificate"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_rollback_publishes_the_pinned_certificate_pair_as_one_generation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let fixture = tempfile::TempDir::new().expect("temporary root is created");
+        let store = crate::config::DeploymentStore::new(fixture.path());
+        let directory = fixture
+            .path()
+            .join("var/lib/sbctl/certificates/sub.example.test");
+        fs::create_dir_all(&directory).expect("pinned directory is created");
+        fs::write(directory.join("fullchain.pem"), b"old chain").unwrap();
+        fs::write(directory.join("privkey.pem"), b"old key").unwrap();
+        fs::write(directory.join("cert.pem"), b"auxiliary pair").unwrap();
+        let previous_generation = fs::metadata(&directory).unwrap().ino();
+
+        let relative = "var/lib/sbctl/certificates/sub.example.test";
+        let backup = vec![
+            BackupEntry {
+                relative: format!("{relative}/fullchain.pem"),
+                contents: Some(b"new chain".to_vec()),
+            },
+            BackupEntry {
+                relative: format!("{relative}/privkey.pem"),
+                contents: Some(b"new key".to_vec()),
+            },
+        ];
+        restore(&store, &backup).expect("the rollback restore succeeds");
+
+        assert_eq!(
+            fs::read(directory.join("fullchain.pem")).unwrap(),
+            b"new chain"
+        );
+        assert_eq!(fs::read(directory.join("privkey.pem")).unwrap(), b"new key");
+        assert_eq!(
+            fs::read(directory.join("cert.pem")).unwrap(),
+            b"auxiliary pair",
+            "auxiliary certificate files must survive the pair publication"
+        );
+        assert_ne!(
+            fs::metadata(&directory).unwrap().ino(),
+            previous_generation,
+            "the pair must be replaced as one directory generation, not file by file"
+        );
+        assert_eq!(
+            fs::metadata(&directory).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
+        assert_eq!(
+            fs::metadata(directory.join("privkey.pem"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o640
         );
     }
 

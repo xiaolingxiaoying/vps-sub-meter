@@ -550,6 +550,11 @@ impl DeploymentConfig {
         reality_decoy_sni: Option<String>,
         ports: ProtocolPorts,
     ) -> Result<Self, ConfigError> {
+        // Hostnames are case-insensitive, but Certbot creates its live
+        // directory from the lowercased domain. Normalize here so certificate
+        // paths, certbot arguments, and generated sing-box paths agree.
+        let subscription_host = subscription_host.to_ascii_lowercase();
+        let proxy_host = proxy_host.map(|host| host.to_ascii_lowercase());
         let subscription_credential = generate_subscription_credential()?;
         let mut allocated_ports = Vec::new();
         validate_requested_ports(&enabled_protocols, &ports)?;
@@ -699,8 +704,8 @@ impl DeploymentConfig {
         };
         let config = Self {
             subscription_mode: subscription_mode.clone(),
-            subscription_host: subscription_host.clone(),
-            proxy_host: proxy_host.clone(),
+            subscription_host: subscription_host.to_ascii_lowercase(),
+            proxy_host: proxy_host.as_ref().map(|host| host.to_ascii_lowercase()),
             http_port: *http_port,
             subscription_listen_port: *subscription_listen_port,
             certificate_mode: certificate_mode.clone(),
@@ -848,10 +853,11 @@ impl DeploymentConfig {
             }
             if set.url.is_empty()
                 || set.url.contains(char::is_whitespace)
-                || (!set.url.starts_with("http://") && !set.url.starts_with("https://"))
+                || !set.url.starts_with("https://")
             {
                 return Err(ConfigError::InvalidValue(
-                    "extra rule-set url must be an absolute http(s) URL without whitespace",
+                    "extra rule-set url must be an absolute https:// URL without whitespace; \
+                     clients fetch it themselves and plain HTTP can be replaced in flight",
                 ));
             }
             // Shipping a URL the subscribers' cores cannot parse would break
@@ -1500,6 +1506,12 @@ fn ensure_protocol_port_available(port: u16) -> Result<(), ConfigError> {
         if let Err(error) = tcp6_available {
             return Err(ConfigError::PortInUse(port, error.to_string()));
         }
+        // Hysteria2/TUIC listen on `::` with UDP; a v6-only daemon on the
+        // selected port must be found before services are installed.
+        let udp6_available = std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, port));
+        if let Err(error) = udp6_available {
+            return Err(ConfigError::PortInUse(port, error.to_string()));
+        }
     }
     Ok(())
 }
@@ -1598,7 +1610,9 @@ impl DeploymentStore {
             io::ErrorKind::NotFound => ConfigError::Missing,
             _ => ConfigError::Storage(error),
         })?;
-        let config = toml::from_str::<DeploymentConfig>(&contents)?;
+        let mut config = toml::from_str::<DeploymentConfig>(&contents)?;
+        config.subscription_host = config.subscription_host.to_ascii_lowercase();
+        config.proxy_host = config.proxy_host.map(|host| host.to_ascii_lowercase());
         config.validate()?;
         Ok(config)
     }
@@ -1684,13 +1698,15 @@ impl DeploymentStore {
     /// read the certificate from here; the deploy hook refreshes it after each
     /// Certbot renewal.
     pub fn certificate_directory(&self, host: &str) -> PathBuf {
-        self.root.join(CERTIFICATES_RELATIVE_PATH).join(host)
+        self.root
+            .join(CERTIFICATES_RELATIVE_PATH)
+            .join(host.to_ascii_lowercase())
     }
 
     /// The live-host path of the pinned certificate copy for a subscription
     /// host, used when generating the sing-box server configuration.
     pub fn certificate_directory_absolute(host: &str) -> PathBuf {
-        PathBuf::from(CERTIFICATES_ABSOLUTE_PATH).join(host)
+        PathBuf::from(CERTIFICATES_ABSOLUTE_PATH).join(host.to_ascii_lowercase())
     }
 
     pub fn write_artifact(&self, name: &str, contents: &[u8]) -> Result<(), ConfigError> {
@@ -2085,7 +2101,7 @@ mod tests {
 
     use super::{
         AccountingPolicy, CertificateMode, DeploymentConfig, DeploymentOptions, DeploymentStore,
-        ManagedProtocol, ProtocolPorts, SubscriptionMode,
+        ExtraRuleSet, ManagedProtocol, ProtocolPorts, SubscriptionMode,
     };
 
     #[cfg(unix)]
@@ -2439,6 +2455,65 @@ mod tests {
             },
         );
         assert!(disabled.is_err());
+    }
+
+    #[test]
+    fn hostnames_are_lowercased_for_certificate_paths_and_load() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "Sub.Example.COM".into(),
+            Some("Proxy.Example.COM".into()),
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("an uppercase hostname is valid");
+        assert_eq!(config.subscription_host, "sub.example.com");
+        assert_eq!(config.proxy_host.as_deref(), Some("proxy.example.com"));
+
+        let fixture = TempDir::new().unwrap();
+        let store = DeploymentStore::new(fixture.path());
+        let mut hand_edited = config.clone();
+        hand_edited.subscription_host = "Sub.Example.COM".into();
+        hand_edited.proxy_host = Some("Proxy.Example.COM".into());
+        store
+            .initialize_with_artifacts(&hand_edited, &[])
+            .expect("the hand-edited deployment is written");
+        let loaded = store.load().expect("the deployment loads");
+        assert_eq!(loaded.subscription_host, "sub.example.com");
+        assert_eq!(loaded.proxy_host.as_deref(), Some("proxy.example.com"));
+        assert_eq!(
+            store.certificate_directory("Sub.Example.COM"),
+            fixture
+                .path()
+                .join("var/lib/sbctl/certificates/sub.example.com")
+        );
+    }
+
+    #[test]
+    fn a_hand_edited_extra_rule_set_must_not_ship_plain_http_to_clients() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a base deployment is valid");
+        config.client_extra_rule_sets = vec![ExtraRuleSet {
+            name: "game".into(),
+            url: "http://cdn.example/game.srs".into(),
+            outbound: "reject".into(),
+        }];
+        assert!(matches!(
+            config.validate(),
+            Err(super::ConfigError::InvalidValue(message)) if message.contains("https://")
+        ));
+        config.client_extra_rule_sets[0].url = "https://cdn.example/game.srs".into();
+        config.validate().expect("an https rule-set is accepted");
     }
 
     #[test]

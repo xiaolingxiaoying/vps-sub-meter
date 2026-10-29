@@ -207,6 +207,19 @@ if [[ "$replace_existing" -eq 1 ]]; then
   install_args+=(--replace-existing)
 fi
 
+# A guided install is interactive even when the installer itself arrived on a
+# pipe. Resolve the real terminal before replacing the management binary, so a
+# missing terminal refuses cleanly instead of failing after the host changed.
+guided_install=0
+for arg in "${install_args[@]}"; do
+  if [[ "$arg" == --guided ]]; then
+    guided_install=1
+  fi
+done
+if [[ "$guided_install" -eq 1 ]]; then
+  resolve_installer_input
+fi
+
 # Only now is the host changed. Replace by rename, never in place:
 # `install`/`cp` truncates the target, and a running sbctl is exactly the case
 # during a re-install or an upgrade - writing over a live executable fails with
@@ -223,7 +236,11 @@ ln -sf /usr/local/bin/sbctl /usr/local/bin/ly
 green "sbctl 已安装；快捷方式：ly"
 
 if [[ "$#" -gt 0 ]]; then
-  run_installer /usr/local/bin/sbctl install "${install_args[@]}"
+  if [[ "$guided_install" -eq 1 ]]; then
+    run_installer /usr/local/bin/sbctl install "${install_args[@]}" <"$installer_input"
+  else
+    run_installer /usr/local/bin/sbctl install "${install_args[@]}"
+  fi
 fi
 green "运行 ly，在安装与部署菜单中选择内核下载源、版本和部署配置。"
 if [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; then

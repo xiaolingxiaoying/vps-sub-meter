@@ -53,3 +53,26 @@ VPS 文件摘要一致。此产物与安装的真实 sing-box 1.14.2 在私有�
 生产原子交换保证为 Linux 本地文件系统；非 Linux 开发适配不声称同等竞态/崩溃保证。旧代读句柄若尚未打开第二份 PEM 就被清理，可能暂时读取失败；不会接受混合代，原内存中的有效证书仍可服务。异常退出可能留下私有暂存目录。
 
 两个特权发布命令并发时的刷新确认代际绑定仍需 [专门故障注入](issues/05-refresh-ack-concurrency.md)，不将当前顺序重试测试当作该并发问题已解决。此前观测夹具的 [偶发失败](../review-connection-isolation/issues/03-observation-fixture-flake.md) 也继续保留，未用自动重试掩盖。
+
+
+## 刷新确认的代际绑定（工单 05）
+
+新增 `clear_refresh_pending` 代际参数：Linux 下清除动作相对于已打开并通过 dev/inode 校验的代目录执行；并发发布者接入新代时，旧调用方的确认返回 `false`，新代标记保留。目标代在确认前消失时按幂等成功处理；清除与目录发布共用发布锁，避免并发清除让发布在复制保留项时失败。
+
+本地 Linux 门禁覆盖目录层与证书 API 两层：`marker_acknowledgement_cannot_clear_a_concurrent_publishers_generation`、`refresh_acknowledgement_is_bound_to_the_published_generation`、`acknowledgement_waits_for_an_in_progress_publication`。`managed_fs` 目录测试同时验证代被重命名/删除后的迟到确认是 no-op。该修复未改变订阅工件或证书字节。
+
+
+## 2026-10-28 本地构建的 VPS 验收（工单 05 修复，无 Actions）
+
+工作站 WSL Ubuntu 22.04 全量门禁：格式、全目标全特性 Clippy、319 项库测试、168 项 CLI 测试、4 项版本注册表测试通过；Linux release 与 test-signing 工件由本地 `cargo build --release` 生成。
+
+候选 amd64 摘要 `9228efff64a1531b534f09a727ad51f15c4e3fc270b1e32ce75755196e01a252`，上传到 VPS `/root/sbctl-local-9228efff64a1/`。测试前以 root-only tar 备份原部署（摘要 `db46ab1e8e926fc15a4134cde98dbd42a885d6d7efc5b5fcaa0ea75a7778a0a0`），并启动 15 分钟 systemd 恢复 guard。
+
+- 隔离：`--root` 下的向导/凭据冲突、fake-IP 规则、SRS/MRS 隔离、非法 interval 无写入均通过；生产配置副本重新生成的 12 个客户端工件与部署逐字节一致，服务端工件在根路径归一后一致。
+- 证书：`check-certificate-generation.py` 的第二文件写失败保留完整旧代；解除故障后的重试、真实 sing-box 1.14.2 的新代证书握手、失败刷新后的持久标记与同证书重试均通过。
+- 实际部署：候选替换 `/usr/local/bin/sbctl` 后 `regenerate` 未改变配置、内核、工件或服务 PID；`sbctl.service`、`sing-box.service`、`sbctl-http.socket` 均 active。
+- 外部：正常 TLS 校验下 12 种订阅体与 VPS 工件逐字节一致、`subscription-userinfo` 存在、12 个 SVG 二维码实际解码为对应 URL；overview 200，非法格式/凭据/query 404。
+- 客户端：Windows 工作站 sing-box 1.14.1 直接经 VLESS Reality、VMess WebSocket、Hysteria2、TUIC、AnyTLS 各完成 HTTPS 204；WSL Ubuntu 22.04 的 sing-box 1.14.1 经 Windows 上的 SSH direct-tcpip/VPS 回环转发完成同一 204 结果。宿主机代理把 WSL DNS 指向 `198.18.0.0/15` 且阻断 WSL 直连 VPS，因此 WSL 腿使用转发而不是伪装成直连；Docker Desktop 引擎在测试期间返回 500，未用于本轮结论。
+- 恢复：停止 guard，恢复原 v0.0.21 程序与工件，文件摘要/属主/权限与基线一致，三个服务与会计定时器恢复 active，外部订阅矩阵再次通过。
+
+未在本轮制造真实证书的并发故障：代际绑定由 Linux 确定性回归证明；真实部署不使用并发写入来验证安全属性。发布/清除未共用发布锁的既有竞争仍是后续项。

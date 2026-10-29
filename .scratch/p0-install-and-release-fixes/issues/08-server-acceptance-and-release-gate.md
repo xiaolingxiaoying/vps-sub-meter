@@ -1,6 +1,6 @@
 # 08 服务端 systemd 验收可跑 + 发布门禁
 
-Status: ready-for-agent
+Status: resolved
 
 ## 问题
 
@@ -33,3 +33,7 @@ P0-2/P0-3/P0-4/P0-5 的问题全部只有真机 systemd 安装才会暴露。
 
 `tests/acceptance/run.sh`、`.github/workflows/ci.yml`、
 `scripts/dev/release-trust-anchor-check.sh`。
+
+## Resolution
+
+`run.sh` 客户端产物可选、server-only 分支与信任锚门禁已落地；本轮本地 release + VPS systemd 验收通过。

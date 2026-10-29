@@ -317,6 +317,66 @@ mod implementation {
         staged.commit(&name, previous)
     }
 
+    /// Removes a marker only from the directory generation the caller
+    /// published. A concurrent publisher may have exchanged in a newer
+    /// generation after the caller refreshed the data plane; that generation's
+    /// marker belongs to the other publisher and must survive this call.
+    pub(crate) fn clear_generation_marker(
+        directory: &Path,
+        marker: &str,
+        expected: Option<(u64, u64)>,
+    ) -> io::Result<bool> {
+        let marker = c_name(OsStr::new(marker))?;
+        let (parent_path, name) = super::super::split_file(directory)?;
+        let parent = match open_directory(parent_path, false) {
+            Ok(parent) => parent,
+            // A generation removed before acknowledgement has nothing left to
+            // acknowledge; the old path-based clear also treated this as a
+            // no-op rather than failing an already completed operation.
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        // Serialize with `replace_files_with_marker`, which retains auxiliary
+        // entries by linking them from the current generation. Without the
+        // same lock a concurrent acknowledgement could unlink the marker
+        // between the listing and the link and fail an otherwise correct
+        // publication.
+        let lock = crate::managed_fs::platform::open_lock_in(&parent)?;
+        fs2::FileExt::lock_exclusive(&lock)?;
+        let name = c_name(name)?;
+        let handle = match open_at(&parent, &name, DIRECTORY_FLAGS) {
+            Ok(handle) => handle,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let metadata = handle.metadata()?;
+        let Some(expected) = expected else {
+            return Ok(false);
+        };
+        if (metadata.dev(), metadata.ino()) != expected {
+            return Ok(false);
+        }
+        // Only a regular file is a valid marker at this relative name; a link
+        // is rejected rather than unlinked so the refusal stays visible.
+        match open_at(&handle, &marker, FILE_FLAGS) {
+            Ok(file) if file.metadata()?.is_file() => {}
+            Ok(_) => return Err(io::Error::other("invalid certificate refresh marker")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        if unsafe { libc::unlinkat(handle.as_raw_fd(), marker.as_ptr(), 0) } != 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(false);
+            }
+            return Err(error);
+        }
+        // The unlink is relative to the open generation; a later exchange can
+        // no longer redirect it to the newer publisher's marker.
+        let _ = handle.sync_all();
+        Ok(true)
+    }
+
     #[cfg(test)]
     fn replace_files(
         directory: &Path,
@@ -494,6 +554,82 @@ mod implementation {
                 !directory.join(".pending").exists(),
                 "acknowledged unchanged material needs no new refresh"
             );
+        }
+
+        #[test]
+        fn marker_acknowledgement_cannot_clear_a_concurrent_publishers_generation() {
+            let (_fixture, directory) = seed();
+            let publish = |bytes: &'static [u8]| {
+                replace_files_with_marker(
+                    &directory,
+                    &[("cert", bytes), ("key", bytes)],
+                    Some(".pending"),
+                    |_| Ok(()),
+                    |_| Ok(()),
+                )
+                .unwrap();
+                let metadata = fs::metadata(&directory).unwrap();
+                (metadata.dev(), metadata.ino())
+            };
+            let first = publish(b"first");
+            let second = publish(b"second");
+            assert_ne!(first, second);
+            // The first publisher's refresh confirmation arrives after the
+            // second generation was published: the newer marker must remain.
+            assert!(
+                !clear_generation_marker(&directory, ".pending", Some(first)).unwrap(),
+                "a stale generation must not acknowledge the newer marker"
+            );
+            assert!(directory.join(".pending").is_file());
+            assert!(clear_generation_marker(&directory, ".pending", Some(second)).unwrap());
+            assert!(!directory.join(".pending").exists());
+            // The old generation is gone; a late retry is a no-op, not an error.
+            assert!(!clear_generation_marker(&directory, ".pending", Some(first)).unwrap());
+            assert!(!directory.join(".pending").exists());
+            // A generation that disappears entirely before acknowledgement is
+            // also a no-op rather than a failure of a completed operation.
+            let removed = _fixture.path().join("removed");
+            fs::rename(&directory, &removed).unwrap();
+            assert!(!clear_generation_marker(&directory, ".pending", Some(second)).unwrap());
+            fs::rename(&removed, &directory).unwrap();
+            // The pair is still the complete second generation.
+            assert_eq!(
+                read_pair(&directory, "cert", "key").unwrap(),
+                (b"second".to_vec(), b"second".to_vec())
+            );
+        }
+
+        #[test]
+        fn acknowledgement_waits_for_an_in_progress_publication() {
+            let (_fixture, directory) = seed();
+            replace_files_with_marker(
+                &directory,
+                &[("cert", b"first"), ("key", b"first")],
+                Some(".pending"),
+                |_| Ok(()),
+                |_| Ok(()),
+            )
+            .unwrap();
+            let metadata = fs::metadata(&directory).unwrap();
+            let generation = Some((metadata.dev(), metadata.ino()));
+            let parent = directory.parent().unwrap().to_owned();
+            let parent_handle = open_directory(&parent, false).unwrap();
+            let lock = crate::managed_fs::platform::open_lock_in(&parent_handle).unwrap();
+            fs2::FileExt::lock_exclusive(&lock).unwrap();
+            let acknowledgement = {
+                let directory = directory.clone();
+                std::thread::spawn(move || {
+                    clear_generation_marker(&directory, ".pending", generation)
+                })
+            };
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(
+                !acknowledgement.is_finished(),
+                "acknowledgement must wait for the publication lock"
+            );
+            fs2::FileExt::unlock(&lock).unwrap();
+            assert!(acknowledgement.join().unwrap().unwrap());
+            assert!(!directory.join(".pending").exists());
         }
 
         #[test]
@@ -773,6 +909,43 @@ mod implementation {
         Ok(())
     }
 
+    /// Windows has no stable directory generation tied to an open handle, so
+    /// the platform adapter acknowledges the current path. The generation
+    /// guarantee is Linux-only, matching the publication mechanism.
+    pub(crate) fn clear_generation_marker(
+        directory: &Path,
+        marker: &str,
+        expected: Option<(u64, u64)>,
+    ) -> io::Result<bool> {
+        match existing_directory(directory) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error),
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            if let Some((dev, ino)) = expected {
+                let metadata = fs::symlink_metadata(directory)?;
+                if (metadata.dev(), metadata.ino()) != (dev, ino) {
+                    return Ok(false);
+                }
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = expected;
+        super::super::validate_file_name(OsStr::new(marker))?;
+        let path = directory.join(marker);
+        if fs::symlink_metadata(&path).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(io::Error::other("invalid certificate refresh marker"));
+        }
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(true),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     pub(crate) fn read_pair(
         directory: &Path,
         first: &str,
@@ -791,4 +964,6 @@ mod implementation {
     }
 }
 
-pub(crate) use implementation::{read_pair, replace_files_with_marker as replace_files};
+pub(crate) use implementation::{
+    clear_generation_marker, read_pair, replace_files_with_marker as replace_files,
+};

@@ -327,6 +327,66 @@ fn install_with_a_signed_manifest_downloads_and_verifies_sing_box() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn a_concurrent_installation_is_not_rolled_back_by_the_loser() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = supported_systemd_host();
+    write_systemctl_fixture(&fixture, true);
+    let checker = fixture.path().join("concurrent-checker");
+    let config = fixture.path().join("etc/sbctl/config.toml");
+    // Simulate another installer committing between this installer's preflight
+    // and its configuration transaction.
+    fs::write(
+        &checker,
+        format!(
+            "#!/bin/sh\nmkdir -p '{}'\nprintf 'winner\\n' > '{}'\nexit 0\n",
+            config.parent().expect("config parent").display(),
+            config.display()
+        ),
+    )
+    .expect("checker is written");
+    fs::set_permissions(&checker, fs::Permissions::from_mode(0o700))
+        .expect("checker is executable");
+
+    Command::cargo_bin("sbctl")
+        .expect("sbctl binary is built")
+        .args([
+            "--root",
+            fixture.path().to_str().expect("fixture path is UTF-8"),
+            "install",
+            "--mode",
+            "ip-fallback",
+            "--subscription-host",
+            "127.0.0.1",
+            "--http-port",
+            "2080",
+            "--interface",
+            "ens3",
+            "--reality-decoy-sni",
+            "www.cloudflare.com",
+            "--sing-box-bin",
+            checker.to_str().expect("checker path is UTF-8"),
+            "--no-start",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "another installation completed while this one was running",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(&config).expect("the winning configuration is still there"),
+        "winner\n",
+        "a losing installation must not delete the deployment it did not create"
+    );
+    assert!(
+        !fixture.path().join("var/lib/sbctl/ownership").exists(),
+        "the loser must not write the ownership marker"
+    );
+}
+
 #[test]
 fn install_reports_a_supported_systemd_fixture_as_ready() {
     let fixture = supported_systemd_host();

@@ -38,6 +38,10 @@ pub enum SubscriptionError {
     SocketActivation(String),
     #[error("Direct HTTPS received an unexpected listener on port {0}")]
     UnexpectedDirectListener(u16),
+    #[error(
+        "Direct HTTPS received multiple socket-activated listeners for port {0}; remove the duplicate ListenStream"
+    )]
+    DuplicateDirectListener(u16),
     #[error("Direct HTTPS is missing the {0} listener")]
     MissingDirectListener(u16),
     #[error("HTTP handling failed: {0}")]
