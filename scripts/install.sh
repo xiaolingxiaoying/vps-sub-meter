@@ -216,7 +216,10 @@ for arg in "${install_args[@]}"; do
     guided_install=1
   fi
 done
-if [[ "$guided_install" -eq 1 ]]; then
+# An explicit --replace-existing already authorizes the replacement; do not
+# turn it into a second terminal prompt. A plain --guided install still needs
+# the operator's terminal, including when the script arrived on a pipe.
+if [[ "$guided_install" -eq 1 && "$explicit_replacement" -eq 0 ]]; then
   resolve_installer_input
 fi
 
@@ -236,7 +239,7 @@ ln -sf /usr/local/bin/sbctl /usr/local/bin/ly
 green "sbctl 已安装；快捷方式：ly"
 
 if [[ "$#" -gt 0 ]]; then
-  if [[ "$guided_install" -eq 1 ]]; then
+  if [[ "$guided_install" -eq 1 && -n "$installer_input" ]]; then
     run_installer /usr/local/bin/sbctl install "${install_args[@]}" <"$installer_input"
   else
     run_installer /usr/local/bin/sbctl install "${install_args[@]}"
