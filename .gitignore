@@ -78,3 +78,6 @@ node_modules/
 
 # Local VPS acceptance scripts and downloaded client binaries.
 /.scratch/vps-local/
+
+# Downloaded release assets kept for local acceptance.
+/.scratch/release-v*/
