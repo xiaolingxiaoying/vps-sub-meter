@@ -602,7 +602,10 @@ pub fn generated_artifacts_for_kernel(
     let mut artifacts: Vec<(String, String)> = vec![
         (
             SING_BOX_SERVER_ARTIFACT.to_owned(),
-            apply_server_override(root, &sing_box_server(config, &nodes, root)?)?,
+            apply_server_override(
+                root,
+                &sing_box_server(config, &nodes, root, !full_profile.route_rule_actions)?,
+            )?,
         ),
         (SING_BOX_ARTIFACT.to_owned(), sing_box(config, &nodes)?),
         (CLASH_ARTIFACT.to_owned(), clash(config, &nodes)?),

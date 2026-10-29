@@ -777,7 +777,12 @@ pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
                     .iter()
                     .any(sbctl::config::ManagedProtocol::has_generated_subscription_artifacts)
                 {
-                    sbctl::subscription::generated_artifacts(&config, root).map_err(|error| {
+                    sbctl::subscription::generated_artifacts_for_kernel(
+                        &config,
+                        root,
+                        sing_box_bin.as_deref(),
+                    )
+                    .map_err(|error| {
                         sbctl::config::ConfigError::StateContent(error.to_string())
                     })?
                 } else {

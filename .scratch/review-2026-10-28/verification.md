@@ -111,3 +111,22 @@ WSL 本地 `scripts/dev/wsl-real-cores.sh` 在当前树上通过：
 
 - sing-box 1.10.7 / 1.11.15 / 1.12.25 / 1.13.21 / 1.14.1 对 standard/global/split/compact × standard/minimal/fake-ip/example 生成的 profile 全部 `check` 通过。
 - mihomo 1.19.x（`~/bin/mihomo`）接受 standard/global/split/compact × standard/minimal × 两个 Clash 工件，以及真实 `.mrs` provider 二进制规则加载。
+
+
+## 第五轮（服务端 1.10 兼容）
+
+| # | 缺陷 | 修复 | 回归 |
+| --- | --- | --- | --- |
+| 34 | 服务端内核为 1.10 且主机有 IPv6 路由时，`config init --sing-box-bin 1.10` 生成的 server 配置使用 `route.rules[].action`/`dns.strategy`，真实 1.10 报 unknown field，安装/生成直接失败 | `sing_box_server` 接收 full profile 的 legacy 标记；1.10 用入站 `domain_strategy: ipv4_only`，不写 `dns.strategy`/route action | `a_legacy_server_config_pins_ipv4_on_the_inbound`；真实 1.10.7 `check` |
+
+
+## 第五轮 VPS 验收（本地构建，无 Actions）
+
+最终 amd64 候选摘要 `528669a0ca6d671c7501be2ff400579f1f982df4e2a1722eb0306541e1d5a063`，上传到 `/root/sbctl-local-528669a0ca6d/`。测试前备份摘要 `aa2596e053f1828166d7795a8d7308585b67eb2283cc0858dd8beb45cb0b4929`。
+
+- 真实 1.10.7：`config init --sing-box-bin .../sing-box-1.10.7` 成功；server 配置使用入站 `domain_strategy`，`route.rules` 不再含 `action`；full 工件 `sing-box check` 通过，reject 规则使用 `block-out`。
+- VPS 隔离：生产配置副本 12 个客户端工件逐字节一致；证书写失败/真实核心刷新通过。
+- 实际部署：候选启动后配置/内核/工件/PID 不变；实时内存 7,561,216 字节。
+- 外部：12 种订阅逐字节一致、流量头、12 个二维码、非法路径 404。
+- 客户端：WSL sing-box 1.14.1 五协议全部 204。
+- 恢复：原 `abde4999…` 程序、工件、服务、定时器恢复；guard inactive。

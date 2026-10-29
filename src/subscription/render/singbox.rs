@@ -723,6 +723,7 @@ pub(crate) fn sing_box_server(
     config: &DeploymentConfig,
     nodes: &[CanonicalNode],
     root: &Path,
+    legacy_route: bool,
 ) -> Result<String, SubscriptionError> {
     let certificate = certificate_tls_config(config, root)?;
     let mut inbounds = Vec::new();
@@ -785,18 +786,26 @@ pub(crate) fn sing_box_server(
         "inbounds": inbounds
     });
     if ipv4_only_required(config, crate::system::host_has_ipv6_route()) {
-        // The inbound `domain_strategy` field was deprecated in 1.11 and
-        // removed in 1.13, so the destination pin now lives on a route action
-        // (the documented migration). Pinning the default DNS strategy keeps
-        // every other lookup, including the Reality camouflage handshake that
-        // dials its decoy independently of the inbound destination, on IPv4.
-        server["dns"] = json!({"strategy": "ipv4_only"});
-        server["route"] = json!({
-            "rules": tags
-                .iter()
-                .map(|tag| json!({"inbound": tag, "action": "resolve", "strategy": "ipv4_only"}))
-                .collect::<Vec<_>>()
-        });
+        if legacy_route {
+            // sing-box 1.10 has neither route actions nor dns.strategy; the
+            // only accepted destination pin is the inbound domain_strategy.
+            for inbound in server["inbounds"].as_array_mut().unwrap() {
+                inbound["domain_strategy"] = json!("ipv4_only");
+            }
+        } else {
+            // The inbound `domain_strategy` field was deprecated in 1.11 and
+            // removed in 1.13, so the destination pin now lives on a route
+            // action (the documented migration). Pinning the default DNS
+            // strategy keeps every other lookup, including the Reality
+            // camouflage handshake, on IPv4.
+            server["dns"] = json!({"strategy": "ipv4_only"});
+            server["route"] = json!({
+                "rules": tags
+                    .iter()
+                    .map(|tag| json!({"inbound": tag, "action": "resolve", "strategy": "ipv4_only"}))
+                    .collect::<Vec<_>>()
+            });
+        }
     }
     // Opt-in only: with no `server_clash_api` the server bytes stay exactly as
     // they were, which the artifact golden asserts. When present it is bound to
@@ -957,6 +966,7 @@ fn server_tls(tls_server_name: &str, certificate: &Value, alpn: &[&str]) -> Valu
 mod tests {
     use super::ipv4_only_required;
     use super::sing_box_full;
+    use super::sing_box_server;
 
     /// The whole point of passing the host fact in: both halves of the rule are
     /// now reachable without a network. `ipv4_only` pins it on its own, a host
@@ -1339,6 +1349,28 @@ mod tests {
                 && rule["action"] == "resolve"
                 && rule["strategy"] == "ipv4_only"
         }));
+    }
+
+    #[test]
+    fn a_legacy_server_config_pins_ipv4_on_the_inbound() {
+        let fixture = TempDir::new().unwrap();
+        let mut config = vless_config();
+        config.ipv4_only = true;
+        let nodes = crate::canonical::nodes(&config);
+        let legacy: serde_json::Value =
+            serde_json::from_str(&sing_box_server(&config, &nodes, fixture.path(), true).unwrap())
+                .unwrap();
+        for inbound in legacy["inbounds"].as_array().unwrap() {
+            assert_eq!(inbound["domain_strategy"], "ipv4_only");
+        }
+        assert!(legacy.get("dns").is_none());
+        assert!(legacy.get("route").is_none());
+
+        let modern: serde_json::Value =
+            serde_json::from_str(&sing_box_server(&config, &nodes, fixture.path(), false).unwrap())
+                .unwrap();
+        assert!(modern["inbounds"][0].get("domain_strategy").is_none());
+        assert_eq!(modern["dns"]["strategy"], "ipv4_only");
     }
 
     #[test]
