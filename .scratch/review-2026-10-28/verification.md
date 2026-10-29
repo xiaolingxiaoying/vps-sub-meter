@@ -130,3 +130,13 @@ WSL 本地 `scripts/dev/wsl-real-cores.sh` 在当前树上通过：
 - 外部：12 种订阅逐字节一致、流量头、12 个二维码、非法路径 404。
 - 客户端：WSL sing-box 1.14.1 五协议全部 204。
 - 恢复：原 `abde4999…` 程序、工件、服务、定时器恢复；guard inactive。
+
+
+## v0.0.23 GitHub Release
+
+- 首次 v0.0.22 发布运行在 `ci / server-acceptance` 失败：安装器把 `--guided` 的终端解析提前，导致 `--guided --replace-existing </dev/null` 在替换二进制前退出 2；已改为显式替换不强制终端，并在没有解析到输入时继承原 stdin。
+- 本地 `setsid` 无控制终端复现并通过 `verify-bootstrap.sh`；提交 `08bc223`。
+- `v0.0.23` 的 Release Actions [40880554678](https://github.com/xiaolingxiaoying/vps-sub-meter/actions/runs/40880554678) 成功（validate、CI、三发行版 systemd 验收、双架构 build/runtime、package）。
+- 发布前下载 draft：生产 amd64 摘要 `6dc3ebf621e416538273f0417b8da236e31561ce8e15f714e86bc9c9ca813a04`；生产二进制用内置公钥验证 `manifest-amd64.json` 通过；VPS 加载该实际发布二进制，0.0.23、12 种订阅、二维码、实时内存、外部 TLS 均通过，随后恢复原 v0.0.21。
+- 发布后重新下载公开资产：SHA256SUMS 与 8 个资产逐项一致；`install.sh` 含生产公钥且无占位符；`update --check --manifest` 通过。
+- Release: https://github.com/xiaolingxiaoying/vps-sub-meter/releases/tag/sbctl-v0.0.23 （Latest）。
