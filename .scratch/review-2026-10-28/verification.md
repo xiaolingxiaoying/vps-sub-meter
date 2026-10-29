@@ -47,3 +47,36 @@
 - 外部：正常 TLS 校验下 12 种订阅体与 VPS 工件逐字节一致、流量头存在、12 个二维码实际解码；overview 200，非法路径 404。
 - 客户端：WSL Ubuntu 22.04 的 sing-box 1.14.1 经 Windows 上的 SSH TCP 转发/UDP 中继，VLESS Reality、VMess WebSocket、Hysteria2、TUIC、AnyTLS 全部 HTTPS 204。
 - 恢复：停止 guard，原 v0.0.21 程序与工件、属主/权限、三项服务与会计定时器全部恢复；guard inactive。
+
+
+## 第三轮（同日第二轮审查代理）
+
+| # | 缺陷 | 修复 | 回归 |
+| --- | --- | --- | --- |
+| 15 | Mihomo `.mrs` 一律声明 `behavior: domain`，IP-CIDR 集载入 0 条规则 | `ExtraRuleSet.behavior`（默认 domain，`--behavior ipcidr`）；IP 集追加 `no-resolve`；菜单对 `.mrs` 询问类型 | `an_ipcidr_mrs_set_is_declared_with_its_behavior_and_no_resolve`、扩展的 CLI 规则集测试 |
+| 16 | 服务端内核为 1.10 时，full 工件仍用 `action: reject` 且缺 `block-out` | 一次解析 full profile，把 legacy 标记传入规则列表注入 | `a_full_profile_targeting_1_10_uses_legacy_block_rules` |
+| 17 | Clash `src`/`no-resolve` 修饰符被当成代理组目标，合法覆写被拒 | 按规则类型取目标字段，跳过逻辑规则 | 扩展的 `reference_checks_...` |
+| 18 | 切回 Direct 时只检查 pinned 存在，不重新 pin 更新的 live 证书 | 比较指纹，live 更新即 pin | `switching_back_to_direct_repins_a_renewed_live_certificate` |
+| 19 | 配置向导修改 Direct 主机后不签发/pin 新证书，HTTPS 静默不可用 | 提交前 `ensure_direct_certificate`；主机变化时签发或给出可操作错误 | `a_config_change_pins_a_renewed_live_certificate_for_direct_mode` |
+| 20 | 安装在提交配置后释放操作锁，另一个配置命令可在健康检查期间提交，随后被安装回滚删除 | 操作锁保持到 ownership marker；安装内改用 `*_locked` 写路径 | 全量安装/CLI 测试 |
+| 21 | `switch-mode` 未归一化新主机大小写，证书路径与 Certbot 不一致 | `desired` 中统一小写 | `a_mode_switch_host_is_lowercased_...` |
+| 22 | 模式切换时复用同一托管端口被自身监听误报 `already in use` | 仅当旧端口属于即将停止的旧模式时跳过探测 | `reusing_the_running_subscription_port_is_not_a_false_conflict` |
+| 23 | `--replace-existing` 冲突端口检测漏掉 IP fallback 的 `http_port` | `install_ports` 取 `http_port.or(subscription_listen_port)` | `replacement_install_ports_include_the_ip_fallback_public_port` |
+| 24 | `/memory` 第一个样本恒为 0，状态页永远显示 0 字节 | 同一 reader 读取两个 JSON 值取第二个，超时 4s | `the_memory_endpoint_skips_the_synthetic_zero_sample` |
+| 25 | `sing-box api enable --port 0` 成功但端点不可达 | 配置校验拒绝端口 0 | `a_hand_edited_zero_observation_port_is_rejected` |
+| 26 | 纯 IP 连接的 `host: ""` 让目标列空白 | 空 host 回退 `destinationIP` | 扩展的连接描述测试 |
+| 27 | 命名凭据可命名为 `default`，revoke 永远拒绝，泄露链接无法吊销 | add 拒绝该名称；revoke 优先检查同名命名记录；索引页给出 `--name` 提示 | 扩展凭据测试 |
+| 28 | 观测 IO 错误不总带 `api enable` 提示，端口复用测试偶发失败 | 所有传输错误统一带可操作提示 | 全量门禁 |
+| 29 | Direct 部署仅存在自签协议证书而没有 pinned 对时，更新备份被误判为不完整 | 两文件都不存在视为无 pinned 对；仅部分存在才拒绝 | `a_direct_deployment_without_a_pinned_pair...` |
+
+
+## 第三轮 VPS 验收（本地构建，无 Actions）
+
+最终 amd64 候选摘要 `ef99ca0a18c382fc5924e09ffe8f8c4308f7e07c74a30a8d6c07ad4045fa8699`，上传到 `/root/sbctl-local-ef99ca0a18c3/`。测试前备份原部署（摘要 `4886bc9b7babefb0375348e28d2c269db5625eac707ea32bb5313b6c9e26c90b`），启动 15 分钟 systemd 恢复 guard。
+
+- 隔离实测：大写主机落盘为小写；仅注释 Clash 覆写后工件有效；`rule-set add --behavior ipcidr` 产出 `behavior: ipcidr` 与 `RULE-SET,...,no-resolve` 且不进入 sing-box 工件；`sing-box api enable --port 0` 退出 2 且配置字节不变；`credential add --name default` 被拒绝。
+- 证书：第二文件写失败保留旧代、真实 sing-box 1.14.2 新代握手、失败刷新标记与同证书重试通过；生产配置副本重新生成 12 个客户端工件逐字节一致。
+- 实际部署：候选替换后 `regenerate` 未改变配置/内核/工件/PID；三项服务 active；`sing-box status` 的“内核实时内存”为 7,520,256 字节（旧逻辑会显示 0），`api status` 为 7,528,448 字节。
+- 外部：12 种订阅体与 VPS 工件逐字节一致、流量头存在、12 个二维码实际解码；overview 200，非法路径 404。
+- 客户端：WSL Ubuntu 22.04 的 sing-box 1.14.1 经 Windows SSH TCP 转发/UDP 中继，五协议全部 HTTPS 204。
+- 恢复：停止 guard，原 v0.0.21 `abde4999…` 程序、工件、属主/权限、服务与会计定时器恢复；guard inactive。

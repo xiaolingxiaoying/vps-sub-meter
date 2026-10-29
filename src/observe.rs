@@ -266,11 +266,33 @@ fn duration_since(
 /// alternative would add a dependency (and a TLS stack sbctl does not need here)
 /// to read two JSON documents. The secret travels as a bearer token and is never
 /// returned in an error, so a failure cannot paste it into the journal.
+/// A read/write failure after the TCP connect can be a stale or foreign
+/// listener as well as a closed API. Keep the actionable enable hint on every
+/// transport error so diagnostics do not depend on which side reset first.
+fn api_io_error(error: impl std::fmt::Display) -> String {
+    format!("sing-box 观测接口请求失败（sbctl sing-box api enable 是否已启用？）：{error}")
+}
+
 pub fn clash_api_request(
     api: &crate::config::ServerClashApi,
     path: &str,
     timeout: Duration,
 ) -> Result<serde_json::Value, String> {
+    let mut values = clash_api_request_values(api, path, timeout, 1)?;
+    values
+        .pop()
+        .ok_or_else(|| "观测接口没有返回 JSON".to_owned())
+}
+
+/// Requests one HTTP response and deserializes the first `count` JSON values
+/// from its body. The streaming memory endpoint sends an explicit zero sample
+/// first and the real value on the next tick, so its consumer must read two.
+fn clash_api_request_values(
+    api: &crate::config::ServerClashApi,
+    path: &str,
+    timeout: Duration,
+    count: usize,
+) -> Result<Vec<serde_json::Value>, String> {
     let address: std::net::SocketAddr = format!("127.0.0.1:{}", api.port)
         .parse()
         .map_err(|error| format!("invalid observation address: {error}"))?;
@@ -279,16 +301,14 @@ pub fn clash_api_request(
     })?;
     stream
         .set_read_timeout(Some(timeout))
-        .map_err(|error| error.to_string())?;
+        .map_err(api_io_error)?;
     let request = format!(
         "GET {path} HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\nAccept: application/json\r\nConnection: close\r\n\r\n",
         api.secret
     );
     let mut stream = stream;
-    stream
-        .write_all(request.as_bytes())
-        .map_err(|error| error.to_string())?;
-    stream.flush().map_err(|error| error.to_string())?;
+    stream.write_all(request.as_bytes()).map_err(api_io_error)?;
+    stream.flush().map_err(api_io_error)?;
     // /memory is an HTTP chunked stream that stays open and emits snapshots.
     // Read one complete JSON value, not EOF, and bound the whole read rather
     // than letting each successive sample renew a socket inactivity timeout.
@@ -298,7 +318,7 @@ pub fn clash_api_request(
     };
     let mut reader = BufReader::new(timed.take(8 * 1024 * 1024));
     let mut status = String::new();
-    reader.read_line(&mut status).map_err(|e| e.to_string())?;
+    reader.read_line(&mut status).map_err(api_io_error)?;
     if status.split_whitespace().nth(1) != Some("200") {
         return Err(format!("观测接口返回 {}", status.trim()));
     }
@@ -307,7 +327,7 @@ pub fn clash_api_request(
     let mut content_length = None;
     loop {
         let mut line = String::new();
-        let count = reader.read_line(&mut line).map_err(|e| e.to_string())?;
+        let count = reader.read_line(&mut line).map_err(api_io_error)?;
         header_bytes += count;
         if count == 0 || header_bytes > 16 * 1024 {
             return Err("观测接口响应头不完整或过大".into());
@@ -325,19 +345,22 @@ pub fn clash_api_request(
             }
         }
     }
-    let value = if chunked {
-        read_api_json(ChunkedBody {
-            reader,
-            remaining: 0,
-            started: false,
-            done: false,
-        })
+    let values = if chunked {
+        read_api_json_values(
+            ChunkedBody {
+                reader,
+                remaining: 0,
+                started: false,
+                done: false,
+            },
+            count,
+        )
     } else if let Some(length) = content_length {
-        read_api_json(reader.take(length))
+        read_api_json_values(reader.take(length), count)
     } else {
-        read_api_json(reader)
+        read_api_json_values(reader, count)
     };
-    value.map_err(|error| format!("观测接口 JSON 解析失败: {error}"))
+    values.map_err(|error| format!("观测接口 JSON 解析失败: {error}"))
 }
 
 struct DeadlineStream {
@@ -403,20 +426,33 @@ impl<R: BufRead> Read for ChunkedBody<R> {
     }
 }
 
-fn read_api_json(reader: impl Read) -> Result<serde_json::Value, serde_json::Error> {
-    // Deserializing one value deliberately does not check for EOF: a streaming
-    // memory endpoint is expected to send more values after this snapshot.
-    serde::Deserialize::deserialize(&mut serde_json::Deserializer::from_reader(reader))
+fn read_api_json_values(
+    reader: impl Read,
+    count: usize,
+) -> Result<Vec<serde_json::Value>, serde_json::Error> {
+    // Deserializing a value deliberately does not check for EOF: a streaming
+    // memory endpoint sends more samples after this one.
+    let mut deserializer = serde_json::Deserializer::from_reader(reader);
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count.max(1) {
+        values.push(serde::Deserialize::deserialize(&mut deserializer)?);
+    }
+    Ok(values)
 }
 
 /// Live memory of the data plane, in bytes, when the observation API is on.
 pub fn clash_api_memory(api: &crate::config::ServerClashApi) -> Result<u64, String> {
-    clash_api_request(api, "/memory", Duration::from_secs(3)).and_then(|value| {
-        value
-            .get("inuse")
-            .and_then(serde_json::Value::as_u64)
-            .ok_or_else(|| "响应缺少 inuse 字段".to_owned())
-    })
+    // sing-box emits an explicit `{"inuse":0}` sample on the first tick and the
+    // real heap on the next; reading only the first value always reported 0.
+    let values = clash_api_request_values(api, "/memory", Duration::from_secs(4), 2)?;
+    let value = values
+        .get(1)
+        .or_else(|| values.first())
+        .ok_or_else(|| "观测接口没有返回 JSON".to_owned())?;
+    value
+        .get("inuse")
+        .and_then(serde_json::Value::as_u64)
+        .ok_or_else(|| "响应缺少 inuse 字段".to_owned())
 }
 
 /// A short label for one live connection from `/connections`.
@@ -431,7 +467,9 @@ pub fn describe_connections(connections: &serde_json::Value) -> Vec<String> {
                     let metadata = &item["metadata"];
                     let destination = metadata["host"]
                         .as_str()
+                        .filter(|host| !host.is_empty())
                         .or_else(|| metadata["destinationIP"].as_str())
+                        .filter(|address| !address.is_empty())
                         .unwrap_or("?");
                     let chain = item["chains"]
                         .as_array()
@@ -678,7 +716,12 @@ mod api_tests {
     #[test]
     fn the_request_carries_the_bearer_token_and_parses_the_answer() {
         let (sender, receiver) = std::sync::mpsc::channel();
-        let port = mock_api("200 OK", r#"{"inuse":1048576,"inuse_one":0}"#, sender);
+        // The real endpoint emits a synthetic zero sample first.
+        let port = mock_api(
+            "200 OK",
+            "{\"inuse\":0}\n{\"inuse\":1048576,\"inuse_one\":0}",
+            sender,
+        );
 
         assert_eq!(
             clash_api_memory(&api(port)).expect("memory reads"),
@@ -754,6 +797,33 @@ mod api_tests {
     }
 
     #[test]
+    fn the_memory_endpoint_skips_the_synthetic_zero_sample() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0; 2048];
+            assert!(stream.read(&mut request).unwrap() > 0);
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n")
+                .unwrap();
+            for payload in [
+                b"{\"inuse\":0}\n".as_slice(),
+                b"{\"inuse\":1048576}\n".as_slice(),
+            ] {
+                write!(stream, "{:x}\r\n", payload.len()).unwrap();
+                stream.write_all(payload).unwrap();
+                stream.write_all(b"\r\n").unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        assert_eq!(clash_api_memory(&api(port)).unwrap(), 1_048_576);
+        server.join().unwrap();
+    }
+
+    #[test]
     fn a_trickling_response_cannot_extend_the_observation_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -796,5 +866,14 @@ mod api_tests {
             "{}",
             lines[0]
         );
+
+        let ip_only = serde_json::json!({
+            "connections": [{
+                "metadata": {"host": "", "destinationIP": "203.0.113.9"},
+                "upload": 1, "download": 2, "chains": []
+            }]
+        });
+        let lines = describe_connections(&ip_only);
+        assert!(lines[0].contains("203.0.113.9"), "{}", lines[0]);
     }
 }

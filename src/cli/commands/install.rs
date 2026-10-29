@@ -230,7 +230,7 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         // other sbctl writer. A second install that started before the winner
         // committed must not overwrite the winner's artifacts or binaries just
         // because its own preflight ran earlier.
-        let operation_lock = store
+        let _operation_lock = store
             .acquire_operation_lock()
             .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
         if root.join("etc/sbctl/config.toml").exists() {
@@ -282,9 +282,10 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             .collect::<Vec<_>>();
         store.initialize_with_artifacts_locked(&config, &references)?;
         config_committed = true;
-        drop(operation_lock);
-        // Only the winning transaction writes the data-plane binary. A late
-        // install that lost the race above must not replace it.
+        // Keep the operation lock until the ownership marker commits the
+        // complete installation. Otherwise another config command can commit
+        // while the health check is still running, and this command's rollback
+        // would then delete that newer deployment.
         sbctl::lifecycle::install_checked_sing_box(root, &sing_box_bin)?;
         let direct = config.subscription_mode == sbctl::config::SubscriptionMode::Direct;
         if !options.no_start {
@@ -294,7 +295,7 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 sbctl::certificate::pin_if_present(&store, &config)
                     .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
             }
-            sbctl::traffic::reset(&store, &config)
+            sbctl::traffic::reset_locked(&store, &config)
                 .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
         }
         sbctl::lifecycle::install_units(&store, server, direct)?;
@@ -322,10 +323,13 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                             "域名协议证书签发失败；请检查 DNS 和公网 80 端口后重试".into(),
                         ));
                     }
-                    sbctl::subscription::regenerate(&store, &config, Some(&sing_box_bin), true)
-                        .map_err(|error| {
-                            sbctl::config::ConfigError::StateContent(error.to_string())
-                        })?;
+                    sbctl::subscription::regenerate_current_locked(
+                        &store,
+                        Some(&sing_box_bin),
+                        true,
+                    )
+                    .map(|_| ())
+                    .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
                     sbctl::lifecycle::restart_services(root)
                         .map_err(sbctl::config::ConfigError::StateContent)?;
                 }

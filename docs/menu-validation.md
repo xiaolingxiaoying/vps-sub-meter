@@ -99,7 +99,7 @@ Debian/Ubuntu containers in `tests/acceptance/run.sh`; WSL-only tests do not est
 | 添加本地规则 | `sbctl rule add <direct|proxy|reject|fakeip-filter> <entry>` | Rule tests verify validation and regenerated artifacts. |
 | 移除本地规则 | `sbctl rule remove <direct|proxy|reject|fakeip-filter> <entry>` | Rule tests verify persistence and regeneration in a fixture. |
 | 查看远程规则集 | `sbctl rule-set list` | Rule-set CLI tests verify listing and configured refresh values. |
-| 注册远程规则集 | `sbctl rule-set add <name> --url <url> --outbound <target>` | Rule-set tests cover input validation and persistence; remote download behavior must use a controlled test endpoint. |
+| 注册远程规则集 | `sbctl rule-set add <name> --url <url> --outbound <target> [--behavior domain|ipcidr]` | Rule-set tests cover input validation, Mihomo behavior rendering and persistence; remote download behavior must use a controlled test endpoint. |
 | 移除远程规则集 | `sbctl rule-set remove <name>` | Rule-set tests verify persistence and regenerated artifacts in a fixture. |
 | 导入文本规则列表 | `sbctl rule-set import-list --url <url> --into <target>` | Rule-set tests should use a local HTTP fixture; no public CDN is needed. |
 | 设置规则集刷新间隔 | `sbctl rule-set interval <duration>` | Rule-set tests verify duration parsing and regenerated artifacts. |

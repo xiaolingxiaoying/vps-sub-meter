@@ -162,6 +162,40 @@ fn all_six_mode_transitions_preserve_credentials_accounting_and_overrides() {
 }
 
 #[test]
+fn switching_back_to_direct_repins_a_renewed_live_certificate() {
+    let (fixture, binary) = mode_fixture(SubscriptionMode::Direct);
+    let store = DeploymentStore::new(fixture.path());
+    let config = store.load().unwrap();
+    let initial = sbctl::certificate::load(&store, &config).unwrap();
+    sbctl::certificate::pin(&store, &config, &initial).unwrap();
+    let pinned = fixture
+        .path()
+        .join("var/lib/sbctl/certificates/sub.example.test/fullchain.pem");
+    let old_pinned = fs::read(&pinned).unwrap();
+
+    switch(&fixture, &binary, "external-proxy", free_high_tcp_port())
+        .assert()
+        .success();
+    seed_live_certificate(&fixture, &["sub.example.test"]);
+    let new_live = fs::read(
+        fixture
+            .path()
+            .join("etc/letsencrypt/live/sub.example.test/fullchain.pem"),
+    )
+    .unwrap();
+    assert_ne!(old_pinned, new_live, "the renewal must produce new bytes");
+
+    switch(&fixture, &binary, "direct", free_high_tcp_port())
+        .assert()
+        .success();
+    assert_eq!(
+        fs::read(&pinned).unwrap(),
+        new_live,
+        "switching back to Direct must pin the renewed live certificate, not keep the stale copy"
+    );
+}
+
+#[test]
 fn mode_restart_failure_restores_files_and_removes_new_certificates() {
     let (fixture, binary) = mode_fixture(SubscriptionMode::ExternalProxy);
     let paths = [

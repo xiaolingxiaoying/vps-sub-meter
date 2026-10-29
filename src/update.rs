@@ -849,16 +849,29 @@ fn backup(
                 .expect("pinned certificate path has a parent")
                 .to_owned();
             if directory.is_dir() {
-                match crate::managed_fs::read_pair(&directory, "fullchain.pem", "privkey.pem") {
-                    Ok((fullchain, privkey)) => Some((chain, key, fullchain, privkey)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                let exists = |name: &str| fs::symlink_metadata(directory.join(name)).is_ok();
+                match (exists("fullchain.pem"), exists("privkey.pem")) {
+                    // A Direct deployment may legitimately have no pinned pair
+                    // yet (Certbot missing or issuance pending); the same
+                    // directory still holds the protocol self-signed pair.
+                    (false, false) => None,
+                    (true, true) => {
+                        match crate::managed_fs::read_pair(
+                            &directory,
+                            "fullchain.pem",
+                            "privkey.pem",
+                        ) {
+                            Ok((fullchain, privkey)) => Some((chain, key, fullchain, privkey)),
+                            Err(error) => return Err(error.into()),
+                        }
+                    }
+                    _ => {
                         return Err(UpdateError::Operation(format!(
                             "pinned certificate pair under {} is incomplete; run \
                              `sbctl certificate verify` before retrying the update",
                             directory.display()
                         )));
                     }
-                    Err(error) => return Err(error.into()),
                 }
             } else {
                 None
@@ -1109,6 +1122,44 @@ fn check_sbctl_candidate(candidate: &Path) -> Result<(), UpdateError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_direct_deployment_without_a_pinned_pair_is_backed_up_and_a_partial_pair_is_refused() {
+        let fixture = tempfile::TempDir::new().expect("temporary root");
+        let store = DeploymentStore::new(fixture.path());
+        let config = DeploymentConfig::new(
+            crate::config::SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![crate::config::ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("direct config");
+        let directory = store.certificate_directory(&config.subscription_host);
+        fs::create_dir_all(&directory).expect("certificate directory");
+        fs::write(directory.join("cert.pem"), b"self-signed cert").unwrap();
+        fs::write(directory.join("key.pem"), b"self-signed key").unwrap();
+
+        let entries = backup(&store, &fixture.path().join("rollback"), &config)
+            .expect("a Direct deployment without a pinned pair still updates");
+        for entry in entries
+            .iter()
+            .filter(|entry| is_pinned_certificate_path(&entry.relative))
+        {
+            assert!(
+                entry.contents.is_none(),
+                "no pinned pair means both entries are absent"
+            );
+        }
+
+        fs::write(directory.join("fullchain.pem"), b"partial pair").unwrap();
+        assert!(matches!(
+            backup(&store, &fixture.path().join("rollback-2"), &config),
+            Err(UpdateError::Operation(message)) if message.contains("incomplete")
+        ));
+    }
 
     #[test]
     fn official_release_asset_digest_selects_the_exact_archive_name() {

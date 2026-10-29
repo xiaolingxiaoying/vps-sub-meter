@@ -62,9 +62,12 @@ sudo sbctl rule add fakeip-filter DOMAIN,music.example DOMAIN-SUFFIX,example.net
 
 远程二进制规则集按客户端格式分别注册。`.srs` 仅写入 sing-box 完整订阅，`.mrs` 仅写入现行 Mihomo 订阅，两种二进制不能互换。需要两端覆盖同一策略时，使用两个名称及对应的两个 URL。minimal 档与 Mihomo 1.18 兼容订阅不加载远程规则集。
 
+Mihomo 的 `.mrs` 还要声明载荷类型：域名/关键词集用默认的 `--behavior domain`，IP-CIDR 集必须用 `--behavior ipcidr`，否则 Mihomo 会把它当作域名集载入 0 条规则。IP 类型会自动追加 `no-resolve`。
+
 ```bash
 sudo sbctl rule-set add game-sing --url https://example.com/game.srs --outbound proxy
 sudo sbctl rule-set add game-mihomo --url https://example.com/game.mrs --outbound proxy
+sudo sbctl rule-set add cn-ip --url https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs --outbound direct --behavior ipcidr
 sudo sbctl rule-set interval 12h
 ```
 

@@ -22,7 +22,9 @@ fn desired(prior: &DeploymentConfig, options: &ModeOptions) -> Result<Deployment
     let mut new = prior.clone();
     new.subscription_mode = options.mode.clone();
     if let Some(host) = &options.subscription_host {
-        new.subscription_host = host.clone();
+        // Certbot creates its live directory from the lowercased domain;
+        // normalize before validation, snapshots, and pinned-path generation.
+        new.subscription_host = host.to_ascii_lowercase();
     }
     if let Some(mode) = &options.certificate_mode {
         new.certificate_mode = mode.clone();
@@ -432,19 +434,27 @@ fn prepare_listener(
         SubscriptionMode::IpFallback => prior.http_port,
         SubscriptionMode::Direct => None,
     };
-    if let Some(port) = port
-        && (explicit_port
-            || new.subscription_mode != prior.subscription_mode
-            || old_port != Some(port))
-    {
-        // IP fallback binds publicly; test the wildcard address, not only loopback.
-        let address = if new.subscription_mode == SubscriptionMode::IpFallback {
-            "0.0.0.0"
-        } else {
-            "127.0.0.1"
-        };
-        let _listener = std::net::TcpListener::bind((address, port))
-            .map_err(|_| format!("subscription listener port {port} already in use"))?;
+    if let Some(port) = port {
+        // When the mode changes on the same managed port, the old listener is
+        // stopped by this transaction; probing it first would report a false
+        // conflict. Same-mode reconfiguration still probes, because a foreign
+        // process may hold the port while the managed service is stopped.
+        let reuses_managed_port =
+            new.subscription_mode != prior.subscription_mode && old_port == Some(port);
+        if !reuses_managed_port
+            && (explicit_port
+                || new.subscription_mode != prior.subscription_mode
+                || old_port != Some(port))
+        {
+            // IP fallback binds publicly; test the wildcard address, not only loopback.
+            let address = if new.subscription_mode == SubscriptionMode::IpFallback {
+                "0.0.0.0"
+            } else {
+                "127.0.0.1"
+            };
+            let _listener = std::net::TcpListener::bind((address, port))
+                .map_err(|_| format!("subscription listener port {port} already in use"))?;
+        }
     }
     if root == Path::new("/")
         && new.subscription_mode == SubscriptionMode::Direct
@@ -514,7 +524,11 @@ pub(crate) fn switch_mode(root: &Path, options: ModeOptions) -> ExitCode {
             if root == Path::new("/") {
                 sbctl::lifecycle::prepare_daemon_prerequisites(root, true)?;
             }
-            if (direct && pinned.is_none()
+            let live_is_newer = live.as_ref().is_some_and(|live| {
+                pinned.as_ref().map(|pinned| pinned.fingerprint.as_str())
+                    != Some(live.fingerprint.as_str())
+            });
+            if (direct && live_is_newer
                 || new.subscription_mode == SubscriptionMode::ExternalProxy
                     && new.certificate_mode == CertificateMode::Domain)
                 && let Some(live) = &live
@@ -583,5 +597,59 @@ pub(crate) fn switch_mode(root: &Path, options: ModeOptions) -> ExitCode {
             eprintln!("configuration failed: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cli::commands::mode::{ModeOptions, desired, prepare_listener};
+
+    fn config(mode: SubscriptionMode, host: &str) -> DeploymentConfig {
+        let mut config = DeploymentConfig::new(
+            mode.clone(),
+            host.into(),
+            None,
+            (mode == SubscriptionMode::IpFallback).then_some(2080),
+            "ens3".into(),
+            vec![sbctl::config::ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("fixture config");
+        if mode == SubscriptionMode::ExternalProxy {
+            config.subscription_listen_port = Some(2080);
+        }
+        config
+    }
+
+    #[test]
+    fn a_mode_switch_host_is_lowercased_before_certificate_paths_are_built() {
+        let prior = config(SubscriptionMode::ExternalProxy, "old.example.test");
+        let options = ModeOptions {
+            mode: SubscriptionMode::ExternalProxy,
+            listen_port: None,
+            subscription_host: Some("Sub.Example.TEST".into()),
+            http_port: None,
+            certificate_mode: None,
+            protocol_sni: None,
+            certbot_email: None,
+            sing_box_bin: None,
+        };
+        let new = desired(&prior, &options).expect("the desired config is valid");
+        assert_eq!(new.subscription_host, "sub.example.test");
+    }
+
+    #[test]
+    fn reusing_the_running_subscription_port_is_not_a_false_conflict() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("blocker binds");
+        let port = listener.local_addr().unwrap().port();
+        let mut prior = config(SubscriptionMode::ExternalProxy, "sub.example.test");
+        prior.subscription_listen_port = Some(port);
+        let mut new = config(SubscriptionMode::IpFallback, "203.0.113.7");
+        new.subscription_listen_port = None;
+        new.http_port = Some(port);
+        let root = tempfile::tempdir().expect("fixture root");
+        prepare_listener(root.path(), &prior, &new, false)
+            .expect("the old managed listener is stopped before the new one binds");
     }
 }

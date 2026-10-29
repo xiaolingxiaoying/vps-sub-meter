@@ -110,7 +110,15 @@ fn main() -> ExitCode {
                 name,
                 url,
                 outbound,
-            } => rule_set_add(root, &name, &url, outbound.into(), sing_box_bin),
+                behavior,
+            } => rule_set_add(
+                root,
+                &name,
+                &url,
+                outbound.into(),
+                behavior.into(),
+                sing_box_bin,
+            ),
             cli::args::RuleSetCommand::Remove { name } => {
                 rule_set_remove(root, &name, sing_box_bin)
             }

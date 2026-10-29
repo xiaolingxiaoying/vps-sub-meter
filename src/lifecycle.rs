@@ -186,7 +186,10 @@ pub fn install_units(
             return Err(ConfigError::AlreadyExists);
         }
     }
-    store.write_active_sing_box_config(server_config.as_bytes())?;
+    // The install transaction holds the operation lock through service start
+    // and the ownership marker; use the unlocked write helper so the active
+    // configuration cannot be swapped by another writer mid-install.
+    store.write_relative_locked("etc/sing-box/config.json", server_config.as_bytes())?;
     write_unit(store.root(), SING_BOX_UNIT, sing_box_unit())?;
     write_unit(store.root(), SBCTL_UNIT, &sbctl_unit(direct))?;
     write_unit(
@@ -542,7 +545,10 @@ fn install_ports(config: &DeploymentConfig) -> std::collections::BTreeSet<u16> {
         .collect::<std::collections::BTreeSet<_>>();
     if config.subscription_mode == crate::config::SubscriptionMode::Direct {
         ports.extend([80, 443]);
-    } else if let Some(port) = config.subscription_listen_port {
+    } else if let Some(port) = config.http_port.or(config.subscription_listen_port) {
+        // IP fallback stores its public port in `http_port`; external proxy
+        // stores the loopback port in `subscription_listen_port`. Both belong
+        // to the managed listener that replacement must stop.
         ports.insert(port);
     }
     ports
@@ -1792,12 +1798,43 @@ mod tests {
             fs::read_to_string(&calls).unwrap(),
             "try-restart sing-box.service\n"
         );
+        // Replace the inode instead of truncating an executable that may still
+        // be exiting; truncating an in-use script returns ETXTBSY under load.
+        fs::remove_file(&command).unwrap();
         fs::write(&command, "#!/bin/sh\nexit 1\n").unwrap();
         assert!(
             refresh_certificate_consumer(root)
                 .unwrap_err()
                 .contains("certificate published but data-plane refresh failed")
         );
+    }
+
+    #[test]
+    fn replacement_install_ports_include_the_ip_fallback_public_port() {
+        let ip_fallback = crate::config::DeploymentConfig::new(
+            crate::config::SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![crate::config::ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        assert!(install_ports(&ip_fallback).contains(&2080));
+
+        let external = crate::config::DeploymentConfig::new(
+            crate::config::SubscriptionMode::ExternalProxy,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![crate::config::ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        let listen = external.subscription_listen_port.unwrap();
+        assert!(install_ports(&external).contains(&listen));
     }
 
     #[test]

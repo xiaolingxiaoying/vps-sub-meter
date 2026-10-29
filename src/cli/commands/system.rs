@@ -247,6 +247,10 @@ fn named_url(
 }
 
 fn add_credential(root: &Path, name: &str) -> ExitCode {
+    if name == "default" {
+        eprintln!("credential add failed: 名称 default 保留给部署默认凭据；请换一个设备名");
+        return ExitCode::from(2);
+    }
     let result = credential_transaction(root, |config| {
         let now = chrono::Utc::now().timestamp();
         if config
@@ -289,12 +293,16 @@ fn add_credential(root: &Path, name: &str) -> ExitCode {
 fn revoke_credential(root: &Path, name: &str, grace: Option<&str>) -> ExitCode {
     let result = grace_seconds(grace).and_then(|window| {
         credential_transaction(root, |config| {
-            if name == "default" {
+            let now = chrono::Utc::now().timestamp();
+            let named_default = config
+                .subscription_credentials
+                .iter()
+                .any(|entry| entry.name == "default" && entry.is_active(now));
+            if name == "default" && !named_default {
                 return Err(credential_error(
                     "默认凭据不能吊销；用 sbctl credential rotate 轮换它",
                 ));
             }
-            let now = chrono::Utc::now().timestamp();
             let until = expiry(now, window)?;
             let entries: Vec<_> = config
                 .subscription_credentials

@@ -669,7 +669,15 @@ fn execute_action(root: &Path, action: Action) {
             let Some(target) = menu_rule_set_target() else {
                 return;
             };
-            ruleset::add(root, &name, &url, target, None);
+            let behavior = if url.ends_with(".mrs") {
+                let Some(behavior) = menu_rule_set_behavior() else {
+                    return;
+                };
+                behavior
+            } else {
+                sbctl::config::RuleSetBehavior::Domain
+            };
+            ruleset::add(root, &name, &url, target, behavior, None);
         }
         RuleSetRemove => {
             if let Some(name) = required_menu_text("要移除的规则集名称: ") {
@@ -733,6 +741,20 @@ fn menu_rule_kind(include_filter: bool) -> Option<CliRuleKind> {
         }
     }
 }
+fn menu_rule_set_behavior() -> Option<sbctl::config::RuleSetBehavior> {
+    use sbctl::config::RuleSetBehavior;
+    println!("Mihomo 规则集类型：1) domain（域名/关键字） 2) ipcidr（IP-CIDR）");
+    let value = required_menu_text("选择 [1]: ")?;
+    match value.trim() {
+        "" | "1" => Some(RuleSetBehavior::Domain),
+        "2" => Some(RuleSetBehavior::Ipcidr),
+        _ => {
+            eprintln!("请输入 1 或 2");
+            None
+        }
+    }
+}
+
 fn menu_rule_set_target() -> Option<crate::cli::commands::ruleset::RuleSetTarget> {
     use crate::cli::commands::ruleset::RuleSetTarget;
     menu_rule_kind(false).map(|kind| match kind {

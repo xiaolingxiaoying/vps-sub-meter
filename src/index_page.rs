@@ -72,6 +72,22 @@ pub fn render_with_credential(
             note = esc(&row.note),
         ));
     }
+    // A named credential must not point the operator at `rotate` without
+    // `--name`; that command only rotates the deployment default and leaves the
+    // leaked device link valid. Quote the name for a shell if it contains one.
+    let rotate_command = config
+        .subscription_credentials
+        .iter()
+        .find(|entry| {
+            entry.credential == credential && entry.is_active(chrono::Utc::now().timestamp())
+        })
+        .map(|entry| {
+            format!(
+                "sbctl credential rotate --name {}",
+                shell_quote(&entry.name)
+            )
+        })
+        .unwrap_or_else(|| "sbctl credential rotate".to_owned());
     let mut node_rows = String::new();
     for node in crate::canonical::nodes(config) {
         node_rows.push_str("<tr><th>");
@@ -135,7 +151,7 @@ code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
 <p><span class=\"badge\">主机：{host}</span>\
 <span class=\"badge\">模式：{mode}</span>\
 {traffic_badges}</p>\n\
-<p class=\"note\">二维码内容是对应的订阅 URL，请使用客户端的订阅扫码功能，或复制链接添加订阅；系统相机可能只会打开下载页面。订阅凭据泄露时请在服务器上执行 <code>sbctl credential rotate</code> 更换。</p>\n\
+<p class=\"note\">二维码内容是对应的订阅 URL，请使用客户端的订阅扫码功能，或复制链接添加订阅；系统相机可能只会打开下载页面。订阅凭据泄露时请在服务器上执行 <code>{rotate_command}</code> 更换。</p>\n\
 <h2>按客户端选择</h2>\n\
 <table>\n{client_rows}</table>\n\
 <h2>节点与原生分享链接</h2>\n\
@@ -153,6 +169,7 @@ code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
 <li><strong>Shadowrocket（iOS）</strong>：扫码或粘贴 <code>shadowrocket.txt</code> 链接 → 首页添加配置 → 自动更新。五协议均受支持，最低版本：VLESS Reality 2.2.16、TUIC 2.2.12、Hysteria2 2.2.35、AnyTLS 2.2.64；低于对应版本时该协议节点不会被识别（其余节点仍可正常导入）。</li>\n\
 </ul>\n\
 </body>\n</html>\n",
+        rotate_command = esc(&rotate_command),
         host = esc(&config.subscription_host),
         mode = esc(&config.subscription_mode.to_string()),
         traffic_badges = traffic_badges(config, traffic.as_ref())?,
@@ -223,6 +240,12 @@ fn esc_attr(text: &str) -> String {
 /// Re-exported for tests and callers that want to label version rows.
 pub fn version_label(version: ClientVersion) -> String {
     format!("sing-box {version}")
+}
+
+/// Quotes a configuration name for a shell command shown on the page. Single
+/// quotes are the only quoting operator that suppresses every expansion.
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 #[cfg(test)]

@@ -598,6 +598,7 @@ pub fn generated_artifacts_for_kernel(
     ensure_subscription_nodes(config)?;
     let nodes = crate::canonical::nodes(config);
     let uri = uri(config, &nodes)?;
+    let full_profile = resolve_full_profile(config, &nodes, kernel);
     let mut artifacts: Vec<(String, String)> = vec![
         (
             SING_BOX_SERVER_ARTIFACT.to_owned(),
@@ -613,7 +614,7 @@ pub fn generated_artifacts_for_kernel(
         ),
         (
             SING_BOX_FULL_ARTIFACT.to_owned(),
-            sing_box_full(config, &nodes, resolve_full_profile(config, &nodes, kernel))?,
+            sing_box_full(config, &nodes, full_profile)?,
         ),
     ];
     for profile in SING_BOX_VERSION_PROFILES {
@@ -649,7 +650,7 @@ pub fn generated_artifacts_for_kernel(
         ));
     }
     apply_client_overrides(root, &mut artifacts)?;
-    apply_rule_lists(root, &mut artifacts)?;
+    apply_rule_lists(root, &mut artifacts, !full_profile.route_rule_actions)?;
     validate_client_references(&artifacts)?;
     Ok(artifacts)
 }
@@ -914,11 +915,17 @@ fn validate_mihomo_references(
         .flatten()
         .filter_map(|v| v.as_str())
     {
-        if let Some(target) = rule
-            .strip_suffix(",no-resolve")
-            .unwrap_or(rule)
-            .rsplit(',')
-            .next()
+        // Clash rule types place the policy in a fixed field: MATCH/FINAL use
+        // field 1, ordinary rules use field 2, and trailing modifiers such as
+        // `no-resolve` or `src` must not be mistaken for the target. Logical
+        // rules contain commas inside parentheses; do not guess their target.
+        let parts = rule.split(',').collect::<Vec<_>>();
+        let target = match parts.first().copied() {
+            Some("AND" | "OR" | "NOT") => None,
+            Some("MATCH" | "FINAL") => parts.get(1).copied(),
+            _ => parts.get(2).copied(),
+        };
+        if let Some(target) = target
             && !known.contains(target)
             && !["DIRECT", "REJECT", "PASS", "GLOBAL"].contains(&target)
         {
@@ -1069,6 +1076,7 @@ fn validate_mihomo_references(
 fn apply_rule_lists(
     root: &Path,
     artifacts: &mut [(String, String)],
+    legacy_full_profile: bool,
 ) -> Result<(), SubscriptionError> {
     let lists = crate::rule_list::RuleLists::load(root)
         .map_err(|error| SubscriptionError::Override(error.to_string()))?;
@@ -1083,8 +1091,11 @@ fn apply_rule_lists(
     for (name, contents) in artifacts.iter_mut() {
         if name.starts_with("subscription-sing-box") && *name != SING_BOX_ARTIFACT {
             // The 1.10 profile predates route rule actions, so a block there is
-            // an outbound reference — and that outbound has to exist too.
-            let legacy_block = name.contains("-1.10.");
+            // an outbound reference — and that outbound has to exist too. The
+            // unversioned full artifact can itself target the 1.10 profile when
+            // the installed kernel is that old.
+            let legacy_block =
+                name.contains("-1.10.") || (name == SING_BOX_FULL_ARTIFACT && legacy_full_profile);
             let rules = lists.sing_box_rules(legacy_block);
             let mut value: serde_json::Value = serde_json::from_str(contents)
                 .map_err(|error| SubscriptionError::Override(error.to_string()))?;
@@ -2525,6 +2536,10 @@ ot-a-sing-box.bin"
         let mut reject_drop = mihomo.clone();
         reject_drop["rules"] = serde_yaml::to_value(["MATCH,REJECT-DROP"]).unwrap();
         super::validate_mihomo_references("mihomo.yaml", &reject_drop).unwrap();
+        let mut src_rule = mihomo.clone();
+        src_rule["rules"] = serde_yaml::to_value(["IP-CIDR,192.168.1.0/24,DIRECT,src"]).unwrap();
+        super::validate_mihomo_references("mihomo.yaml", &src_rule)
+            .expect("src is a rule modifier, not a proxy group");
         for (address, valid) in [
             ("https://dns.test/query#Proxy&h3", true),
             ("https://dns.test/query#自动选择#h3", false),
@@ -3425,6 +3440,63 @@ ot-a-sing-box.bin"
     }
 
     #[test]
+    fn an_ipcidr_mrs_set_is_declared_with_its_behavior_and_no_resolve() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let (_store, mut config, _) = seed_direct_subscription(&fixture);
+        config.client_extra_rule_sets = vec![crate::config::ExtraRuleSet {
+            name: "cn-ip".to_owned(),
+            url: "https://cdn.example/geoip/cn.mrs".to_owned(),
+            outbound: "direct".to_owned(),
+            behavior: crate::config::RuleSetBehavior::Ipcidr,
+        }];
+        let artifacts = generated_artifacts(&config, fixture.path()).unwrap();
+        let clash = artifact_text(&artifacts, "subscription-clash.yaml");
+        assert!(
+            clash.contains("behavior: ipcidr"),
+            "Mihomo must load an IP rule-set as ipcidr, not domain"
+        );
+        assert!(
+            clash.contains("RULE-SET,cn-ip,DIRECT,no-resolve"),
+            "IP rule-set references need no-resolve"
+        );
+        let full = artifact_text(&artifacts, "subscription-sing-box-full.json");
+        assert!(
+            !full.contains("cn.mrs"),
+            "mihomo .mrs sets must not leak into sing-box artifacts"
+        );
+    }
+
+    #[test]
+    fn a_full_profile_targeting_1_10_uses_legacy_block_rules() {
+        let fixture = TempDir::new().expect("temporary root is created");
+        let lists = fixture.path().join("etc/sbctl/rules");
+        fs::create_dir_all(&lists).unwrap();
+        fs::write(lists.join("reject.list"), "DOMAIN-SUFFIX,ads.example\n").unwrap();
+        let full = serde_json::json!({"route":{"rules":[]},"outbounds":[]}).to_string();
+        let versioned = serde_json::json!({"route":{"rules":[]},"outbounds":[]}).to_string();
+        let mut artifacts = vec![
+            ("subscription-sing-box-full.json".to_owned(), full),
+            ("subscription-sing-box-1.10.json".to_owned(), versioned),
+        ];
+        super::apply_rule_lists(fixture.path(), &mut artifacts, true).unwrap();
+        for (name, contents) in artifacts {
+            let value: serde_json::Value = serde_json::from_str(&contents).unwrap();
+            assert_eq!(
+                value["route"]["rules"][0]["outbound"], "block-out",
+                "{name}"
+            );
+            assert!(
+                value["outbounds"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|outbound| outbound["tag"] == "block-out"),
+                "{name} must declare the legacy block outbound"
+            );
+        }
+    }
+
+    #[test]
     fn registered_rule_sets_reach_only_their_client_format_and_stay_out_of_minimal() {
         let fixture = TempDir::new().expect("temporary root is created");
         let (_store, mut config, _) = seed_direct_subscription(&fixture);
@@ -3433,11 +3505,13 @@ ot-a-sing-box.bin"
                 name: "game".to_owned(),
                 url: "https://cdn.example/geo/game.srs".to_owned(),
                 outbound: "reject".to_owned(),
+                behavior: Default::default(),
             },
             crate::config::ExtraRuleSet {
                 name: "game-mihomo".to_owned(),
                 url: "https://cdn.example/geo/game.mrs".to_owned(),
                 outbound: "reject".to_owned(),
+                behavior: Default::default(),
             },
         ];
 
@@ -3531,11 +3605,13 @@ ot-a-sing-box.bin"
                 name: "game".to_owned(),
                 url: "https://cdn.example/geo/game.srs".to_owned(),
                 outbound: "proxy".to_owned(),
+                behavior: Default::default(),
             },
             crate::config::ExtraRuleSet {
                 name: "game-mihomo".to_owned(),
                 url: "https://cdn.example/geo/game.mrs".to_owned(),
                 outbound: "proxy".to_owned(),
+                behavior: Default::default(),
             },
         ];
         config.client_rule_set_update_interval = "12h".to_owned();
@@ -3582,11 +3658,13 @@ ot-a-sing-box.bin"
                 name: "review-srs".into(),
                 url: "https://cdn.example/review.srs".into(),
                 outbound: "reject".into(),
+                behavior: Default::default(),
             },
             crate::config::ExtraRuleSet {
                 name: "review-mrs".into(),
                 url: "https://cdn.example/review.mrs".into(),
                 outbound: "reject".into(),
+                behavior: Default::default(),
             },
         ];
         for template in [

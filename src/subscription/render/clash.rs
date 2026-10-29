@@ -210,17 +210,17 @@ fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> Stri
     }
     let mut providers =
         serde_yaml::to_string(&serde_json::json!({"rule-providers": values})).unwrap();
-    // An operator registers a URL, not a behaviour, so everything is declared as
-    // a domain set: mihomo only mis-sorts a domain list, never mis-routes an IP
-    // one, and `rule-set add` documents that a CIDR list belongs in
-    // `etc/sbctl/rules/direct.list` instead, where it is parsed as one.
     for set in config
         .client_extra_rule_sets
         .iter()
         .filter(|set| set.is_mihomo())
     {
+        let behavior = match set.behavior {
+            crate::config::RuleSetBehavior::Domain => "domain",
+            crate::config::RuleSetBehavior::Ipcidr => "ipcidr",
+        };
         providers.push_str(&format!(
-            "  {tag}:\n    type: http\n    behavior: domain\n    format: mrs\n    url: {url}\n    path: ./ruleset/{tag}.mrs\n    interval: {interval}\n",
+            "  {tag}:\n    type: http\n    behavior: {behavior}\n    format: mrs\n    url: {url}\n    path: ./ruleset/{tag}.mrs\n    interval: {interval}\n",
             tag = set.name,
             url = set.url,
             interval = clash_interval(config)
@@ -272,8 +272,13 @@ fn clash_extra_rules(config: &DeploymentConfig) -> String {
         .iter()
         .filter(|set| set.is_mihomo())
     {
+        let suffix = if set.behavior == crate::config::RuleSetBehavior::Ipcidr {
+            ",no-resolve"
+        } else {
+            ""
+        };
         lines.push_str(&format!(
-            "  - RULE-SET,{name},{target}\n",
+            "  - RULE-SET,{name},{target}{suffix}\n",
             name = set.name,
             target = clash_extra_rule_target(&set.outbound)
         ));

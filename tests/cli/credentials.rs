@@ -304,6 +304,13 @@ fn credential_list_masks_every_secret_and_refuses_ambiguous_names() {
 
     Command::cargo_bin("sbctl")
         .expect("sbctl binary is built")
+        .args(["--root", root, "credential", "add", "--name", "default"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("保留给部署默认凭据"));
+
+    Command::cargo_bin("sbctl")
+        .expect("sbctl binary is built")
         .args(["--root", root, "credential", "revoke", "ghost"])
         .assert()
         .failure()
@@ -462,6 +469,18 @@ fn named_and_retiring_routes_never_advertise_the_default_secret() {
         let index = http_get(port, &format!("/sub/{credential}/index"));
         assert!(index.starts_with("HTTP/1.1 200"));
         assert!(index.contains(&format!("/sub/{credential}/")));
+        if credential == &named {
+            assert!(
+                index.contains("credential rotate --name &#39;phone&#39;"),
+                "a named credential page must rotate that device, not the default"
+            );
+        }
+        if credential == &default {
+            assert!(
+                index.contains("credential rotate</code>"),
+                "the default credential keeps the default rotate hint"
+            );
+        }
         for other in [&default, &named, &retiring] {
             if credential != other {
                 assert!(!index.contains(other));

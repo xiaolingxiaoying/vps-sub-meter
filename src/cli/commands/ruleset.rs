@@ -114,6 +114,7 @@ pub(crate) fn add(
     name: &str,
     url: &str,
     target: RuleSetTarget,
+    behavior: sbctl::config::RuleSetBehavior,
     sing_box_bin: Option<std::path::PathBuf>,
 ) -> ExitCode {
     if name.is_empty() || name.contains(char::is_whitespace) {
@@ -141,6 +142,7 @@ pub(crate) fn add(
                 name: name.to_owned(),
                 url: url.to_owned(),
                 outbound: target.word().to_owned(),
+                behavior,
             };
             match config
                 .client_extra_rule_sets

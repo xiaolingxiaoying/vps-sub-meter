@@ -164,11 +164,13 @@ fn a_registered_mrs_provider_loads_actual_binary_rules() {
             name: "review-srs".into(),
             url: "https://cdn.example/review.srs".into(),
             outbound: "reject".into(),
+            behavior: Default::default(),
         },
         sbctl::config::ExtraRuleSet {
             name: "review-mrs".into(),
             url: "https://cdn.example/review.mrs".into(),
             outbound: "reject".into(),
+            behavior: Default::default(),
         },
     ];
     let artifacts = generated_artifacts(&config, root.path()).unwrap();

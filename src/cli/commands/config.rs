@@ -922,6 +922,47 @@ pub(crate) fn run_config_wizard(root: &Path, sing_box_bin: Option<PathBuf>) -> E
     }
 }
 
+/// Makes the Direct subscription certificate usable for `new` before the
+/// configuration transaction commits. A renewed live certificate is re-pinned;
+/// a host change without any usable certificate is issued here (or fails with
+/// an actionable error) instead of leaving a healthy-looking but unreachable
+/// HTTPS listener.
+fn ensure_direct_certificate(
+    store: &sbctl::config::DeploymentStore,
+    new: &sbctl::config::DeploymentConfig,
+    root: &Path,
+    require_issuance: bool,
+) -> Result<(), sbctl::config::ConfigError> {
+    let pinned = sbctl::certificate::load_pinned(store, new).ok();
+    let live = sbctl::certificate::load(store, new).ok();
+    if let Some(live) = live {
+        if pinned.as_ref().map(|pinned| pinned.fingerprint.as_str())
+            != Some(live.fingerprint.as_str())
+        {
+            sbctl::certificate::pin(store, new, &live)
+                .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+        }
+        return Ok(());
+    }
+    if pinned.is_some() || !require_issuance {
+        return Ok(());
+    }
+    sbctl::certificate::require_certbot(root)
+        .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
+    if !new
+        .certbot_email
+        .as_deref()
+        .is_some_and(sbctl::certificate::acme_email_is_valid)
+    {
+        return Err(sbctl::config::ConfigError::StateContent(
+            "签发 Direct 订阅证书需要有效的 --certbot-email（或已保存的邮箱）".into(),
+        ));
+    }
+    sbctl::certificate::obtain(store, new, new.certbot_email.as_deref())
+        .map(|_| ())
+        .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))
+}
+
 /// Commits a confirmed wizard configuration through the artifact/check/health
 /// transaction. A fresh deployment initializes artifacts and configuration;
 /// an existing deployment atomically replaces the changed files, restarts the
@@ -999,6 +1040,15 @@ pub(crate) fn commit_config_change(
                 Ok(())
             }
             Some(prior) => {
+                // A subscription host change in Direct mode needs a usable
+                // pinned certificate for the new host before the listener is
+                // restarted; otherwise the command reports success while every
+                // subscription handshake is dropped.
+                if new.subscription_mode == sbctl::config::SubscriptionMode::Direct {
+                    let require_issuance = prior.subscription_host != new.subscription_host
+                        || prior.subscription_mode != sbctl::config::SubscriptionMode::Direct;
+                    ensure_direct_certificate(store, new, root, require_issuance)?;
+                }
                 let snapshot = sbctl::subscription::apply_config_transaction_locked(
                     store,
                     new,
@@ -1110,5 +1160,53 @@ fn configuration_artifact(root: &Path, format: &str, output: Option<&Path>) -> E
             eprintln!("配置读取 / 导出失败：{error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ensure_direct_certificate;
+    use std::fs;
+
+    use sbctl::config::{DeploymentConfig, DeploymentStore, ManagedProtocol, SubscriptionMode};
+
+    #[test]
+    fn a_config_change_pins_a_renewed_live_certificate_for_direct_mode() {
+        let fixture = tempfile::tempdir().expect("fixture root");
+        let store = DeploymentStore::new(fixture.path());
+        let config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("direct config");
+        let live = fixture.path().join("etc/letsencrypt/live/sub.example.test");
+        fs::create_dir_all(&live).unwrap();
+        let write_certificate = || {
+            let certificate = rcgen::generate_simple_self_signed(vec!["sub.example.test".into()])
+                .expect("certificate");
+            fs::write(live.join("fullchain.pem"), certificate.cert.pem()).unwrap();
+            fs::write(
+                live.join("privkey.pem"),
+                certificate.signing_key.serialize_pem(),
+            )
+            .unwrap();
+        };
+        write_certificate();
+        ensure_direct_certificate(&store, &config, fixture.path(), false)
+            .expect("the live pair is pinned");
+        let pinned = store.certificate_directory("sub.example.test");
+        let first = fs::read(pinned.join("fullchain.pem")).unwrap();
+
+        write_certificate();
+        ensure_direct_certificate(&store, &config, fixture.path(), false)
+            .expect("the renewed pair is re-pinned");
+        let second = fs::read(pinned.join("fullchain.pem")).unwrap();
+        assert_ne!(first, second);
+        assert_eq!(second, fs::read(live.join("fullchain.pem")).unwrap());
     }
 }

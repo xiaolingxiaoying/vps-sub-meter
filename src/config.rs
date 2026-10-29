@@ -360,12 +360,26 @@ fn default_client_rule_profile() -> ClientRuleProfile {
 /// cannot be parsed. Importing a plain-text list is a CLI operation that turns
 /// it into `etc/sbctl/rules/*.list` entries instead, because generation must
 /// stay free of network access to keep artifacts reproducible.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RuleSetBehavior {
+    /// A Mihomo `domain` rule-set: domain and keyword matchers.
+    #[default]
+    Domain,
+    /// A Mihomo `ipcidr` rule-set: IP-CIDR matchers; rendered with no-resolve.
+    Ipcidr,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct ExtraRuleSet {
     pub name: String,
     pub url: String,
     /// One of `direct`, `proxy`, `reject`, or a generated group tag.
     pub outbound: String,
+    /// How Mihomo should load the `.mrs` payload. The URL does not encode this;
+    /// declaring an IP-CIDR set as `domain` silently yields zero rules.
+    #[serde(default)]
+    pub behavior: RuleSetBehavior,
 }
 
 impl ExtraRuleSet {
@@ -820,6 +834,15 @@ impl DeploymentConfig {
             // and report them as this one's.
             return Err(ConfigError::InvalidValue(
                 "interface must be a Linux interface name",
+            ));
+        }
+        if self
+            .server_clash_api
+            .as_ref()
+            .is_some_and(|api| api.port == 0)
+        {
+            return Err(ConfigError::InvalidValue(
+                "server clash api port must not be zero",
             ));
         }
         for (field, url) in [
@@ -2101,7 +2124,8 @@ mod tests {
 
     use super::{
         AccountingPolicy, CertificateMode, DeploymentConfig, DeploymentOptions, DeploymentStore,
-        ExtraRuleSet, ManagedProtocol, ProtocolPorts, SubscriptionMode,
+        ExtraRuleSet, ManagedProtocol, ProtocolPorts, RuleSetBehavior, ServerClashApi,
+        SubscriptionMode,
     };
 
     #[cfg(unix)]
@@ -2458,6 +2482,28 @@ mod tests {
     }
 
     #[test]
+    fn a_hand_edited_zero_observation_port_is_rejected() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("a base deployment is valid");
+        config.server_clash_api = Some(ServerClashApi {
+            port: 0,
+            secret: "abcdefghijklmnop".into(),
+        });
+        assert!(matches!(
+            config.validate(),
+            Err(super::ConfigError::InvalidValue(message)) if message.contains("port")
+        ));
+    }
+
+    #[test]
     fn hostnames_are_lowercased_for_certificate_paths_and_load() {
         let config = DeploymentConfig::new(
             SubscriptionMode::Direct,
@@ -2507,6 +2553,7 @@ mod tests {
             name: "game".into(),
             url: "http://cdn.example/game.srs".into(),
             outbound: "reject".into(),
+            behavior: RuleSetBehavior::Domain,
         }];
         assert!(matches!(
             config.validate(),

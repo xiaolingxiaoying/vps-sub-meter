@@ -1566,6 +1566,8 @@ fn rule_set_add_persists_renders_and_refuses_an_uncompilable_url() {
             "https://cdn.example/geo/game.mrs",
             "--outbound",
             "reject",
+            "--behavior",
+            "ipcidr",
             "--sing-box-bin",
             checker_path,
         ])
@@ -1578,8 +1580,9 @@ fn rule_set_add_persists_renders_and_refuses_an_uncompilable_url() {
             .join("var/lib/sbctl/artifacts/subscription-clash.yaml"),
     )
     .unwrap();
-    assert!(clash.contains("RULE-SET,game-mihomo,REJECT"));
+    assert!(clash.contains("RULE-SET,game-mihomo,REJECT,no-resolve"));
     assert!(clash.contains("game.mrs"));
+    assert!(clash.contains("behavior: ipcidr"));
     let full = fs::read_to_string(
         fixture
             .path()

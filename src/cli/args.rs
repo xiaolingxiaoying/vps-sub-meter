@@ -528,6 +528,21 @@ impl From<CliRuleKind> for sbctl::rule_list::RuleKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum CliRuleSetBehavior {
+    Domain,
+    Ipcidr,
+}
+
+impl From<CliRuleSetBehavior> for sbctl::config::RuleSetBehavior {
+    fn from(value: CliRuleSetBehavior) -> Self {
+        match value {
+            CliRuleSetBehavior::Domain => Self::Domain,
+            CliRuleSetBehavior::Ipcidr => Self::Ipcidr,
+        }
+    }
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum RuleSetCommand {
     /// Show the registered rule-sets, the refresh interval and the local lists.
@@ -541,6 +556,9 @@ pub(crate) enum RuleSetCommand {
         /// Where matched traffic goes.
         #[arg(long, value_enum, default_value = "proxy")]
         outbound: CliRuleSetTarget,
+        /// Mihomo loading behavior for a .mrs set; ignored by sing-box .srs.
+        #[arg(long, value_enum, default_value = "domain")]
+        behavior: CliRuleSetBehavior,
     },
     /// Remove a registered rule-set by name.
     Remove { name: String },
