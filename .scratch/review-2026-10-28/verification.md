@@ -103,3 +103,11 @@
 - 外部：12 种订阅逐字节一致、流量头、12 个二维码、非法路径 404 通过。
 - 客户端：WSL sing-box 1.14.1 五协议全部 HTTPS 204。
 - 恢复：原 `abde4999…` 程序、工件、服务、定时器恢复；guard inactive。
+
+
+## 真实客户端内核矩阵
+
+WSL 本地 `scripts/dev/wsl-real-cores.sh` 在当前树上通过：
+
+- sing-box 1.10.7 / 1.11.15 / 1.12.25 / 1.13.21 / 1.14.1 对 standard/global/split/compact × standard/minimal/fake-ip/example 生成的 profile 全部 `check` 通过。
+- mihomo 1.19.x（`~/bin/mihomo`）接受 standard/global/split/compact × standard/minimal × 两个 Clash 工件，以及真实 `.mrs` provider 二进制规则加载。
