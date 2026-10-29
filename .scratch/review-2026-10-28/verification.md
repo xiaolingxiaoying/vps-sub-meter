@@ -80,3 +80,26 @@
 - 外部：12 种订阅体与 VPS 工件逐字节一致、流量头存在、12 个二维码实际解码；overview 200，非法路径 404。
 - 客户端：WSL Ubuntu 22.04 的 sing-box 1.14.1 经 Windows SSH TCP 转发/UDP 中继，五协议全部 HTTPS 204。
 - 恢复：停止 guard，原 v0.0.21 `abde4999…` 程序、工件、属主/权限、服务与会计定时器恢复；guard inactive。
+
+
+## 第四轮（回归与安全复查）
+
+| # | 缺陷 | 修复 | 回归 |
+| --- | --- | --- | --- |
+| 30 | 失败的模式切换回滚只恢复配置，不恢复证书存储属主；Direct→非 Direct 的 `chown root:sing-box` 后回滚，`sbctl` 不再能读 pinned 私钥，Direct HTTPS 静默全断 | 回滚后按**恢复后的**模式重跑 prerequisites/storage；`apply_and_activate_locked` 同样按恢复后的配置决定 | 全量门禁；live `chown` 路径无 fixture 覆盖，记录为平台行为 |
+| 31 | 向导从 ExternalProxy/IpFallback 切到 Direct 时，在提交前跑 Certbot，但 80/443 尚未启动，ACME 必然失败 | 无现成 live/pinned 材料时明确提示改用 `sbctl config switch-mode --mode direct`；有材料则直接 pin | 全量门禁 |
+| 32 | Mihomo 规则目标校验对含逗号的正则匹配（`DOMAIN-REGEX,...,REJECT`）误判 | 改为取最后一个非 `no-resolve`/`src` 字段；逻辑规则仍跳过 | 扩展的 `reference_checks_...` 正则用例 |
+| 33 | 菜单新增的 `.mrs` behavior 提示用 `required_menu_text`，回车默认值被过滤而静默取消 | 改用 `read_menu_choice`，空回答取 domain | 菜单代码路径；无交互测试 |
+
+
+## 第四轮 VPS 验收（本地构建，无 Actions）
+
+最终 amd64 候选摘要 `b5be40581b3a80e7e432f773a61689ad92da40bff762d329d59d09d43b8aa91b`，上传到 `/root/sbctl-local-b5be40581b3a/`。测试前备份摘要 `34fbdf82335356d1ad655f30a06a0728e00edd6c4904cc02a70b10ec675bbfaf`，启动 15 分钟 guard。
+
+- 隔离：生产配置副本重生成 12 个客户端工件逐字节一致；大写主机、注释覆写、MRS `ipcidr`、`--port 0` 拒绝、`default` 名称拒绝全部通过。
+- 新增验证：Clash 覆写 `DOMAIN-REGEX,^ads?\.[a-z]{2,3}$,REJECT` 经 `regenerate` 接受并出现在工件中。
+- 证书：写失败保留旧代、真实核心新代握手、刷新失败重试通过。
+- 实际部署：候选启动后配置/内核/工件/PID 不变；实时内存 `7,553,024` / `7,561,216` 字节（非 0）。
+- 外部：12 种订阅逐字节一致、流量头、12 个二维码、非法路径 404 通过。
+- 客户端：WSL sing-box 1.14.1 五协议全部 HTTPS 204。
+- 恢复：原 `abde4999…` 程序、工件、服务、定时器恢复；guard inactive。

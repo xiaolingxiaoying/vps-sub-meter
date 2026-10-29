@@ -915,15 +915,20 @@ fn validate_mihomo_references(
         .flatten()
         .filter_map(|v| v.as_str())
     {
-        // Clash rule types place the policy in a fixed field: MATCH/FINAL use
-        // field 1, ordinary rules use field 2, and trailing modifiers such as
-        // `no-resolve` or `src` must not be mistaken for the target. Logical
-        // rules contain commas inside parentheses; do not guess their target.
+        // The policy is the last field that is not a rule modifier. Taking a
+        // fixed field breaks regex matchers whose pattern contains commas
+        // (`DOMAIN-REGEX,^ads?\.[a-z]{2,3}$,REJECT`); taking the last field
+        // breaks `...,DIRECT,no-resolve|src`. Logical rules contain commas
+        // inside parentheses, so do not guess their target at all.
         let parts = rule.split(',').collect::<Vec<_>>();
-        let target = match parts.first().copied() {
-            Some("AND" | "OR" | "NOT") => None,
-            Some("MATCH" | "FINAL") => parts.get(1).copied(),
-            _ => parts.get(2).copied(),
+        let target = if matches!(parts.first().copied(), Some("AND" | "OR" | "NOT")) {
+            None
+        } else {
+            parts
+                .iter()
+                .rev()
+                .copied()
+                .find(|field| !matches!(*field, "no-resolve" | "src"))
         };
         if let Some(target) = target
             && !known.contains(target)

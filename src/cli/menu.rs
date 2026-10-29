@@ -744,14 +744,14 @@ fn menu_rule_kind(include_filter: bool) -> Option<CliRuleKind> {
 fn menu_rule_set_behavior() -> Option<sbctl::config::RuleSetBehavior> {
     use sbctl::config::RuleSetBehavior;
     println!("Mihomo 规则集类型：1) domain（域名/关键字） 2) ipcidr（IP-CIDR）");
-    let value = required_menu_text("选择 [1]: ")?;
-    match value.trim() {
-        "" | "1" => Some(RuleSetBehavior::Domain),
-        "2" => Some(RuleSetBehavior::Ipcidr),
-        _ => {
+    match read_menu_choice("选择 [1]: ").as_deref() {
+        Some("" | "1") => Some(RuleSetBehavior::Domain),
+        Some("2") => Some(RuleSetBehavior::Ipcidr),
+        Some(_) => {
             eprintln!("请输入 1 或 2");
             None
         }
+        None => None,
     }
 }
 

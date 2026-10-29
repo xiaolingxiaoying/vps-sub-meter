@@ -257,7 +257,20 @@ pub(crate) fn apply_and_activate_locked(
         let recovery = (|| -> Result<(), String> {
             sbctl::subscription::restore_config_transaction_locked(store, &snapshot)
                 .map_err(|e| e.to_string())?;
-            sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
+            // The attempted mode may differ from the restored one; re-apply the
+            // storage policy of the configuration that is now on disk, or a
+            // failed Direct transition leaves the pinned key owned by the wrong
+            // group and the restored Direct listener cannot read it.
+            let restored_direct = store
+                .load()
+                .map(|restored| {
+                    restored.subscription_mode == sbctl::config::SubscriptionMode::Direct
+                })
+                .unwrap_or(direct);
+            if root == Path::new("/") {
+                sbctl::lifecycle::prepare_daemon_prerequisites(root, restored_direct)?;
+            }
+            sbctl::lifecycle::prepare_daemon_storage(root, restored_direct)?;
             if activate {
                 sbctl::lifecycle::restart_services(root)?;
             }
@@ -1045,9 +1058,24 @@ pub(crate) fn commit_config_change(
                 // restarted; otherwise the command reports success while every
                 // subscription handshake is dropped.
                 if new.subscription_mode == sbctl::config::SubscriptionMode::Direct {
-                    let require_issuance = prior.subscription_host != new.subscription_host
-                        || prior.subscription_mode != sbctl::config::SubscriptionMode::Direct;
-                    ensure_direct_certificate(store, new, root, require_issuance)?;
+                    if prior.subscription_mode != sbctl::config::SubscriptionMode::Direct {
+                        // A pre-provisioned live/pinned certificate can be used
+                        // without ACME. Otherwise the wizard cannot open 80/443
+                        // before committing; send the operator to the command
+                        // that stages the Direct socket first.
+                        let has_material = sbctl::certificate::load_pinned(store, new).is_ok()
+                            || sbctl::certificate::load(store, new).is_ok();
+                        if !has_material {
+                            return Err(sbctl::config::ConfigError::StateContent(
+                                "切换到 Direct 需要先提交并启动 80/443 监听器，向导无法在提交前完成 ACME 校验；请运行 `sbctl config switch-mode --mode direct`"
+                                    .into(),
+                            ));
+                        }
+                        ensure_direct_certificate(store, new, root, false)?;
+                    } else {
+                        let require_issuance = prior.subscription_host != new.subscription_host;
+                        ensure_direct_certificate(store, new, root, require_issuance)?;
+                    }
                 }
                 let snapshot = sbctl::subscription::apply_config_transaction_locked(
                     store,
@@ -1075,6 +1103,17 @@ pub(crate) fn commit_config_change(
                                 "{error}; rollback failed: {recovery}"
                             ))
                         })?;
+                    // Restore the storage policy of the configuration we just
+                    // rolled back to, not the attempted mode. A failed Direct
+                    // transition must hand the pinned key back to sbctl-cert.
+                    let prior_direct =
+                        prior.subscription_mode == sbctl::config::SubscriptionMode::Direct;
+                    if root == Path::new("/") {
+                        sbctl::lifecycle::prepare_daemon_prerequisites(root, prior_direct)
+                            .map_err(sbctl::config::ConfigError::StateContent)?;
+                    }
+                    sbctl::lifecycle::prepare_daemon_storage(root, prior_direct)
+                        .map_err(sbctl::config::ConfigError::StateContent)?;
                     if let Err(recovery) = sbctl::lifecycle::restart_services(root) {
                         return Err(sbctl::config::ConfigError::StateContent(format!(
                             "{error}; rollback restart failed: {recovery}"
