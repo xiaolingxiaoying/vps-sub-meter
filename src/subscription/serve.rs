@@ -18,8 +18,8 @@ use tokio_rustls::TlsAcceptor;
 
 use super::artifacts::{SubscriptionError, read_authorized};
 use super::profile::{
-    CLASH_LEGACY_VERSION, ClientVersion, SING_BOX_VERSION_PROFILES, SubscriptionFormat,
-    SubscriptionRoute,
+    CLASH_LEGACY_VERSION, ClientVersion, SubscriptionFormat,
+    SubscriptionRoute, all_sing_box_version_profiles,
 };
 use super::render::ensure_subscription_nodes;
 use crate::config::{DeploymentConfig, DeploymentStore, SubscriptionMode};
@@ -1030,7 +1030,7 @@ fn qr_http_response(
         SubscriptionRoute::Format(format),
     )
     .map_err(|error| error.to_string())
-    .and_then(|url| crate::qr::render_svg(&url))
+    .and_then(|url| crate::qr::render_svg(&format.qr_payload(&url)))
     {
         Ok(body) => body,
         Err(error) => return unavailable_http_response(credential, &error),
@@ -1166,7 +1166,7 @@ fn parse_format_path(segment: &str) -> Option<SubscriptionFormat> {
         .and_then(|rest| rest.strip_suffix(".json"))
     {
         let version = parse_client_version(version)?;
-        return SING_BOX_VERSION_PROFILES
+        return all_sing_box_version_profiles()
             .iter()
             .any(|profile| profile.version == version)
             .then_some(SubscriptionFormat::SingBoxVersion(version));
@@ -1183,8 +1183,16 @@ fn parse_format_path(segment: &str) -> Option<SubscriptionFormat> {
 }
 
 fn parse_client_version(text: &str) -> Option<ClientVersion> {
-    let (major, minor) = text.split_once('.')?;
-    Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?))
+    let parts: Vec<&str> = text.split('.').collect();
+    match parts.as_slice() {
+        [major, minor] => Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?)),
+        [major, minor, patch] => Some(ClientVersion::with_patch(
+            major.parse().ok()?,
+            minor.parse().ok()?,
+            patch.parse().ok()?,
+        )),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -1497,7 +1505,7 @@ mod tests {
                 "route {path} must parse"
             );
         }
-        for profile in super::SING_BOX_VERSION_PROFILES {
+        for profile in super::all_sing_box_version_profiles() {
             let target = format!("/sub/{credential}/sing-box-{}.json", profile.version);
             assert_eq!(
                 parse_route(&target),

@@ -1157,13 +1157,14 @@ fn subscription_matrix_routes_serve_content_types_and_reject_bad_paths() {
         .assert()
         .success();
     let stderr_log = fixture.path().join("serve.err");
-    let mut server = spawn_sbctl_serve(&fixture, port, 17, &stderr_log);
+    let mut server = spawn_sbctl_serve(&fixture, port, 18, &stderr_log);
 
     for (path, content_type) in [
         ("sing-box.json", "application/json; charset=utf-8"),
         ("sing-box-full.json", "application/json; charset=utf-8"),
         ("sing-box-1.12.json", "application/json; charset=utf-8"),
         ("sing-box-1.14.json", "application/json; charset=utf-8"),
+        ("sing-box-1.14.4.json", "application/json; charset=utf-8"),
         ("clash.yaml", "application/yaml; charset=utf-8"),
         ("clash-1.18.yaml", "application/yaml; charset=utf-8"),
         ("uri", "text/plain; charset=utf-8"),
@@ -1302,7 +1303,7 @@ fn anytls_only_links_and_qrs_exclude_formats_with_no_compatible_nodes() {
         String::from_utf8_lossy(&output.get_output().stdout)
             .matches("订阅二维码：")
             .count(),
-        9
+        10
     );
     Command::cargo_bin("sbctl")
         .unwrap()

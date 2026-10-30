@@ -140,8 +140,8 @@ pub(crate) fn print_subscription_qr(
         for format in formats {
             let url = sbctl::subscription::subscription_url(&config, format)
                 .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
-            let qr =
-                sbctl::qr::render_ansi(&url).map_err(sbctl::config::ConfigError::StateContent)?;
+            let qr = sbctl::qr::render_ansi(&format.qr_payload(&url))
+                .map_err(sbctl::config::ConfigError::StateContent)?;
             rendered.push((format, url, qr));
         }
         Ok(rendered)

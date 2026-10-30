@@ -7,22 +7,40 @@ use super::artifacts::{
 };
 
 /// A client application version that a versioned subscription profile targets,
-/// rendered as `1.12` in route paths (`sing-box-1.12.json`) and artifact names.
+/// rendered as `1.12` or `1.14.4` in route paths (`sing-box-1.12.json`, `sing-box-1.14.4.json`)
+/// and artifact names.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ClientVersion {
     pub major: u8,
     pub minor: u8,
+    pub patch: Option<u8>,
 }
 
 impl ClientVersion {
     pub const fn new(major: u8, minor: u8) -> Self {
-        Self { major, minor }
+        Self {
+            major,
+            minor,
+            patch: None,
+        }
+    }
+
+    pub const fn with_patch(major: u8, minor: u8, patch: u8) -> Self {
+        Self {
+            major,
+            minor,
+            patch: Some(patch),
+        }
     }
 }
 
 impl fmt::Display for ClientVersion {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "{}.{}", self.major, self.minor)
+        if let Some(patch) = self.patch {
+            write!(formatter, "{}.{}.{}", self.major, self.minor, patch)
+        } else {
+            write!(formatter, "{}.{}", self.major, self.minor)
+        }
     }
 }
 
@@ -49,7 +67,7 @@ impl SubscriptionFormat {
     /// Older sing-box and mihomo versions cannot import AnyTLS at all.
     pub fn has_compatible_nodes(self, config: &crate::config::DeploymentConfig) -> bool {
         let supports_anytls = match self {
-            Self::SingBoxVersion(version) => SING_BOX_VERSION_PROFILES
+            Self::SingBoxVersion(version) => all_sing_box_version_profiles()
                 .iter()
                 .find(|profile| profile.version == version)
                 .is_some_and(|profile| profile.supports_anytls),
@@ -108,6 +126,32 @@ impl SubscriptionFormat {
             .find(|info| info.format == self)
             .map(|info| format!("{}（{}）", info.label, info.audience))
             .unwrap_or_else(|| self.path_name())
+    }
+
+    /// Returns the text payload to encode into a QR code for this format.
+    ///
+    /// For sing-box profiles, official graphical clients (sing-box for Apple
+    /// and sing-box for Android) parse scanned QR codes with
+    /// `LibboxParseRemoteProfileImportLink`, which expects the custom scheme:
+    /// `sing-box://import-remote-profile?url=<urlEncodedURL>#<name>`.
+    /// Encoding the custom scheme allows both in-app camera scanning and
+    /// system camera scanning to automatically prefill Name and Remote URL.
+    /// Other formats (Clash, Shadowrocket, URI) encode the subscription URL directly.
+    pub fn qr_payload(self, subscription_url: &str) -> String {
+        match self {
+            Self::SingBox | Self::SingBoxFull | Self::SingBoxVersion(_) => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(subscription_url.as_bytes()).collect();
+                let name = match self {
+                    Self::SingBox => "sing-box".to_owned(),
+                    Self::SingBoxFull => "sing-box-full".to_owned(),
+                    Self::SingBoxVersion(v) => format!("sing-box-{v}"),
+                    _ => unreachable!(),
+                };
+                format!("sing-box://import-remote-profile?url={encoded}#{name}")
+            }
+            _ => subscription_url.to_owned(),
+        }
     }
 }
 
@@ -211,14 +255,34 @@ pub const SING_BOX_VERSION_PROFILES: &[SingBoxVersionProfile] = &[
     },
 ];
 
+pub const SING_BOX_1_14_4_PROFILE: SingBoxVersionProfile = SingBoxVersionProfile {
+    version: ClientVersion::with_patch(1, 14, 4),
+    supported: ">= 1.14.4",
+    notes: "彻底移除 legacy DNS 格式，引入 cache_file.store_dns 乐观缓存，适配 1.14.4 内核",
+    typed_dns: true,
+    route_rule_actions: true,
+    supports_anytls: true,
+    supports_store_dns: true,
+    tun_stack: Some("mixed"),
+};
+
+pub const SING_BOX_PATCH_PROFILES: &[SingBoxVersionProfile] = &[SING_BOX_1_14_4_PROFILE];
+
+/// All supported sing-box version profiles: the minor profiles (1.10–1.14)
+/// plus specific released kernel profiles like 1.14.4.
+pub fn all_sing_box_version_profiles() -> Vec<SingBoxVersionProfile> {
+    let mut profiles =
+        Vec::with_capacity(SING_BOX_VERSION_PROFILES.len() + SING_BOX_PATCH_PROFILES.len());
+    profiles.extend_from_slice(SING_BOX_VERSION_PROFILES);
+    profiles.extend_from_slice(SING_BOX_PATCH_PROFILES);
+    profiles
+}
+
 /// The newest sing-box version profile; `sing-box-full.json` targets it.
 /// The newest kernel this table can describe.
 fn registry_top() -> ClientVersion {
     let top = latest_version_profile().version;
-    ClientVersion {
-        major: top.major,
-        minor: top.minor,
-    }
+    ClientVersion::new(top.major, top.minor)
 }
 
 /// The warning for a kernel newer than anything this table describes; `None`
@@ -252,7 +316,7 @@ pub fn parse_kernel_version(reported: &str) -> Option<ClientVersion> {
     let mut parts = version.split('.');
     let major = parts.next()?.parse::<u8>().ok()?;
     let minor = parts.next()?.parse::<u8>().ok()?;
-    Some(ClientVersion { major, minor })
+    Some(ClientVersion::new(major, minor))
 }
 
 /// Asks the installed kernel which version it is, returning `None` for any
@@ -348,11 +412,12 @@ fn static_matrix_rows() -> Vec<SubscriptionLinkInfo> {
 /// sing-box version profile (inserted right before `sing-box-full`).
 pub fn subscription_matrix() -> Vec<SubscriptionLinkInfo> {
     let latest = latest_version_profile().version;
+    let all_profiles = all_sing_box_version_profiles();
     let mut rows: Vec<SubscriptionLinkInfo> =
-        Vec::with_capacity(static_matrix_rows().len() + SING_BOX_VERSION_PROFILES.len());
+        Vec::with_capacity(static_matrix_rows().len() + all_profiles.len());
     for info in static_matrix_rows() {
         if info.format == SubscriptionFormat::SingBoxFull {
-            for profile in SING_BOX_VERSION_PROFILES {
+            for profile in &all_profiles {
                 let is_latest = profile.version == latest;
                 rows.push(SubscriptionLinkInfo {
                     format: SubscriptionFormat::SingBoxVersion(profile.version),
@@ -425,7 +490,7 @@ pub fn client_subscription_matrix() -> Vec<ClientSubscriptionRow> {
         format: SubscriptionFormat::SingBoxFull,
         note: "客户端内核为最新稳定版时使用".to_owned(),
     }];
-    for profile in SING_BOX_VERSION_PROFILES {
+    for profile in all_sing_box_version_profiles() {
         sing_box_formats.push(ClientSubscriptionFormat {
             format: SubscriptionFormat::SingBoxVersion(profile.version),
             note: format!("客户端内核为 {} 时使用", profile.supported),
@@ -485,7 +550,7 @@ pub fn client_subscription_matrix() -> Vec<ClientSubscriptionRow> {
 
 #[cfg(test)]
 mod tests {
-    use super::{SING_BOX_VERSION_PROFILES, client_subscription_matrix};
+    use super::{all_sing_box_version_profiles, client_subscription_matrix};
 
     #[test]
     fn the_client_matrix_covers_the_mainstream_clients() {
@@ -510,8 +575,28 @@ mod tests {
         // One recommendation per version profile plus sing-box-full.
         assert_eq!(
             sing_box_row.formats.len(),
-            SING_BOX_VERSION_PROFILES.len() + 1,
+            all_sing_box_version_profiles().len() + 1,
             "the sing-box row must recommend one format per supported version"
         );
+    }
+
+    #[test]
+    fn sing_box_formats_encode_remote_profile_import_link_in_qr() {
+        use super::{ClientVersion, SubscriptionFormat};
+
+        let url = "https://example.com/sub/cred/sing-box-1.14.4.json";
+        let payload = SubscriptionFormat::SingBoxVersion(ClientVersion::with_patch(1, 14, 4))
+            .qr_payload(url);
+        assert!(payload.starts_with("sing-box://import-remote-profile?url="));
+        assert!(payload.contains("https%3A%2F%2Fexample.com%2Fsub%2Fcred%2Fsing-box-1.14.4.json"));
+        assert!(payload.ends_with("#sing-box-1.14.4"));
+
+        let full_url = "https://example.com/sub/cred/sing-box-full.json";
+        let full_payload = SubscriptionFormat::SingBoxFull.qr_payload(full_url);
+        assert!(full_payload.starts_with("sing-box://import-remote-profile?url="));
+        assert!(full_payload.ends_with("#sing-box-full"));
+
+        let clash_url = "https://example.com/sub/cred/clash.yaml";
+        assert_eq!(SubscriptionFormat::Clash.qr_payload(clash_url), clash_url);
     }
 }

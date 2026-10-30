@@ -8,7 +8,7 @@ use thiserror::Error;
 use super::base64_uri;
 use super::profile::{
     CLASH_LEGACY_VERSION, SING_BOX_VERSION_PROFILES, SingBoxVersionProfile, SubscriptionFormat,
-    SubscriptionRoute, latest_version_profile,
+    SubscriptionRoute, all_sing_box_version_profiles, latest_version_profile,
 };
 use super::render::{
     clash, clash_legacy, ensure_subscription_nodes, shadowrocket, sing_box, sing_box_full,
@@ -620,7 +620,7 @@ pub fn generated_artifacts_for_kernel(
             sing_box_full(config, &nodes, full_profile)?,
         ),
     ];
-    for profile in SING_BOX_VERSION_PROFILES {
+    for profile in all_sing_box_version_profiles() {
         // Pre-1.12 client cores have no AnyTLS outbound. A deployment whose
         // only enabled protocol is AnyTLS has no usable node for those
         // profiles, so the artifact is skipped (with a warning) instead of
@@ -642,7 +642,7 @@ pub fn generated_artifacts_for_kernel(
             SubscriptionFormat::SingBoxVersion(profile.version)
                 .artifact_name()
                 .into_owned(),
-            sing_box_full(config, &nodes, profile)?,
+            sing_box_full(config, &nodes, &profile)?,
         ));
     }
     let legacy = SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION);
@@ -1597,6 +1597,7 @@ mod tests {
                 "subscription-sing-box-1.11.json",
                 "subscription-sing-box-1.12.json",
                 "subscription-sing-box-1.13.json",
+                "subscription-sing-box-1.14.4.json",
                 "subscription-sing-box-1.14.json",
                 "subscription-sing-box-full.json",
                 "subscription-sing-box.json",

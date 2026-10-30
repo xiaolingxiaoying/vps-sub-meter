@@ -296,23 +296,17 @@ fn only_a_kernel_newer_than_the_registry_top_draws_a_warning() {
         "the version the table is built for must not warn"
     );
     assert!(
-        band_warning_for(ClientVersion {
-            major: described.major,
-            minor: described.minor - 1,
-        })
+        band_warning_for(ClientVersion::new(
+            described.major,
+            described.minor - 1,
+        ))
         .is_none(),
         "an older kernel is served by its own profile, not by a warning"
     );
 
     for beyond in [
-        ClientVersion {
-            major: described.major,
-            minor: described.minor + 1,
-        },
-        ClientVersion {
-            major: described.major + 1,
-            minor: 0,
-        },
+        ClientVersion::new(described.major, described.minor + 1),
+        ClientVersion::new(described.major + 1, 0),
     ] {
         let warning =
             band_warning_for(beyond).unwrap_or_else(|| panic!("{beyond} must draw a warning"));

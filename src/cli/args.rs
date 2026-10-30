@@ -786,8 +786,16 @@ fn parse_cli_format(text: &str) -> Result<sbctl::subscription::SubscriptionForma
         "shadowrocket" => Ok(SubscriptionFormat::Shadowrocket),
         other => {
             let parse_version = |value: &str| -> Option<ClientVersion> {
-                let (major, minor) = value.split_once('.')?;
-                Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?))
+                let parts: Vec<&str> = value.split('.').collect();
+                match parts.as_slice() {
+                    [major, minor] => Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?)),
+                    [major, minor, patch] => Some(ClientVersion::with_patch(
+                        major.parse().ok()?,
+                        minor.parse().ok()?,
+                        patch.parse().ok()?,
+                    )),
+                    _ => None,
+                }
             };
             if let Some(version) = other.strip_prefix("sing-box-") {
                 let version = parse_version(version).ok_or_else(|| {
