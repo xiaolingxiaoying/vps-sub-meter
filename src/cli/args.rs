@@ -788,7 +788,9 @@ fn parse_cli_format(text: &str) -> Result<sbctl::subscription::SubscriptionForma
             let parse_version = |value: &str| -> Option<ClientVersion> {
                 let parts: Vec<&str> = value.split('.').collect();
                 match parts.as_slice() {
-                    [major, minor] => Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?)),
+                    [major, minor] => {
+                        Some(ClientVersion::new(major.parse().ok()?, minor.parse().ok()?))
+                    }
                     [major, minor, patch] => Some(ClientVersion::with_patch(
                         major.parse().ok()?,
                         minor.parse().ok()?,

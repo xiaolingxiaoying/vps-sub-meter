@@ -585,8 +585,8 @@ mod tests {
         use super::{ClientVersion, SubscriptionFormat};
 
         let url = "https://example.com/sub/cred/sing-box-1.14.4.json";
-        let payload = SubscriptionFormat::SingBoxVersion(ClientVersion::with_patch(1, 14, 4))
-            .qr_payload(url);
+        let payload =
+            SubscriptionFormat::SingBoxVersion(ClientVersion::with_patch(1, 14, 4)).qr_payload(url);
         assert!(payload.starts_with("sing-box://import-remote-profile?url="));
         assert!(payload.contains("https%3A%2F%2Fexample.com%2Fsub%2Fcred%2Fsing-box-1.14.4.json"));
         assert!(payload.ends_with("#sing-box-1.14.4"));

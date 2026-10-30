@@ -18,8 +18,8 @@ use tokio_rustls::TlsAcceptor;
 
 use super::artifacts::{SubscriptionError, read_authorized};
 use super::profile::{
-    CLASH_LEGACY_VERSION, ClientVersion, SubscriptionFormat,
-    SubscriptionRoute, all_sing_box_version_profiles,
+    CLASH_LEGACY_VERSION, ClientVersion, SubscriptionFormat, SubscriptionRoute,
+    all_sing_box_version_profiles,
 };
 use super::render::ensure_subscription_nodes;
 use crate::config::{DeploymentConfig, DeploymentStore, SubscriptionMode};
