@@ -84,7 +84,7 @@ fn kernel_selection_rejects_a_version_for_repository_or_a_conflicting_manifest()
         ])
         .assert()
         .code(2)
-        .stderr(predicate::str::contains("不支持选择版本"));
+        .stderr(predicate::str::contains("invalid value"));
     Command::cargo_bin("sbctl")
         .unwrap()
         .args([

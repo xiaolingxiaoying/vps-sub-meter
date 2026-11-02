@@ -109,8 +109,8 @@ fn confirm_with_io(
     loop {
         write!(
             output,
-            "{question} [{}]: ",
-            if default { "Y/n" } else { "y/N" }
+            "{question}（1 是 / 2 否）[{}]: ",
+            if default { "1" } else { "2" }
         )?;
         output.flush()?;
         let mut answer = String::new();
@@ -122,9 +122,9 @@ fn confirm_with_io(
         }
         match answer.trim().to_ascii_lowercase().as_str() {
             "" => return Ok(default),
-            "y" | "yes" | "是" | "确认" => return Ok(true),
-            "n" | "no" | "否" | "取消" => return Ok(false),
-            _ => writeln!(output, "请输入 y / 是 或 n / 否；直接回车使用默认值。")?,
+            "1" | "y" | "yes" | "是" | "确认" => return Ok(true),
+            "2" | "n" | "no" | "否" | "取消" => return Ok(false),
+            _ => writeln!(output, "请输入 1 / 是 或 2 / 否；直接回车使用默认值。")?,
         }
     }
 }
@@ -135,7 +135,12 @@ mod tests {
 
     #[test]
     fn confirmation_retries_invalid_input_and_accepts_chinese_answers() {
-        for (answers, expected) in [("oops\n是\n", true), ("?\n取消\n", false)] {
+        for (answers, expected) in [
+            ("oops\n是\n", true),
+            ("?\n取消\n", false),
+            ("?\n1\n", true),
+            ("?\n2\n", false),
+        ] {
             let mut input = io::Cursor::new(answers);
             let mut output = Vec::new();
             assert_eq!(

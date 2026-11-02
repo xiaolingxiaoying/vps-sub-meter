@@ -84,7 +84,7 @@ Debian/Ubuntu containers in `tests/acceptance/run.sh`; WSL-only tests do not est
 | 签发 / 修复 HTTPS 证书 | `sbctl certificate obtain` | `tests/cli/certificate.rs` uses a fake Certbot and certificates; public ACME challenge reachability must be checked on an isolated VPS. |
 | 续期 HTTPS 证书 | `sbctl certificate renew` | `tests/cli/certificate.rs` covers renewal, pinning and rollback with fixtures; real Certbot/systemd reload is an isolated-host check. |
 | 更新 sbctl | `sbctl update` | `tests/cli/update_release.rs` and `tests/release_trust.rs`: signature/hash verification and rollback fixtures. |
-| 更新 / 切换 sing-box 内核 | `sbctl sing-box fetch --source <repository|official> [--version <version>]` | `tests/cli/update_release.rs`, `tests/version_profiles.rs -- --ignored`, and `docs/release-readiness-and-vps-test-plan.md`; kernel replacement and service health need isolated system validation. |
+| 更新 / 切换 sing-box 内核 | `sbctl sing-box fetch --source official [--version <version>]` | `tests/cli/update_release.rs`, `tests/version_profiles.rs -- --ignored`, and `docs/release-readiness-and-vps-test-plan.md`; kernel replacement and service health need isolated system validation. |
 
 ## 高级与维护
 

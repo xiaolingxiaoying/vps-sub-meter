@@ -1,8 +1,9 @@
 name: Release
 
 # Publishes the signed sbctl release this repository's own documentation points
-# at: two architecture-specific binaries, the sing-box runtime each manifest
-# pins, two signed manifests, the bootstrapped `install.sh`, and SHA256SUMS.
+# at: two architecture-specific sbctl binaries, two signed manifests, the
+# bootstrapped install.sh and SHA256SUMS. Runtime bytes are verified for signing
+# but never re-hosted: clients download sing-box only from SagerNet.
 #
 # Trust chain, in order:
 #   1. `build` compiles the binary with the production public key from the
@@ -290,7 +291,7 @@ jobs:
             exit 1
           fi
 
-          ( cd dist && sha256sum sbctl-linux-* sing-box-linux-* manifest-*.json install.sh > SHA256SUMS )
+          ( cd dist && sha256sum sbctl-linux-* manifest-*.json install.sh > SHA256SUMS )
           cat dist/SHA256SUMS
 
           if [ "$UPDATE_EXISTING" = true ]; then
@@ -311,7 +312,6 @@ jobs:
           fi
           # Replacement is opt-in and reaches here only after CI and signing.
           gh release upload "$TAG" dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
-            dist/sing-box-linux-amd64 dist/sing-box-linux-arm64 \
             dist/manifest-amd64.json dist/manifest-arm64.json \
             dist/install.sh dist/SHA256SUMS --clobber
           if [ "$UPDATE_EXISTING" != true ] && [ "$PUBLISH" = true ]; then

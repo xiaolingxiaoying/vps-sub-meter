@@ -44,6 +44,7 @@ pub enum ConfigurationTopic {
     Protocols,
     Traffic,
     ClientTemplate,
+    PortHopping,
 }
 
 /// The interactive prompt boundary. Production uses the console; tests drive a
@@ -166,7 +167,7 @@ pub fn run<C: Prompts>(
 
     let mode = ask_required(
         prompts,
-        "订阅模式 (direct / external-proxy / ip-fallback)",
+        "订阅模式（1 自动 HTTPS / 2 外部反向代理 / 3 无域名 IP）",
         existing
             .map(|config| config.subscription_mode.to_string())
             .or_else(|| Some(SubscriptionMode::Direct.to_string())),
@@ -230,7 +231,7 @@ pub fn run<C: Prompts>(
 
     let certificate_mode = ask_required(
         prompts,
-        "协议监听证书 (domain / self-signed)",
+        "协议监听证书（1 域名证书：复用订阅证书 / 2 自签证书：无需填写证书）",
         existing
             .map(|config| config.certificate_mode.to_string())
             .or_else(|| Some(CertificateMode::SelfSigned.to_string())),
@@ -305,11 +306,11 @@ pub fn run<C: Prompts>(
                 | ManagedProtocol::Anytls
         )
     }) {
-        ask_value(
+        ask_protocol_sni(
             prompts,
-            "协议 TLS 伪装域名（protocol_sni，留空 = 自动：www.bing.com 或订阅域名）",
             existing.and_then(|config| config.protocol_sni.clone()),
-            parse_hostname,
+            &certificate_mode,
+            &subscription_host,
         )?
     } else {
         None
@@ -343,7 +344,7 @@ pub fn run<C: Prompts>(
         )?;
         let accounting_policy = ask_required(
             prompts,
-            "账期策略 (natural-month / anchored-month)",
+            "账期策略（1 自然月 / 2 指定日期重置）",
             existing.map(|config| config.accounting_policy.to_string()),
             parse_policy,
         )?;
@@ -476,7 +477,7 @@ pub fn ask_initial_customization<C: Prompts>(
         )?;
         config.accounting_policy = ask_required(
             prompts,
-            "账期策略 (natural-month / anchored-month)",
+            "账期策略（1 自然月 / 2 指定日期重置）",
             Some(config.accounting_policy.to_string()),
             parse_policy,
         )?;
@@ -634,7 +635,7 @@ pub fn run_topic<C: Prompts>(
             clear_ports_for_disabled(&mut ports, &enabled_protocols);
             certificate_mode = ask_required(
                 prompts,
-                "协议证书（1 domain / 2 self-signed）",
+                "协议证书（1 域名证书：复用订阅证书 / 2 自签证书：无需填写证书）",
                 Some(certificate_mode.to_string()),
                 parse_certificate_mode,
             )?;
@@ -675,15 +676,23 @@ pub fn run_topic<C: Prompts>(
                         | ManagedProtocol::Anytls
                 )
             }) {
-                ask_value(
-                    prompts,
-                    "协议 TLS 伪装域名（protocol_sni，留空 = 自动：www.bing.com 或订阅域名）",
-                    protocol_sni,
-                    parse_hostname,
-                )?
+                ask_protocol_sni(prompts, protocol_sni, &certificate_mode, &subscription_host)?
             } else {
                 None
             };
+        }
+        ConfigurationTopic::PortHopping => {
+            let mut new = existing.clone();
+            crate::port_hopping::configure(&mut new, prompts)?;
+            new.validate()?;
+            if new == *existing {
+                return Ok(WizardOutcome::Unchanged);
+            }
+            prompts.report(&new.summary());
+            if !prompts.confirm("确认应用端口跳跃配置？", false)? {
+                return Ok(WizardOutcome::Cancelled);
+            }
+            return Ok(WizardOutcome::Changed(new));
         }
         ConfigurationTopic::ClientTemplate => {
             // The client template fields never flow through DeploymentOptions;
@@ -897,12 +906,42 @@ fn ask_yes_no<C: Prompts>(
     default: bool,
 ) -> Result<bool, WizardError> {
     loop {
-        let answer = prompts.ask(label, Some(if default { "y" } else { "n" }))?;
+        let answer = prompts.ask(
+            &format!("{label}（1 是 / 2 否）"),
+            Some(if default { "1" } else { "2" }),
+        )?;
         match answer.trim().to_ascii_lowercase().as_str() {
             "" => return Ok(default),
-            "y" | "yes" => return Ok(true),
-            "n" | "no" => return Ok(false),
-            _ => prompts.report("请输入 y 或 n"),
+            "1" | "y" | "yes" => return Ok(true),
+            "2" | "n" | "no" => return Ok(false),
+            _ => prompts.report("请输入 1（是）或 2（否）"),
+        }
+    }
+}
+
+fn ask_protocol_sni<C: Prompts>(
+    prompts: &mut C,
+    current: Option<String>,
+    mode: &CertificateMode,
+    host: &str,
+) -> Result<Option<String>, WizardError> {
+    if *mode == CertificateMode::Domain {
+        prompts.report(&format!("VMess WebSocket、Hy2、TUIC、AnyTLS 自动共用 {host} 的域名证书；无需粘贴证书或私钥。域名须解析到本机，证书由证书管理维护。"));
+    } else {
+        prompts.report("自签证书由 sbctl 自动生成，无需填写证书；客户端将跳过证书验证。协议 TLS 伪装域名只是 SNI，无需拥有该域名。");
+    }
+    loop {
+        let answer = prompts.ask(
+            "协议 TLS 伪装域名（1 自动选择：自签 www.bing.com / 域名证书使用订阅域名；或输入域名）",
+            current.as_deref(),
+        )?;
+        match answer.trim() {
+            "1" => return Ok(None),
+            "" => return Ok(current),
+            value => match parse_hostname(value) {
+                Ok(host) => return Ok(Some(host)),
+                Err(message) => prompts.report(&message),
+            },
         }
     }
 }
@@ -1168,6 +1207,100 @@ mod tests {
         fn confirm(&mut self, _question: &str, _default: bool) -> io::Result<bool> {
             Ok(self.confirms.pop_front().unwrap_or(false))
         }
+    }
+
+    #[test]
+    fn hopping_topic_uses_numeric_presets_preserves_credentials_and_can_cancel() {
+        let config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::Hysteria2],
+            None,
+        )
+        .unwrap();
+        let mut prompts = ScriptPrompts::new(&["1", "2", "1"], &[true]);
+        let WizardOutcome::Changed(edited) =
+            run_topic(&config, ConfigurationTopic::PortHopping, &mut prompts).unwrap()
+        else {
+            panic!("expected a change");
+        };
+        assert_eq!(
+            edited.subscription_credential,
+            config.subscription_credential
+        );
+        assert_eq!(edited.hysteria2, config.hysteria2);
+        assert_eq!(
+            edited.hysteria2_port_hopping.as_ref().unwrap().range(),
+            "40000-50000"
+        );
+        assert_eq!(
+            edited
+                .hysteria2_port_hopping
+                .as_ref()
+                .unwrap()
+                .interval_seconds,
+            30
+        );
+        assert_eq!(
+            run_topic(
+                &edited,
+                ConfigurationTopic::PortHopping,
+                &mut ScriptPrompts::new(&["0"], &[])
+            )
+            .unwrap(),
+            WizardOutcome::Unchanged
+        );
+        assert_eq!(
+            run_topic(
+                &edited,
+                ConfigurationTopic::PortHopping,
+                &mut ScriptPrompts::new(&["2"], &[false])
+            )
+            .unwrap(),
+            WizardOutcome::Cancelled
+        );
+        let WizardOutcome::Changed(disabled) = run_topic(
+            &edited,
+            ConfigurationTopic::PortHopping,
+            &mut ScriptPrompts::new(&["2"], &[true]),
+        )
+        .unwrap() else {
+            panic!("expected disabled");
+        };
+        assert_eq!(disabled, config);
+    }
+
+    #[test]
+    fn automatic_tls_sni_clears_custom_value_and_explains_certificate_ownership() {
+        let mut prompts = ScriptPrompts::new(&["1"], &[]);
+        let sni = super::ask_protocol_sni(
+            &mut prompts,
+            Some("old.example".into()),
+            &crate::config::CertificateMode::Domain,
+            "sub.example",
+        )
+        .unwrap();
+        assert_eq!(sni, None);
+        assert!(
+            prompts
+                .reports
+                .iter()
+                .any(|m| m.contains("无需粘贴证书或私钥"))
+        );
+        let mut prompts = ScriptPrompts::new(&[""], &[]);
+        assert_eq!(
+            super::ask_protocol_sni(
+                &mut prompts,
+                Some("old.example".into()),
+                &crate::config::CertificateMode::SelfSigned,
+                "203.0.113.7"
+            )
+            .unwrap(),
+            Some("old.example".into())
+        );
     }
 
     fn ip_fallback_config() -> DeploymentConfig {

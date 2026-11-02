@@ -318,7 +318,7 @@ def refused_confirmations():
         menu.choose(3, "订阅与客户端")
         menu.choose(5, "确认轮换默认订阅凭据")
         menu.send("maybe")
-        menu.wait("请输入 y / 是 或 n / 否")
+        menu.wait("请输入 1 / 是 或 2 / 否")
         menu.send("否")
         menu.pause()
         menu.send("0")

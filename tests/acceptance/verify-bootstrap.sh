@@ -180,7 +180,7 @@ if [ -f /tmp/sbctl-bootstrap-arguments ]; then
   ! grep -Fx -- 'install' /tmp/sbctl-bootstrap-arguments >/dev/null \
     || fail 'default bootstrap attempted a deployment install'
 fi
-grep -F -- '选择内核下载源' "$work/management-only.out" >/dev/null \
+grep -F -- '选择官方内核版本' "$work/management-only.out" >/dev/null \
   || fail 'management bootstrap did not explain kernel selection'
 rm -f /usr/local/bin/sing-box
 

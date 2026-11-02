@@ -61,6 +61,32 @@ for format in sing-box.json clash.yaml uri; do
   contains "$response" 'subscription-userinfo:'
 done
 
+# Exercise the real systemd root hooks without granting root to the data plane.
+cp /etc/sbctl/config.toml "$work/before-hopping.toml"
+python3 - <<'PY'
+import json
+from pathlib import Path
+server = json.loads(Path('/var/lib/sbctl/artifacts/sing-box-server.json').read_text())
+occupied = {n['listen_port'] for n in server['inbounds']}
+start = next(p for p in range(40000, 60000, 100) if not occupied.intersection(range(p, p + 11)))
+path = Path('/etc/sbctl/config.toml')
+path.write_text(f'hysteria2_port_hopping = {{ start = {start}, end = {start + 10}, interval_seconds = 5 }}\n' + path.read_text())
+PY
+$sbctl regenerate >/dev/null
+$sbctl restart >/dev/null
+nft list table inet sbctl_hy2 >/dev/null || fail 'Hy2 startup hook did not install redirects'
+[ "$(systemctl show -p User --value sing-box.service)" = sing-box ] || fail 'hopping gave the data plane root'
+systemctl stop sing-box.service
+if nft list table inet sbctl_hy2 >/dev/null 2>&1; then fail 'Hy2 stop hook left redirects behind'; fi
+systemctl start sing-box.service
+nft list table inet sbctl_hy2 >/dev/null || fail 'Hy2 restart did not restore redirects'
+cp "$work/before-hopping.toml" /etc/sbctl/config.toml
+$sbctl regenerate >/dev/null
+$sbctl restart >/dev/null
+if nft list table inet sbctl_hy2 >/dev/null 2>&1; then fail 'disabling hopping left redirects behind'; fi
+if grep -F 'port-hopping-firewall' /etc/systemd/system/sing-box.service >/dev/null; then fail 'disabled hopping retained root hooks'; fi
+echo 'real systemd Hy2 enable/stop/start/disable cleanup passed'
+
 # SMTP files stay root-only across regeneration and configuration transactions.
 cat >/etc/sbctl/email.toml <<'EOF'
 smtp_host = "smtp.example.test"

@@ -16,6 +16,30 @@ use crate::subscription::profile::SingBoxVersionProfile;
 use crate::subscription::template::{GroupMember, GroupTag};
 use crate::subscription::{GroupRole, GroupSpec, RuleMatcher, TemplateSpec};
 
+fn profile_outbounds(
+    config: &DeploymentConfig,
+    nodes: &[CanonicalNode],
+    profile: &SingBoxVersionProfile,
+) -> Vec<Value> {
+    let mut outbounds = client_outbounds(config, nodes);
+    if profile.version.minor < 11 {
+        for outbound in &mut outbounds {
+            if outbound["type"] == "hysteria2" {
+                outbound.as_object_mut().unwrap().remove("server_ports");
+                outbound.as_object_mut().unwrap().remove("hop_interval");
+                outbound["server_port"] = json!(
+                    config
+                        .hysteria2
+                        .as_ref()
+                        .expect("validated Hy2")
+                        .listen_port
+                );
+            }
+        }
+    }
+    outbounds
+}
+
 /// The outbound a pre-1.11 core blocks traffic with. Route rule actions arrived
 /// in 1.11.0 and the `block` outbound was removed in 1.13.0, so this tag only
 /// ever appears in the 1.10 profile, where `action: reject` does not exist.
@@ -162,7 +186,7 @@ pub(crate) fn sing_box_full(
     let spec = TemplateSpec::for_template(config, config.client_template.clone());
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
     let node_tags: Vec<&str> = nodes.iter().map(CanonicalNode::tag).collect();
-    let mut outbounds = client_outbounds(config, nodes);
+    let mut outbounds = profile_outbounds(config, nodes, profile);
     for group in spec
         .groups
         .iter()
@@ -483,7 +507,7 @@ fn standard_full(
         }
         outbounds.push(outbound);
     }
-    for live in client_outbounds(config, nodes) {
+    for live in profile_outbounds(config, nodes, profile) {
         let mut node = baseline["outbounds"]
             .as_array()
             .unwrap()
@@ -494,6 +518,9 @@ fn standard_full(
         // Live TLS objects carry real SNI, trust and Reality parameters.
         for (key, field) in live.as_object().unwrap() {
             node[key] = field.clone();
+        }
+        if live.get("server_ports").is_some() {
+            node.as_object_mut().unwrap().remove("server_port");
         }
         if node["type"] == "vmess" {
             node["transport"]["headers"] = json!({"Host": node["tls"]["server_name"]});

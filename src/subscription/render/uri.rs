@@ -178,7 +178,7 @@ pub(crate) fn shadowrocket(
             )),
         }
     }
-    Ok(base64_uri(&uris))
+    Ok(base64_uri(&hopping_uris(config, &uris)))
 }
 
 /// Percent-encodes everything outside the RFC 3986 unreserved set so secrets
@@ -306,7 +306,26 @@ pub(crate) fn uri(
     for node in &nodes {
         uris.push_str(&node_uri(insecure, node));
     }
-    Ok(uris)
+    Ok(hopping_uris(config, &uris))
+}
+
+// The official Hy2 URI encodes a range in the authority. URI importers use
+// their own hopping interval (the URI standard has no interval parameter).
+pub(crate) fn hopping_uris(config: &DeploymentConfig, uris: &str) -> String {
+    let Some(hop) = &config.hysteria2_port_hopping else {
+        return uris.to_owned();
+    };
+    uris.split_inclusive('\n')
+        .map(|line| {
+            if line.starts_with("hysteria2://") {
+                let (authority, query) = line.split_once('?').expect("generated URI");
+                let (host, _) = authority.rsplit_once(':').expect("generated port");
+                format!("{host}:{}?{query}", hop.range())
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]

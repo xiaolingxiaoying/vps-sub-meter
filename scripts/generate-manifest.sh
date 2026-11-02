@@ -69,7 +69,7 @@ jq -n \
   --arg sbctl_url "$base/sbctl-linux-$arch" \
   --arg sbctl_sha "$sbctl_sha" \
   --arg sing_box_version "$sing_box_version" \
-  --arg sing_box_url "$base/sing-box-linux-$arch" \
+  --arg sing_box_url "https://github.com/SagerNet/sing-box/releases/download/v$sing_box_version/sing-box-$sing_box_version-linux-$arch.tar.gz" \
   --arg sing_box_sha "$sing_box_sha" \
   --arg min "$min_version" \
   --arg max "$max_version" \

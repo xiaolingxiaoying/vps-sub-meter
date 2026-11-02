@@ -6,8 +6,10 @@ Usage (namespace creation and loopback setup are the caller's responsibility):
       /path/to/sbctl --sing-box /path/to/sing-box'
 
 The script refuses the initial network namespace and any namespace containing a
-non-loopback interface. Every listener/destination is 127.0.0.1; no TUN, system
-proxy, DNS, firewall, sysctl or systemd change is used. sbctl writes only a private
+non-loopback interface. The optional --port-hopping mode then creates a private
+veth pair and a second namespace to exercise real ingress nftables redirects.
+The default mode uses loopback only. No host TUN, system proxy, DNS, firewall,
+sysctl or systemd state is changed. sbctl writes only a private
 temporary --root. It generates five original nodes and their bare outbounds.
 Server adaptation is limited to tightening inbound listen addresses to loopback
 and pointing Reality's decoy dial at a local TLS 1.3 server, using sbctl's generated
@@ -81,23 +83,23 @@ def stop_process(process):
             process.wait(timeout=4)
 
 
-def start_core(stack, core, config, root, label):
+def start_core(stack, core, config, root, label, prefix=()):
     checked = subprocess.run([str(core), "check", "-c", str(config)],
                              capture_output=True, cwd=root, timeout=20)
     require(checked.returncode == 0, label + " configuration check failed")
     log = stack.enter_context((root / (label + ".log")).open("wb"))
-    process = subprocess.Popen([str(core), "run", "-c", str(config)],
+    process = subprocess.Popen([*prefix, str(core), "run", "-c", str(config)],
                                cwd=root, stdout=log, stderr=log, start_new_session=True)
     stack.callback(stop_process, process)
     return process
 
 
-def wait_tcp(port, process, label):
+def wait_tcp(port, process, label, host="127.0.0.1"):
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline:
         require(process.poll() is None, label + " process exited during startup")
         try:
-            with socket.create_connection(("127.0.0.1", port), timeout=0.2):
+            with socket.create_connection((host, port), timeout=0.2):
                 return
         except OSError:
             time.sleep(0.05)
@@ -167,8 +169,8 @@ def receive_exact(connection, length):
     return bytes(data)
 
 
-def proxy_get(socks_port, origin_port):
-    with socket.create_connection(("127.0.0.1", socks_port), timeout=10) as connection:
+def proxy_get(socks_port, origin_port, socks_host="127.0.0.1"):
+    with socket.create_connection((socks_host, socks_port), timeout=10) as connection:
         connection.sendall(b"\x05\x01\x00")
         require(receive_exact(connection, 2) == b"\x05\x00", "SOCKS authentication negotiation failed")
         connection.sendall(b"\x05\x01\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", origin_port))
@@ -200,6 +202,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("binary", type=Path)
     parser.add_argument("--sing-box", type=Path, required=True)
+    parser.add_argument("--port-hopping", action="store_true", help="verify Hy2 redirects and a live hop in this private namespace")
     args = parser.parse_args()
     private_namespace()
     signal.signal(signal.SIGTERM, interrupt)
@@ -212,8 +215,30 @@ def main():
             temporary = stack.enter_context(tempfile.TemporaryDirectory(prefix="sbctl-proxy-data-"))
             root = Path(temporary)
             root.chmod(0o700)
+            client_prefix = []
+            socks_host = "127.0.0.1"
+            if args.port_hopping:
+                client_ns = subprocess.Popen(["unshare", "--net", "sleep", "120"])
+                stack.callback(stop_process, client_ns)
+                for _ in range(100):
+                    if os.readlink(f"/proc/{client_ns.pid}/ns/net") != os.readlink("/proc/self/ns/net"):
+                        break
+                    time.sleep(0.01)
+                client_prefix = ["nsenter", "-t", str(client_ns.pid), "-n"]
+                def net(command):
+                    subprocess.run(command, check=True, capture_output=True, timeout=10)
+                net(["ip", "link", "add", "hy2-server", "type", "veth", "peer", "name", "hy2-client"])
+                net(["ip", "link", "set", "hy2-client", "netns", str(client_ns.pid)])
+                net(["ip", "address", "add", "192.0.2.1/30", "dev", "hy2-server"])
+                net(["ip", "link", "set", "hy2-server", "up"])
+                net(client_prefix + ["ip", "link", "set", "lo", "up"])
+                net(client_prefix + ["ip", "address", "add", "192.0.2.2/30", "dev", "hy2-client"])
+                net(client_prefix + ["ip", "link", "set", "hy2-client", "up"])
+                socks_host = "192.0.2.2"
+
             init = [str(sbctl), "--root", str(root), "config", "init", "--mode", "ip-fallback",
-                    "--subscription-host", "127.0.0.1", "--http-port", str(free_port()), "--interface", "lo",
+                    "--subscription-host", "192.0.2.1" if args.port_hopping else "127.0.0.1",
+                    "--http-port", str(free_port()), "--interface", "hy2-server" if args.port_hopping else "lo",
                     "--reality-decoy-sni", "www.cloudflare.com", "--protocol-sni", "www.cloudflare.com",
                     "--sing-box-bin", str(core)]
             for protocol in PROTOCOLS:
@@ -221,14 +246,36 @@ def main():
             initialized = subprocess.run(init, capture_output=True, cwd=root, timeout=30)
             require(initialized.returncode == 0, "isolated five-protocol configuration generation failed")
             artifacts = root / "var/lib/sbctl/artifacts"
+            if args.port_hopping:
+                existing_server = json.loads((artifacts / "sing-box-server.json").read_bytes())
+                occupied = {n["listen_port"] for n in existing_server["inbounds"]}
+                start = next(p for p in range(40000, 60000, 100) if not occupied.intersection(range(p, p + 11)))
+                config_path = root / "etc/sbctl/config.toml"
+                config_path.write_text(f"hysteria2_port_hopping = {{ start = {start}, end = {start + 10}, interval_seconds = 5 }}\n" + config_path.read_text())
+                regenerated = subprocess.run([str(sbctl), "--root", str(root), "regenerate", "--sing-box-bin", str(core)], capture_output=True, timeout=30)
+                require(regenerated.returncode == 0, "hopping artifacts failed regeneration")
+                # Alternate roots cannot invoke a host command: explicitly provide
+                # this namespace's nft binary inside the disposable root.
+                import shutil
+                nft = shutil.which("nft")
+                require(nft is not None, "install nftables before the hopping check")
+                (root / "usr/bin").mkdir(parents=True, exist_ok=True)
+                (root / "usr/bin/nft").symlink_to(nft)
+                hook = [str(sbctl), "--root", str(root), "sing-box", "port-hopping-firewall"]
+                applied = subprocess.run(hook, capture_output=True, timeout=10)
+                require(applied.returncode == 0, "hopping firewall hook failed")
+                stack.callback(lambda: subprocess.run(hook + ["--cleanup"], capture_output=True, timeout=10))
+                table = subprocess.run([nft, "list", "table", "inet", "sbctl_hy2"], capture_output=True)
+                require(table.returncode == 0, "hopping table missing")
+
             server = json.loads((artifacts / "sing-box-server.json").read_bytes())
             original_server = copy.deepcopy(server)
             bare = json.loads((artifacts / "subscription-sing-box.json").read_bytes())
             original_outbounds = copy.deepcopy(bare["outbounds"])
             require({node["type"] for node in server["inbounds"]} == TYPES, "server protocol matrix is incomplete")
             require({node["type"] for node in bare["outbounds"]} == TYPES, "bare outbound matrix is incomplete")
-            require(all(node["server"] == "127.0.0.1" for node in bare["outbounds"]),
-                    "a generated client node does not dial loopback")
+            require(all(node["server"] == ("192.0.2.1" if args.port_hopping else "127.0.0.1") for node in bare["outbounds"]),
+                    "a generated client node escapes the private test network")
 
             certificate_tls = next(node["tls"] for node in server["inbounds"] if node["type"] == "vmess")
             certificate = Path(certificate_tls["certificate_path"]).resolve()
@@ -243,13 +290,13 @@ def main():
             origin_port = serve_http(stack)
             decoy_port = serve_http(stack, context)
             for node in server["inbounds"]:
-                node["listen"] = "127.0.0.1"
+                node["listen"] = "0.0.0.0" if args.port_hopping else "127.0.0.1"
                 if node["type"] == "vless":
                     node["tls"]["reality"]["handshake"] = {"server": "127.0.0.1", "server_port": decoy_port}
             # Assert the complete adaptation boundary before starting any core.
             expected = copy.deepcopy(original_server)
             for node in expected["inbounds"]:
-                node["listen"] = "127.0.0.1"
+                node["listen"] = "0.0.0.0" if args.port_hopping else "127.0.0.1"
                 if node["type"] == "vless":
                     node["tls"]["reality"]["handshake"] = {"server": "127.0.0.1", "server_port": decoy_port}
             require(server == expected, "server adaptation changed an unexpected protocol field")
@@ -266,20 +313,35 @@ def main():
                     socks_port = free_port()
                     client = {
                         "log": {"level": "error"},
-                        "inbounds": [{"type": "socks", "tag": "offline-socks", "listen": "127.0.0.1", "listen_port": socks_port}],
+                        "inbounds": [{"type": "socks", "tag": "offline-socks", "listen": "0.0.0.0" if args.port_hopping else "127.0.0.1", "listen_port": socks_port}],
                         "outbounds": [copy.deepcopy(node)],
                         "route": {"final": node["tag"]},
                     }
                     require(client["outbounds"][0] == node, "client outbound was modified")
                     client_path = root / (node["type"] + "-client.json")
                     write_json(client_path, client)
-                    client_process = start_core(client_stack, core, client_path, root, node["type"])
-                    wait_tcp(socks_port, client_process, node["type"])
-                    proxy_get(socks_port, origin_port)
+                    client_process = start_core(client_stack, core, client_path, root, node["type"], client_prefix)
+                    wait_tcp(socks_port, client_process, node["type"], socks_host)
+                    proxy_get(socks_port, origin_port, socks_host)
+                    if args.port_hopping and node["type"] == "hysteria2":
+                        time.sleep(6)
+                        proxy_get(socks_port, origin_port, socks_host)
+                        counters = subprocess.run([nft, "list", "table", "inet", "sbctl_hy2"], capture_output=True, text=True)
+                        require(counters.returncode == 0 and "packets 0 bytes 0" not in counters.stdout,
+                                "Hy2 did not traverse the hopping redirect")
+                        print("PASS Hy2 transfer before and after a live port hop", flush=True)
+
                     require(server_process.poll() is None and client_process.poll() is None,
                             "a protocol core exited during the data-plane request")
                     print("PASS isolated protocol HTTP body: " + node["type"], flush=True)
             require(bare["outbounds"] == original_outbounds, "bare outbounds changed during testing")
+            if args.port_hopping:
+                cleaned = subprocess.run(hook + ["--cleanup"], capture_output=True, timeout=10)
+                require(cleaned.returncode == 0, "hopping firewall cleanup failed")
+                require(subprocess.run([nft, "list", "table", "inet", "sbctl_hy2"], capture_output=True).returncode != 0,
+                        "hopping table survived cleanup")
+                print("PASS Hy2 nftables cleanup", flush=True)
+
         print("PASS five offline data planes; all processes, listeners and temporary credentials removed", flush=True)
     except Exception as error:
         # Never print captured core logs, credential-bearing JSON or exception

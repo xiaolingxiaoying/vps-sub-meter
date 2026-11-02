@@ -26,3 +26,5 @@ test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
 交互管理入口和各菜单项对应的 CLI、验证证据见[菜单与验证指南](docs/menu-validation.md)；客户端模板、订阅格式和版本差异见[订阅指南](docs/subscription-guide.md)与[内置模板说明](src/subscription/templates/README.md)。
 
 日常可用 `sbctl status` 查看剩余流量及重置时间，`sbctl credential list` 查看各设备凭据的宽限期，或从菜单「概览与诊断」检查订阅入口。订阅支持 GET 与 HEAD，便于使用 `curl -I` 检查响应头；链接仍使用路径凭据并拒绝查询参数。
+
+内核只从 [SagerNet 官方发布](https://github.com/SagerNet/sing-box/releases) 下载，菜单提供数字选项。可在「部署与协议」启用 [Hy2 端口跳跃](docs/hy2-port-hopping.md)，VMess 等 TLS 协议的证书由工具生成或复用，无需手工粘贴。

@@ -624,6 +624,12 @@ fn firewall_port_commands(config: &sbctl::config::DeploymentConfig) -> Vec<Strin
             commands.push(format!("sudo ufw allow {port}/{transport}  # {protocol}"));
         }
     }
+    if let Some(hop) = &config.hysteria2_port_hopping {
+        commands.push(format!(
+            "sudo ufw allow {}:{}/udp  # Hy2 端口跳跃；云安全组也须放行",
+            hop.start, hop.end
+        ));
+    }
     commands
 }
 

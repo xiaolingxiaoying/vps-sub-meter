@@ -6,15 +6,6 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
-#[cfg(unix)]
-use std::io::{Read, Write};
-
-#[cfg(unix)]
-use std::net::TcpListener;
-
-#[cfg(unix)]
-use std::thread;
-
 use crate::fixture::{
     assert_existing_deployment_is_preserved, seed_service_accounts, sing_box_check_fixture,
     supported_systemd_host, write_os_release, write_systemctl_fixture,
@@ -255,24 +246,52 @@ use crate::fixture::write_manifest_spec;
 fn install_with_a_signed_manifest_downloads_and_verifies_sing_box() {
     let fixture = supported_systemd_host();
     let sing_box_fixture = sing_box_check_fixture(&fixture, true, &["vless"]);
-    let sing_box_contents = fs::read(&sing_box_fixture).expect("sing-box fixture is readable");
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("an ephemeral port is available");
-    let port = listener.local_addr().expect("address is available").port();
-    let served = sing_box_contents.clone();
-    let server = thread::spawn(move || {
-        for stream in listener.incoming().take(1) {
-            let mut stream = stream.expect("client stream is accepted");
-            let mut request = [0u8; 4096];
-            let _ = stream.read(&mut request);
-            let header = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                served.len()
-            );
-            let _ = stream.write_all(header.as_bytes());
-            let _ = stream.write_all(&served);
-        }
-    });
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let mut sing_box_contents = fs::read(&sing_box_fixture).unwrap();
+    let version_check =
+        b"#!/bin/sh\nif [ \"$1\" = version ]; then echo 'sing-box version 1.12.0'; exit 0; fi\n";
+    sing_box_contents.splice(..10, version_check.iter().copied());
+    let member = fixture.path().join("sing-box-1.12.0-linux-amd64");
+    fs::create_dir(&member).unwrap();
+    fs::write(member.join("sing-box"), &sing_box_contents).unwrap();
+    fs::set_permissions(member.join("sing-box"), fs::Permissions::from_mode(0o700)).unwrap();
+    let archive = fixture.path().join("official.tar.gz");
+    assert!(
+        std::process::Command::new("tar")
+            .args(["-czf"])
+            .arg(&archive)
+            .arg("-C")
+            .arg(fixture.path())
+            .arg("sing-box-1.12.0-linux-amd64")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let digest = format!("{:x}", Sha256::digest(fs::read(&archive).unwrap()));
+    let curl = fixture.path().join("usr/bin/curl");
+    fs::create_dir_all(curl.parent().unwrap()).unwrap();
+    fs::write(&curl, format!(r##"#!/bin/sh
+set -eu
+output=
+url=
+while [ "$#" -gt 0 ]; do
+    case "$1" in --output) output=$2; shift 2 ;; *) url=$1; shift ;; esac
+done
+case "$url" in
+  https://api.github.com/repos/SagerNet/sing-box/releases/tags/v1.12.0)
+    printf '%s' '{{"assets":[{{"name":"sing-box-1.12.0-linux-amd64.tar.gz","digest":"sha256:{digest}"}}]}}' > "$output" ;;
+  https://github.com/SagerNet/sing-box/releases/download/v1.12.0/sing-box-1.12.0-linux-amd64.tar.gz)
+    cp '{}' "$output" ;;
+  *) echo "refusing non-official download" >&2; exit 1 ;;
+esac
+"##, archive.display())).unwrap();
+    fs::set_permissions(&curl, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = format!(
+        "{}:{}",
+        curl.parent().unwrap().display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
 
     let manifest = fixture.path().join("release-manifest.json");
     write_manifest_spec(
@@ -282,7 +301,7 @@ fn install_with_a_signed_manifest_downloads_and_verifies_sing_box() {
         "https://example.test/sbctl",
         b"candidate sbctl",
         "1.12.0",
-        &format!("http://127.0.0.1:{port}/sing-box"),
+        "https://untrusted.example.test/this-url-must-never-be-requested",
         &sing_box_contents,
         "1.12.0",
         "1.12.0",
@@ -316,11 +335,11 @@ fn install_with_a_signed_manifest_downloads_and_verifies_sing_box() {
             manifest.to_str().expect("manifest path is UTF-8"),
             "--no-start",
         ])
+        .env("PATH", path)
         .assert()
         .success()
         .stdout(predicate::str::contains("后续必做清单"));
 
-    server.join().expect("byte server exits");
     assert_eq!(
         fs::read(fixture.path().join("usr/local/bin/sing-box")).expect("sing-box is installed"),
         sing_box_contents

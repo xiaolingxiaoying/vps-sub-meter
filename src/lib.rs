@@ -19,3 +19,5 @@ pub mod term;
 pub mod traffic;
 pub mod update;
 pub mod wizard;
+
+pub mod port_hopping;

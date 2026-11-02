@@ -143,9 +143,11 @@ jobs:
         run: |
           cargo build --locked -p sbctl
           sudo unshare --net python3 scripts/dev/check-certificate-generation.py "$GITHUB_WORKSPACE/target/debug/sbctl" --serve --core "$GITHUB_WORKSPACE/sing-box-1.14.1/sing-box"
+      - name: Install nftables for the isolated Hy2 hopping check
+        run: sudo apt-get update && sudo apt-get install -y nftables
       - name: Verify five protocol data planes in a private network namespace
         run: |
-          sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py target/debug/sbctl --sing-box sing-box-1.14.1/sing-box'
+          sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py target/debug/sbctl --sing-box sing-box-1.14.1/sing-box --port-hopping'
 
   mihomo-profiles:
     runs-on: ubuntu-24.04

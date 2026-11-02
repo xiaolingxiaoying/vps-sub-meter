@@ -1,7 +1,7 @@
-# Pinned sing-box runtime bundled into every sbctl release.
+# Pinned official sing-box runtime verified while signing each sbctl release.
 #
-# `version` is the sing-box release whose linux binary ships as
-# `sing-box-linux-<arch>` and whose version is declared in the signed
+# The Linux binaries are staging artifacts only, never uploaded to our Release.
+# The version and extracted binary SHA-256 are declared in the signed
 # manifests. It must stay inside the compatibility band published in those
 # manifests and inside the client version-profile registry
 # (src/subscription/profile.rs).

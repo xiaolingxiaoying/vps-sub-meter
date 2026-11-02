@@ -59,6 +59,11 @@ fn generated_clash_artifacts_load_in_a_real_mihomo() {
             Some("www.cloudflare.com".into()),
         )
         .expect("a five-protocol IP fallback deployment is valid");
+        config.hysteria2_port_hopping = Some(sbctl::port_hopping::PortHopping {
+            start: 20000,
+            end: 20100,
+            interval_seconds: 30,
+        });
         config.client_template = template.clone();
         config.client_rule_profile = rule_profile.clone();
         // Validate both the baseline and the file users can paste into the

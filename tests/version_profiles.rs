@@ -60,6 +60,35 @@ fn generated_profiles_pass_a_real_sing_box_check() {
     );
 }
 
+#[test]
+#[ignore = "requires real sing-box cores; run by CI"]
+fn hopping_profiles_pass_every_supported_core() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "127.0.0.1".into(),
+        None,
+        Some(2080),
+        "lo".into(),
+        vec![ManagedProtocol::Hysteria2],
+        None,
+    )
+    .unwrap();
+    config.hysteria2_port_hopping = Some(sbctl::port_hopping::PortHopping {
+        start: 20000,
+        end: 20100,
+        interval_seconds: 30,
+    });
+    for template in [ClientTemplate::Standard, ClientTemplate::Compact] {
+        config.client_template = template;
+        let artifacts = generated_artifacts(&config, root.path()).unwrap();
+        assert_eq!(
+            check_against_cores("port-hopping", &artifacts),
+            SING_BOX_VERSION_PROFILES.len()
+        );
+    }
+}
+
 /// Checks each per-minor artifact of one template against the core that owns it,
 /// returning how many combinations actually ran.
 fn check_against_cores(template: &str, artifacts: &[(String, String)]) -> usize {

@@ -19,7 +19,7 @@ use crate::subscription::artifacts::SubscriptionError;
 
 pub(super) use clash::{clash, clash_legacy};
 pub(super) use singbox::{sing_box_full, sing_box_server};
-pub(super) use uri::{insecure_flag, node_uri, shadowrocket, uri};
+pub(super) use uri::{hopping_uris, insecure_flag, node_uri, shadowrocket, uri};
 
 pub(crate) fn ensure_subscription_nodes(
     config: &DeploymentConfig,
@@ -56,7 +56,7 @@ pub(super) fn client_outbounds(config: &DeploymentConfig, nodes: &[CanonicalNode
     let skip_verify = client_skip_cert_verify(config);
     nodes
         .iter()
-        .map(|node| match &node {
+        .map(|node| { let mut outbound = match &node {
             CanonicalNode::VlessReality {
                 host,
                 port,
@@ -109,6 +109,14 @@ pub(super) fn client_outbounds(config: &DeploymentConfig, nodes: &[CanonicalNode
                 "idle_session_check_interval": "30s", "idle_session_timeout": "30s",
                 "min_idle_session": 5,
                 "tls": {"enabled": true, "server_name": tls_server_name, "insecure": skip_verify}}),
+        };
+            if node.protocol() == crate::config::ManagedProtocol::Hysteria2
+                && let Some(hop) = &config.hysteria2_port_hopping {
+                outbound.as_object_mut().unwrap().remove("server_port");
+                outbound["server_ports"] = json!([format!("{}:{}", hop.start, hop.end)]);
+                outbound["hop_interval"] = json!(format!("{}s", hop.interval_seconds));
+            }
+            outbound
         })
         .collect()
 }

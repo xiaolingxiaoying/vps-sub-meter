@@ -245,7 +245,7 @@ if [[ "$#" -gt 0 ]]; then
     run_installer /usr/local/bin/sbctl install "${install_args[@]}"
   fi
 fi
-green "运行 ly，在安装与部署菜单中选择内核下载源、版本和部署配置。"
+green "运行 ly，在安装与部署菜单中选择官方内核版本和部署配置。"
 if [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; then
   resolve_installer_input
   run_installer /usr/local/bin/sbctl menu <"$installer_input"

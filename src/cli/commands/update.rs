@@ -8,6 +8,11 @@ use std::process::ExitCode;
 
 pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
     let result = match command {
+        SingBoxCommand::PortHoppingFirewall { cleanup } => {
+            sbctl::port_hopping::apply_firewall(root, cleanup)
+                .map(|_| "Hy2 firewall reconciled".to_owned())
+                .map_err(sbctl::update::UpdateError::Operation)
+        }
         SingBoxCommand::Version => return sing_box_version(root),
         SingBoxCommand::Status => return sing_box_status(root),
         SingBoxCommand::Api { command } => return sing_box_api(root, command),
@@ -68,22 +73,6 @@ pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
         },
         SingBoxCommand::Fetch { source, version } => match source {
             KernelSource::Official => update_sing_box_official(root, None, version.as_deref()),
-            KernelSource::Repository => {
-                if version.is_some() {
-                    eprintln!("本仓库原版二进制由签名 manifest 固定版本，不支持选择版本");
-                    return ExitCode::from(2);
-                }
-                sbctl::update::fetch_latest_manifest().and_then(|manifest| {
-                    let temporary = tempfile::NamedTempFile::new()?.into_temp_path();
-                    sbctl::update::download_sing_box(&manifest, &temporary)?;
-                    sbctl::update::install_signed_sing_box(
-                        &sbctl::config::DeploymentStore::new(root),
-                        &manifest,
-                        &temporary,
-                    )
-                    .map(|path| format!("本仓库内核已安装；回滚点：{}", path.display()))
-                })
-            }
         },
         SingBoxCommand::Remove => sbctl::lifecycle::remove_managed_sing_box(root)
             .map(|_| "sing-box removed".to_owned())

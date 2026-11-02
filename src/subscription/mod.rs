@@ -59,7 +59,10 @@ pub fn node_share_link(
     config: &crate::config::DeploymentConfig,
     node: &crate::canonical::CanonicalNode,
 ) -> String {
-    render::node_uri(render::insecure_flag(config), &node.with_bracketed_host())
+    render::hopping_uris(
+        config,
+        &render::node_uri(render::insecure_flag(config), &node.with_bracketed_host()),
+    )
 }
 
 fn base64_uri(uri: &str) -> String {

@@ -290,26 +290,8 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
         }
         true
     };
-    let Some((source, kernel_version)) = select_kernel() else {
+    let Some((_source, kernel_version)) = select_kernel() else {
         return ExitCode::SUCCESS;
-    };
-    let manifest_guard = if matches!(source, KernelSource::Repository) {
-        let result = (|| -> Result<tempfile::TempPath, Box<dyn std::error::Error>> {
-            let manifest = sbctl::update::fetch_latest_manifest()?;
-            println!("本仓库固定内核：{}", manifest.sing_box.version);
-            let path = tempfile::NamedTempFile::new()?.into_temp_path();
-            std::fs::write(&path, serde_json::to_vec(&manifest)?)?;
-            Ok(path)
-        })();
-        match result {
-            Ok(path) => Some(path),
-            Err(error) => {
-                eprintln!("读取本仓库 Release 失败：{error}");
-                return ExitCode::from(2);
-            }
-        }
-    } else {
-        None
     };
     let existing_config = if replace_existing {
         // Replacement must work even when an old configuration is unreadable.
@@ -341,7 +323,7 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
                 anytls_port: None,
                 sing_box_bin: None,
                 kernel_version,
-                manifest: manifest_guard.as_ref().map(|path| path.to_path_buf()),
+                manifest: None,
                 replace_existing,
                 manage_firewall: false,
                 ipv4_only: false,
@@ -366,26 +348,17 @@ pub(crate) fn confirm_menu_action(prompt: &str) -> bool {
 }
 
 fn select_kernel() -> Option<(KernelSource, Option<String>)> {
-    println!(
-        "内核下载源：1. 本仓库 Release（原版二进制，固定版本）  2. 官方仓库（可选版本）  0. 取消"
-    );
-    match read_menu_choice("请选择 [2]: ")?.as_str() {
-        "1" => Some((KernelSource::Repository, None)),
-        "2" | "" => {
-            let version =
-                read_menu_choice("官方版本（例如 1.14.1；latest 表示最新稳定版）[latest]: ")?;
-            let version = if version.is_empty() || version == "latest" {
-                None
-            } else {
-                Some(version.trim_start_matches('v').to_owned())
-            };
-            if let Some(version) = &version
-                && let Err(error) = sbctl::update::official_sing_box_archive_url(version)
-            {
+    println!("sing-box 仅从 SagerNet 官方仓库下载：\n1. 最新稳定版（推荐）\n2. 指定版本\n0. 取消");
+    match read_menu_choice("请选择 [1]: ")?.as_str() {
+        "1" | "" => Some((KernelSource::Official, None)),
+        "2" => {
+            let version = read_menu_choice("版本号（例如 1.14.4）: ")?;
+            let version = version.trim_start_matches('v').to_owned();
+            if let Err(error) = sbctl::update::official_sing_box_archive_url(&version) {
                 eprintln!("版本无效：{error}");
                 return None;
             }
-            Some((KernelSource::Official, version))
+            Some((KernelSource::Official, Some(version)))
         }
         "0" => None,
         _ => {

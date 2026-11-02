@@ -44,6 +44,8 @@ pub struct DeploymentConfig {
     /// certificate, or a long-lived self-signed certificate (sing-box-yg style).
     #[serde(default)]
     pub certificate_mode: CertificateMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hysteria2_port_hopping: Option<crate::port_hopping::PortHopping>,
     pub interface: String,
     /// Force server-side domain resolution, including the independent
     /// Reality handshake dialer, to IPv4 even on dual-stack hosts. IPv4-only
@@ -638,6 +640,7 @@ impl DeploymentConfig {
             subscription_listen_port,
             certificate_mode: CertificateMode::SelfSigned,
             interface,
+            hysteria2_port_hopping: None,
             ipv4_only: false,
             enabled_protocols,
             reality_decoy_sni,
@@ -758,6 +761,9 @@ impl DeploymentConfig {
             subscription_listen_port: *subscription_listen_port,
             certificate_mode: certificate_mode.clone(),
             interface: interface.clone(),
+            hysteria2_port_hopping: existing
+                .and_then(|c| c.hysteria2_port_hopping.clone())
+                .filter(|_| enabled_protocols.contains(&ManagedProtocol::Hysteria2)),
             ipv4_only: existing.is_some_and(|config| config.ipv4_only),
             enabled_protocols: enabled_protocols.clone(),
             reality_decoy_sni: reality_decoy_sni.clone(),
@@ -845,6 +851,7 @@ impl DeploymentConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        crate::port_hopping::validate(self)?;
         self.validate_deployment_identity()?;
         self.validate_protocols()?;
         self.validate_secret_and_accounting()?;
@@ -1277,6 +1284,13 @@ impl DeploymentConfig {
         lines.push(format!("protocol SNI: {}", self.protocol_server_name()));
         if let Some(reset_at) = &self.anchored_reset_at {
             lines.push(format!("anchored reset: {reset_at}"));
+        }
+        if let Some(hop) = &self.hysteria2_port_hopping {
+            lines.push(format!(
+                "Hy2 port hopping: {} UDP / {}s",
+                hop.range(),
+                hop.interval_seconds
+            ));
         }
         lines.join("\n")
     }

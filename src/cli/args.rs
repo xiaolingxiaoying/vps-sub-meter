@@ -821,6 +821,12 @@ sing-box-<version>, clash, clash-<version>, uri, base64-uri, or shadowrocket"
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum SingBoxCommand {
+    /// Internal root-only systemd hook for the managed Hy2 nftables table.
+    #[command(hide = true)]
+    PortHoppingFirewall {
+        #[arg(long)]
+        cleanup: bool,
+    },
     /// Download the pinned sing-box artifact and verify its digest.
     Download {
         #[arg(long)]
@@ -843,7 +849,7 @@ pub(crate) enum SingBoxCommand {
         #[arg(long)]
         artifact: Option<PathBuf>,
     },
-    /// Install a repository pinned binary or a selected official version.
+    /// Install a selected version from the official SagerNet repository.
     Fetch {
         #[arg(long, value_enum, default_value = "official")]
         source: KernelSource,
@@ -919,7 +925,6 @@ impl From<CliAccountingPolicy> for sbctl::config::AccountingPolicy {
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
 pub(crate) enum KernelSource {
-    Repository,
     Official,
 }
 

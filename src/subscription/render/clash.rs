@@ -46,7 +46,7 @@ fn clash_proxies(
     // exactly that string, including whitespace and line breaks.
     let mut entries = Vec::with_capacity(nodes.len());
     for node in nodes {
-        let entry = match &node {
+        let mut entry = match &node {
             CanonicalNode::VlessReality {
                 host,
                 port,
@@ -107,6 +107,12 @@ fn clash_proxies(
                 "tls": true, "sni": tls_server_name, "skip-cert-verify": skip,
             }),
         };
+        if node.protocol() == crate::config::ManagedProtocol::Hysteria2
+            && let Some(hop) = &config.hysteria2_port_hopping
+        {
+            entry["ports"] = serde_json::json!(hop.range());
+            entry["hop-interval"] = serde_json::json!(hop.interval_seconds);
+        }
         entries.push(entry);
     }
     let mut proxies = serde_yaml::to_string(&serde_json::json!({"proxies": entries}))

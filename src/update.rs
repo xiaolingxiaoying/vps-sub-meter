@@ -39,8 +39,7 @@ pub enum UpdateError {
     OfficialChecksumMismatch,
     #[error(
         "GitHub 未提供 sing-box {0} 资产的 SHA-256 摘要，无法校验归档完整性，已中止下载。\n\
-         请改用签名发布清单（sbctl install --manifest <清单> 或 sbctl sing-box update --manifest <清单>），\n\
-         或直接提供已校验的本地内核（--sing-box-bin <路径>）。"
+         请稍后重试或选择具有官方摘要的版本；离线安装可直接提供已校验的本地内核（--sing-box-bin <路径>）。"
     )]
     OfficialChecksumUnavailable(String),
     #[error("official sing-box archive contains an unsafe member name: {0}")]
@@ -132,7 +131,8 @@ pub fn available_versions(manifest: &ReleaseManifest) -> String {
 }
 
 pub fn download_sing_box(manifest: &ReleaseManifest, output: &Path) -> Result<(), UpdateError> {
-    download_artifact("sing-box", &manifest.sing_box, output)
+    download_sing_box_official(&manifest.sing_box.version, output)?;
+    verify_sing_box_artifact(manifest, output)
 }
 
 pub fn download_sbctl(manifest: &ReleaseManifest, output: &Path) -> Result<(), UpdateError> {
@@ -1290,7 +1290,7 @@ mod tests {
             "unexpected error: {error}"
         );
         let message = error.to_string();
-        assert!(message.contains("--manifest"), "{message}");
+        assert!(message.contains("具有官方摘要的版本"), "{message}");
         assert!(message.contains("--sing-box-bin"), "{message}");
 
         let digest = format!("{:x}", Sha256::digest(b"official archive"));

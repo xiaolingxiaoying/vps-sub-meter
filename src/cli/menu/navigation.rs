@@ -143,6 +143,10 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
                     Topic(ConfigurationTopic::Protocols),
                 ),
                 entry("节点分享链接（含凭据，需确认）", NodeLinks),
+                entry(
+                    "Hy2 端口跳跃（UDP 范围与间隔）",
+                    Topic(ConfigurationTopic::PortHopping),
+                ),
             ]);
             result
         }

@@ -137,8 +137,13 @@ const BACKED_UP_PATHS: &[&str] = &[
     CERTBOT_DEPLOY_HOOK,
 ];
 
-fn sing_box_unit() -> &'static str {
-    "[Unit]\nDescription=sing-box data plane managed by sbctl\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=sing-box\nGroup=sing-box\nExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n\n[Install]\nWantedBy=multi-user.target\n"
+fn sing_box_unit(hopping: bool) -> String {
+    let unit = "[Unit]\nDescription=sing-box data plane managed by sbctl\nAfter=network-online.target\nWants=network-online.target\n\n[Service]\nType=simple\nUser=sing-box\nGroup=sing-box\nExecStart=/usr/local/bin/sing-box run -c /etc/sing-box/config.json\nRestart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectSystem=strict\nProtectHome=true\n\n[Install]\nWantedBy=multi-user.target\n";
+    if hopping {
+        unit.replace("ExecStart=", "ExecStartPre=+/usr/local/bin/sbctl sing-box port-hopping-firewall\nExecStopPost=+/usr/local/bin/sbctl sing-box port-hopping-firewall --cleanup\nExecStart=")
+    } else {
+        unit.to_owned()
+    }
 }
 
 /// Direct subscription mode runs under systemd socket activation: the
@@ -190,7 +195,11 @@ pub fn install_units(
     // and the ownership marker; use the unlocked write helper so the active
     // configuration cannot be swapped by another writer mid-install.
     store.write_relative_locked("etc/sing-box/config.json", server_config.as_bytes())?;
-    write_unit(store.root(), SING_BOX_UNIT, sing_box_unit())?;
+    write_unit(
+        store.root(),
+        SING_BOX_UNIT,
+        &sing_box_unit(store.load()?.hysteria2_port_hopping.is_some()),
+    )?;
     write_unit(store.root(), SBCTL_UNIT, &sbctl_unit(direct))?;
     write_unit(
         store.root(),
@@ -248,7 +257,34 @@ pub fn install_checked_sing_box(root: &Path, candidate: &Path) -> Result<(), Con
 /// update while `Restart=on-failure` loops it. The standalone `sbctl sing-box
 /// update` path used to do exactly that; sharing the window with
 /// `restart_services` is what makes its rollback trigger.
+fn reconcile_sing_box_unit(root: &Path) -> Result<(), String> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER)? {
+        return Err("sing-box.service is not sbctl-managed".into());
+    }
+    let hopping = DeploymentStore::new(root)
+        .load()
+        .map_err(|e| e.to_string())?
+        .hysteria2_port_hopping
+        .is_some();
+    let unit = sing_box_unit(hopping);
+    let previous = fs::read_to_string(root.join(SING_BOX_UNIT)).map_err(|e| e.to_string())?;
+    if !hopping && previous.contains("port-hopping-firewall") {
+        // daemon-reload replaces ExecStopPost too; remove the old table before
+        // dropping its cleanup hook from the disabled configuration.
+        crate::port_hopping::apply_firewall(root, true)?;
+    }
+    if previous != unit {
+        write_unit(root, SING_BOX_UNIT, &unit).map_err(|e| e.to_string())?;
+        systemctl(root, &["daemon-reload"])?;
+    }
+    Ok(())
+}
+
 pub fn restart_sing_box_service(root: &Path) -> Result<(), String> {
+    reconcile_sing_box_unit(root)?;
     systemctl(root, &["restart", "sing-box.service"])?;
     wait_for_stable_activation(root, "sing-box.service")
 }
@@ -1102,6 +1138,7 @@ pub fn refresh_certificate_consumer(root: &Path) -> Result<(), String> {
 }
 
 pub fn restart_services(root: &Path) -> Result<(), String> {
+    reconcile_sing_box_unit(root)?;
     migrate_credential_rotate_service(root)?;
     // Isolated deployment roots used by CLI tests and image builders do not
     // control the host's systemd units or sockets. Keep their historical
