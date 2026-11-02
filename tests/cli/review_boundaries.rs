@@ -82,6 +82,7 @@ mod linux {
                 write_managed_file(&fixture, "proc/sys/net/core/default_qdisc", b"pfifo_fast\n");
                 command.args(["system", "bbr"]);
             } else {
+                write_managed_file(&fixture, "etc/sing-box/config.json", b"{}");
                 let kernel = script(root, "usr/local/bin/sing-box", "exit 0\n");
                 command.args(["restart", "--sing-box-bin", kernel.to_str().unwrap()]);
             }

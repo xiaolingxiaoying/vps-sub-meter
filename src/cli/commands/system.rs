@@ -76,6 +76,12 @@ pub(crate) fn run_credential(root: &Path, command: CredentialCommand) -> ExitCod
                 return ExitCode::from(2);
             }
             if install_timer || remove_timer {
+                if grace.is_some() {
+                    eprintln!(
+                        "credential rotate failed: --grace 只能用于即时轮换，不能与定时器设置一起使用"
+                    );
+                    return ExitCode::from(2);
+                }
                 return set_rotation_timer(root, install_timer);
             }
             rotate_credential(root, name.as_deref(), grace.as_deref())
@@ -96,7 +102,9 @@ fn set_rotation_timer(root: &Path, enable: bool) -> ExitCode {
         Ok(()) => {
             if enable {
                 println!("已启用每月自动轮换默认订阅凭据（sbctl-credential-rotate.timer）");
-                println!("提醒：每次轮换都会让旧链接立即失效，所有设备需重新导入。");
+                println!(
+                    "提醒：旧默认链接会立即失效，使用默认链接的设备需重新导入；命名凭据不受影响。"
+                );
                 println!(
                     "用 sbctl credential rotate --name <设备> --grace 30m 做平滑的设备级轮换。"
                 );
@@ -147,11 +155,40 @@ fn mask(credential: &str) -> String {
     format!("{head}…（{} 字符）", credential.len())
 }
 
-fn credential_status(entry: &sbctl::config::NamedCredential, now: i64) -> String {
+fn credential_expiry(expires: i64, timezone: chrono_tz::Tz) -> String {
+    chrono::DateTime::from_timestamp(expires, 0)
+        .and_then(|instant| {
+            let local = instant.with_timezone(&timezone);
+            // UTC can be representable while the selected timezone pushes its
+            // local date outside chrono's range. Check before formatting.
+            let offset = chrono::Offset::fix(local.offset()).local_minus_utc();
+            instant
+                .naive_utc()
+                .checked_add_signed(chrono::Duration::seconds(i64::from(offset)))?;
+            Some(local.format("%Y-%m-%d %H:%M:%S %:z").to_string())
+        })
+        .unwrap_or_else(|| "时间超出可显示范围".to_owned())
+}
+
+fn credential_status(
+    entry: &sbctl::config::NamedCredential,
+    now: i64,
+    timezone: chrono_tz::Tz,
+) -> String {
     match entry.revoked_at {
-        None => "生效中".to_owned(),
-        Some(expires) if expires > now => format!("宽限至 {expires}"),
-        Some(_) => "已失效".to_owned(),
+        None => "生效中（长期）".to_owned(),
+        Some(expires) if expires > now => {
+            format!("宽限至 {}", credential_expiry(expires, timezone))
+        }
+        Some(expires) => format!("已失效（{}）", credential_expiry(expires, timezone)),
+    }
+}
+
+fn credential_priority(entry: &sbctl::config::NamedCredential, now: i64) -> u8 {
+    match entry.revoked_at {
+        None => 0,
+        Some(expires) if expires > now => 1,
+        Some(_) => 2,
     }
 }
 
@@ -160,16 +197,39 @@ fn list_credentials(root: &Path) -> ExitCode {
     match store.load() {
         Ok(config) => {
             let now = chrono::Utc::now().timestamp();
-            println!("default  {}  生效中", mask(&config.subscription_credential));
-            for entry in &config.subscription_credentials {
+            let timezone = config
+                .client_display_timezone
+                .parse::<chrono_tz::Tz>()
+                .unwrap_or(chrono_tz::UTC);
+            println!("订阅凭据 · 显示时区：{}", config.client_display_timezone);
+            println!(
+                "default（默认凭据）\n  {}  生效中（长期）",
+                mask(&config.subscription_credential)
+            );
+            let mut entries: Vec<_> = config.subscription_credentials.iter().collect();
+            entries.sort_by(|left, right| {
+                left.name
+                    .cmp(&right.name)
+                    .then_with(|| {
+                        credential_priority(left, now).cmp(&credential_priority(right, now))
+                    })
+                    .then_with(|| left.revoked_at.cmp(&right.revoked_at))
+            });
+            let mut counts = [1usize, 0, 0];
+            for entry in entries {
+                counts[usize::from(credential_priority(entry, now))] += 1;
                 println!(
-                    "{:<8} {}  {}",
+                    "{:?}\n  {}  {}",
                     entry.name,
                     mask(&entry.credential),
-                    credential_status(entry, now)
+                    credential_status(entry, now, timezone)
                 );
             }
-            println!("\n完整链接（含凭据）只在终端输出: sbctl sub");
+            println!(
+                "\n汇总：长期生效 {}，宽限 {}，已失效 {}",
+                counts[0], counts[1], counts[2]
+            );
+            println!("\n默认完整链接：sbctl sub；命名链接在添加或轮换成功后输出（均含凭据）。");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -247,6 +307,10 @@ fn named_url(
 }
 
 fn add_credential(root: &Path, name: &str) -> ExitCode {
+    if name.trim().is_empty() || name.chars().any(char::is_control) {
+        eprintln!("credential add failed: 设备名不能为空或含控制字符");
+        return ExitCode::from(2);
+    }
     if name == "default" {
         eprintln!("credential add failed: 名称 default 保留给部署默认凭据；请换一个设备名");
         return ExitCode::from(2);
@@ -279,7 +343,7 @@ fn add_credential(root: &Path, name: &str) -> ExitCode {
     match result {
         Ok(url) => {
             println!(
-                "已新增命名凭据 {name}，sbctl 服务已重载（订阅工件内容未变）\n凭据 {name} 链接: {url}"
+                "已新增命名凭据 {name:?}，sbctl 服务已重载（订阅工件内容未变）\n凭据 {name:?} 链接: {url}"
             );
             ExitCode::SUCCESS
         }
@@ -325,9 +389,9 @@ fn revoke_credential(root: &Path, name: &str, grace: Option<&str>) -> ExitCode {
     match result {
         Ok(window) => {
             if window > 0 {
-                println!("凭据 {name} 将在宽限期结束后失效");
+                println!("凭据 {name:?} 将在宽限期结束后失效");
             } else {
-                println!("凭据 {name} 已立即失效（其他链接不受影响）");
+                println!("凭据 {name:?} 已立即失效（其他链接不受影响）");
             }
             ExitCode::SUCCESS
         }
@@ -359,31 +423,45 @@ fn rotate_credential(root: &Path, name: Option<&str>, grace: Option<&str>) -> Ex
         let index = config
             .subscription_credentials
             .iter()
-            .position(|entry| entry.name == name && entry.is_active(now))
+            .position(|entry| entry.name == name && entry.revoked_at.is_none())
+            .or_else(|| {
+                config
+                    .subscription_credentials
+                    .iter()
+                    .position(|entry| entry.name == name && entry.is_active(now))
+            })
             .ok_or_else(|| {
                 credential_error(format!(
                     "没有生效中的凭据 {name:?}（sbctl credential list 可查）"
                 ))
             })?;
-        if window > 0 {
+        let previous_expiry = if window > 0 {
             let mut retired = config.subscription_credentials[index].clone();
-            retired.revoked_at = Some(until);
+            // A previous revoke/rotation already promised an expiry. Rotating
+            // during that grace window must not extend the old URL's access.
+            let previous_expiry = retired.revoked_at.map_or(until, |old| old.min(until));
+            retired.revoked_at = Some(previous_expiry);
             config.subscription_credentials.push(retired);
-        }
+            Some(previous_expiry)
+        } else {
+            None
+        };
         let fresh = sbctl::config::generate_subscription_credential()?;
         let url = named_url(config, &fresh)?;
         config.subscription_credentials[index].credential = fresh;
         config.subscription_credentials[index].revoked_at = None;
-        Ok(url)
+        Ok((url, previous_expiry.map(|expires| expires - now)))
     });
     match result {
-        Ok(url) => {
-            if window > 0 {
-                println!("凭据 {name} 已轮换；旧链接在 {window} 秒内仍然有效，之后失效");
+        Ok((url, previous_window)) => {
+            if let Some(seconds) = previous_window {
+                println!("凭据 {name:?} 已轮换；旧链接在 {seconds} 秒内仍然有效，之后失效");
             } else {
-                println!("凭据 {name} 已轮换；该设备的旧链接立即失效（其他凭据不受影响）");
+                println!(
+                    "凭据 {name:?} 已轮换；本次替换的旧链接立即失效（其他凭据与此前宽限链接按原期限处理）"
+                );
             }
-            println!("凭据 {name} 链接: {url}");
+            println!("凭据 {name:?} 链接: {url}");
             ExitCode::SUCCESS
         }
         Err(error) => {
@@ -401,7 +479,7 @@ pub(crate) fn rotate_subscription_credential(root: &Path) -> ExitCode {
     match result {
         Ok(()) => {
             println!(
-                "subscription credential rotated; all previous subscription URLs are now invalid"
+                "default subscription credential rotated; previous default URLs are now invalid; named credentials are unchanged"
             );
             println!("run 'sbctl sub' to display the new subscription URLs");
             ExitCode::SUCCESS
@@ -433,5 +511,22 @@ mod tests {
             assert_eq!(parse_grace(text).unwrap(), seconds);
         }
         assert!(expiry(i64::MAX, 1).is_err());
+    }
+
+    #[test]
+    fn credential_expiry_keeps_timezone_offsets_and_handles_extreme_dates() {
+        assert_eq!(
+            credential_expiry(0, chrono_tz::Asia::Shanghai),
+            "1970-01-01 08:00:00 +08:00"
+        );
+        for timestamp in [
+            i64::MAX,
+            chrono::DateTime::<chrono::Utc>::MAX_UTC.timestamp(),
+        ] {
+            assert_eq!(
+                credential_expiry(timestamp, chrono_tz::Asia::Shanghai),
+                "时间超出可显示范围"
+            );
+        }
     }
 }

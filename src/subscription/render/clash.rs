@@ -41,7 +41,10 @@ fn clash_proxies(
     let skip = client_skip_cert_verify(config);
     let probe_url =
         serde_json::to_string(&config.client_latency_probe_url).expect("URL serializes");
-    let mut proxies = String::from("proxies:\n");
+    // Serialize dynamic strings instead of interpolating YAML scalars: a
+    // perfectly valid password such as `null`, `1234` or `a: b` must remain
+    // exactly that string, including whitespace and line breaks.
+    let mut entries = Vec::with_capacity(nodes.len());
     for node in nodes {
         let entry = match &node {
             CanonicalNode::VlessReality {
@@ -52,51 +55,62 @@ fn clash_proxies(
                 short_id,
                 decoy_sni,
                 ..
-            } => format!(
-                "  - name: {}\n    type: vless\n    server: {host}\n    port: {port}\n    uuid: {uuid}\n    network: tcp\n    udp: true\n    flow: xtls-rprx-vision\n    tls: true\n    servername: {decoy_sni}\n    client-fingerprint: chrome\n    reality-opts:\n      public-key: {public_key}\n      short-id: {short_id}\n",
-                node.tag()
-            ),
+            } => serde_json::json!({
+                "name": node.tag(), "type": "vless", "server": host,
+                "port": port, "uuid": uuid, "network": "tcp", "udp": true,
+                "flow": "xtls-rprx-vision", "tls": true, "servername": decoy_sni,
+                "client-fingerprint": "chrome",
+                "reality-opts": {"public-key": public_key, "short-id": short_id},
+            }),
             CanonicalNode::VmessWebsocket {
                 host,
                 port,
                 tls_server_name,
                 uuid,
                 path,
-            } => format!(
-                "  - name: {}\n    type: vmess\n    server: {host}\n    port: {port}\n    uuid: {uuid}\n    alterId: 0\n    cipher: auto\n    tls: true\n    servername: {tls_server_name}\n    skip-cert-verify: {skip}\n    network: ws\n    ws-opts:\n      path: {path}\n      headers:\n        Host: {tls_server_name}\n",
-                node.tag()
-            ),
+            } => serde_json::json!({
+                "name": node.tag(), "type": "vmess", "server": host,
+                "port": port, "uuid": uuid, "alterId": 0, "cipher": "auto",
+                "tls": true, "servername": tls_server_name, "skip-cert-verify": skip,
+                "network": "ws", "ws-opts": {"path": path, "headers": {"Host": tls_server_name}},
+            }),
             CanonicalNode::Hysteria2 {
                 host,
                 port,
                 tls_server_name,
                 password,
-            } => format!(
-                "  - name: {}\n    type: hysteria2\n    server: {host}\n    port: {port}\n    password: {password}\n    sni: {tls_server_name}\n    skip-cert-verify: {skip}\n    up: 50 Mbps\n    down: 200 Mbps\n",
-                node.tag()
-            ),
+            } => serde_json::json!({
+                "name": node.tag(), "type": "hysteria2", "server": host,
+                "port": port, "password": password, "sni": tls_server_name,
+                "skip-cert-verify": skip, "up": "50 Mbps", "down": "200 Mbps",
+            }),
             CanonicalNode::Tuic {
                 host,
                 port,
                 tls_server_name,
                 uuid,
                 password,
-            } => format!(
-                "  - name: {}\n    type: tuic\n    server: {host}\n    port: {port}\n    uuid: {uuid}\n    password: {password}\n    sni: {tls_server_name}\n    alpn:\n      - h3\n    skip-cert-verify: {skip}\n",
-                node.tag()
-            ),
+            } => serde_json::json!({
+                "name": node.tag(), "type": "tuic", "server": host,
+                "port": port, "uuid": uuid, "password": password,
+                "sni": tls_server_name, "alpn": ["h3"], "skip-cert-verify": skip,
+            }),
             CanonicalNode::Anytls {
                 host,
                 port,
                 tls_server_name,
                 password,
-            } => format!(
-                "  - name: {}\n    type: anytls\n    server: {host}\n    port: {port}\n    password: {password}\n    client-fingerprint: chrome\n    udp: true\n    idle-session-check-interval: 30\n    idle-session-timeout: 30\n    tls: true\n    sni: {tls_server_name}\n    skip-cert-verify: {skip}\n",
-                node.tag()
-            ),
+            } => serde_json::json!({
+                "name": node.tag(), "type": "anytls", "server": host,
+                "port": port, "password": password, "client-fingerprint": "chrome",
+                "udp": true, "idle-session-check-interval": 30, "idle-session-timeout": 30,
+                "tls": true, "sni": tls_server_name, "skip-cert-verify": skip,
+            }),
         };
-        proxies.push_str(&entry);
+        entries.push(entry);
     }
+    let mut proxies = serde_yaml::to_string(&serde_json::json!({"proxies": entries}))
+        .expect("proxy values serialize");
     proxies.push_str("mode: rule\nproxy-groups:\n");
     for group in spec
         .groups
@@ -208,8 +222,6 @@ fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> Stri
         provider["url"] = serde_json::json!(format!("{base}@meta/{suffix}"));
         provider["interval"] = serde_json::json!(clash_interval(config));
     }
-    let mut providers =
-        serde_yaml::to_string(&serde_json::json!({"rule-providers": values})).unwrap();
     for set in config
         .client_extra_rule_sets
         .iter()
@@ -219,14 +231,14 @@ fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> Stri
             crate::config::RuleSetBehavior::Domain => "domain",
             crate::config::RuleSetBehavior::Ipcidr => "ipcidr",
         };
-        providers.push_str(&format!(
-            "  {tag}:\n    type: http\n    behavior: {behavior}\n    format: mrs\n    url: {url}\n    path: ./ruleset/{tag}.mrs\n    interval: {interval}\n",
-            tag = set.name,
-            url = set.url,
-            interval = clash_interval(config)
-        ));
+        values[&set.name] = serde_json::json!({
+            "type": "http", "behavior": behavior, "format": "mrs",
+            "url": set.url, "path": format!("./ruleset/{}.mrs", set.name),
+            "interval": clash_interval(config),
+        });
     }
-    providers
+    serde_yaml::to_string(&serde_json::json!({"rule-providers": values}))
+        .expect("rule provider values serialize")
 }
 
 /// The refresh interval in the seconds shape mihomo wants.
@@ -349,7 +361,101 @@ pub(crate) fn clash_legacy(
 
 #[cfg(test)]
 mod tests {
-    use super::extra_rule_set_seconds;
+    use super::{clash, clash_legacy, extra_rule_set_seconds};
+    use crate::config::{DeploymentConfig, ExtraRuleSet, ManagedProtocol, SubscriptionMode};
+
+    #[test]
+    fn node_yaml_preserves_credentials_and_paths_as_strings() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![
+                ManagedProtocol::VlessReality,
+                ManagedProtocol::VmessWebsocket,
+                ManagedProtocol::Hysteria2,
+                ManagedProtocol::Tuic,
+                ManagedProtocol::Anytls,
+            ],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        config.vless_reality.as_mut().unwrap().short_id = "0000000000000001".into();
+        for secret in [
+            "null",
+            "true",
+            "123456",
+            "0x1234",
+            "a: b",
+            "#comment",
+            " leading and trailing ",
+            "line1\nline2",
+            "a\u{85}b\u{2028}c\u{2029}d",
+        ] {
+            config.hysteria2.as_mut().unwrap().password = secret.into();
+            config.tuic.as_mut().unwrap().password = secret.into();
+            config.anytls.as_mut().unwrap().password = secret.into();
+            config.vmess_websocket.as_mut().unwrap().path = "/ws#fragment: value".into();
+            config.validate().unwrap();
+            let nodes = crate::canonical::nodes(&config);
+            for body in [clash(&config, &nodes), clash_legacy(&config, &nodes)] {
+                let value: serde_yaml::Value = serde_yaml::from_str(&body.unwrap()).unwrap();
+                let proxies = value["proxies"].as_sequence().unwrap();
+                for proxy in proxies {
+                    match proxy["type"].as_str().unwrap() {
+                        "hysteria2" | "tuic" | "anytls" => {
+                            assert_eq!(proxy["password"].as_str(), Some(secret));
+                        }
+                        "vmess" => assert_eq!(
+                            proxy["ws-opts"]["path"].as_str(),
+                            Some("/ws#fragment: value")
+                        ),
+                        "vless" => assert_eq!(
+                            proxy["reality-opts"]["short-id"].as_str(),
+                            Some(config.vless_reality.as_ref().unwrap().short_id.as_str())
+                        ),
+                        _ => unreachable!(),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_names_and_urls_remain_yaml_strings() {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::IpFallback,
+            "203.0.113.7".into(),
+            None,
+            Some(2080),
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .unwrap();
+        for name in ["true", "null", "1234", "中文规则"] {
+            let url = "https://example.test/rules.mrs?name=value&other=two";
+            config.client_extra_rule_sets = vec![ExtraRuleSet {
+                name: name.into(),
+                url: url.into(),
+                outbound: "proxy".into(),
+                behavior: Default::default(),
+            }];
+            config.validate().unwrap();
+            let nodes = crate::canonical::nodes(&config);
+            let value: serde_yaml::Value =
+                serde_yaml::from_str(&clash(&config, &nodes).unwrap()).unwrap();
+            let provider = &value["rule-providers"][name];
+            assert_eq!(provider["url"].as_str(), Some(url));
+            assert_eq!(
+                provider["path"].as_str(),
+                Some(format!("./ruleset/{name}.mrs").as_str())
+            );
+            assert_eq!(value["rule-providers"].as_mapping().unwrap().len(), 5);
+        }
+    }
 
     #[test]
     fn rule_set_intervals_reject_overflow_zero_and_invalid_text() {

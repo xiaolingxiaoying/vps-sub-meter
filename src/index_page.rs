@@ -94,9 +94,13 @@ pub fn render_with_credential(
     for node in crate::canonical::nodes(config) {
         node_rows.push_str("<tr><th>");
         node_rows.push_str(&esc(node.protocol().label_zh()));
+        let share_link = crate::subscription::node_share_link(config, &node);
+        let share_link = share_link.trim();
         node_rows.push_str(&format!(
-            "</th><td><code>{}</code></td></tr>",
-            esc(crate::subscription::node_share_link(config, &node).trim())
+            "</th><td><code>{link}</code> \
+<button type=\"button\" class=\"btn btn-sm\" data-copy=\"{link_attr}\" onclick=\"copyUrl(this, this.dataset.copy)\">复制节点</button></td></tr>",
+            link = esc(share_link),
+            link_attr = esc_attr(share_link),
         ));
     }
     let mut rows = String::new();
@@ -173,6 +177,7 @@ pub fn render_with_credential(
 <meta charset=\"utf-8\">\n\
 <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
 <meta name=\"robots\" content=\"noindex, nofollow\">\n\
+<link rel=\"icon\" href=\"data:,\">\n\
 <title>sbctl 订阅中心</title>\n\
 <style>\n\
 :root {{ color-scheme: light dark; }}\n\
@@ -202,19 +207,29 @@ th, td {{ border: 1px solid #8884; padding: .4rem .6rem; text-align: left; verti
 th {{ white-space: nowrap; }}\n\
 td ul {{ margin: 0; padding-left: 1rem; }}\n\
 td li {{ margin: .2rem 0; word-break: break-all; }}\n\
+td code {{ overflow-wrap: anywhere; word-break: break-all; }}\n\
 code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
+@media (max-width: 540px) {{\n\
+  .node-table, .node-table tbody, .node-table tr, .node-table th, .node-table td {{ display: block; width: 100%; box-sizing: border-box; }}\n\
+  .node-table tr {{ border: 1px solid #8884; }}\n\
+  .node-table tr + tr {{ border-top: 0; }}\n\
+  .node-table th, .node-table td {{ border: 0; }}\n\
+  .node-table th {{ white-space: normal; }}\n\
+  .node-table td {{ padding-top: 0; }}\n\
+}}\n\
 </style>\n</head>\n<body>\n\
 <h1>sbctl 订阅中心</h1>\n\
 <p><span class=\"badge\">主机：{host}</span>\
 <span class=\"badge\">模式：{mode}</span>\
 {traffic_badges}</p>\n\
+<p id=\"copy-status\" class=\"note\" role=\"status\" aria-live=\"polite\" hidden></p>\n\
 <p class=\"note\">二维码已适配各客户端扫码标准（sing-box 扫码直接识别导入；Clash/Shadowrocket 扫码获取订阅）。也可点击对应按钮「一键导入」或「复制链接」。订阅凭据泄露时请在服务器上执行 <code>{rotate_command}</code> 更换。</p>\n\
 <h2>按客户端选择</h2>\n\
 <table>\n{client_rows}</table>\n\
 <h2>节点与原生分享链接</h2>\n\
 <details><summary>查看节点分享链接（含节点凭据）</summary>\n\
 <p class=\"note\">下面每条链接与 <code>uri</code> 订阅工件内容一致，含节点凭据；本页本身已受订阅凭据保护，请勿将其截图或转发。</p>\n\
-<table>\n{node_rows}</table>\n\
+<table class=\"node-table\">\n{node_rows}</table>\n\
 </details>\n\
 <h2>全部订阅链接</h2>\n\
 {rows}\n\
@@ -225,38 +240,7 @@ code {{ background: #8882; border-radius: .3rem; padding: 0 .3rem; }}\n\
 <li><strong>V2rayN</strong>：粘贴 <code>uri.txt</code>（Base64 URI）或复制 <code>uri</code> 明文分享链接；6.6+ 也可导入 <code>sing-box-full.json</code>。</li>\n\
 <li><strong>Shadowrocket（iOS）</strong>：扫码或粘贴 <code>shadowrocket.txt</code> 链接 → 首页添加配置 → 自动更新。五协议均受支持，最低版本：VLESS Reality 2.2.16、TUIC 2.2.12、Hysteria2 2.2.35、AnyTLS 2.2.64；低于对应版本时该协议节点不会被识别（其余节点仍可正常导入）。</li>\n\
 </ul>\n\
-<script>\n\
-function copyUrl(btn, text) {{\n\
-  function ok() {{\n\
-    var orig = btn.innerText;\n\
-    btn.innerText = '已复制 ✓';\n\
-    btn.classList.add('btn-success');\n\
-    setTimeout(function() {{\n\
-      btn.innerText = orig;\n\
-      btn.classList.remove('btn-success');\n\
-    }}, 2000);\n\
-  }}\n\
-  if (navigator.clipboard && navigator.clipboard.writeText) {{\n\
-    navigator.clipboard.writeText(text).then(ok, function() {{ fallback(); }});\n\
-  }} else {{\n\
-    fallback();\n\
-  }}\n\
-  function fallback() {{\n\
-    var ta = document.createElement('textarea');\n\
-    ta.value = text;\n\
-    ta.style.position = 'fixed';\n\
-    ta.style.left = '-9999px';\n\
-    ta.style.top = '-9999px';\n\
-    document.body.appendChild(ta);\n\
-    ta.focus();\n\
-    ta.select();\n\
-    try {{\n\
-      if (document.execCommand('copy')) {{ ok(); }}\n\
-    }} catch (e) {{}}\n\
-    document.body.removeChild(ta);\n\
-  }}\n\
-}}\n\
-</script>\n\
+<script>{copy_script}</script>\n\
 </body>\n</html>\n",
         rotate_command = esc(&rotate_command),
         host = esc(&config.subscription_host),
@@ -265,6 +249,7 @@ function copyUrl(btn, text) {{\n\
         client_rows = client_rows,
         node_rows = node_rows,
         rows = rows,
+        copy_script = include_str!("subscription/copy.js"),
     ))
 }
 

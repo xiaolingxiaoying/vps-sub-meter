@@ -4,8 +4,8 @@
 //! how a subscription ends up referencing a file no core can parse:
 //!
 //! - `add` registers a **compiled rule-set URL** (`.srs` for sing-box, `.mrs`
-//!   for mihomo). It is rendered into every full client profile and both clash
-//!   artifacts, so subscribers download it themselves on their own schedule.
+//!   for mihomo). It is rendered into compatible client profiles, so subscribers
+//!   download it themselves on their own schedule.
 //! - `import-list` fetches a **plain-text list** (the `DOMAIN-SUFFIX,x` line
 //!   format shared rule collections publish) and appends it to one of the
 //!   operator lists under `etc/sbctl/rules/`. The conversion happens here, at
@@ -48,28 +48,7 @@ impl RuleSetTarget {
 /// Validates a registration before it is stored: an absolute https URL with no
 /// whitespace, and the compiled form the subscribers' cores actually accept.
 pub(crate) fn validate_rule_set_url(url: &str) -> Result<(), String> {
-    if url.contains(char::is_whitespace) {
-        return Err("URL 不能包含空白字符".to_owned());
-    }
-    if !url.starts_with("https://") {
-        // Subscribers fetch this URL themselves, from whatever network they are
-        // on. A plain-http rule-set can be replaced in flight by anyone between
-        // the CDN and the client, and the payload steers all their traffic.
-        return Err("规则集 URL 必须是 https://（订阅端会自行下载它）".to_owned());
-    }
-    let name = url
-        .rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    if !name.ends_with(".srs") && !name.ends_with(".mrs") {
-        return Err(
-            "规则集 URL 必须以 .srs（sing-box）或 .mrs（mihomo）结尾；文本列表请用 \
-             sbctl rule-set import-list"
-                .to_owned(),
-        );
-    }
-    Ok(())
+    sbctl::config::validate_extra_rule_set_url(url).map_err(str::to_owned)
 }
 
 pub(crate) fn list(root: &Path) -> ExitCode {
@@ -122,7 +101,7 @@ pub(crate) fn add(
         return ExitCode::from(2);
     }
     if let Err(message) = validate_rule_set_url(url) {
-        eprintln!("拒绝 {url}：{message}");
+        eprintln!("规则集 URL 无效：{message}");
         return ExitCode::from(2);
     }
     commit_rule_set_change(
@@ -131,7 +110,7 @@ pub(crate) fn add(
         &format!(
             "已注册规则集 {name} -> {}（仅用于 {}）",
             target.word(),
-            if url.ends_with(".srs") {
+            if url::Url::parse(url).is_ok_and(|url| url.path().ends_with(".srs")) {
                 "sing-box"
             } else {
                 "Mihomo"
@@ -397,6 +376,17 @@ mod tests {
     fn a_registered_rule_set_must_be_https_and_a_compiled_form() {
         assert!(validate_rule_set_url("https://cdn.example/geo/game.srs").is_ok());
         assert!(validate_rule_set_url("https://cdn.example/geo/game.mrs").is_ok());
+        assert!(validate_rule_set_url("https://cdn.example/geo/game.srs?signature=abc").is_ok());
+        assert!(validate_rule_set_url("https://cdn.example/geo/game.mrs?signature=abc").is_ok());
+        for url in [
+            "https:///game.srs",
+            "https://cdn.example:invalid/game.srs",
+            "https://cdn.example/game.txt?download=game.srs",
+            "https://cdn.example/game.txt#game.mrs",
+            "https://cdn.example/\\game.srs",
+        ] {
+            assert!(validate_rule_set_url(url).is_err(), "must reject {url}");
+        }
         // Subscribers fetch this themselves; a plain-http rule-set can be
         // swapped in flight and it steers all of their traffic.
         let http =

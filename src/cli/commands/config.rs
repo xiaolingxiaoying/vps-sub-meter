@@ -11,17 +11,28 @@ use std::process::ExitCode;
 
 pub(crate) fn restart(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
     let store = sbctl::config::DeploymentStore::new(root);
-    let result = store.load().and_then(|config| {
+    let result = (|| -> Result<(), sbctl::config::ConfigError> {
+        // Restart must observe the same committed configuration as other
+        // operations, and hold that snapshot stable through service activation.
+        let _lock = store.acquire_operation_lock()?;
+        store.load()?;
         let binary = sing_box_bin.unwrap_or_else(|| root.join("usr/local/bin/sing-box"));
+        // This is the path ExecStart actually loads. Checking the cached
+        // artifact can approve a restart while the active file is invalid.
         let server =
-            std::fs::read_to_string(root.join("var/lib/sbctl/artifacts/sing-box-server.json"))
+            sbctl::config::read_managed_file_no_follow(&root.join("etc/sing-box/config.json"))
+                .and_then(|bytes| {
+                    String::from_utf8(bytes).map_err(|_| {
+                        std::io::Error::other("active sing-box configuration is not UTF-8")
+                    })
+                })
                 .map_err(sbctl::config::ConfigError::Storage)?;
         sbctl::subscription::check_sing_box_config(&binary, &server)
             .map_err(|error| sbctl::config::ConfigError::StateContent(error.to_string()))?;
         sbctl::lifecycle::restart_services(root)
             .map_err(sbctl::config::ConfigError::StateContent)?;
-        Ok(config)
-    });
+        Ok(())
+    })();
     match result {
         Ok(_) => {
             println!("sing-box and sbctl services restarted");

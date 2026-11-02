@@ -895,10 +895,19 @@ fn the_index_page_shows_every_native_share_link_the_uri_route_serves() {
         3,
         "the three enabled nodes must each have a share link"
     );
+    assert_eq!(
+        node_section.matches(">复制节点</button>").count(),
+        lines.len(),
+        "each enabled node has its own copy action"
+    );
     for line in &lines {
         assert!(
             node_section.contains(&html_escape(line)),
             "the index page must carry the {line} link"
+        );
+        assert!(
+            node_section.contains(&format!("data-copy=\"{}\"", html_escape(line))),
+            "copying a node must use exactly the URI artifact's link"
         );
     }
     for tag in [
@@ -1321,18 +1330,22 @@ fn anytls_only_links_and_qrs_exclude_formats_with_no_compatible_nodes() {
         "stale artifact",
     )
     .unwrap();
-    let mut server = spawn_sbctl_serve(&fixture, port, 7, &fixture.path().join("serve.err"));
+    let mut server = spawn_sbctl_serve(&fixture, port, 13, &fixture.path().join("serve.err"));
     for path in [
         "sing-box-1.10.json",
         "sing-box-1.11.json",
         "clash-1.18.yaml",
     ] {
         for prefix in ["", "qr/"] {
-            let response = http_get(
-                port,
-                &format!("/sub/{}/{prefix}{path}", config.subscription_credential),
-            );
-            assert!(response.starts_with("HTTP/1.1 404"));
+            for method in ["GET", "HEAD"] {
+                let response = http_request(
+                    method,
+                    port,
+                    &format!("/sub/{}/{prefix}{path}", config.subscription_credential),
+                );
+                assert!(response.starts_with("HTTP/1.1 404"));
+                assert!(response.split_once("\r\n\r\n").unwrap().1.is_empty());
+            }
         }
     }
     assert!(
@@ -1522,22 +1535,26 @@ fn subscription_userinfo_total_reflects_a_total_only_correction() {
 }
 
 #[test]
-fn a_non_get_subscription_request_is_asked_for_get_rather_than_a_missing_route() {
+fn unsupported_subscription_methods_advertise_get_and_head() {
     let fixture = TempDir::new().expect("temporary root is created");
     let port = free_high_tcp_port();
     let credential = initialize_ip_fallback_subscription(&fixture, port);
     let stderr_log = fixture.path().join("serve.err");
-    let mut server = spawn_sbctl_serve(&fixture, port, 2, &stderr_log);
+    let mut server = spawn_sbctl_serve(&fixture, port, 3, &stderr_log);
 
     let response = http_request("POST", port, &format!("/sub/{credential}/uri"));
     assert!(
         response.starts_with("HTTP/1.1 405 Method Not Allowed"),
         "a probe should learn the method is wrong, not that the subscription vanished: {response}"
     );
-    assert!(response.contains("allow: GET"), "{response}");
+    assert!(response.contains("allow: GET, HEAD\r\n"), "{response}");
     assert!(
         http_get(port, &format!("/sub/{credential}/uri")).starts_with("HTTP/1.1 200 OK"),
         "the route itself must keep serving GET"
     );
+    let head = http_request("HEAD", port, &format!("/sub/{credential}/uri"));
+    assert!(head.starts_with("HTTP/1.1 200 OK"));
+    assert!(head.contains("content-length:"));
+    assert!(head.split_once("\r\n\r\n").unwrap().1.is_empty());
     assert!(server.wait().expect("server exits").success());
 }

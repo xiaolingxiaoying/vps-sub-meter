@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import pty
 import select
+import shlex
 import signal
 import subprocess
 import tempfile
@@ -229,6 +230,77 @@ def template_paths():
     print("PASS template success, cancellation, and dangling-override rollback", flush=True)
 
 
+def damaged_configuration_and_read_only_diagnosis():
+    with tempfile.TemporaryDirectory(prefix="sbctl-menu-damaged-") as temp:
+        root = Path(temp)
+        config = root / "etc/sbctl/config.toml"
+        config.parent.mkdir(parents=True)
+        # A parser error on a credential-bearing line must never be rendered in
+        # the menu header, nor turn an existing deployment into a fresh install.
+        secret = "private-subscription-credential-do-not-display"
+        contents = f'subscription_credential = "{secret}" unexpected\n'
+        config.write_text(contents, encoding="utf-8")
+        menu = Menu(root)
+        text = menu.choose(2, "部署与协议")
+        assert "状态: 配置不可用" in text
+        assert "状态: 未安装" not in text
+        assert "快速安装（默认五协议" not in text and "引导安装" not in text
+        assert secret not in text, "configuration errors must not disclose credential source lines"
+        menu.close()
+        assert config.read_text(encoding="utf-8") == contents
+
+    with tempfile.TemporaryDirectory(prefix="sbctl-menu-diagnosis-") as temp:
+        root = Path(temp)
+        initialize(root)
+        before = snapshot(root)
+        command_log = root / "rooted-systemctl.log"
+        systemctl = root / "usr/bin/systemctl"
+        systemctl.write_text(
+            "#!/bin/sh\nprintf 'called\\n' >> " + shlex.quote(str(command_log)) + "\nexit 97\n",
+            encoding="utf-8",
+        )
+        menu = Menu(root)
+        menu.choose(1, "概览与诊断")
+        # The header legitimately queries rooted read-only systemctl fixtures.
+        # The diagnosis itself must skip even those calls for an isolated root.
+        before_diagnosis_calls = command_log.read_bytes()
+        menu.choose(6, "订阅入口诊断（只读，不修改网络或服务配置）")
+        text = menu.wait("完整诊断: sbctl system diagnose-subscription --json")
+        assert "订阅监听: 已跳过（隔离目录或尚无监听配置）" in text
+        assert "本地 HTTPS: 当前模式不适用" in text
+        assert command_log.read_bytes() == before_diagnosis_calls
+        menu.pause()
+        menu.close()
+        assert snapshot(root) == before, "read-only diagnosis must preserve deployment artifacts"
+    print("PASS damaged configuration visibility and isolated read-only subscription diagnosis", flush=True)
+
+
+def signed_mrs_registration_keeps_the_behavior_prompt():
+    with tempfile.TemporaryDirectory(prefix="sbctl-menu-signed-mrs-") as temp:
+        root = Path(temp)
+        initialize(root)
+        before = snapshot(root)
+        menu = Menu(root)
+        menu.choose(6, "高级与维护")
+        menu.choose(2, "=== 高级与维护 / 路由规则 ===")
+        menu.choose(5, "规则集名称: ")
+        menu.send("signed-ip")
+        menu.wait("编译规则集 HTTPS URL（.srs / .mrs）: ")
+        menu.send("https://rules.example.test/ip.mrs?signature=fixture")
+        menu.wait("请选择 [0]: ")
+        menu.send("1")
+        menu.wait("Mihomo 规则集类型")
+        # Abort at behavior validation, before a transaction or core check.
+        menu.send("0")
+        menu.wait("请输入 1 或 2")
+        menu.pause()
+        menu.choose(0, "高级与维护")
+        menu.choose(0, "主菜单")
+        menu.close()
+        assert snapshot(root) == before
+    print("PASS signed MRS URLs retain explicit domain/IP behavior selection", flush=True)
+
+
 def refused_confirmations():
     with tempfile.TemporaryDirectory(prefix="sbctl-menu-refusal-") as temp:
         root = Path(temp)
@@ -245,7 +317,9 @@ def refused_confirmations():
         # Default credential rotation.
         menu.choose(3, "订阅与客户端")
         menu.choose(5, "确认轮换默认订阅凭据")
-        menu.send("n")
+        menu.send("maybe")
+        menu.wait("请输入 y / 是 或 n / 否")
+        menu.send("否")
         menu.pause()
         menu.send("0")
         menu.wait("=== 主菜单 ===")
@@ -298,5 +372,7 @@ def refused_confirmations():
 
 navigation_and_deployment_visibility()
 template_paths()
+damaged_configuration_and_read_only_diagnosis()
+signed_mrs_registration_keeps_the_behavior_prompt()
 refused_confirmations()
 print("PASS all menu acceptance checks", flush=True)

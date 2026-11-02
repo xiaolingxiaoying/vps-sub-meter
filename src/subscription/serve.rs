@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::Full;
-use hyper::body::Incoming;
+use hyper::body::{Body, Incoming};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
@@ -824,7 +824,9 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request: Request<Incoming>| {
-        let response = subscription_http_response(request, &store, &config, peer, &budget);
+        let response = with_representation_length(subscription_http_response(
+            request, &store, &config, peer, &budget,
+        ));
         async { Ok::<_, std::convert::Infallible>(response) }
     });
     http1_builder()
@@ -841,7 +843,7 @@ where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let service = service_fn(move |request: Request<Incoming>| {
-        let response = acme_http_response(request, &store);
+        let response = with_representation_length(acme_http_response(request, &store));
         async { Ok::<_, std::convert::Infallible>(response) }
     });
     http1_builder()
@@ -850,10 +852,28 @@ where
         .map_err(|error| SubscriptionError::Http(error.to_string()))
 }
 
+/// HEAD uses exactly the same read-only response path as GET. Hyper suppresses
+/// its body on the wire; keeping the full representation's known length here
+/// preserves GET metadata even for an empty error response.
+fn with_representation_length(mut response: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
+    let length = response
+        .body()
+        .size_hint()
+        .exact()
+        .expect("a Full response has a known representation length");
+    response
+        .headers_mut()
+        .insert(hyper::header::CONTENT_LENGTH, length.into());
+    response
+}
+
 fn acme_http_response(
     request: Request<Incoming>,
     store: &DeploymentStore,
 ) -> Response<Full<Bytes>> {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return method_not_allowed_http_response();
+    }
     let body = request
         .uri()
         .path()
@@ -908,10 +928,9 @@ fn subscription_http_response(
     {
         return throttled_http_response(&retry_after);
     }
-    if request.method() != Method::GET {
-        // A probe with HEAD or POST is a client asking about the route, not an
-        // attacker: answering 404 tells it the subscription disappeared, while
-        // 405 tells it to retry with GET.
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        // This answer is independent of the route or credential. HEAD goes
+        // through the same validation and read-only generation path as GET.
         return method_not_allowed_http_response();
     }
     if request.uri().query().is_some() {
@@ -1126,7 +1145,7 @@ fn not_found_http_response() -> Response<Full<Bytes>> {
 fn method_not_allowed_http_response() -> Response<Full<Bytes>> {
     Response::builder()
         .status(StatusCode::METHOD_NOT_ALLOWED)
-        .header("Allow", "GET")
+        .header("Allow", "GET, HEAD")
         .header("Cache-Control", "no-store")
         .header("Connection", "close")
         .body(Full::new(Bytes::new()))
@@ -1380,11 +1399,15 @@ mod tests {
     }
 
     async fn http_get(port: u16, path: &str) -> String {
+        http_request("GET", port, path).await
+    }
+
+    async fn http_request(method: &str, port: u16, path: &str) -> String {
         let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .expect("subscription service accepts connections");
         stream
-            .write_all(format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
+            .write_all(format!("{method} {path} HTTP/1.1\r\nHost: localhost\r\n\r\n").as_bytes())
             .await
             .expect("request is sent");
         let mut response = String::new();
@@ -1393,6 +1416,178 @@ mod tests {
             .await
             .expect("response is readable");
         response
+    }
+
+    fn assert_head_matches_get(get: &str, head: &str) {
+        let (get_headers, get_body) = get.split_once("\r\n\r\n").unwrap();
+        let (head_headers, head_body) = head.split_once("\r\n\r\n").unwrap();
+        let comparable_headers = |headers: &str| {
+            headers
+                .lines()
+                .filter(|line| !line.starts_with("date:"))
+                .map(str::to_owned)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            comparable_headers(get_headers),
+            comparable_headers(head_headers)
+        );
+        let length = get_headers
+            .lines()
+            .find_map(|line| line.strip_prefix("content-length: "))
+            .unwrap()
+            .parse::<usize>()
+            .unwrap();
+        assert_eq!(
+            length,
+            get_body.len(),
+            "length is measured in representation bytes"
+        );
+        assert!(
+            head_body.is_empty(),
+            "HEAD must never send representation bytes"
+        );
+        assert!(head_headers.contains("cache-control: no-store"));
+    }
+
+    #[tokio::test]
+    async fn head_matches_get_for_subscription_formats_qrs_and_index_without_writing_state() {
+        let fixture = TempDir::new().unwrap();
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        let state_path = store.root().join("var/lib/sbctl/state.json");
+        let state_before = fs::read(&state_path).unwrap();
+        let modified_before = fs::metadata(&state_path).unwrap().modified().unwrap();
+        let mut paths = super::super::subscription_matrix()
+            .into_iter()
+            .map(|row| row.format.path_name())
+            .collect::<Vec<_>>();
+        paths.extend([
+            "qr/uri".into(),
+            "qr/sing-box-full.json".into(),
+            "index".into(),
+        ]);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let requests = paths.len() * 2;
+        let handler = tokio::spawn(async move {
+            super::serve_http_listener(
+                listener,
+                &Arc::new(store),
+                &Arc::new(config),
+                &super::fresh_budget(),
+                Some(requests),
+            )
+            .await
+        });
+        for path in paths {
+            let path = format!("/sub/{credential}/{path}");
+            let get = http_get(port, &path).await;
+            assert!(get.starts_with("HTTP/1.1 200 OK"));
+            let head = http_request("HEAD", port, &path).await;
+            assert_head_matches_get(&get, &head);
+        }
+        handler.await.unwrap().unwrap();
+        assert_eq!(fs::read(&state_path).unwrap(), state_before);
+        assert_eq!(
+            fs::metadata(&state_path).unwrap().modified().unwrap(),
+            modified_before
+        );
+    }
+
+    #[tokio::test]
+    async fn head_preserves_authorization_failures_and_degraded_responses_without_creating_state() {
+        let fixture = TempDir::new().unwrap();
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        let artifact = store
+            .root()
+            .join("var/lib/sbctl/artifacts/subscription-uri.txt");
+        let contents = fs::read(&artifact).unwrap();
+        fs::remove_file(&artifact).unwrap();
+        let state_path = store.root().join("var/lib/sbctl/state.json");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(async move {
+            super::serve_http_listener(
+                listener,
+                &Arc::new(store),
+                &Arc::new(config),
+                &super::fresh_budget(),
+                None,
+            )
+            .await
+        });
+        for path in [
+            "/sub/wrong-credential/uri".to_owned(),
+            format!("/sub/{credential}/uri?x=1"),
+            format!("/sub/{credential}/uri/extra"),
+            format!("/sub/{credential}/sing-box-9.99.json"),
+        ] {
+            let get = http_get(port, &path).await;
+            let head = http_request("HEAD", port, &path).await;
+            assert!(get.starts_with("HTTP/1.1 404 Not Found"));
+            assert_head_matches_get(&get, &head);
+        }
+        let path = format!("/sub/{credential}/uri");
+        let get = http_get(port, &path).await;
+        let head = http_request("HEAD", port, &path).await;
+        assert!(get.starts_with("HTTP/1.1 503 Service Unavailable"));
+        assert_head_matches_get(&get, &head);
+        fs::write(&artifact, contents).unwrap();
+        for corrupt in [true, false] {
+            if corrupt {
+                fs::write(&state_path, "not json").unwrap();
+            } else {
+                fs::remove_file(&state_path).unwrap();
+            }
+            let get = http_get(port, &path).await;
+            let head = http_request("HEAD", port, &path).await;
+            assert!(get.starts_with("HTTP/1.1 200 OK"));
+            assert!(!head.contains("subscription-userinfo:"));
+            assert_head_matches_get(&get, &head);
+            if corrupt {
+                assert_eq!(fs::read_to_string(&state_path).unwrap(), "not json");
+            } else {
+                assert!(
+                    !state_path.exists(),
+                    "a HEAD probe must not establish accounting state"
+                );
+            }
+        }
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn head_uses_the_same_pre_authentication_request_budget() {
+        let fixture = TempDir::new().unwrap();
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        let budget = super::fresh_budget();
+        // Future timestamps keep the test's empty bucket stable under a slow CI host.
+        let now = std::time::Instant::now() + Duration::from_secs(3600);
+        for _ in 0..super::REQUEST_BURST {
+            budget
+                .lock()
+                .unwrap()
+                .try_acquire(Ipv4Addr::LOCALHOST.into(), now)
+                .unwrap();
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(async move {
+            super::serve_http_listener(
+                listener,
+                &Arc::new(store),
+                &Arc::new(config),
+                &budget,
+                Some(2),
+            )
+            .await
+        });
+        let get = http_get(port, &format!("/sub/{credential}/uri")).await;
+        let head = http_request("HEAD", port, "/sub/wrong-credential/uri").await;
+        assert!(get.starts_with("HTTP/1.1 429 Too Many Requests"));
+        assert!(head.contains("retry-after:"));
+        assert_head_matches_get(&get, &head);
+        handler.await.unwrap().unwrap();
     }
 
     async fn tcp_from(port: u16, last: u8) -> tokio::net::TcpStream {
@@ -1569,6 +1764,41 @@ mod tests {
         assert!(served.starts_with("HTTP/1.1 200 OK"), "challenge is served");
         assert!(served.contains("challenge-body"));
         handler.await.expect("handler completes").expect("no error");
+    }
+
+    #[tokio::test]
+    async fn acme_head_matches_get_and_other_methods_are_rejected() {
+        let fixture = TempDir::new().unwrap();
+        let store = DeploymentStore::new(fixture.path());
+        let challenge = store.acme_webroot().join(".well-known/acme-challenge");
+        fs::create_dir_all(&challenge).unwrap();
+        fs::write(challenge.join("token-1"), "challenge-body").unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(super::serve_acme_listener(
+            listener,
+            Arc::new(store),
+            Some(8),
+        ));
+        for (path, status) in [
+            ("/.well-known/acme-challenge/token-1", "HTTP/1.1 200 OK"),
+            (
+                "/.well-known/acme-challenge/missing",
+                "HTTP/1.1 404 Not Found",
+            ),
+        ] {
+            let get = http_get(port, path).await;
+            let head = http_request("HEAD", port, path).await;
+            assert!(get.starts_with(status));
+            assert_head_matches_get(&get, &head);
+        }
+        for method in ["POST", "PUT", "DELETE", "OPTIONS"] {
+            let response = http_request(method, port, "/.well-known/acme-challenge/token-1").await;
+            assert!(response.starts_with("HTTP/1.1 405 Method Not Allowed"));
+            assert!(response.contains("allow: GET, HEAD\r\n"));
+            assert!(response.split_once("\r\n\r\n").unwrap().1.is_empty());
+        }
+        handler.await.unwrap().unwrap();
     }
 
     #[tokio::test]
@@ -2108,6 +2338,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_tls_head_matches_get_including_length_and_traffic_headers() {
+        let fixture = TempDir::new().unwrap();
+        let (store, config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config),
+            super::fresh_budget(),
+            Some(2),
+        ));
+        let path = format!("/sub/{credential}/uri.txt");
+        let get = tls_get(port, &path).await;
+        let head = tls_request("HEAD", port, &path).await;
+        assert!(get.starts_with("HTTP/1.1 200 OK"));
+        assert!(head.contains("subscription-userinfo:"));
+        assert_head_matches_get(&get, &head);
+        handler.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
     async fn direct_tls_listener_rejects_a_handshake_whose_sni_is_not_the_subscription_host() {
         let fixture = TempDir::new().expect("temporary root is created");
         let (store, config, _) = seed_direct_subscription(&fixture);
@@ -2191,11 +2444,17 @@ mod tests {
     /// by the deploy hook and the certificate ticket; this test exercises the
     /// listener's TLS termination path, not certificate trust.
     async fn tls_get(port: u16, path: &str) -> String {
+        tls_request("GET", port, path).await
+    }
+
+    async fn tls_request(method: &str, port: u16, path: &str) -> String {
         let mut stream = tls_connect(port, "sub.example.test")
             .await
             .expect("TLS handshake completes");
         stream
-            .write_all(format!("GET {path} HTTP/1.1\r\nHost: sub.example.test\r\n\r\n").as_bytes())
+            .write_all(
+                format!("{method} {path} HTTP/1.1\r\nHost: sub.example.test\r\n\r\n").as_bytes(),
+            )
             .await
             .expect("request is sent");
         let mut response = String::new();

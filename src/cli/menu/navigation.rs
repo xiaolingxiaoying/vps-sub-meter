@@ -26,6 +26,7 @@ pub(super) enum Action {
     KernelStatus,
     Connections,
     CertificateStatus,
+    SubscriptionDiagnosis,
     QuickInstall,
     GuidedInstall,
     Nodes,
@@ -122,6 +123,10 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
             entry("内核版本、进程和资源状态", KernelStatus),
             entry("当前连接", Connections),
             entry("证书状态", CertificateStatus),
+            entry(
+                "订阅入口诊断（DNS / 监听 / HTTPS，只读）",
+                SubscriptionDiagnosis,
+            ),
         ],
         Deployment => {
             let mut result = Vec::new();

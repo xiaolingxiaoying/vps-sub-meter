@@ -46,12 +46,15 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Verify subscription page copy interactions
+        run: node tests/index-copy.mjs
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo test --workspace --features sbctl/test-signing
       - name: Exercise menu and first-install prompts in isolated terminals
         run: |
           python3 tests/acceptance/verify-menu.py target/debug/sbctl
           python3 tests/acceptance/verify-onboarding.py --cli target/debug/sbctl
+          python3 tests/acceptance/verify-review.py target/debug/sbctl
       - name: Verify private mail and daemon storage with real Linux UIDs
         run: |
           sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
@@ -140,6 +143,9 @@ jobs:
         run: |
           cargo build --locked -p sbctl
           sudo unshare --net python3 scripts/dev/check-certificate-generation.py "$GITHUB_WORKSPACE/target/debug/sbctl" --serve --core "$GITHUB_WORKSPACE/sing-box-1.14.1/sing-box"
+      - name: Verify five protocol data planes in a private network namespace
+        run: |
+          sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py target/debug/sbctl --sing-box sing-box-1.14.1/sing-box'
 
   mihomo-profiles:
     runs-on: ubuntu-24.04

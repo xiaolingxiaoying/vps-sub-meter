@@ -2,7 +2,7 @@
 //! install path and the interactive menu, so they live apart from `cli::menu`.
 
 use crate::cli::args::CliManagedProtocol;
-use std::io::{self, Write};
+use std::io::{self, BufRead, Write};
 
 pub(crate) fn select_protocols(
     disabled: &[CliManagedProtocol],
@@ -91,23 +91,80 @@ impl sbctl::wizard::Prompts for ConsolePrompts {
     }
 
     fn confirm(&mut self, question: &str, default: bool) -> io::Result<bool> {
-        loop {
-            print!("{question} [{}]: ", if default { "Y/n" } else { "y/N" });
-            io::stdout().flush()?;
-            let mut answer = String::new();
-            let read = io::stdin().read_line(&mut answer)?;
-            if read == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "wizard input ended before the confirmation was answered",
-                ));
-            }
-            match answer.trim().to_ascii_lowercase().as_str() {
-                "" => return Ok(default),
-                "y" | "yes" => return Ok(true),
-                "n" | "no" => return Ok(false),
-                _ => eprintln!("请输入 y 或 n"),
-            }
+        confirm_with_io(
+            &mut io::stdin().lock(),
+            &mut io::stdout().lock(),
+            question,
+            default,
+        )
+    }
+}
+
+fn confirm_with_io(
+    input: &mut impl BufRead,
+    output: &mut impl Write,
+    question: &str,
+    default: bool,
+) -> io::Result<bool> {
+    loop {
+        write!(
+            output,
+            "{question} [{}]: ",
+            if default { "Y/n" } else { "y/N" }
+        )?;
+        output.flush()?;
+        let mut answer = String::new();
+        if input.read_line(&mut answer)? == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "wizard input ended before the confirmation was answered",
+            ));
+        }
+        match answer.trim().to_ascii_lowercase().as_str() {
+            "" => return Ok(default),
+            "y" | "yes" | "是" | "确认" => return Ok(true),
+            "n" | "no" | "否" | "取消" => return Ok(false),
+            _ => writeln!(output, "请输入 y / 是 或 n / 否；直接回车使用默认值。")?,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn confirmation_retries_invalid_input_and_accepts_chinese_answers() {
+        for (answers, expected) in [("oops\n是\n", true), ("?\n取消\n", false)] {
+            let mut input = io::Cursor::new(answers);
+            let mut output = Vec::new();
+            assert_eq!(
+                confirm_with_io(&mut input, &mut output, "应用?", false).unwrap(),
+                expected
+            );
+            let output = String::from_utf8(output).unwrap();
+            assert!(output.contains("请输入"));
+            assert_eq!(output.matches("应用?").count(), 2);
+        }
+    }
+
+    #[test]
+    fn confirmation_uses_explicit_default_but_never_treats_eof_as_acceptance() {
+        for default in [false, true] {
+            assert_eq!(
+                confirm_with_io(
+                    &mut io::Cursor::new("\n"),
+                    &mut Vec::new(),
+                    "应用?",
+                    default
+                )
+                .unwrap(),
+                default
+            );
+            let error =
+                confirm_with_io(&mut io::Cursor::new(""), &mut Vec::new(), "应用?", default)
+                    .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         }
     }
 }

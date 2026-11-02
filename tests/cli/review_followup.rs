@@ -1,7 +1,9 @@
 use crate::fixture::{initialize_update_fixture, write_managed_file};
 use assert_cmd::Command;
 use sbctl::config::DeploymentStore;
-use std::{fs, path::Path};
+use std::fs;
+#[cfg(unix)]
+use std::path::Path;
 use tempfile::TempDir;
 
 fn seed() -> TempDir {

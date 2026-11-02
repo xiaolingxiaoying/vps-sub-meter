@@ -384,11 +384,11 @@ pub struct ExtraRuleSet {
 
 impl ExtraRuleSet {
     pub fn is_sing_box(&self) -> bool {
-        self.url.ends_with(".srs")
+        parse_http_url(&self.url).is_some_and(|url| url.path().ends_with(".srs"))
     }
 
     pub fn is_mihomo(&self) -> bool {
-        self.url.ends_with(".mrs")
+        parse_http_url(&self.url).is_some_and(|url| url.path().ends_with(".mrs"))
     }
 
     /// sing-box takes `.srs`, mihomo takes `.mrs`.
@@ -408,6 +408,40 @@ fn default_client_rule_set_base_url() -> String {
 /// Use one URL across client groups so Android does not read mismatched delay histories.
 fn default_client_latency_probe_url() -> String {
     "https://www.gstatic.com/generate_204".to_owned()
+}
+
+/// Parse the URL that will be embedded into client artifacts without silently
+/// normalizing control characters or backslashes into a different endpoint.
+fn parse_http_url(value: &str) -> Option<url::Url> {
+    let after_scheme = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))?;
+    if after_scheme.is_empty()
+        || after_scheme.starts_with('/')
+        || value.contains('\\')
+        || value
+            .chars()
+            .any(|character| character.is_whitespace() || character.is_control())
+    {
+        return None;
+    }
+    let parsed = url::Url::parse(value).ok()?;
+    parsed.host_str().filter(|host| !host.is_empty())?;
+    Some(parsed)
+}
+
+/// Validate a remote rule-set before it reaches configuration or client
+/// artifacts. Query parameters (for example signed download URLs) do not
+/// participate in the file-format decision.
+pub fn validate_extra_rule_set_url(value: &str) -> Result<(), &'static str> {
+    let parsed = parse_http_url(value).filter(|url| url.scheme() == "https")
+        .ok_or("extra rule-set url must be an absolute https:// URL without whitespace; clients fetch it themselves and plain HTTP can be replaced in flight")?;
+    if !parsed.path().ends_with(".srs") && !parsed.path().ends_with(".mrs") {
+        return Err(
+            "extra rule-set URL path must end in .srs (sing-box) or .mrs (mihomo); import a plain-text list with sbctl rule-set import-list instead",
+        );
+    }
+    Ok(())
 }
 
 /// Keeps endpoint locations useful in previews while ensuring credentials and
@@ -849,10 +883,7 @@ impl DeploymentConfig {
             ("client_rule_set_base_url", &self.client_rule_set_base_url),
             ("client_latency_probe_url", &self.client_latency_probe_url),
         ] {
-            if url.is_empty()
-                || url.contains(char::is_whitespace)
-                || (!url.starts_with("http://") && !url.starts_with("https://"))
-            {
+            if parse_http_url(url).is_none() {
                 let message = match field {
                     "client_rule_set_base_url" => {
                         "client_rule_set_base_url must be an absolute http(s) URL without whitespace"
@@ -864,33 +895,50 @@ impl DeploymentConfig {
                 return Err(ConfigError::InvalidValue(message));
             }
         }
+        // The renderers append @sing/... and @meta/... to this base. A query
+        // or fragment would absorb that suffix instead of extending the path.
+        if parse_http_url(&self.client_rule_set_base_url)
+            .is_some_and(|url| url.query().is_some() || url.fragment().is_some())
+        {
+            return Err(ConfigError::InvalidValue(
+                "client_rule_set_base_url must not contain a query or fragment; use a repository base URL",
+            ));
+        }
         let mut rule_set_names = std::collections::HashSet::new();
+        let builtin_rule_sets =
+            crate::subscription::TemplateSpec::for_template(self, self.client_template.clone())
+                .rule_sets;
         for set in &self.client_extra_rule_sets {
-            if set.name.trim().is_empty()
+            // Names are also Clash CSV fields and client cache filenames.
+            // Keep Unicode letters/digits for administrator-friendly labels,
+            // but forbid path separators, traversal names and CSV punctuation.
+            if set.name.is_empty()
                 || !rule_set_names.insert(set.name.as_str())
-                || set.name.contains(char::is_whitespace)
+                || matches!(set.name.as_str(), "." | "..")
+                || !set.name.chars().all(|character| {
+                    character.is_alphanumeric() || matches!(character, '_' | '-' | '.')
+                })
             {
                 return Err(ConfigError::InvalidValue(
-                    "each extra rule-set needs a distinct name without whitespace",
+                    "each extra rule-set needs a distinct filename-safe name using letters, digits, _, - or . (not . or ..)",
                 ));
             }
-            if set.url.is_empty()
-                || set.url.contains(char::is_whitespace)
-                || !set.url.starts_with("https://")
+            if builtin_rule_sets
+                .iter()
+                .any(|builtin| builtin.tag == set.name)
+                || matches!(
+                    set.name.as_str(),
+                    "review-private-domain"
+                        | "review-private-ip"
+                        | "review-cn-domain"
+                        | "review-cn-ip"
+                )
             {
                 return Err(ConfigError::InvalidValue(
-                    "extra rule-set url must be an absolute https:// URL without whitespace; \
-                     clients fetch it themselves and plain HTTP can be replaced in flight",
+                    "extra rule-set name conflicts with a built-in rule-set; choose another name",
                 ));
             }
-            // Shipping a URL the subscribers' cores cannot parse would break
-            // every client at once, so the extension decides acceptance here.
-            if !set.format_is_expected() {
-                return Err(ConfigError::InvalidValue(
-                    "extra rule-set url must end in .srs (sing-box) or .mrs (mihomo); \
-                     import a plain-text list with sbctl rule-set import-list instead",
-                ));
-            }
+            validate_extra_rule_set_url(&set.url).map_err(ConfigError::InvalidValue)?;
             // `direct`/`proxy`/`reject` are the three verdict words; anything
             // else names a group tag, which is deliberately not checked here
             // because the group set depends on the template and the client
@@ -1556,7 +1604,10 @@ pub enum ConfigError {
     Missing,
     #[error("deployment configuration already exists; refusing to overwrite it")]
     AlreadyExists,
-    #[error("could not parse deployment configuration: {0}")]
+    // toml::de::Error's Display repeats the source line and may include any
+    // subscription, node or SMTP secret. Preserve its source for programmatic
+    // inspection, while every CLI caller receives a redacted diagnostic.
+    #[error("could not parse deployment configuration (invalid TOML; source values omitted)")]
     Parse(#[from] toml::de::Error),
     #[error("could not serialize deployment configuration: {0}")]
     Serialize(#[from] toml::ser::Error),
@@ -2561,6 +2612,140 @@ mod tests {
         ));
         config.client_extra_rule_sets[0].url = "https://cdn.example/game.srs".into();
         config.validate().expect("an https rule-set is accepted");
+    }
+
+    #[test]
+    fn malformed_client_urls_are_rejected_before_artifact_generation() {
+        let base = rule_set_config();
+        for url in [
+            "https://",
+            "https:///rules.test/base",
+            "https://:443/rules",
+            "https://[::1/rules",
+            "https://rules.test:invalid/rules",
+            "https://rules.test/\0rules",
+            "https://rules.test\\rules",
+        ] {
+            for field in ["base", "probe"] {
+                let mut config = base.clone();
+                if field == "base" {
+                    config.client_rule_set_base_url = url.to_owned();
+                } else {
+                    config.client_latency_probe_url = url.to_owned();
+                }
+                assert!(config.validate().is_err(), "{field}: {url:?}");
+            }
+        }
+        for url in [
+            "https://rules.test/base?token=private",
+            "https://rules.test/base#fragment",
+        ] {
+            let mut config = base.clone();
+            config.client_rule_set_base_url = url.to_owned();
+            assert!(
+                config.validate().is_err(),
+                "a base must leave room for a path suffix: {url}"
+            );
+            config.client_rule_set_base_url = base.client_rule_set_base_url.clone();
+            config.client_latency_probe_url = url.to_owned();
+            config
+                .validate()
+                .expect("a complete probe URL may have a query or fragment");
+        }
+    }
+
+    #[test]
+    fn extra_rule_set_names_cannot_escape_cache_paths_or_replace_builtins() {
+        let mut config = rule_set_config();
+        for name in [
+            "../escape",
+            "..\\escape",
+            ".",
+            "..",
+            "a,b",
+            "a:b",
+            "has space",
+            "line\nbreak",
+            "nul\0byte",
+            "review-cn-domain",
+            "geosite-cn",
+        ] {
+            config.client_extra_rule_sets[0].name = name.to_owned();
+            assert!(
+                config.validate().is_err(),
+                "unsafe or reserved name {name:?}"
+            );
+        }
+        for name in ["game", "game.test-1", "true", "null", "中国规则"] {
+            config.client_extra_rule_sets[0].name = name.to_owned();
+            config
+                .validate()
+                .expect("safe administrator labels remain usable");
+        }
+    }
+
+    #[test]
+    fn remote_rule_set_format_uses_the_download_path_instead_of_query_or_fragment() {
+        let mut config = rule_set_config();
+        for (url, sing_box) in [
+            ("https://rules.test/game.srs?token=secret", true),
+            ("https://rules.test/game.mrs?token=secret", false),
+        ] {
+            let set = &mut config.client_extra_rule_sets[0];
+            set.url = url.to_owned();
+            assert_eq!(set.is_sing_box(), sing_box);
+            assert_eq!(set.is_mihomo(), !sing_box);
+            config
+                .validate()
+                .expect("signed rule-set downloads remain supported");
+        }
+        for url in [
+            "https://",
+            "https:///rules.test/game.srs",
+            "https://:443/game.srs",
+            "https://rules.test:bad/game.srs",
+            "https://rules.test/file.txt?name=game.srs",
+            "https://rules.test/file.txt#game.mrs",
+            "https://rules.test/game.\0mrs",
+            "http://rules.test/game.srs",
+        ] {
+            config.client_extra_rule_sets[0].url = url.to_owned();
+            assert!(
+                config.validate().is_err(),
+                "not a valid compiled rule-set download: {url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_error_display_redacts_source_text_but_retains_the_underlying_error() {
+        let secret = "private-subscription-value";
+        let contents = format!("subscription_credential = \"{secret}\" invalid");
+        let source = toml::from_str::<DeploymentConfig>(&contents).unwrap_err();
+        assert!(source.to_string().contains(secret));
+        let error = super::ConfigError::from(source);
+        assert!(!error.to_string().contains(secret));
+        assert!(std::error::Error::source(&error).is_some());
+    }
+
+    fn rule_set_config() -> DeploymentConfig {
+        let mut config = DeploymentConfig::new(
+            SubscriptionMode::Direct,
+            "sub.example.test".into(),
+            None,
+            None,
+            "ens3".into(),
+            vec![ManagedProtocol::VlessReality],
+            Some("www.cloudflare.com".into()),
+        )
+        .expect("base deployment");
+        config.client_extra_rule_sets = vec![ExtraRuleSet {
+            name: "game".into(),
+            url: "https://rules.test/game.srs".into(),
+            outbound: "proxy".into(),
+            behavior: RuleSetBehavior::Domain,
+        }];
+        config
     }
 
     #[test]

@@ -32,6 +32,37 @@ support is established only by `run.sh` in a Debian/Ubuntu VM or equivalent real
 systemd environment. WSL2 is a Development host for compilation, Rust tests and
 simulated CLI checks; it is not evidence for the Production host release gate.
 
+`verify-review.py` checks every advertised subscription format and QR route,
+authentication/query/method boundaries, read-only accounting/artifacts, and
+redacted malformed-configuration errors. It uses a private temporary root,
+loopback listener and command shims; it never changes the host deployment or
+network settings. An optional real core is restricted to `version` and `check`.
+On a shared VPS, run it inside a private network namespace with its own loopback:
+
+```sh
+python3 tests/acceptance/verify-review.py /absolute/path/to/candidate-sbctl \
+  --sing-box /absolute/path/to/sing-box
+```
+
+This smoke test does not establish real systemd lifecycle or proxy data-plane
+connectivity; those remain the responsibility of the production acceptance legs.
+
+`verify-proxy-data.py` supplements the smoke with actual VLESS Reality, VMess
+WebSocket, Hysteria2, TUIC and AnyTLS client-to-server bytes. It requires a private
+Linux network namespace containing only loopback; it refuses the initial host
+namespace. The CLI generates five temporary nodes, then each unchanged bare
+client outbound sends a SOCKS5 HTTP request to a local origin. Server adaptation
+only narrows the listeners to loopback and points Reality's decoy dial at a local
+TLS 1.3 endpoint using the generated certificate. All processes and credentials
+are temporary; no TUN, system proxy or external network is used.
+
+```sh
+sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py /path/to/candidate-sbctl --sing-box /path/to/sing-box'
+```
+
+This verifies offline protocol interoperability, not public reachability,
+real-domain Reality camouflage, public certificate trust or systemd lifecycle.
+
 签名测试现在需要显式 `test-signing` 构建，通过 `SBCTL_TEST_ARTIFACT` 传入；生产工件仍通过 `SBCTL_ARTIFACT` 传入。两者不得混用，详见 [签名与验收隔离](../../docs/release-signing.md)。
 
 `run.sh` 跑三发行版（debian:12-slim、ubuntu:22.04、ubuntu:24.04），每个容器依次执行

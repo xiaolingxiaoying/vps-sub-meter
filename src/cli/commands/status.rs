@@ -16,6 +16,108 @@ pub(crate) fn format_local_time(instant: chrono::DateTime<chrono::Utc>, timezone
         .unwrap_or_else(|_| instant.to_rfc3339())
 }
 
+fn format_local_time_rfc3339(instant: chrono::DateTime<chrono::Utc>, timezone: &str) -> String {
+    timezone
+        .parse::<chrono_tz::Tz>()
+        .map(|timezone| instant.with_timezone(&timezone).to_rfc3339())
+        .unwrap_or_else(|_| instant.to_rfc3339())
+}
+
+struct TrafficAllowance {
+    remaining_bytes: Option<u64>,
+    over_limit_bytes: u64,
+    usage_percent: Option<f64>,
+}
+
+impl TrafficAllowance {
+    fn new(total: u64, limit: u64) -> Self {
+        if limit == 0 {
+            return Self {
+                remaining_bytes: None,
+                over_limit_bytes: 0,
+                usage_percent: None,
+            };
+        }
+        Self {
+            remaining_bytes: Some(limit.saturating_sub(total)),
+            over_limit_bytes: total.saturating_sub(limit),
+            usage_percent: Some(total as f64 / limit as f64 * 100.0),
+        }
+    }
+}
+
+fn format_bytes(bytes: u64) -> String {
+    if bytes < 1024 {
+        return format!("{bytes} B");
+    }
+    let mut amount = bytes as f64;
+    let mut unit = "B";
+    for next in ["KiB", "MiB", "GiB", "TiB", "PiB", "EiB"] {
+        amount /= 1024.0;
+        unit = next;
+        if amount < 1024.0 {
+            break;
+        }
+    }
+    format!("{amount:.2} {unit}")
+}
+
+fn traffic_allowance_summary(report: &sbctl::traffic::TrafficReport) -> String {
+    let total = report.total();
+    let allowance = TrafficAllowance::new(total, report.monthly_traffic_limit);
+    let Some(percent) = allowance.usage_percent else {
+        return format!("本周期已用: {}；额度: 不限额", format_bytes(total));
+    };
+    let balance = if allowance.over_limit_bytes > 0 {
+        format!(
+            "超额: {}（仅统计，不自动断开连接）",
+            format_bytes(allowance.over_limit_bytes)
+        )
+    } else {
+        format!(
+            "剩余: {}",
+            format_bytes(allowance.remaining_bytes.unwrap_or(0))
+        )
+    };
+    format!(
+        "本周期已用: {} / {}（{percent:.1}%）；{balance}",
+        format_bytes(total),
+        format_bytes(report.monthly_traffic_limit)
+    )
+}
+
+fn print_traffic_report(
+    report: &sbctl::traffic::TrafficReport,
+    config: &sbctl::config::DeploymentConfig,
+) {
+    println!(
+        "{}\n{}\n下一次刷新（VPS: {}）: {}\n下一次刷新（客户端: {}）: {}",
+        report.summary(),
+        traffic_allowance_summary(report),
+        config.accounting_timezone,
+        format_local_time_rfc3339(report.next_reset, &config.accounting_timezone),
+        config.client_display_timezone,
+        format_local_time_rfc3339(report.next_reset, &config.client_display_timezone)
+    );
+}
+
+fn format_uptime(duration: std::time::Duration) -> String {
+    let seconds = duration.as_secs();
+    let days = seconds / 86_400;
+    let hours = seconds / 3_600 % 24;
+    let minutes = seconds / 60 % 60;
+    let seconds = seconds % 60;
+    if days > 0 {
+        format!("{days} 天 {hours} 小时 {minutes} 分 {seconds} 秒")
+    } else if hours > 0 {
+        format!("{hours} 小时 {minutes} 分 {seconds} 秒")
+    } else if minutes > 0 {
+        format!("{minutes} 分 {seconds} 秒")
+    } else {
+        format!("{seconds} 秒")
+    }
+}
+
 pub(crate) fn print_nodes(
     root: &Path,
     links: bool,
@@ -74,7 +176,13 @@ pub(crate) fn print_nodes(
 
 pub(crate) fn days_until(timestamp: i64) -> Option<i64> {
     let now = chrono::Utc::now().timestamp();
-    Some((timestamp - now).div_euclid(86_400))
+    days_until_at(timestamp, now)
+}
+
+fn days_until_at(timestamp: i64, now: i64) -> Option<i64> {
+    timestamp
+        .checked_sub(now)
+        .map(|seconds| seconds.div_euclid(86_400))
 }
 
 pub(crate) fn print_status(root: &Path) -> ExitCode {
@@ -89,25 +197,27 @@ pub(crate) fn print_status(root: &Path) -> ExitCode {
                     && let Some(not_after) = status.not_after
                     && let Some(days) = days_until(not_after)
                 {
-                    let hint = if days < 14 {
-                        "（即将到期，请检查 certbot.timer）"
+                    if days < 0 {
+                        println!("\n证书已过期，请运行 sbctl certificate renew");
+                    } else if days == 0 {
+                        println!("\n证书剩余有效期: 不足 1 天（即将到期，请检查 certbot.timer）");
                     } else {
-                        ""
-                    };
-                    println!("\n证书剩余有效期: {days} 天{hint}");
+                        let hint = if days < 14 {
+                            "（即将到期，请检查 certbot.timer）"
+                        } else {
+                            ""
+                        };
+                        println!("\n证书剩余有效期: {days} 天{hint}");
+                    }
                 } else if let Some(error) = &status.error {
                     println!("\n证书状态: 异常（{error}）；运行 sbctl certificate status 查看详情");
                 }
             }
             match sbctl::traffic::report(&sbctl::config::DeploymentStore::new(root), &config) {
-                Ok(report) => println!(
-                    "\n{}\n下一次刷新（VPS: {}）: {}\n下一次刷新（客户端: {}）: {}",
-                    report.summary(),
-                    config.accounting_timezone,
-                    format_local_time(report.next_reset, &config.accounting_timezone),
-                    config.client_display_timezone,
-                    format_local_time(report.next_reset, &config.client_display_timezone)
-                ),
+                Ok(report) => {
+                    println!();
+                    print_traffic_report(&report, &config);
+                }
                 Err(error) => println!("\nVPS traffic: unavailable ({error})"),
             }
             // The data plane's process facts, one line: state, PID, memory,
@@ -117,12 +227,19 @@ pub(crate) fn print_status(root: &Path) -> ExitCode {
                 let observation =
                     sbctl::observe::observe_sing_box_process(root, chrono::Utc::now());
                 if observation.error.is_none() {
-                    let uptime = observation
-                        .uptime
-                        .map(|duration| format!("{}s", duration.as_secs()))
-                        .unwrap_or_else(|| "未知".into());
+                    let uptime = match observation.active_state.as_deref() {
+                        Some("active") => format!(
+                            "已运行 {}",
+                            observation
+                                .uptime
+                                .map(format_uptime)
+                                .unwrap_or_else(|| "未知".into())
+                        ),
+                        Some("inactive" | "failed") => "当前未运行".into(),
+                        _ => "运行时长未知".into(),
+                    };
                     println!(
-                        "\nsing-box: {} / {}  PID {}  内存 {}  已运行 {}",
+                        "\nsing-box: {} / {}  PID {}  内存 {}  {}",
                         observation.active_state.as_deref().unwrap_or("未知"),
                         observation.sub_state.as_deref().unwrap_or("未知"),
                         observation
@@ -132,6 +249,10 @@ pub(crate) fn print_status(root: &Path) -> ExitCode {
                             .unwrap_or("未知"),
                         observation.memory_label().unwrap_or_else(|| "未知".into()),
                         uptime,
+                    );
+                } else if let Some(error) = &observation.error {
+                    println!(
+                        "\nsing-box 进程状态: 无法查询（{error}）；运行 sbctl sing-box status 查看详情"
                     );
                 }
             }
@@ -162,6 +283,8 @@ pub(crate) fn print_status_json(root: &Path) -> ExitCode {
         Ok(config) => {
             let traffic = sbctl::traffic::report(&store, &config)
                 .map(|report| {
+                    let allowance =
+                        TrafficAllowance::new(report.total(), report.monthly_traffic_limit);
                     serde_json::json!({
                         "interface": report.interface,
                         "received": report.received,
@@ -169,6 +292,9 @@ pub(crate) fn print_status_json(root: &Path) -> ExitCode {
                         "total_adjustment": report.total_adjustment,
                         "total": report.total(),
                         "monthly_traffic_limit": report.monthly_traffic_limit,
+                        "remaining_bytes": allowance.remaining_bytes,
+                        "over_limit_bytes": allowance.over_limit_bytes,
+                        "usage_percent": allowance.usage_percent,
                         "accounting_period": report.accounting_period,
                         "next_reset": report.next_reset.to_rfc3339(),
                         "next_reset_vps_refresh": format_local_time(
@@ -176,6 +302,14 @@ pub(crate) fn print_status_json(root: &Path) -> ExitCode {
                             &config.accounting_timezone
                         ),
                         "next_reset_client_display": format_local_time(
+                            report.next_reset,
+                            &config.client_display_timezone
+                        ),
+                        "next_reset_vps_refresh_rfc3339": format_local_time_rfc3339(
+                            report.next_reset,
+                            &config.accounting_timezone
+                        ),
+                        "next_reset_client_display_rfc3339": format_local_time_rfc3339(
                             report.next_reset,
                             &config.client_display_timezone
                         ),
@@ -260,14 +394,7 @@ pub(crate) fn print_traffic(root: &Path) -> ExitCode {
     let result = match store.load() {
         Ok(config) => match sbctl::traffic::report(&store, &config) {
             Ok(report) => {
-                println!(
-                    "{}\n下一次刷新（VPS: {}）: {}\n下一次刷新（客户端: {}）: {}",
-                    report.summary(),
-                    config.accounting_timezone,
-                    format_local_time(report.next_reset, &config.accounting_timezone),
-                    config.client_display_timezone,
-                    format_local_time(report.next_reset, &config.client_display_timezone)
-                );
+                print_traffic_report(&report, &config);
                 return ExitCode::SUCCESS;
             }
             Err(error) => Err(error.to_string()),
@@ -331,5 +458,57 @@ pub(crate) fn run_accounting_reset(root: &Path) -> ExitCode {
             eprintln!("accounting reset failed: {error}");
             ExitCode::from(2)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn days_until_does_not_overflow_and_keeps_expired_fractional_days_negative() {
+        assert_eq!(days_until_at(i64::MIN, 1), None);
+        assert_eq!(days_until_at(i64::MAX, -1), None);
+        assert_eq!(days_until_at(99, 100), Some(-1));
+        assert_eq!(days_until_at(101, 100), Some(0));
+        assert_eq!(days_until_at(86_500, 100), Some(1));
+    }
+
+    #[test]
+    fn reset_time_offsets_distinguish_both_los_angeles_fall_back_hours() {
+        let first = chrono::DateTime::parse_from_rfc3339("2026-11-01T08:30:00Z")
+            .unwrap()
+            .to_utc();
+        let second = chrono::DateTime::parse_from_rfc3339("2026-11-01T09:30:00Z")
+            .unwrap()
+            .to_utc();
+        assert_eq!(
+            format_local_time(first, "America/Los_Angeles"),
+            format_local_time(second, "America/Los_Angeles")
+        );
+        assert_eq!(
+            format_local_time_rfc3339(first, "America/Los_Angeles"),
+            "2026-11-01T01:30:00-07:00"
+        );
+        assert_eq!(
+            format_local_time_rfc3339(second, "America/Los_Angeles"),
+            "2026-11-01T01:30:00-08:00"
+        );
+    }
+
+    #[test]
+    fn usage_percent_is_finite_at_extreme_totals_and_unlimited_has_no_balance() {
+        let unlimited = TrafficAllowance::new(u64::MAX, 0);
+        assert_eq!(unlimited.remaining_bytes, None);
+        assert_eq!(unlimited.usage_percent, None);
+        assert_eq!(unlimited.over_limit_bytes, 0);
+        let extreme = TrafficAllowance::new(u64::MAX, 1);
+        assert_eq!(extreme.remaining_bytes, Some(0));
+        assert_eq!(extreme.over_limit_bytes, u64::MAX - 1);
+        assert!(extreme.usage_percent.unwrap().is_finite());
+        assert_eq!(
+            format_uptime(std::time::Duration::from_secs(90_061)),
+            "1 天 1 小时 1 分 1 秒"
+        );
     }
 }

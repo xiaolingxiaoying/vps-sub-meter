@@ -22,6 +22,11 @@ Debian/Ubuntu containers in `tests/acceptance/run.sh`; WSL-only tests do not est
 
 ## 概览与诊断
 
+- 「订阅入口诊断」在概览菜单末尾提供中文的服务、DNS、监听和 HTTPS 探测结果，复用现有只读诊断。使用隔离 `--root` 时跳过主机服务和网络探测。探测不携带订阅凭据，根路径返回 HTTP 404 属正常情况；完整机器可读结果仍使用 `sbctl system diagnose-subscription --json`。
+- 配置文件损坏或不可读时，首页显示「配置不可用」，部署菜单隐藏首次安装入口。需要重装时请检查备份并显式选择高级菜单中的重新安装；错误提示不展示配置原文。
+- 菜单与向导确认统一接受 `y / yes / 是 / 确认` 和 `n / no / 否 / 取消`，误输后提示重试。菜单回车仍默认取消，输入结束不会执行操作。
+- `python3 tests/acceptance/verify-menu.py <Linux sbctl 路径>` 覆盖损坏配置的显示及脱敏、隔离目录只读诊断、误输后的中文拒绝和原有菜单路径。
+
 | Menu action | Underlying CLI | Automated / real-core / isolated-system evidence |
 | --- | --- | --- |
 | 完整部署状态 | `sbctl status` | `tests/cli/lifecycle.rs`: status output and redaction cases, using temporary roots. |
@@ -110,3 +115,13 @@ choice is selectable once and that installed deployments do not show fresh
 install actions. The integration tests in `tests/acceptance/verify-menu.py` cover scripted
 menu interaction. This guide records intended mappings and evidence locations;
 it does not report test results or certify a VPS deployment.
+
+## 日常状态与凭据提示
+
+`sbctl status` 与 `sbctl traffic` 在原始流量字节值之外显示已用比例、剩余或超额；额度为 0 时表示不限额。超额只报告状态，不自动断开代理连接。流量校正后的总量用于计算余额，RX/TX 原始方向值不受该显示功能影响。
+
+重置时间同时显示 VPS 刷新时区和客户端显示时区，并带 UTC 偏移。`status --json` 保留已有字段，额外提供 `remaining_bytes`（不限额为 null）、`over_limit_bytes`、`usage_percent`（不限额为 null），以及 `next_reset_vps_refresh_rfc3339` 和 `next_reset_client_display_rfc3339`。
+
+`sbctl credential list` 显示配置选定时区的完整到期时间，同名当前凭据、宽限记录和失效历史依次排列。命名凭据轮换优先替换当前记录，不延长已经约定的旧链接到期时间；默认凭据轮换不影响命名凭据。定时轮换设置不能与 `--grace` 混用。
+
+`sbctl restart` 在持有部署操作锁时，校验服务实际加载的 `etc/sing-box/config.json` 后才重启；活动文件缺失、无效或为符号链接时拒绝重启，避免缓存工件有效却导致运行中服务停机。

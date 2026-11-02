@@ -40,8 +40,12 @@ fn menu_page(root: &Path, page: Page) {
         clear_menu_screen();
         print_menu_header(root);
         print_menu_section(navigation::title(page));
-        let config = sbctl::config::DeploymentStore::new(root).load().ok();
-        let mut entries = navigation::entries(page, config.is_some());
+        let config = sbctl::config::DeploymentStore::new(root).load();
+        // An unreadable existing deployment needs repair, not fresh-install
+        // choices. Only an actually missing configuration offers installation.
+        let needs_install = matches!(config, Err(sbctl::config::ConfigError::Missing));
+        let config = config.ok();
+        let mut entries = navigation::entries(page, !needs_install);
         if let Some(config) = &config {
             entries.retain(|entry| match entry.action {
                 Action::Qr(format) => format.has_compatible_nodes(config),
@@ -169,9 +173,15 @@ fn print_menu_header(root: &Path) {
             }
             println!("{}", sbctl::term::green("状态: 已部署"));
         }
-        Err(_) => println!(
+        Err(sbctl::config::ConfigError::Missing) => println!(
             "{}",
             sbctl::term::red("状态: 未安装，请进入「部署与协议」安装")
+        ),
+        Err(_) => println!(
+            "{}",
+            sbctl::term::red(
+                "状态: 配置不可用，请检查配置文件或访问权限；确认修复方案后再选择「高级与维护 → 备份旧部署并重新安装」"
+            )
         ),
     }
     println!("{bar}");
@@ -352,13 +362,7 @@ fn menu_logs(root: &Path) {
 }
 
 pub(crate) fn confirm_menu_action(prompt: &str) -> bool {
-    print!("{prompt} [y/N]: ");
-    if io::stdout().flush().is_err() {
-        return false;
-    }
-    let mut answer = String::new();
-    io::stdin().read_line(&mut answer).is_ok()
-        && matches!(answer.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+    sbctl::wizard::Prompts::confirm(&mut ConsolePrompts, prompt, false).unwrap_or(false)
 }
 
 fn select_kernel() -> Option<(KernelSource, Option<String>)> {
@@ -410,6 +414,7 @@ fn execute_action(root: &Path, action: Action) {
         CertificateStatus => {
             certificate::run_certificate(root, CertificateCommand::Status);
         }
+        SubscriptionDiagnosis => menu_subscription_diagnosis(root),
         QuickInstall => {
             menu_install(root, false);
         }
@@ -669,7 +674,7 @@ fn execute_action(root: &Path, action: Action) {
             let Some(target) = menu_rule_set_target() else {
                 return;
             };
-            let behavior = if url.ends_with(".mrs") {
+            let behavior = if url::Url::parse(&url).is_ok_and(|url| url.path().ends_with(".mrs")) {
                 let Some(behavior) = menu_rule_set_behavior() else {
                     return;
                 };
@@ -716,6 +721,106 @@ fn execute_action(root: &Path, action: Action) {
         }
     }
 }
+
+fn menu_subscription_diagnosis(root: &Path) {
+    let diagnosis = sbctl::system::diagnose_subscription(root);
+    println!("订阅入口诊断（只读，不修改网络或服务配置）");
+    if !diagnosis.configuration_loaded {
+        println!("部署配置不可用，请先检查配置文件或访问权限。");
+        return;
+    }
+    println!(
+        "模式: {}   主机: {}   公网端口: {}",
+        diagnosis.mode.as_deref().unwrap_or("未知"),
+        diagnosis.host.as_deref().unwrap_or("未知"),
+        diagnosis
+            .public_port
+            .map_or_else(|| "未知".into(), |port| port.to_string()),
+    );
+    for unit in std::iter::once(&diagnosis.service).chain(diagnosis.socket.as_ref()) {
+        println!(
+            "{}: {} / {}{}",
+            unit.unit,
+            unit.active_state.as_deref().unwrap_or("未知"),
+            unit.sub_state.as_deref().unwrap_or("未知"),
+            if unit.error.is_some() {
+                "（无法查询）"
+            } else {
+                ""
+            },
+        );
+    }
+    if let Some(dns) = &diagnosis.dns {
+        println!(
+            "DNS IPv4: {}",
+            if dns.ipv4.is_empty() {
+                "无".into()
+            } else {
+                dns.ipv4.join(", ")
+            }
+        );
+        println!(
+            "DNS IPv6: {}",
+            if dns.ipv6.is_empty() {
+                "无".into()
+            } else {
+                dns.ipv6.join(", ")
+            }
+        );
+        if dns.error.is_some() {
+            println!("DNS 查询失败，请检查域名解析。");
+        }
+    }
+    for (label, probe) in [
+        ("订阅监听", &diagnosis.listener),
+        ("本地 HTTPS", &diagnosis.local_tls),
+    ] {
+        let status = diagnosis_probe_label(probe);
+        println!("{label}: {status}");
+        if let Some(target) = &probe.target {
+            println!("  目标: {target}   耗时: {} ms", probe.elapsed_ms);
+        }
+        if let Some(status) = probe.http_status {
+            println!("  HTTP: {status}（探测不携带订阅凭据，根路径返回 404 属正常情况）");
+        }
+    }
+    if let Some(certificate) = &diagnosis.certificate {
+        println!(
+            "证书: {}",
+            if certificate.state == "ok" {
+                "有效"
+            } else {
+                "异常，请查看证书状态"
+            }
+        );
+    }
+    println!("完整诊断: sbctl system diagnose-subscription --json");
+}
+
+fn diagnosis_probe_label(probe: &sbctl::system::ProbeDiagnosis) -> &'static str {
+    match probe.status {
+        "not_run" => "已跳过（隔离目录或尚无监听配置）",
+        "not_applicable" => "当前模式不适用",
+        "address_invalid" => "监听地址无效，无法探测",
+        "curl_unavailable" => "缺少 curl，无法探测 HTTPS",
+        "tcp_connected" => "TCP 已连接（尚未验证 HTTP）",
+        "http_response" | "tls_verified_http_response"
+            if probe.http_status.is_some_and(|status| status >= 500) =>
+        {
+            "已连接，但服务返回 HTTP 错误"
+        }
+        "http_response" => "已收到 HTTP 响应",
+        "tls_verified_http_response" => "TLS 证书校验通过，已收到 HTTP 响应",
+        "tls_verified_http_error" => "TLS 证书校验通过，但 HTTP 传输失败",
+        "certificate_validation_failed" => "证书校验失败",
+        "tcp_connect_failed" | "tcp_connect_timeout" => "连接失败，请检查服务与监听端口",
+        "tls_handshake_failed" | "tls_handshake_timeout" => "TLS 握手失败",
+        "http_response_timeout" | "tcp_connected_no_http_response" => "已连接，但未收到 HTTP 响应",
+        "probe_failed" => "探测失败，请检查本地端点",
+        _ => "未知探测状态，请运行 JSON 诊断查看详情",
+    }
+}
+
 fn required_menu_text(label: &str) -> Option<String> {
     read_menu_choice(label).filter(|value| !value.is_empty())
 }
@@ -762,4 +867,32 @@ fn menu_rule_set_target() -> Option<crate::cli::commands::ruleset::RuleSetTarget
         CliRuleKind::Proxy => RuleSetTarget::Proxy,
         _ => RuleSetTarget::Reject,
     })
+}
+
+#[cfg(test)]
+mod diagnosis_tests {
+    use super::diagnosis_probe_label;
+    use sbctl::system::ProbeDiagnosis;
+
+    #[test]
+    fn diagnostic_labels_distinguish_transport_success_from_http_failure() {
+        let mut probe = ProbeDiagnosis {
+            status: "tls_verified_http_response",
+            target: None,
+            tcp_connected: true,
+            tls_handshake: Some(true),
+            trust_validation: Some(true),
+            http_status: Some(404),
+            elapsed_ms: 0,
+        };
+        assert!(diagnosis_probe_label(&probe).contains("已收到 HTTP 响应"));
+        probe.http_status = Some(503);
+        assert!(diagnosis_probe_label(&probe).contains("HTTP 错误"));
+        probe.status = "tls_verified_http_error";
+        assert!(diagnosis_probe_label(&probe).contains("HTTP 传输失败"));
+        probe.status = "curl_unavailable";
+        assert!(diagnosis_probe_label(&probe).contains("缺少 curl"));
+        probe.status = "address_invalid";
+        assert!(diagnosis_probe_label(&probe).contains("地址无效"));
+    }
 }

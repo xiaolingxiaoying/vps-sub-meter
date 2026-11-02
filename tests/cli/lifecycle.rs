@@ -75,15 +75,16 @@ fn status_json_reports_the_current_period_without_exposing_credentials() {
     assert_eq!(status["traffic"]["transmitted"], 60);
     assert_eq!(status["traffic"]["total"], 90);
     let now = chrono::Utc::now().with_timezone(&chrono_tz::America::Los_Angeles);
-    use chrono::Datelike;
+    use chrono::{Datelike, TimeZone};
+    // The period starts at local midnight on the first, whose DST offset can
+    // differ from today's (March/November in Los Angeles).
+    let month_start = chrono_tz::America::Los_Angeles
+        .with_ymd_and_hms(now.year(), now.month(), 1, 0, 0, 0)
+        .single()
+        .expect("the month starts at an unambiguous local midnight");
     assert_eq!(
         status["traffic"]["accounting_period"],
-        format!(
-            "{:04}-{:02}-01T00:00:00{}",
-            now.year(),
-            now.month(),
-            now.format("%:z")
-        )
+        month_start.to_rfc3339()
     );
     assert_eq!(
         status["services"]["sing-box.service"],

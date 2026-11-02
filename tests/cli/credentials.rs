@@ -54,6 +54,195 @@ fn read_named_credential(fixture: &TempDir, name: &str) -> (String, Option<i64>)
 }
 
 #[test]
+fn rotating_named_credentials_prioritizes_the_live_record_and_preserves_earlier_expiry() {
+    for with_live in [true, false] {
+        let fixture = TempDir::new().unwrap();
+        initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+        write_systemctl_fixture(&fixture, true);
+        let store = sbctl::config::DeploymentStore::new(fixture.path());
+        let mut config = store.load().unwrap();
+        let historical = sbctl::config::generate_subscription_credential().unwrap();
+        let original_live = sbctl::config::generate_subscription_credential().unwrap();
+        let earlier_expiry = chrono::Utc::now().timestamp() + 300;
+        config
+            .subscription_credentials
+            .push(sbctl::config::NamedCredential {
+                name: "phone".into(),
+                credential: historical.clone(),
+                revoked_at: Some(earlier_expiry),
+            });
+        if with_live {
+            config
+                .subscription_credentials
+                .push(sbctl::config::NamedCredential {
+                    name: "phone".into(),
+                    credential: original_live.clone(),
+                    revoked_at: None,
+                });
+        }
+        store.replace(&config).unwrap();
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .arg("--root")
+            .arg(fixture.path())
+            .args(["credential", "rotate", "--name", "phone", "--grace", "30m"])
+            .assert()
+            .success();
+        let after = store.load().unwrap();
+        assert_eq!(
+            after.subscription_credential,
+            config.subscription_credential
+        );
+        let records = &after.subscription_credentials;
+        assert_eq!(
+            records
+                .iter()
+                .filter(|entry| entry.revoked_at.is_none())
+                .count(),
+            1
+        );
+        assert_eq!(
+            records
+                .iter()
+                .find(|entry| entry.credential == historical)
+                .unwrap()
+                .revoked_at,
+            Some(earlier_expiry),
+            "rotation must not extend a previously promised expiry"
+        );
+        if with_live {
+            assert!(
+                records
+                    .iter()
+                    .find(|entry| entry.credential == original_live)
+                    .unwrap()
+                    .revoked_at
+                    .unwrap()
+                    > earlier_expiry
+            );
+        }
+    }
+}
+
+#[test]
+fn credential_list_uses_client_timezone_and_distinguishes_live_grace_and_expired_records() {
+    let fixture = TempDir::new().unwrap();
+    let default = initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+    let store = sbctl::config::DeploymentStore::new(fixture.path());
+    let mut config = store.load().unwrap();
+    config.client_display_timezone = "Asia/Shanghai".into();
+    config.accounting_timezone = "America/Los_Angeles".into();
+    for revoked_at in [Some(946684800), Some(4102444800), None, Some(i64::MAX)] {
+        config
+            .subscription_credentials
+            .push(sbctl::config::NamedCredential {
+                name: "手机".into(),
+                credential: sbctl::config::generate_subscription_credential().unwrap(),
+                revoked_at,
+            });
+    }
+    store.replace(&config).unwrap();
+    let path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&path).unwrap();
+    let output = Command::cargo_bin("sbctl")
+        .unwrap()
+        .arg("--root")
+        .arg(fixture.path())
+        .args(["credential", "list"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("显示时区：Asia/Shanghai"), "{text}");
+    assert!(text.contains("2100-01-01 08:00:00 +08:00"), "{text}");
+    assert!(text.contains("2000-01-01 08:00:00 +08:00"), "{text}");
+    assert!(text.contains("时间超出可显示范围"), "{text}");
+    assert!(text.contains("长期生效 2，宽限 2，已失效 1"), "{text}");
+    assert!(
+        text.rfind("生效中（长期）").unwrap() < text.find("宽限至").unwrap(),
+        "the current credential appears before its same-name history"
+    );
+    assert!(
+        text.rfind("宽限至").unwrap() < text.find("已失效（").unwrap(),
+        "expired records follow active grace windows"
+    );
+    assert!(
+        !text.contains("4102444800"),
+        "show dates instead of Unix seconds"
+    );
+    assert!(!text.contains(&default));
+    for entry in &config.subscription_credentials {
+        assert!(!text.contains(&entry.credential));
+    }
+    assert_eq!(
+        before,
+        fs::read(path).unwrap(),
+        "listing must stay read-only"
+    );
+}
+
+#[test]
+fn timer_configuration_cannot_silently_ignore_a_grace_window() {
+    for flag in ["--install-timer", "--remove-timer"] {
+        let fixture = TempDir::new().unwrap();
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .arg("--root")
+            .arg(fixture.path())
+            .args(["credential", "rotate", flag, "--grace", "30m"])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("--grace"));
+        assert_eq!(
+            fs::read_dir(fixture.path()).unwrap().count(),
+            0,
+            "invalid arguments must not install or remove a timer"
+        );
+    }
+}
+
+#[test]
+fn credential_names_cannot_inject_terminal_controls_and_legacy_names_are_escaped() {
+    let fixture = TempDir::new().unwrap();
+    initialize_ip_fallback_subscription(&fixture, free_high_tcp_port());
+    write_systemctl_fixture(&fixture, true);
+    let path = fixture.path().join("etc/sbctl/config.toml");
+    let before = fs::read(&path).unwrap();
+    for name in ["", "  ", "phone\nforged", "phone\u{1b}[31m", "phone\tother"] {
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .arg("--root")
+            .arg(fixture.path())
+            .args(["credential", "add", "--name", name])
+            .assert()
+            .code(2)
+            .stderr(predicate::str::contains("设备名不能为空或含控制字符"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    let store = sbctl::config::DeploymentStore::new(fixture.path());
+    let mut config = store.load().unwrap();
+    config
+        .subscription_credentials
+        .push(sbctl::config::NamedCredential {
+            name: "phone\u{1b}[31m\nforged".into(),
+            credential: sbctl::config::generate_subscription_credential().unwrap(),
+            revoked_at: None,
+        });
+    store.replace(&config).unwrap();
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .arg("--root")
+        .arg(fixture.path())
+        .args(["credential", "list"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains('\u{1b}').not())
+        .stdout(predicate::str::contains("\\u{1b}[31m\\nforged"));
+}
+
+#[test]
 fn named_credentials_serve_side_by_side_and_revoke_touches_only_one_link() {
     let fixture = TempDir::new().expect("temporary root is created");
     let port = free_high_tcp_port();
@@ -544,7 +733,7 @@ fn concurrent_credential_adds_keep_both_records() {
     let mut children = Vec::new();
     for name in ["phone", "tablet"] {
         children.push(
-            std::process::Command::new(assert_cmd::cargo::cargo_bin!("sbctl"))
+            std::process::Command::new(assert_cmd::cargo::cargo_bin("sbctl"))
                 .args(["--root", root, "credential", "add", "--name", name])
                 .stdout(std::process::Stdio::null())
                 .spawn()

@@ -653,7 +653,9 @@ pub(crate) fn spawn_sbctl_serve(
     stderr_log: &PathBuf,
 ) -> std::process::Child {
     let stderr_file = fs::File::create(stderr_log).expect("stderr log is created");
-    ProcessCommand::new(assert_cmd::cargo::cargo_bin!("sbctl"))
+    // Resolve at runtime too, so an explicitly selected candidate can be
+    // exercised by the same harness on a separate isolated Linux host.
+    ProcessCommand::new(assert_cmd::cargo::cargo_bin("sbctl"))
         .args([
             "--root",
             fixture.path().to_str().expect("fixture path is UTF-8"),
