@@ -1,8 +1,6 @@
 use crate::config::ConfigError;
 use std::fs;
-use std::io::Write;
 use std::path::Path;
-use std::process::Command;
 use thiserror::Error;
 
 use super::base64_uri;
@@ -1249,22 +1247,12 @@ pub fn check_sing_box_config(
     sing_box_binary: &Path,
     config: &str,
 ) -> Result<(), SubscriptionError> {
-    let mut temporary = tempfile::NamedTempFile::new().map_err(SubscriptionError::Artifact)?;
-    temporary
-        .write_all(config.as_bytes())
-        .map_err(SubscriptionError::Artifact)?;
-    let status = Command::new(sing_box_binary)
-        .args(["check", "-c"])
-        .arg(temporary.path())
-        .status()
-        .map_err(SubscriptionError::Artifact)?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(SubscriptionError::Check(format!(
-            "sing-box check exited with {status}"
-        )))
-    }
+    crate::core::CoreKind::SingBox
+        .check_config(sing_box_binary, config)
+        .map_err(|error| match error {
+            crate::core::CoreError::Io(error) => SubscriptionError::Artifact(error),
+            error => SubscriptionError::Check(error.to_string()),
+        })
 }
 
 pub fn read_authorized(
