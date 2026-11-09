@@ -650,6 +650,7 @@ pub fn generated_artifacts_for_kernel(
             clash_legacy(config, &nodes)?,
         ));
     }
+    super::presets::inject(root, config, &mut artifacts)?;
     apply_client_overrides(root, &mut artifacts)?;
     apply_rule_lists(root, &mut artifacts, !full_profile.route_rule_actions)?;
     validate_client_references(&artifacts)?;
@@ -1177,7 +1178,9 @@ pub fn client_customization_is_present(root: &Path) -> Result<bool, Subscription
         .map_err(|error| SubscriptionError::Override(error.to_string()))?;
     let lists = crate::rule_list::RuleLists::load(root)
         .map_err(|error| SubscriptionError::Override(error.to_string()))?;
-    Ok(overrides.sing_box.is_some() || !lists.is_empty())
+    Ok(overrides.sing_box.is_some()
+        || !lists.is_empty()
+        || root.join(super::presets::SOURCE).exists())
 }
 
 /// Deep-merges the administrator's override templates into the generated

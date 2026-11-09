@@ -1,0 +1,66 @@
+{
+  "date": "2026-11-09",
+  "installed_sbctl_sha256": "5bc11d5f6ae16e1381af838e6b45d75d233751cfe0a155478197a7134ce5264b",
+  "publication": {
+    "passed": true,
+    "subscription_identity_sha256": "2478ef26094c3f58561363a89afbcc931dc0256f41f05735f294cb8e66191d20",
+    "unchanged_existing_nodes": 5,
+    "added_nodes": 4,
+    "uri_nodes": 9,
+    "connectivity": {
+      "VLESS XHTTP Reality": "verified TLS and HTTPS egress",
+      "VLESS XHTTP TLS": "verified TLS and HTTPS egress",
+      "VLESS WS TLS": "verified TLS and HTTPS egress",
+      "Trojan TCP TLS": "verified TLS and HTTPS egress"
+    },
+    "ports": {
+      "VLESS XHTTP Reality": 54953,
+      "VLESS XHTTP TLS": 33477,
+      "VLESS WS TLS": 49927,
+      "Trojan TCP TLS": 38053
+    },
+    "services": {
+      "sbctl": "active",
+      "sing-box": "active",
+      "sbctl-xray": "active"
+    }
+  },
+  "persistence": {
+    "passed": true,
+    "companion_restarted_with_singbox": true,
+    "unchanged_subscription_identity": true,
+    "uris_stable_after_regeneration": true,
+    "uri_nodes": 9,
+    "services": {
+      "sbctl": "active",
+      "sing-box": "active",
+      "sbctl-xray": "active"
+    }
+  },
+  "external_wsl_clients": [
+    {
+      "node": "VLESS XHTTP Reality",
+      "passed": true,
+      "bytes": 577,
+      "curl_exit": 0
+    },
+    {
+      "node": "VLESS XHTTP TLS",
+      "passed": true,
+      "bytes": 577,
+      "curl_exit": 0
+    },
+    {
+      "node": "VLESS WS TLS",
+      "passed": true,
+      "bytes": 577,
+      "curl_exit": 0
+    },
+    {
+      "node": "Trojan TCP TLS",
+      "passed": true,
+      "bytes": 577,
+      "curl_exit": 0
+    }
+  ]
+}

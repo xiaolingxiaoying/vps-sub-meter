@@ -2,7 +2,21 @@
 
 新增四个预设：`vless-xhttp-reality`、`vless-xhttp-tls`、`vless-ws-tls`、`trojan-tcp-tls`。协议、传输和安全层由预设限定，不接受任意拼接的 transport/security/flow 字段。
 
-当前入口用于生成、校验候选配置，**尚未接入托管部署、安装菜单或订阅 HTTP 路由**。执行下面的命令不会把节点加入已有部署，也不会启动/停止服务。现有 sing-box 节点配置保持原状。
+`list/check/export` 用于生成、校验候选配置，不改变部署。新增 `enable` 可把已经运行的 sbctl-xray 伴随服务节点加入现有正式订阅，保持原订阅域名、路径和凭据。当前测试 VPS 已完成发布与公网连通性验证；通用 URI 共 9 个节点，原有 5 个节点参数不变。安装菜单和通用内核切换仍是独立待办。
+
+## 发布到现有订阅
+
+先安装、启动非 root 的 `sbctl-xray.service`，配置 `/etc/sbctl-xray/config.json` 并校验端口、证书和真实连接。然后执行：
+
+```bash
+sudo sbctl protocol enable --input /root/private-nodes.json
+```
+
+该命令在发布前检查运行服务的所有权标记和入站配置，拒绝与活动配置不一致的节点。持久化组合源位于 `/etc/sbctl/protocol-presets.json`，之后普通 `sbctl regenerate` 继续保留这些节点。它不会修改部署配置中的订阅凭据，也不会更换主页、订阅或 QR 地址。修改节点需先更新/验证伴随服务，再执行 enable；enable 本身不安装内核或重写服务。
+
+现有完整订阅的选择组、自动组会包含新增兼容节点。通用 URI 包含四种组合；sing-box、Shadowrocket 和旧版兼容订阅过滤 XHTTP；当前 Mihomo 包含 XHTTP TLS、WS 与 Trojan，过滤当前 Xray Reality。只看某个客户端格式时，节点数不同属于兼容性过滤。
+
+测试部署的伴随 unit 使用 `PartOf=sing-box.service`，证书刷新和 sing-box 重启会带动它重启。私有源文件与运行配置分别保存，不通过 HTTP 直接读取；主页只读取生成后的分享链接索引。参见 [ADR-0040](adr/0040-published-companion-presets.md)。
 
 ## 使用
 

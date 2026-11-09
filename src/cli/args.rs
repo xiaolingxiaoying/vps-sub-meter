@@ -191,6 +191,13 @@ pub(crate) enum Command {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum ProtocolCommand {
+    /// Publish already activated companion listeners into existing subscription URLs.
+    Enable {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        sing_box_bin: Option<PathBuf>,
+    },
     /// List supported protocol-combination presets and client limitations.
     List,
     /// Validate a JSON array of preset nodes; optionally run Xray configuration checks.

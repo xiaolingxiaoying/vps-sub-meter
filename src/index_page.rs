@@ -103,6 +103,18 @@ pub fn render_with_credential(
             link_attr = esc_attr(share_link),
         ));
     }
+    let preset_index = store
+        .root()
+        .join("var/lib/sbctl/artifacts/subscription-preset-nodes.json");
+    if let Ok(bytes) = crate::config::read_managed_file_no_follow(&preset_index) {
+        let entries: Vec<serde_json::Value> =
+            serde_json::from_slice(&bytes).map_err(|_| "invalid published preset node index")?;
+        for entry in entries {
+            if let (Some(name), Some(uri)) = (entry["name"].as_str(), entry["uri"].as_str()) {
+                node_rows.push_str(&format!("<tr><th>{}</th><td><code>{}</code><p class=\"note\">XHTTP 仅加入兼容客户端订阅；当前 Mihomo 不包含 Xray Reality 组合。</p></td></tr>", esc(name), esc(uri)));
+            }
+        }
+    }
     let mut rows = String::new();
     for info in available_subscription_matrix(config) {
         let url = crate::subscription::route_url_with_credential(

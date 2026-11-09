@@ -98,7 +98,14 @@ fn render(
     }
 }
 
-pub(crate) fn run(command: ProtocolCommand) -> ExitCode {
+pub(crate) fn run(root: &Path, command: ProtocolCommand) -> ExitCode {
+    if let ProtocolCommand::Enable {
+        input,
+        sing_box_bin,
+    } = &command
+    {
+        return enable(root, input, sing_box_bin.as_deref());
+    }
     if matches!(command, ProtocolCommand::List) {
         println!(
             "vless-xhttp-reality  VLESS + XHTTP + Reality（Xray）\nvless-xhttp-tls      VLESS + XHTTP + TLS（Xray）\nvless-ws-tls         VLESS + WebSocket + TLS\ntrojan-tcp-tls       Trojan + TCP + TLS\n候选生成入口，不安装或激活服务。sing-box/Mihomo/Shadowrocket 当前保守导出仅含后两项；XHTTP 客户端兼容性待真核验证。"
@@ -119,6 +126,7 @@ pub(crate) fn run(command: ProtocolCommand) -> ExitCode {
             format,
         } => (input, certificate, private_key, Some(format), None),
         ProtocolCommand::List => unreachable!(),
+        ProtocolCommand::Enable { .. } => unreachable!(),
     };
     let result = (|| -> Result<(), String> {
         let nodes = load(&input)?;
@@ -156,6 +164,100 @@ pub(crate) fn run(command: ProtocolCommand) -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("协议组合操作失败：{error}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn enable(root: &Path, input: &Path, binary: Option<&Path>) -> ExitCode {
+    let result = (|| -> Result<(), String> {
+        let nodes = load(input)?;
+        if root == Path::new("/") {
+            let active_bytes = sbctl::config::read_managed_file_no_follow(Path::new(
+                "/etc/sbctl-xray/config.json",
+            ))
+            .map_err(|_| "无法读取伴随内核配置")?;
+            let active: serde_json::Value =
+                serde_json::from_slice(&active_bytes).map_err(|_| "伴随内核配置无效")?;
+            for node in &nodes {
+                let inbound = active["inbounds"]
+                    .as_array()
+                    .and_then(|entries| {
+                        entries
+                            .iter()
+                            .find(|entry| entry["tag"].as_str() == Some(&node.name))
+                    })
+                    .ok_or("伴随内核中缺少待发布节点")?;
+                let cert =
+                    inbound["streamSettings"]["tlsSettings"]["certificates"][0]["certificateFile"]
+                        .as_str()
+                        .unwrap_or("");
+                let key = inbound["streamSettings"]["tlsSettings"]["certificates"][0]["keyFile"]
+                    .as_str()
+                    .unwrap_or("");
+                let paths = CertificatePaths {
+                    certificate: cert,
+                    private_key: key,
+                };
+                if node.xray_inbound(Some(&paths)).map_err(|e| e.to_string())? != *inbound {
+                    return Err("待发布节点与活动伴随内核配置不一致".into());
+                }
+            }
+            let unit = std::fs::read_to_string("/etc/systemd/system/sbctl-xray.service")
+                .map_err(|_| "先安装并验证 sbctl-xray 托管服务")?;
+            if !unit.contains("Description=sbctl managed protocol companion")
+                || !std::process::Command::new("systemctl")
+                    .args(["is-active", "--quiet", "sbctl-xray.service"])
+                    .status()
+                    .map_err(|_| "无法检查伴随内核状态")?
+                    .success()
+            {
+                return Err("sbctl-xray 托管服务未就绪，拒绝发布不可用节点".into());
+            }
+        }
+        let store = sbctl::config::DeploymentStore::new(root);
+        let _lock = store.acquire_operation_lock().map_err(|e| e.to_string())?;
+        let path = root.join("etc/sbctl/protocol-presets.json");
+        let previous = match sbctl::config::read_managed_file_no_follow(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err("无法读取现有组合源文件".into()),
+        };
+        let bytes = serde_json::to_vec_pretty(&nodes).map_err(|_| "组合序列化失败")?;
+        store
+            .write_relative_locked("etc/sbctl/protocol-presets.json", &bytes)
+            .map_err(|e| e.to_string())?;
+        let managed = root.join("usr/local/bin/sing-box");
+        let binary = binary.unwrap_or(&managed);
+        let regeneration =
+            sbctl::subscription::regenerate_current_locked(&store, Some(binary), false);
+        match regeneration {
+            Ok(config) => sbctl::lifecycle::prepare_daemon_storage(
+                root,
+                config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
+            )
+            .map_err(|_| "订阅发布后权限检查失败".to_owned())?,
+            Err(error) => {
+                if let Some(previous) = previous {
+                    store
+                        .write_relative_locked("etc/sbctl/protocol-presets.json", &previous)
+                        .map_err(|_| "组合源文件恢复失败")?;
+                } else {
+                    std::fs::remove_file(&path).map_err(|_| "组合源文件恢复失败")?;
+                }
+                return Err(error.to_string());
+            }
+        }
+        println!(
+            "已将 {} 个组合加入现有订阅；订阅域名、路径及凭据保持不变",
+            nodes.len()
+        );
+        Ok(())
+    })();
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("组合发布失败：{error}");
             ExitCode::from(2)
         }
     }

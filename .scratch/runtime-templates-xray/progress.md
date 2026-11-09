@@ -42,3 +42,13 @@ amd64 下载位于 WSL `/home/ly/ws/xray-probe/`，二进制未放入仓库。ar
 修复当前 Xray Reality 基线与 Mihomo 的导出边界；增加外部目标、跨客户端用例和独立握手超时预算。新增 WSL 构建返回脚本与 VPS 验收/覆盖/失败恢复驱动。证据见 `vps-acceptance-20261109.json`，说明见 `docs/vps-protocol-validation.md`。
 
 这不完成安装菜单、持久化节点、运行时模板或正式多内核切换事务；也未验证各 GUI App、全部公网入站、CDN 或生产签名发布。01/09 获得新增互通证据，但保留其余未完成条件，不将整项标记已完成。
+
+## 2026-11-09：在原订阅链接中正式发布四个新增组合
+
+用户明确要求新增节点加入正式订阅并保持原链接。已实现持久化组合源、Rust enable 发布入口、按客户端能力合并现有工件与代理组、主页生成索引。伴随 Xray 与原 sing-box 共存，原有五种协议和凭据不变；该要求修订先前单内核/仅候选阶段边界，见 ADR-0040。
+
+WSL 构建返回 Windows 后部署至 VPS，主程序 SHA-256 为 `5bc11d5f6ae16e1381af838e6b45d75d233751cfe0a155478197a7134ce5264b`。发布后的 URI 共 9 个节点，旧 5 条 URI 完整保留；主页显示四个新增节点。sing-box 完整配置与当前 Mihomo 配置通过真实内核检查，所有新增服务端监听器均完成验证证书的 HTTPS 转发。
+
+额外从 WSL 经公网到 VPS 四个真实端口，四组合各完成 HTTPS 转发。再次执行 regenerate 后 URI 内容保持一致，订阅身份摘要保持不变；重启 sing-box 后伴随 Xray 按 PartOf 正常重启，三个服务均 active。脱敏证据见 `subscription-publication-20261109.json`。首轮部署驱动因 Xray 公钥输出标签差异在预检失败并恢复，修正 `Password (PublicKey)` 标签后第二轮通过。
+
+正式订阅接入已完成；全新安装菜单、通用切换内核事务、GUI App 实测、生产签名发布仍按原任务单独推进。
