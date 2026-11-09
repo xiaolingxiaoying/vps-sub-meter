@@ -1,5 +1,6 @@
 //! Opt-in local data-path tests. No systemd or public listeners are modified.
-use sbctl::core::presets::{Node, Preset};
+use base64::Engine;
+use sbctl::core::presets::{Node, Preset, Reality};
 use sbctl::core::xray::CertificatePaths;
 use serde_json::json;
 use sha2::{Digest, Sha256};
@@ -22,10 +23,25 @@ fn port() -> u16 {
         .unwrap()
         .port()
 }
-fn start(binary: &std::path::Path, path: &std::path::Path, port: u16) -> Process {
+#[derive(Clone, Copy)]
+enum ClientKind {
+    Xray,
+    SingBox,
+    Mihomo,
+}
+
+fn start(binary: &std::path::Path, path: &std::path::Path, port: u16, kind: ClientKind) -> Process {
+    let mut command = Command::new(binary);
+    match kind {
+        ClientKind::Xray | ClientKind::SingBox => {
+            command.args(["run", "-c"]);
+        }
+        ClientKind::Mihomo => {
+            command.arg("-d").arg(path.parent().unwrap()).arg("-f");
+        }
+    }
     let mut child = Process(
-        Command::new(binary)
-            .args(["run", "-c"])
+        command
             .arg(path)
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -49,8 +65,61 @@ fn start(binary: &std::path::Path, path: &std::path::Path, port: u16) -> Process
 #[test]
 #[ignore = "requires official Xray via SBCTL_XRAY_BIN and curl"]
 fn tls_presets_carry_http_through_a_real_socks_client() {
+    exercise(
+        &[
+            Preset::VlessXhttpTls,
+            Preset::VlessWsTls,
+            Preset::TrojanTcpTls,
+        ],
+        None,
+        ClientKind::Xray,
+    );
+}
+
+#[test]
+#[ignore = "requires official Xray, curl and an explicitly selected external Reality target"]
+fn xhttp_reality_uses_external_decoy() {
+    let target = std::env::var("SBCTL_REALITY_TARGET").expect("SBCTL_REALITY_TARGET=host:port");
+    exercise(
+        &[Preset::VlessXhttpReality],
+        Some(&target),
+        ClientKind::Xray,
+    );
+}
+
+#[test]
+#[ignore = "requires Xray and SBCTL_CLIENT_BIN pointing to sing-box"]
+fn sing_box_compatible_presets_carry_http() {
+    exercise(
+        &[Preset::VlessWsTls, Preset::TrojanTcpTls],
+        None,
+        ClientKind::SingBox,
+    );
+}
+
+#[test]
+#[ignore = "requires Xray and SBCTL_CLIENT_BIN pointing to Mihomo 1.19.33"]
+fn mihomo_compatible_presets_carry_http() {
+    exercise(
+        &[
+            Preset::VlessXhttpTls,
+            Preset::VlessWsTls,
+            Preset::TrojanTcpTls,
+        ],
+        None,
+        ClientKind::Mihomo,
+    );
+}
+
+fn exercise(presets: &[Preset], reality_target: Option<&str>, kind: ClientKind) {
     let binary =
         std::path::PathBuf::from(std::env::var_os("SBCTL_XRAY_BIN").expect("SBCTL_XRAY_BIN"));
+    let client_binary = match kind {
+        ClientKind::Xray => binary.clone(),
+        _ => std::path::PathBuf::from(
+            std::env::var_os("SBCTL_CLIENT_BIN").expect("SBCTL_CLIENT_BIN"),
+        ),
+    };
     let directory = tempfile::tempdir().unwrap();
     let pair = rcgen::KeyPair::generate().unwrap();
     let cert = rcgen::CertificateParams::new(vec!["localhost".into()])
@@ -65,16 +134,15 @@ fn tls_presets_carry_http_through_a_real_socks_client() {
         certificate: cert_path.to_str().unwrap(),
         private_key: key_path.to_str().unwrap(),
     };
-    for preset in [
-        Preset::VlessXhttpTls,
-        Preset::VlessWsTls,
-        Preset::TrojanTcpTls,
-    ] {
+    for &preset in presets {
+        // Reality includes an external handshake and stream-one buffering;
+        // give it a distinct network budget rather than a local-only timeout.
+        let request_timeout = if preset.is_reality() { 30 } else { 10 };
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let origin_port = listener.local_addr().unwrap().port();
         listener.set_nonblocking(true).unwrap();
         let origin = std::thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(15);
+            let deadline = Instant::now() + Duration::from_secs(request_timeout + 5);
             while Instant::now() < deadline {
                 if let Ok((mut stream, _)) = listener.accept() {
                     stream
@@ -93,25 +161,46 @@ fn tls_presets_carry_http_through_a_real_socks_client() {
         while socks_port == server_port {
             socks_port = port();
         }
+        let reality = reality_target.map(|target| {
+            let encode =
+                |key: [u8; 32]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+            Reality {
+                private_key: encode([1; 32]),
+                public_key: encode(x25519_dalek::x25519(
+                    [1; 32],
+                    x25519_dalek::X25519_BASEPOINT_BYTES,
+                )),
+                short_id: "0123456789abcdef".into(),
+                target: target.into(),
+            }
+        });
+        let server_name = match reality_target {
+            Some(target) => url::Url::parse(&format!("tcp://{target}"))
+                .unwrap()
+                .host_str()
+                .unwrap()
+                .to_owned(),
+            None => "localhost".into(),
+        };
         let node = Node {
             name: "test".into(),
             preset,
             server: "127.0.0.1".into(),
             port: server_port,
-            server_name: "localhost".into(),
+            server_name,
             credential: if preset.is_trojan() {
                 "fixture-password".into()
             } else {
                 "b831381d-6324-4d53-ad4f-8cda48b30811".into()
             },
             path: (!preset.is_trojan()).then(|| "/test".into()),
-            reality: None,
+            reality,
         };
         let mut inbound = node.xray_inbound(Some(&paths)).unwrap();
         inbound["listen"] = json!("127.0.0.1");
         // Test-only exception for the isolated loopback HTTP fixture. Exported
         // production configurations retain Xray's default private-target block.
-        let server = json!({"inbounds": [inbound], "outbounds": [{"protocol": "freedom", "settings":{"finalRules":[{"action":"allow", "ip":["127.0.0.1/32"]}]}}]});
+        let mut server = json!({"inbounds": [inbound], "outbounds": [{"protocol": "freedom", "settings":{"finalRules":[{"action":"allow", "ip":["127.0.0.1/32"]}]}}]});
         let mut outbound = node.xray_outbound().unwrap();
         // Trust only this disposable leaf certificate; do not disable verification.
         let pin = Sha256::digest(cert.der())
@@ -122,18 +211,37 @@ fn tls_presets_carry_http_through_a_real_socks_client() {
             outbound["streamSettings"]["tlsSettings"]["pinnedPeerCertSha256"] = json!(pin);
         }
         let client = json!({"inbounds": [{"listen":"127.0.0.1", "port": socks_port, "protocol":"socks", "settings":{"auth":"noauth"}}], "outbounds":[outbound]});
+        let mut client = match kind {
+            ClientKind::Xray => client,
+            ClientKind::SingBox => {
+                let mut outbound = node.sing_box_outbound().unwrap();
+                outbound["tls"]["certificate"] = json!([cert.pem()]);
+                json!({"log":{"level":"warn"}, "inbounds":[{"type":"socks", "listen":"127.0.0.1", "listen_port":socks_port}], "outbounds":[outbound], "route":{"final":"test"}})
+            }
+            ClientKind::Mihomo => {
+                let mut proxy = node.mihomo_proxy(true).unwrap();
+                proxy["fingerprint"] = json!(pin);
+                json!({"socks-port":socks_port, "allow-lan":false, "mode":"rule", "log-level":"warning", "proxies":[proxy], "rules":["MATCH,test"]})
+            }
+        };
+        if std::env::var_os("SBCTL_TEST_DEBUG").is_some() {
+            server["log"] = json!({"loglevel":"debug"});
+            if matches!(kind, ClientKind::Xray) {
+                client["log"] = json!({"loglevel":"debug"});
+            }
+        }
         let server_path = directory.path().join("server.json");
         let client_path = directory.path().join("client.json");
         std::fs::write(&server_path, server.to_string()).unwrap();
         std::fs::write(&client_path, client.to_string()).unwrap();
-        let _server = start(&binary, &server_path, server_port);
-        let _client = start(&binary, &client_path, socks_port);
+        let _server = start(&binary, &server_path, server_port, ClientKind::Xray);
+        let _client = start(&client_binary, &client_path, socks_port, kind);
         let response = Command::new("curl")
             .args([
                 "--silent",
                 "--show-error",
                 "--max-time",
-                "10",
+                if preset.is_reality() { "30" } else { "10" },
                 "--noproxy",
                 "",
                 "--socks5-hostname",

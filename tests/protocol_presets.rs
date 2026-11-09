@@ -59,3 +59,24 @@ fn arbitrary_transport_fields_and_secret_leaks_are_rejected() {
             .contains("PRIVATE-CREDENTIAL")
     );
 }
+
+#[test]
+fn current_xray_reality_baseline_is_not_exported_as_mihomo_compatible() {
+    use base64::Engine;
+    use sbctl::core::presets::Reality;
+    let encode = |bytes: [u8; 32]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes);
+    let mut node = ws();
+    node.preset = Preset::VlessXhttpReality;
+    node.reality = Some(Reality {
+        private_key: encode([1; 32]),
+        public_key: encode(x25519_dalek::x25519(
+            [1; 32],
+            x25519_dalek::X25519_BASEPOINT_BYTES,
+        )),
+        short_id: "0123456789abcdef".into(),
+        target: "example.com:443".into(),
+    });
+    assert!(node.xray_outbound().is_ok());
+    assert!(node.mihomo_proxy(true).is_err());
+    assert!(node.sing_box_outbound().is_err());
+}

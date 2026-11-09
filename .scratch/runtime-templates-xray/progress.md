@@ -34,3 +34,11 @@ amd64 下载位于 WSL `/home/ly/ws/xray-probe/`，二进制未放入仓库。ar
 未验收：XHTTP Reality 连接原型使用本地自签 OpenSSL 目标时失败，原因待诊断，不计入成功证据；Mihomo 1.19.33 官方工件 URL 多次 HTTP 504，未运行相应二进制；各 GUI App 导入待测。现有 Managed protocol 持久化、安装菜单、订阅 HTTP、内核切换事务仍未接入新组合。新增代码目前仅候选阶段，不能对外声称四组合已可托管部署。
 
 实际使用和边界见 `docs/protocol-presets.md`，任务见 09；原 01–08 仍未完成。
+
+## 2026-11-09：管理员授权的真实 VPS 验收
+
+已按指定流程仅在 WSL Ubuntu 22.04 编译，将程序和原生测试可执行文件取回 Windows 后上传 VPS。覆盖 sbctl 管理程序并完成真实 systemd 非 root 验收；三个 TLS 组合、sing-box 两组合、Mihomo 三组合的 HTTP 转发通过，Reality 外部目标三轮通过。注入 serve 退出 23 后恢复原程序摘要及 13 个订阅/概览入口，最终两个托管服务 active。
+
+修复当前 Xray Reality 基线与 Mihomo 的导出边界；增加外部目标、跨客户端用例和独立握手超时预算。新增 WSL 构建返回脚本与 VPS 验收/覆盖/失败恢复驱动。证据见 `vps-acceptance-20261109.json`，说明见 `docs/vps-protocol-validation.md`。
+
+这不完成安装菜单、持久化节点、运行时模板或正式多内核切换事务；也未验证各 GUI App、全部公网入站、CDN 或生产签名发布。01/09 获得新增互通证据，但保留其余未完成条件，不将整项标记已完成。

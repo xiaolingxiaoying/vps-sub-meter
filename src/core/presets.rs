@@ -241,6 +241,13 @@ impl Node {
     /// infer support from a GUI application name or a generic Clash label.
     pub fn mihomo_proxy(&self, supports_xhttp: bool) -> Result<Value, Error> {
         self.validate()?;
+        // Current server baseline is Xray 26.10.31. Mihomo explicitly does not
+        // promise Reality interoperability with Xray 26.7.11 and later.
+        if self.preset.is_reality() {
+            return Err(Error(
+                "Mihomo Reality interoperability with the Xray 26.10.31 server baseline is not validated",
+            ));
+        }
         if self.preset.is_xhttp() && !supports_xhttp {
             return Err(Error(
                 "target Mihomo profile has no validated XHTTP support",

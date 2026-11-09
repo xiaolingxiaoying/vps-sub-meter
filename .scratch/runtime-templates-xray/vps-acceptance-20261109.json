@@ -1,0 +1,108 @@
+{
+  "date": "2026-11-09",
+  "build_host": "WSL2 Ubuntu 22.04 x86_64",
+  "test_host": "Ubuntu 22.04.5 x86_64 systemd",
+  "no_vps_compilation": true,
+  "activation": {
+    "xray_core": "passed under systemd DynamicUser / NoNewPrivileges",
+    "preset_connections": "passed under systemd DynamicUser / NoNewPrivileges",
+    "sing_box_client": "passed",
+    "mihomo_client": "passed",
+    "before_activation": {
+      "sing-box.json": 200,
+      "sing-box-full.json": 200,
+      "sing-box-1.10.json": 200,
+      "sing-box-1.11.json": 200,
+      "sing-box-1.12.json": 200,
+      "sing-box-1.13.json": 200,
+      "sing-box-1.14.json": 200,
+      "clash.yaml": 200,
+      "clash-1.18.yaml": 200,
+      "uri": 200,
+      "uri.txt": 200,
+      "shadowrocket.txt": 200,
+      "index": 200
+    },
+    "after_activation": {
+      "sing-box.json": 200,
+      "sing-box-full.json": 200,
+      "sing-box-1.10.json": 200,
+      "sing-box-1.11.json": 200,
+      "sing-box-1.12.json": 200,
+      "sing-box-1.13.json": 200,
+      "sing-box-1.14.json": 200,
+      "clash.yaml": 200,
+      "clash-1.18.yaml": 200,
+      "uri": 200,
+      "uri.txt": 200,
+      "shadowrocket.txt": 200,
+      "index": 200
+    },
+    "installed_sha256": "89a7ad403871794189855eeac95d281157f813f1a2f3378e62b12aa34cec2df7",
+    "passed": true
+  },
+  "failure_injection": {
+    "xray_core": "passed under systemd DynamicUser / NoNewPrivileges",
+    "preset_connections": "passed under systemd DynamicUser / NoNewPrivileges",
+    "sing_box_client": "passed",
+    "mihomo_client": "passed",
+    "before_activation": {
+      "sing-box.json": 200,
+      "sing-box-full.json": 200,
+      "sing-box-1.10.json": 200,
+      "sing-box-1.11.json": 200,
+      "sing-box-1.12.json": 200,
+      "sing-box-1.13.json": 200,
+      "sing-box-1.14.json": 200,
+      "clash.yaml": 200,
+      "clash-1.18.yaml": 200,
+      "uri": 200,
+      "uri.txt": 200,
+      "shadowrocket.txt": 200,
+      "index": 200
+    },
+    "rollback_health": {
+      "sing-box.json": 200,
+      "sing-box-full.json": 200,
+      "sing-box-1.10.json": 200,
+      "sing-box-1.11.json": 200,
+      "sing-box-1.12.json": 200,
+      "sing-box-1.13.json": 200,
+      "sing-box-1.14.json": 200,
+      "clash.yaml": 200,
+      "clash-1.18.yaml": 200,
+      "uri": 200,
+      "uri.txt": 200,
+      "shadowrocket.txt": 200,
+      "index": 200
+    },
+    "startup_failure_recovered": true,
+    "restored_sha256": "89a7ad403871794189855eeac95d281157f813f1a2f3378e62b12aa34cec2df7",
+    "passed": true
+  },
+  "reality_repetitions": [
+    {
+      "iteration": 1,
+      "passed": true,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 7.71s"
+    },
+    {
+      "iteration": 2,
+      "passed": true,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 6.12s"
+    },
+    {
+      "iteration": 3,
+      "passed": true,
+      "summary": "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 5.80s"
+    }
+  ],
+  "installed_sbctl_sha256": "89a7ad403871794189855eeac95d281157f813f1a2f3378e62b12aa34cec2df7",
+  "xray_sha256": "cc4b84d3069569f297a61f04b914f2bb37e9d202fd7b84cb50def1fc30fd40e1",
+  "test_binary_sha256": "e3c2c6fa4af4fcc8fb45a630b23632be38607bd98896e8a2664caae336b9899d",
+  "initial_sbctl_backup_sha256": "a5c9fa05a8cce027c51c77afcc02293b678ff3a2863c69cbdb16ff63fba151f9",
+  "final_services": {
+    "sbctl": "active",
+    "sing-box": "active"
+  }
+}

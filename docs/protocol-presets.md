@@ -31,15 +31,17 @@ sbctl protocol export --input nodes.json --format shadowrocket
 
 | 目标 | XHTTP | VLESS WS TLS / Trojan TCP TLS |
 | --- | --- | --- |
-| Xray / v2rayN / v2rayNG 的 Xray 内核 | 生成 Xray 节点和 URI；固定 Xray 26.10.31 配置检查通过，GUI 导入待测 | 同左；三个 TLS 组合已完成 Xray 到 Xray 的本地 HTTP 数据通路验证 |
-| 官方 sing-box 已支持版本 | 跳过并提示 | 生成节点片段，客户端互通待测 |
-| 保守 Mihomo/Clash 导出 | 跳过并提示 | 生成 YAML 节点，客户端互通待测；不承诺所有旧 Clash 内核支持 VLESS |
-| 新版 Mihomo XHTTP | `--format mihomo-xhttp` 显式生成，实验性，固定二进制验证尚未完成 | 生成 YAML 节点 |
+| Xray / v2rayN / v2rayNG 的 Xray 内核 | Xray 26.10.31 的 XHTTP TLS 和 Reality 均完成 VPS 数据通路验证；GUI 导入待测 | 两种组合完成 Xray 到 Xray 的 VPS HTTP 转发 |
+| 官方 sing-box 已支持版本 | 跳过并提示 | sing-box 1.14.2 客户端到 Xray 服务端的 VPS HTTP 转发通过 |
+| 保守 Mihomo/Clash 导出 | 跳过并提示 | Mihomo 1.19.33 的 VPS HTTP 转发通过；不承诺所有旧 Clash 内核支持 VLESS |
+| 新版 Mihomo XHTTP | `--format mihomo-xhttp` 显式生成 XHTTP TLS，1.19.33 已互通；过滤当前 Xray 基线的 Reality 节点 | 生成 YAML 节点，已完成 VPS HTTP 转发 |
 | Shadowrocket 兼容链接 | 保守跳过，尚未验证具体 App 版本 | 生成对应 URI，App 导入待测 |
 
 全部节点被过滤时返回失败且不输出空订阅。过滤消息只写 stderr，不混入配置正文。新版 Mihomo 官方文档已列出 XHTTP，但不将此结论套用到旧版 Clash 或所有客户端应用；实验性导出不会替代现有保守导出。
 
-Reality 节点使用同一结构，将 `preset` 设为 `vless-xhttp-reality`，并加入 `reality` 对象：`private_key`、`public_key`（配对的 URL-safe 无填充 Base64 X25519 密钥）、`short_id`（偶数位十六进制）、`target`（host:port）。`server_name` 为客户端使用的 Reality SNI；`path` 必填。Reality 服务端不需要本地证书。其真实连接尚未验收，不应仅凭配置检查通过投入现有部署。
+Reality 节点使用同一结构，将 `preset` 设为 `vless-xhttp-reality`，并加入 `reality` 对象：`private_key`、`public_key`（配对的 URL-safe 无填充 Base64 X25519 密钥）、`short_id`（偶数位十六进制）、`target`（host:port）。`server_name` 为客户端使用的 Reality SNI；`path` 必填。Reality 服务端不需要本地证书。当前 Xray 26.10.31 的 Xray 客户端链路已在 VPS 连续三轮通过；这不代表其他客户端内核自动兼容。
+
+Mihomo 官方文档明确不承诺与 Xray 26.7.11+ Reality 的兼容，因此当前基线拒绝/过滤该组合，而不是伪装成受支持节点。[上游 TLS/Reality 说明](https://wiki.metacubex.one/config/proxies/tls/)
 
 CDN/反向代理需要额外验证 TLS 终止、域名、路径和端口所有权。候选生成不安装反向代理、不接管 80/443、不自动配置 CDN；高端口继续遵守当前项目 10000–65535 范围。
 
@@ -47,11 +49,13 @@ CDN/反向代理需要额外验证 TLS 终止、域名、路径和端口所有�
 
 ```bash
 SBCTL_XRAY_BIN=/path/to/authenticated/xray cargo test --features test-signing --test xray_core -- --ignored
-SBCTL_XRAY_BIN=/path/to/authenticated/xray cargo test --features test-signing --test preset_connections -- --ignored
+SBCTL_XRAY_BIN=/path/to/authenticated/xray cargo test --features test-signing --test preset_connections -- --ignored --exact tls_presets_carry_http_through_a_real_socks_client
+# 单独选择外部 Reality 目标后执行（会产生外部 TLS 握手）：
+SBCTL_XRAY_BIN=/path/to/authenticated/xray SBCTL_REALITY_TARGET=target.example:443 cargo test --features test-signing --test preset_connections -- --ignored --exact xhttp_reality_uses_external_decoy
 ```
 
 第二项需要 curl，仅打开本地临时监听器并清理子进程，使用一次性叶证书指纹验证。为测试 HTTP 源站单独允许回环目标；正式生成配置不附带该例外。Xray 26.10.31 的 allowInsecure 已移除，测试与新生成器均不依赖它。
 
-Mihomo 1.19.33 官方工件下载在本轮多次返回 HTTP 504，尚未完成对应真核检查。尝试使用本地自签 OpenSSL 站点验证 XHTTP Reality 未通过，原因尚未确定；未将该原型当成验收通过，后续需要可复现、适合 Reality 的目标和握手诊断。
+Windows/WSL 网络下载 Mihomo 工件曾返回 HTTP 504，之后从测试 VPS 下载官方 1.19.33 工件并校验发布摘要，已完成互通。早期本地自签 OpenSSL 目标原型未通过；改用显式外部目标进行握手，并将 Reality 请求超时预算从本地测试的 10 秒独立提高到 30 秒后，VPS 三轮转发通过。详见 [VPS 验收记录](vps-protocol-validation.md)。
 
 依据：[Xray 固定版本传输配置](https://github.com/XTLS/Xray-core/blob/v26.10.31/infra/conf/transport_internet.go)、[Mihomo 传输文档](https://wiki.metacubex.one/config/proxies/transport/)、[sing-box 传输文档](https://sing-box.sagernet.org/configuration/shared/v2ray-transport/)。

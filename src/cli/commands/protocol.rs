@@ -39,6 +39,12 @@ fn render(
         PresetFormat::SingBox | PresetFormat::Mihomo | PresetFormat::MihomoXhttp => {
             let mut values = Vec::new();
             for node in nodes {
+                if matches!(format, PresetFormat::MihomoXhttp) && node.preset.is_reality() {
+                    eprintln!(
+                        "跳过 Reality 节点：Mihomo 与当前 Xray 服务端基线存在 Reality 兼容边界"
+                    );
+                    continue;
+                }
                 // Conservative compatibility baseline until XHTTP has passed
                 // the pinned Mihomo release and client subscription matrix.
                 if node.preset.is_xhttp() && !matches!(format, PresetFormat::MihomoXhttp) {
