@@ -6,6 +6,7 @@ use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 
+pub mod presets;
 pub mod xray;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]

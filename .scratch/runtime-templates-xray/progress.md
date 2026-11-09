@@ -24,3 +24,13 @@ amd64 下载位于 WSL `/home/ly/ws/xray-probe/`，二进制未放入仓库。ar
 尚未完成：01 的跨客户端真实连接、能力/迁移 ADR；02 的部署字段与完整校验解耦；03 外部模板；04 与活动部署的接入；05–08 下载/清单、事务、菜单和生产环境验收。因此不得将任何计划任务标记已完成，也尚未开放内核切换入口。
 
 后续从 01 的跨客户端互通证据及迁移契约继续，随后完成 02/03。生产配置、服务、凭据与发布版本未修改。
+
+## 2026-11-09：新增协议组合候选入口
+
+用户要求增加四组合并覆盖全部客户端。已新增类型化 presets、独立 protocol list/check/export、Xray 服务端/客户端节点、sing-box/Mihomo 节点及 URI/Shadowrocket 兼容导出。旧版/保守目标过滤 XHTTP，新版 Mihomo XHTTP 显式实验性导出。默认 TLS 验证开启；Reality 私公钥检查配对。
+
+本轮 WSL fmt、Clippy 和 workspace/test-signing 回归通过，新增 5 个普通协议/CLI 用例通过；修正最终 hostname 校验后另行重跑 7 个目标用例（含显式真核用例）通过。四组合共 8 份新 Xray 服务端/客户端文档，加前一阶段 6 份文档，均通过官方 Xray 26.10.31 配置检查。三个 TLS 组合通过实际 SOCKS→Xray 客户端→Xray 服务端→本地 HTTP 源站。
+
+未验收：XHTTP Reality 连接原型使用本地自签 OpenSSL 目标时失败，原因待诊断，不计入成功证据；Mihomo 1.19.33 官方工件 URL 多次 HTTP 504，未运行相应二进制；各 GUI App 导入待测。现有 Managed protocol 持久化、安装菜单、订阅 HTTP、内核切换事务仍未接入新组合。新增代码目前仅候选阶段，不能对外声称四组合已可托管部署。
+
+实际使用和边界见 `docs/protocol-presets.md`，任务见 09；原 01–08 仍未完成。

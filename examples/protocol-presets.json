@@ -1,0 +1,28 @@
+[
+  {
+    "name": "VLESS XHTTP TLS",
+    "preset": "vless-xhttp-tls",
+    "server": "proxy.example.com",
+    "port": 23456,
+    "server_name": "proxy.example.com",
+    "credential": "b831381d-6324-4d53-ad4f-8cda48b30811",
+    "path": "/xhttp"
+  },
+  {
+    "name": "VLESS WS TLS",
+    "preset": "vless-ws-tls",
+    "server": "proxy.example.com",
+    "port": 23457,
+    "server_name": "proxy.example.com",
+    "credential": "4bdbd832-9439-4199-837b-fb1706dad813",
+    "path": "/websocket"
+  },
+  {
+    "name": "Trojan TLS",
+    "preset": "trojan-tcp-tls",
+    "server": "proxy.example.com",
+    "port": 23458,
+    "server_name": "proxy.example.com",
+    "credential": "REPLACE-WITH-INDEPENDENT-RANDOM-PASSWORD"
+  }
+]

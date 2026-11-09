@@ -78,4 +78,48 @@ fn generated_servers_pass_the_real_xray_baseline() {
             }
         }
     }
+    use sbctl::core::presets::{Node, Preset, Reality};
+    for preset in [
+        Preset::VlessXhttpReality,
+        Preset::VlessXhttpTls,
+        Preset::VlessWsTls,
+        Preset::TrojanTcpTls,
+    ] {
+        let private = [1u8; 32];
+        let encode = |key: [u8; 32]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(key);
+        let node = Node {
+            name: "candidate".into(),
+            preset,
+            server: "example.com".into(),
+            port: 23458,
+            server_name: "example.com".into(),
+            credential: if preset.is_trojan() {
+                "test-password".into()
+            } else {
+                "b831381d-6324-4d53-ad4f-8cda48b30811".into()
+            },
+            path: (!preset.is_trojan()).then(|| "/candidate".into()),
+            reality: preset.is_reality().then(|| Reality {
+                private_key: encode(private),
+                public_key: encode(x25519_dalek::x25519(
+                    private,
+                    x25519_dalek::X25519_BASEPOINT_BYTES,
+                )),
+                short_id: "0123456789abcdef".into(),
+                target: "example.com:443".into(),
+            }),
+        };
+        let paths = CertificatePaths {
+            certificate: cert_path.to_str().unwrap(),
+            private_key: key_path.to_str().unwrap(),
+        };
+        let server = serde_json::json!({"inbounds": [node.xray_inbound(Some(&paths)).unwrap()], "outbounds": [{"protocol": "freedom"}]});
+        let client = serde_json::json!({"outbounds": [node.xray_outbound().unwrap()]});
+        CoreKind::Xray
+            .check_config(&binary, &server.to_string())
+            .unwrap();
+        CoreKind::Xray
+            .check_config(&binary, &client.to_string())
+            .unwrap();
+    }
 }

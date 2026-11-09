@@ -19,6 +19,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Validate and render protocol-combination candidates without changing a deployment.
+    Protocol {
+        #[command(subcommand)]
+        command: ProtocolCommand,
+    },
     /// Interactively install a fresh sbctl deployment.
     Install {
         #[command(flatten)]
@@ -182,6 +187,47 @@ pub(crate) enum Command {
         #[arg(long, value_name = "PATH")]
         sing_box_bin: Option<PathBuf>,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum ProtocolCommand {
+    /// List supported protocol-combination presets and client limitations.
+    List,
+    /// Validate a JSON array of preset nodes; optionally run Xray configuration checks.
+    Check {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long)]
+        xray_bin: Option<PathBuf>,
+        #[arg(long, requires = "private_key")]
+        certificate: Option<PathBuf>,
+        #[arg(long, requires = "certificate")]
+        private_key: Option<PathBuf>,
+    },
+    /// Print a candidate artifact containing proxy credentials to stdout.
+    /// Does not install nodes or publish a subscription.
+    Export {
+        #[arg(long)]
+        input: PathBuf,
+        #[arg(long, value_enum)]
+        format: PresetFormat,
+        #[arg(long, requires = "private_key")]
+        certificate: Option<PathBuf>,
+        #[arg(long, requires = "certificate")]
+        private_key: Option<PathBuf>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum PresetFormat {
+    XrayServer,
+    XrayClient,
+    SingBox,
+    Mihomo,
+    /// Require Mihomo with XHTTP support (configuration baseline: 1.19.33).
+    MihomoXhttp,
+    Uri,
+    Shadowrocket,
 }
 
 /// The `install` command's arguments. They live here, flattened into

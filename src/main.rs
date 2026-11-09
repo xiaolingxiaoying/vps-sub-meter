@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         }
     };
     match command {
+        Command::Protocol { command } => cli::commands::protocol::run(command),
         Command::Install { options } => install(root, options),
         Command::Menu => menu(root),
         Command::Status { json } => {
