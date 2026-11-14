@@ -169,6 +169,44 @@ def receive_exact(connection, length):
     return bytes(data)
 
 
+def proxy_udp(socks_port, socks_host="127.0.0.1"):
+    """Verify a UDP payload through SOCKS UDP ASSOCIATE and the actual node."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as origin:
+        origin.bind(("127.0.0.1", 0))
+        origin.settimeout(12)
+
+        def echo():
+            try:
+                data, peer = origin.recvfrom(4096)
+                origin.sendto(data, peer)
+            except OSError:
+                pass
+
+        thread = threading.Thread(target=echo, daemon=True)
+        thread.start()
+        with socket.create_connection((socks_host, socks_port), timeout=10) as control:
+            control.sendall(b"\x05\x01\x00")
+            require(receive_exact(control, 2) == b"\x05\x00", "UDP SOCKS authentication failed")
+            control.sendall(b"\x05\x03\x00\x01" + b"\x00" * 6)
+            version, reply, _, address_type = receive_exact(control, 4)
+            require(version == 5 and reply == 0, "SOCKS UDP association failed")
+            require(address_type in (1, 4), "invalid UDP relay address type")
+            family = socket.AF_INET if address_type == 1 else socket.AF_INET6
+            relay = socket.inet_ntop(family, receive_exact(control, 4 if address_type == 1 else 16))
+            relay_port = struct.unpack("!H", receive_exact(control, 2))[0]
+            if relay in ("0.0.0.0", "::"):
+                relay = socks_host
+            with socket.socket(family, socket.SOCK_DGRAM) as udp:
+                udp.settimeout(10)
+                payload = b"sbctl-udp-echo-" + os.urandom(32)
+                frame = b"\x00\x00\x00\x01" + socket.inet_aton("127.0.0.1") + struct.pack("!H", origin.getsockname()[1]) + payload
+                udp.sendto(frame, (relay, relay_port))
+                received, _ = udp.recvfrom(4096)
+                require(received[:4] == b"\x00\x00\x00\x01" and received[10:] == payload,
+                        "UDP origin payload mismatch through the protocol")
+        thread.join(timeout=1)
+
+
 def proxy_get(socks_port, origin_port, socks_host="127.0.0.1"):
     with socket.create_connection((socks_host, socks_port), timeout=10) as connection:
         connection.sendall(b"\x05\x01\x00")
@@ -323,6 +361,9 @@ def main():
                     client_process = start_core(client_stack, core, client_path, root, node["type"], client_prefix)
                     wait_tcp(socks_port, client_process, node["type"], socks_host)
                     proxy_get(socks_port, origin_port, socks_host)
+                    if node["type"] in ("hysteria2", "tuic"):
+                        proxy_udp(socks_port, socks_host)
+                        print("PASS isolated protocol UDP payload: " + node["type"], flush=True)
                     if args.port_hopping and node["type"] == "hysteria2":
                         time.sleep(6)
                         proxy_get(socks_port, origin_port, socks_host)

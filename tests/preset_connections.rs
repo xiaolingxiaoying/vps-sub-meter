@@ -55,6 +55,12 @@ fn start(binary: &std::path::Path, path: &std::path::Path, port: u16, kind: Clie
             "core exited during startup"
         );
         if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            if matches!(kind, ClientKind::Mihomo) {
+                // Mihomo opens the SOCKS listener before its compatible
+                // provider finishes initialization. Allow startup to settle;
+                // a successful bare TCP connection does not prove routing.
+                std::thread::sleep(Duration::from_millis(300));
+            }
             return child;
         }
         assert!(Instant::now() < deadline, "core did not open its listener");
@@ -148,8 +154,22 @@ fn exercise(presets: &[Preset], reality_target: Option<&str>, kind: ClientKind) 
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();
-                    let mut request = [0u8; 4096];
-                    let _ = stream.read(&mut request);
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 4096];
+                    while !request.windows(4).any(|v| v == b"\r\n\r\n") && request.len() < 8192 {
+                        match stream.read(&mut chunk) {
+                            Ok(0) | Err(_) => break,
+                            Ok(size) => request.extend_from_slice(&chunk[..size]),
+                        }
+                    }
+                    // A relay may open and abandon a connection before its
+                    // first request. Keep the origin alive for the real HTTP
+                    // request rather than treating EOF as a successful probe.
+                    if !request.starts_with(b"GET ")
+                        || !request.windows(4).any(|v| v == b"\r\n\r\n")
+                    {
+                        continue;
+                    }
                     stream.write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 9\r\n\r\npreset-ok").unwrap();
                     return;
                 }
@@ -228,6 +248,9 @@ fn exercise(presets: &[Preset], reality_target: Option<&str>, kind: ClientKind) 
             server["log"] = json!({"loglevel":"debug"});
             if matches!(kind, ClientKind::Xray) {
                 client["log"] = json!({"loglevel":"debug"});
+            }
+            if matches!(kind, ClientKind::Mihomo) {
+                client["log-level"] = json!("debug");
             }
         }
         let server_path = directory.path().join("server.json");

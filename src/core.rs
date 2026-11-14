@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 pub mod presets;
 pub mod xray;
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "kebab-case")]
 pub enum CoreKind {
     #[default]

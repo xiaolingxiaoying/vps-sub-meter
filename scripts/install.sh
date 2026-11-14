@@ -223,6 +223,13 @@ if [[ "$guided_install" -eq 1 && "$explicit_replacement" -eq 0 ]]; then
   resolve_installer_input
 fi
 
+# A managed node repository requires a manager that understands its schema.
+# Refuse a stable/older bootstrap binary before touching the running manager.
+if [[ -f /etc/sbctl/nodes.json ]] && ! "$work_dir/sbctl" node migrate --help >/dev/null 2>&1; then
+  echo "现有部署已使用统一节点仓库；候选 sbctl 不支持该仓库，拒绝降级。" >&2
+  exit 2
+fi
+
 # Only now is the host changed. Replace by rename, never in place:
 # `install`/`cp` truncates the target, and a running sbctl is exactly the case
 # during a re-install or an upgrade - writing over a live executable fails with

@@ -53,6 +53,7 @@ jobs:
       - name: Exercise menu and first-install prompts in isolated terminals
         run: |
           python3 tests/acceptance/verify-menu.py target/debug/sbctl
+          python3 tests/acceptance/verify-managed-menu.py target/debug/sbctl
           python3 tests/acceptance/verify-onboarding.py --cli target/debug/sbctl
           python3 tests/acceptance/verify-review.py target/debug/sbctl
       - name: Verify private mail and daemon storage with real Linux UIDs
@@ -148,6 +149,33 @@ jobs:
       - name: Verify five protocol data planes in a private network namespace
         run: |
           sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py target/debug/sbctl --sing-box sing-box-1.14.1/sing-box --port-hopping'
+
+      - name: Fetch fixed Xray and Mihomo interoperability baselines
+        run: |
+          set -euo pipefail
+          mkdir -p managed-cores
+          curl -fLS --retry 3 -o managed-cores/xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip
+          printf '%s  %s\n' e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214 managed-cores/xray.zip | sha256sum -c -
+          unzip -p managed-cores/xray.zip xray > managed-cores/xray
+          curl -fLS --retry 3 -o managed-cores/mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz
+          printf '%s  %s\n' 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6 managed-cores/mihomo.gz | sha256sum -c -
+          gzip -dc managed-cores/mihomo.gz > managed-cores/mihomo
+          chmod +x managed-cores/xray managed-cores/mihomo
+      - name: Validate unified generations and real protocol forwarding
+        env:
+          SBCTL_XRAY_BIN: ${{ github.workspace }}/managed-cores/xray
+          MIHOMO_BIN: ${{ github.workspace }}/managed-cores/mihomo
+          SING_BOX_BIN_1_10: ${{ github.workspace }}/sing-box-1.10.7/sing-box
+          SING_BOX_BIN_1_11: ${{ github.workspace }}/sing-box-1.11.15/sing-box
+          SING_BOX_BIN_1_12: ${{ github.workspace }}/sing-box-1.12.25/sing-box
+          SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
+          SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
+        run: |
+          cargo test --test managed_deployment -- --ignored --nocapture
+          cargo test --test xray_core -- --ignored --nocapture
+          cargo test --test preset_connections tls_presets_carry_http -- --ignored --nocapture
+          SBCTL_CLIENT_BIN="$SING_BOX_BIN_1_14" cargo test --test preset_connections sing_box_compatible -- --ignored --nocapture
+          SBCTL_CLIENT_BIN="$MIHOMO_BIN" cargo test --test preset_connections mihomo_compatible -- --ignored --nocapture
 
   mihomo-profiles:
     runs-on: ubuntu-24.04

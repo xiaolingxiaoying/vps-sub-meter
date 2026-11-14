@@ -31,6 +31,13 @@ pub fn render_with_credential(
     config: &DeploymentConfig,
     credential: &str,
 ) -> Result<String, String> {
+    if let Some(generation) = crate::deployment::current(store.root()).map_err(|e| e.to_string())? {
+        return crate::subscription::managed::index(store, config, credential, &generation)
+            .map_err(|e| e.to_string());
+    }
+    if store.root().join(crate::nodes::SOURCE).exists() {
+        return Err("托管订阅缺少已提交的生成批次".into());
+    }
     let traffic = match crate::traffic::report(store, config) {
         Ok(traffic) => Some(traffic),
         Err(error) => {

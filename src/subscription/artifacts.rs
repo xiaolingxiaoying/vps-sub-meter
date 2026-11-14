@@ -119,6 +119,13 @@ fn regenerate_locked(
     sing_box_bin: Option<&Path>,
     update_active_config: bool,
 ) -> Result<(), SubscriptionError> {
+    if let Some(registry) = crate::nodes::read_optional(store.root())
+        .map_err(|e| SubscriptionError::Override(e.to_string()))?
+    {
+        crate::deployment::apply_locked(store, config, &registry, registry.clone())
+            .map_err(|e| SubscriptionError::Override(e.to_string()))?;
+        return Ok(());
+    }
     let artifacts = generated_artifacts_for_kernel(config, store.root(), sing_box_bin)?;
     if let Some(sing_box_bin) = sing_box_bin {
         let server = server_artifact(&artifacts)?;
@@ -246,6 +253,7 @@ fn restore_replaced(
 /// replace, used to restore the previous known-good deployment after a failed
 /// service health check.
 pub struct DeploymentSnapshot {
+    pub managed: Option<Vec<u8>>,
     pub config: Option<Vec<u8>>,
     pub artifacts: Vec<(String, Option<Vec<u8>>)>,
     pub active_config: Option<Vec<u8>>,
@@ -311,6 +319,24 @@ fn apply_transaction_locked(
     staged_server: Option<&str>,
     clients_only: bool,
 ) -> Result<DeploymentSnapshot, SubscriptionError> {
+    if crate::nodes::read_optional(store.root())
+        .map_err(|e| SubscriptionError::Override(e.to_string()))?
+        .is_some()
+    {
+        if staged_server.is_some() {
+            return Err(SubscriptionError::Override(
+                "托管双内核部署不接受临时 sing-box 配置；请先完成证书准备".into(),
+            ));
+        }
+        let managed = crate::deployment::apply_config_change_locked(store, config)
+            .map_err(|e| SubscriptionError::Override(e.to_string()))?;
+        return Ok(DeploymentSnapshot {
+            managed: Some(managed),
+            config: None,
+            artifacts: Vec::new(),
+            active_config: None,
+        });
+    }
     config.validate()?;
     let mut artifacts = generated_artifacts_for_kernel(config, store.root(), sing_box_bin)?;
     if let Some(server) = staged_server {
@@ -408,6 +434,7 @@ fn apply_transaction_locked(
         eprintln!("warning: superseded subscription artifacts could not be removed: {error}");
     }
     Ok(DeploymentSnapshot {
+        managed: None,
         config: prior_config,
         artifacts: prior_artifacts,
         active_config: prior_active,
@@ -481,6 +508,10 @@ pub fn restore_config_transaction_locked(
     store: &DeploymentStore,
     snapshot: &DeploymentSnapshot,
 ) -> Result<(), SubscriptionError> {
+    if let Some(bytes) = &snapshot.managed {
+        return crate::deployment::restore_snapshot_locked(store, bytes)
+            .map_err(|e| SubscriptionError::Override(e.to_string()));
+    }
     for (name, prior) in snapshot.artifacts.iter().rev() {
         match prior {
             Some(prior) => store.write_artifact_locked(name, prior)?,
@@ -593,6 +624,11 @@ pub fn generated_artifacts_for_kernel(
     root: &Path,
     kernel: Option<&Path>,
 ) -> Result<Vec<(String, String)>, SubscriptionError> {
+    if let Some(registry) =
+        crate::nodes::read_optional(root).map_err(|e| SubscriptionError::Override(e.to_string()))?
+    {
+        return super::managed::generate(config, root, &registry);
+    }
     ensure_subscription_nodes(config)?;
     let nodes = crate::canonical::nodes(config);
     let uri = uri(config, &nodes)?;
@@ -659,7 +695,9 @@ pub fn generated_artifacts_for_kernel(
 
 /// Rejects client artifacts whose merged policy points at groups, nodes, or
 /// rule sets that are not present in that same artifact.
-fn validate_client_references(artifacts: &[(String, String)]) -> Result<(), SubscriptionError> {
+pub(super) fn validate_client_references(
+    artifacts: &[(String, String)],
+) -> Result<(), SubscriptionError> {
     let legacy_name = SubscriptionFormat::ClashLegacy(CLASH_LEGACY_VERSION)
         .artifact_name()
         .into_owned();
@@ -1080,7 +1118,7 @@ fn validate_mihomo_references(
 /// decision beats a generic geo rule), and the fake-ip exceptions join the
 /// generated exception rule in place. The bare node-list and URI artifacts stay
 /// untouched, so their byte compatibility is unaffected.
-fn apply_rule_lists(
+pub(super) fn apply_rule_lists(
     root: &Path,
     artifacts: &mut [(String, String)],
     legacy_full_profile: bool,
@@ -1191,7 +1229,7 @@ pub fn client_customization_is_present(root: &Path) -> Result<bool, Subscription
 /// `outbounds`/`proxies` merged by identifier) rather than the frozen plain
 /// merge, so one extra group or rule no longer means restating everything the
 /// generator produced.
-fn apply_client_overrides(
+pub(super) fn apply_client_overrides(
     root: &Path,
     artifacts: &mut [(String, String)],
 ) -> Result<(), SubscriptionError> {
@@ -1268,6 +1306,21 @@ pub fn read_authorized(
     if !crate::subscription::credential_matches(config, credential, chrono::Utc::now().timestamp())
     {
         return Err(SubscriptionError::InvalidCredential);
+    }
+    if let Some(generation) = crate::deployment::current(store.root())
+        .map_err(|e| SubscriptionError::Override(e.to_string()))?
+    {
+        return crate::deployment::read_generation(
+            store.root(),
+            &generation,
+            format.artifact_name().as_ref(),
+        )
+        .map_err(|e| SubscriptionError::Override(e.to_string()));
+    }
+    if store.root().join(crate::nodes::SOURCE).exists() {
+        return Err(SubscriptionError::Override(
+            "托管订阅缺少已提交的生成批次；请执行 core recover 或 core apply".into(),
+        ));
     }
     if !format.has_compatible_nodes(config) {
         return Err(SubscriptionError::ClientIncompatible(format.path_name()));
@@ -3016,6 +3069,7 @@ ot-a-sing-box.bin"
             .unwrap();
 
         let snapshot = super::DeploymentSnapshot {
+            managed: None,
             config: None,
             artifacts: vec![(artifact_name.clone(), None)],
             active_config: None,

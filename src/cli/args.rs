@@ -45,6 +45,8 @@ pub(crate) enum Command {
     },
     /// List the generated Managed protocol listeners without exposing credentials.
     Node {
+        #[command(subcommand)]
+        command: Option<NodeCommand>,
         /// Also print each node's native share link (`vless://…` and friends).
         /// Those carry the proxy credentials, so they reach this terminal only
         /// and are never written to the journal.
@@ -56,6 +58,16 @@ pub(crate) enum Command {
         /// Render a terminal QR code for each displayed share link.
         #[arg(long, requires = "links")]
         qr: bool,
+    },
+    /// Manage ordered node groups and stable group subscriptions.
+    Group {
+        #[command(subcommand)]
+        command: GroupCommand,
+    },
+    /// Manage data-plane engines, runtime modes and durable recovery.
+    Core {
+        #[command(subcommand)]
+        command: CoreCommand,
     },
     /// Validate the active sing-box configuration and restart both managed services.
     Restart {
@@ -993,4 +1005,196 @@ pub(crate) enum EmailCommand {
     Check,
     Enable,
     Disable,
+}
+
+#[derive(Debug, Subcommand)]
+pub(crate) enum NodeCommand {
+    /// Send a real HTTP(S) request through a temporary local client.
+    Probe {
+        id: String,
+        #[arg(long)]
+        url: Option<String>,
+        #[arg(long)]
+        client_bin: Option<PathBuf>,
+    },
+    /// Unified redacted node list, including legacy companion nodes.
+    List {
+        #[arg(long, value_enum)]
+        core: Option<sbctl::core::CoreKind>,
+        #[arg(long)]
+        preset: Option<String>,
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        enabled: Option<bool>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long, default_value_t = 1)]
+        page: usize,
+        #[arg(long, default_value_t = 20)]
+        per_page: usize,
+    },
+    /// Preview migration; commit only with --apply.
+    Migrate {
+        #[arg(long)]
+        apply: bool,
+    },
+    Add {
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        preset: String,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long, value_enum)]
+        core: Option<sbctl::core::CoreKind>,
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        server_name: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        server: Option<String>,
+        #[arg(long)]
+        server_name: Option<String>,
+        #[arg(long)]
+        path: Option<String>,
+        #[arg(long)]
+        listen: Option<String>,
+        /// Optional private file containing the typed Data document.
+        #[arg(long)]
+        input: Option<PathBuf>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Copy {
+        id: String,
+        #[arg(long)]
+        name: String,
+        #[arg(long)]
+        port: Option<u16>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Enable {
+        id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Disable {
+        id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Remove {
+        id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Move {
+        id: String,
+        #[arg(long, value_enum)]
+        core: sbctl::core::CoreKind,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Validate typed settings and both generated server documents.
+    Check { id: Option<String> },
+    /// Explicitly print credential-bearing node share links.
+    Export {
+        id: String,
+        #[arg(long)]
+        qr: bool,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub(crate) enum GroupCommand {
+    List,
+    Create {
+        #[arg(long)]
+        name: String,
+        #[arg(long, value_delimiter = ',')]
+        members: Vec<String>,
+        #[arg(long, value_enum, default_value = "select")]
+        strategy: sbctl::nodes::Strategy,
+        #[arg(long)]
+        apply: bool,
+    },
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_delimiter = ',')]
+        members: Option<Vec<String>>,
+        #[arg(long, value_enum)]
+        strategy: Option<sbctl::nodes::Strategy>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Remove {
+        id: String,
+        #[arg(long)]
+        apply: bool,
+    },
+    Links {
+        id: Option<String>,
+        #[arg(long,value_parser=parse_cli_format)]
+        format: Option<sbctl::subscription::SubscriptionFormat>,
+        #[arg(long)]
+        credential_name: Option<String>,
+        #[arg(long)]
+        qr: bool,
+    },
+}
+#[derive(Debug, Subcommand)]
+pub(crate) enum CoreCommand {
+    Status,
+    Capabilities,
+    Mode {
+        #[arg(value_enum)]
+        mode: sbctl::nodes::Mode,
+        #[arg(long, value_delimiter = ',')]
+        disable: Vec<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Download and verify an official core; versions must be validated baselines.
+    Install {
+        #[arg(value_enum)]
+        core: sbctl::core::CoreKind,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    Update {
+        #[arg(value_enum)]
+        core: sbctl::core::CoreKind,
+        #[arg(long)]
+        version: Option<String>,
+    },
+    Restart {
+        #[arg(value_enum)]
+        core: Option<sbctl::core::CoreKind>,
+    },
+    /// Apply current nodes, groups, templates and overrides as one generation.
+    Apply {
+        #[arg(long)]
+        client_version: Option<String>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Recover {
+        #[arg(long, hide = true)]
+        boot: bool,
+    },
+    Rollback,
 }

@@ -255,7 +255,12 @@ fn credential_transaction<T>(
     let output = change(&mut config)?;
     config.validate()?;
     let commit = store.replace_locked(&config).and_then(|()| {
-        sbctl::lifecycle::restart_services(root).map_err(sbctl::config::ConfigError::StateContent)
+        (if root.join(sbctl::nodes::SOURCE).exists() {
+            sbctl::lifecycle::restart_subscription_service(root)
+        } else {
+            sbctl::lifecycle::restart_services(root)
+        })
+        .map_err(sbctl::config::ConfigError::StateContent)
     });
     if let Err(error) = commit {
         if let Err(recovery) =
@@ -265,7 +270,11 @@ fn credential_transaction<T>(
                 "{error}; 配置恢复失败：{recovery}；请检查服务与配置"
             )));
         }
-        if let Err(recovery) = sbctl::lifecycle::restart_services(root) {
+        if let Err(recovery) = if root.join(sbctl::nodes::SOURCE).exists() {
+            sbctl::lifecycle::restart_subscription_service(root)
+        } else {
+            sbctl::lifecycle::restart_services(root)
+        } {
             return Err(sbctl::config::ConfigError::StateContent(format!(
                 "{error}; 旧配置已恢复，但恢复重启失败：{recovery}"
             )));

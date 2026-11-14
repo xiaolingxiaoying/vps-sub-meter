@@ -10,6 +10,22 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 pub(crate) fn restart(root: &Path, sing_box_bin: Option<PathBuf>) -> ExitCode {
+    if root.join(sbctl::nodes::SOURCE).exists() {
+        let code = crate::cli::commands::managed::core(
+            root,
+            crate::cli::args::CoreCommand::Restart { core: None },
+        );
+        if code != ExitCode::SUCCESS {
+            return code;
+        }
+        return match sbctl::lifecycle::restart_subscription_service(root) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => {
+                eprintln!("订阅服务重启失败：{e}");
+                ExitCode::from(2)
+            }
+        };
+    }
     let store = sbctl::config::DeploymentStore::new(root);
     let result = (|| -> Result<(), sbctl::config::ConfigError> {
         // Restart must observe the same committed configuration as other
@@ -100,6 +116,34 @@ fn run_config_override(root: &Path, command: OverrideCommand) -> ExitCode {
                     return ExitCode::from(2);
                 }
             };
+            if root.join(sbctl::nodes::SOURCE).exists() {
+                let mut checked = 0;
+                for core in [sbctl::core::CoreKind::SingBox, sbctl::core::CoreKind::Xray] {
+                    if let Some((_, document)) = artifacts
+                        .iter()
+                        .find(|(n, _)| n == sbctl::subscription::managed::server_name(core))
+                    {
+                        let binary = if core == sbctl::core::CoreKind::SingBox {
+                            sing_box_bin
+                                .clone()
+                                .unwrap_or_else(|| root.join(sbctl::deployment::binary(core)))
+                        } else {
+                            root.join(sbctl::deployment::binary(core))
+                        };
+                        if binary.is_file() {
+                            if core.check_config(&binary, document).is_err() {
+                                eprintln!("{core} 合并配置检查失败");
+                                return ExitCode::from(2);
+                            }
+                            checked += 1;
+                        }
+                    }
+                }
+                println!(
+                    "覆写、模板及最终引用有效；执行 {checked} 项服务端真核检查。各客户端版本由固定内核矩阵验收。"
+                );
+                return ExitCode::SUCCESS;
+            }
             let Some(binary) = resolve_sing_box_bin(root, sing_box_bin) else {
                 println!(
                     "override 模板和合并结果有效；未找到 sing-box 内核（用 --sing-box-bin 指定），跳过服务端与客户端真核 check。"
@@ -251,6 +295,7 @@ pub(crate) fn apply_and_activate_locked(
     binary: Option<&Path>,
     activate: bool,
 ) -> Result<(), String> {
+    let prior = store.load().map_err(|e| e.to_string())?;
     let snapshot = sbctl::subscription::apply_config_transaction_locked(store, config, binary)
         .map_err(|e| e.to_string())?;
     let direct = config.subscription_mode == sbctl::config::SubscriptionMode::Direct;
@@ -260,7 +305,13 @@ pub(crate) fn apply_and_activate_locked(
         }
         sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
         if activate {
-            sbctl::lifecycle::restart_services(root)?;
+            if snapshot.managed.is_some() {
+                if prior != *config {
+                    sbctl::lifecycle::restart_subscription_service(root)?;
+                }
+            } else {
+                sbctl::lifecycle::restart_services(root)?;
+            }
         }
         Ok::<_, String>(())
     })();
@@ -283,7 +334,11 @@ pub(crate) fn apply_and_activate_locked(
             }
             sbctl::lifecycle::prepare_daemon_storage(root, restored_direct)?;
             if activate {
-                sbctl::lifecycle::restart_services(root)?;
+                if snapshot.managed.is_some() {
+                    sbctl::lifecycle::restart_subscription_service(root)?;
+                } else {
+                    sbctl::lifecycle::restart_services(root)?;
+                }
             }
             Ok(())
         })();
@@ -843,9 +898,10 @@ pub(crate) fn run_config(root: &Path, command: ConfigCommand) -> ExitCode {
             certbot_email, sing_box_bin,
         }),
         ConfigCommand::Show => store.load().map(|config| config.summary()),
-        ConfigCommand::Validate => store
-            .load()
-            .map(|_| "deployment configuration is valid".to_owned()),
+        ConfigCommand::Validate => store.load().and_then(|config|{
+            if let Some(registry)=sbctl::nodes::read_optional(root).map_err(|e|sbctl::config::ConfigError::StateContent(e.to_string()))?{registry.validate(&config).map_err(|e|sbctl::config::ConfigError::StateContent(e.to_string()))?;}
+            Ok("deployment configuration is valid".to_owned())
+        }),
     };
     match result {
         Ok(message) => {
@@ -893,8 +949,12 @@ fn commit_client_template_locked(
         return Ok(());
     }
     config.client_template = template;
-    let binary = resolve_sing_box_bin(root, sing_box_bin)
-        .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?;
+    let binary = if root.join(sbctl::nodes::SOURCE).exists() {
+        root.join("usr/local/bin/sing-box")
+    } else {
+        resolve_sing_box_bin(root, sing_box_bin)
+            .ok_or("切换模板需要 sing-box 内核，请用 --sing-box-bin 指定")?
+    };
     let snapshot =
         sbctl::subscription::apply_client_template_transaction_locked(store, config, &binary)
             .map_err(|e| e.to_string())?;
@@ -1110,7 +1170,11 @@ pub(crate) fn commit_config_change(
                         sbctl::lifecycle::prepare_daemon_prerequisites(root, direct)?;
                     }
                     sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
-                    sbctl::lifecycle::restart_services(root)
+                    if snapshot.managed.is_some() {
+                        sbctl::lifecycle::restart_subscription_service(root)
+                    } else {
+                        sbctl::lifecycle::restart_services(root)
+                    }
                 })();
                 if let Err(error) = activation {
                     sbctl::subscription::restore_config_transaction_locked(store, &snapshot)

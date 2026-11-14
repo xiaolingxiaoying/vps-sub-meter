@@ -858,7 +858,7 @@ pub(crate) fn sing_box_server(
 /// `SelfSigned` mode generates a long-lived self-signed certificate (sing-box-yg
 /// style, never expires, no ACME dependency) that clients are told to skip
 /// verifying; `Domain` mode uses the administrator-managed certificate.
-fn certificate_tls_config(
+pub(crate) fn certificate_tls_config(
     config: &DeploymentConfig,
     root: &Path,
 ) -> Result<Value, SubscriptionError> {
@@ -900,6 +900,23 @@ fn certificate_tls_config(
         "certificate_path": certificate_path,
         "key_path": key_path}),
     )
+}
+
+pub(crate) fn existing_certificate_tls_config(
+    config: &DeploymentConfig,
+    root: &Path,
+) -> Result<Value, SubscriptionError> {
+    if config.certificate_mode == CertificateMode::SelfSigned {
+        let directory = self_signed_certificate_directory(root, config.protocol_server_name());
+        for name in ["cert.pem", "key.pem"] {
+            crate::config::open_managed_path_no_follow(&directory.join(name)).map_err(|_| {
+                SubscriptionError::Certificate(
+                    "请先通过安装或证书配置生成证书；预览不会生成证书".into(),
+                )
+            })?;
+        }
+    }
+    certificate_tls_config(config, root)
 }
 
 /// Generates and pins a long-lived self-signed certificate for the subscription

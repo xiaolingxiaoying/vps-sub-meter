@@ -912,6 +912,22 @@ fn subscription_http_response(
     peer: Option<IpAddr>,
     budget: &SharedBudget,
 ) -> Response<Full<Bytes>> {
+    // Managed generations are independent of device credential changes. Read
+    // current authorization without reading the root-private node source.
+    let fresh = if store.root().join(crate::deployment::CURRENT).exists() {
+        match store.load() {
+            Ok(c) => Some(c),
+            Err(_) => {
+                return unavailable_http_response(
+                    "",
+                    "managed subscription configuration unavailable",
+                );
+            }
+        }
+    } else {
+        None
+    };
+    let config = fresh.as_ref().unwrap_or(config);
     // Charged before the method and path are even considered, so a throttled
     // address sees the same answer whatever it asks for: the throttle never
     // reveals whether the credential in that URL is real, which is exactly what
@@ -936,19 +952,32 @@ fn subscription_http_response(
     if request.uri().query().is_some() {
         return not_found_http_response();
     }
+    if request.uri().path().split('/').nth(3) == Some("groups") {
+        return group_http_response(request.uri().path(), store, config);
+    }
     let Some((credential, route)) = parse_route(request.uri().path()) else {
         return not_found_http_response();
     };
     if !super::credential_matches(config, credential, chrono::Utc::now().timestamp()) {
         return not_found_http_response();
     }
+    if let SubscriptionRoute::Format(format) | SubscriptionRoute::Qr(format) = route {
+        match crate::deployment::current(store.root()) {
+            Ok(Some(g)) if !g.files.iter().any(|n| n == format.artifact_name().as_ref()) => {
+                return not_found_http_response();
+            }
+            Err(e) => return unavailable_http_response(credential, &e.to_string()),
+            _ => {}
+        }
+    }
     if let SubscriptionRoute::Format(format) | SubscriptionRoute::Qr(format) = route
         && !format.has_compatible_nodes(config)
+        && !store.root().join(crate::deployment::CURRENT).is_file()
     {
         return not_found_http_response();
     }
     match route {
-        SubscriptionRoute::Qr(format) => qr_http_response(config, credential, format),
+        SubscriptionRoute::Qr(format) => qr_http_response(store, config, credential, format),
         SubscriptionRoute::Index => index_http_response(store, config, credential),
         SubscriptionRoute::Format(format) => {
             let body = match read_authorized(store, config, credential, format) {
@@ -983,6 +1012,75 @@ fn subscription_http_response(
                 .expect("valid subscription response")
         }
     }
+}
+
+fn group_http_response(
+    path: &str,
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Response<Full<Bytes>> {
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() < 6
+        || parts[1] != "sub"
+        || parts[3] != "groups"
+        || !crate::nodes::identifier(parts[4])
+    {
+        return not_found_http_response();
+    }
+    let credential = parts[2];
+    if !super::credential_matches(config, credential, chrono::Utc::now().timestamp()) {
+        return not_found_http_response();
+    }
+    let qr = parts.get(5) == Some(&"qr");
+    if parts.len() != if qr { 7 } else { 6 } {
+        return not_found_http_response();
+    }
+    let Some(format) = parse_format_path(parts[if qr { 6 } else { 5 }]) else {
+        return not_found_http_response();
+    };
+    let generation = match crate::deployment::current(store.root()) {
+        Ok(Some(g)) => g,
+        Ok(None) => return not_found_http_response(),
+        Err(e) => return unavailable_http_response(credential, &e.to_string()),
+    };
+    let name = format!("group-{}--{}", parts[4], format.artifact_name());
+    if !generation.files.contains(&name) {
+        return not_found_http_response();
+    }
+    let body = if qr {
+        let url = match super::managed::group_url(config, credential, parts[4], format) {
+            Ok(u) => u,
+            Err(e) => return unavailable_http_response(credential, &e.to_string()),
+        };
+        match crate::qr::render_svg(&format.qr_payload(&url)) {
+            Ok(s) => s,
+            Err(e) => return unavailable_http_response(credential, &e),
+        }
+    } else {
+        match crate::deployment::read_generation(store.root(), &generation, &name) {
+            Ok(s) => s,
+            Err(e) => return unavailable_http_response(credential, &e.to_string()),
+        }
+    };
+    let mut response = Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            "Content-Type",
+            if qr {
+                "image/svg+xml"
+            } else {
+                format.content_type()
+            },
+        )
+        .header("Cache-Control", "no-store")
+        .header("X-Content-Type-Options", "nosniff")
+        .header("Connection", "close");
+    if !qr && let Ok(traffic) = crate::traffic::report(store, config) {
+        response = response.header("subscription-userinfo", subscription_userinfo(&traffic));
+    }
+    response
+        .body(Full::new(Bytes::from(body)))
+        .expect("valid group subscription response")
 }
 
 /// How often a client app should re-download the subscription, in hours, as
@@ -1039,17 +1137,19 @@ fn subscription_userinfo(traffic: &crate::traffic::TrafficReport) -> String {
 /// content is derived from the configuration only, so no artifact file is
 /// needed and the code always encodes the current URL.
 fn qr_http_response(
+    store: &DeploymentStore,
     config: &DeploymentConfig,
     credential: &str,
     format: SubscriptionFormat,
 ) -> Response<Full<Bytes>> {
-    let body = match super::route_url_with_credential(
-        config,
-        credential,
-        SubscriptionRoute::Format(format),
-    )
-    .map_err(|error| error.to_string())
-    .and_then(|url| crate::qr::render_svg(&format.qr_payload(&url)))
+    let url = if store.root().join(crate::deployment::CURRENT).exists() {
+        super::managed::format_url(config, credential, format)
+    } else {
+        super::route_url_with_credential(config, credential, SubscriptionRoute::Format(format))
+    };
+    let body = match url
+        .map_err(|error| error.to_string())
+        .and_then(|url| crate::qr::render_svg(&format.qr_payload(&url)))
     {
         Ok(body) => body,
         Err(error) => return unavailable_http_response(credential, &error),

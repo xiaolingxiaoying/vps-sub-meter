@@ -75,6 +75,14 @@ pub(super) enum Action {
     EmailSend,
     EmailEnable,
     EmailDisable,
+    NodeManage,
+    GroupManage,
+    ManagedLinks,
+    CoreMode,
+    CoreInstall,
+    CoreApply,
+    CoreRollback,
+    CoreRecover,
 }
 pub(super) struct Entry {
     pub label: String,
@@ -90,12 +98,12 @@ pub(super) fn title(page: Page) -> &'static str {
     match page {
         Page::Home => "主菜单",
         Page::Overview => "概览与诊断",
-        Page::Deployment => "部署与协议",
-        Page::Subscriptions => "订阅与客户端",
+        Page::Deployment => "节点与组合",
+        Page::Subscriptions => "节点组与订阅",
         Page::Formats => "订阅与客户端 / 链接与二维码",
         Page::Credentials => "订阅与客户端 / 命名订阅凭据",
         Page::Traffic => "流量与通知",
-        Page::Services => "服务与更新",
+        Page::Services => "内核与运行模式",
         Page::Advanced => "高级与维护",
         Page::Overrides => "高级与维护 / 配置与覆写",
         Page::Rules => "高级与维护 / 路由规则",
@@ -111,17 +119,17 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
     match page {
         Home => vec![
             entry("概览与诊断", Open(Overview)),
-            entry("部署与协议", Open(Deployment)),
-            entry("订阅与客户端", Open(Subscriptions)),
+            entry("节点与组合", Open(Deployment)),
+            entry("节点组与订阅", Open(Subscriptions)),
+            entry("内核与运行模式", Open(Services)),
             entry("流量与通知", Open(Page::Traffic)),
-            entry("服务与更新", Open(Services)),
             entry("高级与维护", Open(Advanced)),
         ],
         Overview => vec![
             entry("完整部署状态", Status),
             entry("运行日志", Logs),
             entry("内核版本、进程和资源状态", KernelStatus),
-            entry("当前连接", Connections),
+            entry("sing-box 当前连接（该内核运行时可用）", Connections),
             entry("证书状态", CertificateStatus),
             entry(
                 "订阅入口诊断（DNS / 监听 / HTTPS，只读）",
@@ -138,6 +146,7 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
             }
             result.extend([
                 entry("查看节点与监听端口", Nodes),
+                entry("管理节点（新增 / 编辑 / 复制 / 迁移 / 启停）", NodeManage),
                 entry(
                     "协议启停、端口、SNI 和证书",
                     Topic(ConfigurationTopic::Protocols),
@@ -151,6 +160,8 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
             result
         }
         Subscriptions => vec![
+            entry("按客户端、节点组和设备获取订阅", ManagedLinks),
+            entry("管理节点组与客户端策略", GroupManage),
             entry("切换客户端模板（精简 / 标准）", Template),
             entry("查看订阅链接 / 按格式显示二维码", Open(Formats)),
             entry(
@@ -191,6 +202,11 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
             entry("邮件通知设置", Open(Email)),
         ],
         Services => vec![
+            entry("切换运行模式（sing-box / Xray / 双内核）", CoreMode),
+            entry("安装 / 更新官方内核（固定已验证版本）", CoreInstall),
+            entry("应用节点、分组和运行时模板", CoreApply),
+            entry("恢复未完成事务", CoreRecover),
+            entry("回退最近一次部署修改", CoreRollback),
             entry("校验配置并重启服务", Restart),
             entry("启用本机连接观察 API", ApiEnable),
             entry("关闭连接观察 API", ApiDisable),

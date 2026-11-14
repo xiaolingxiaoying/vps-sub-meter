@@ -36,7 +36,8 @@ pub fn uri_host(host: &str) -> String {
 /// Every generated artifact derives its node set, host, port, credentials and
 /// TLS fields from this one canonical model, so the sing-box server
 /// configuration and the three Subscription formats cannot drift apart.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "protocol", rename_all = "kebab-case", deny_unknown_fields)]
 pub enum CanonicalNode {
     VlessReality {
         host: String,

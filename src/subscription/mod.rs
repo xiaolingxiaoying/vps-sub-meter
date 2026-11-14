@@ -3,6 +3,7 @@
 //! renderers. Every public item of the crate-facing surface is re-exported here
 //! so callers keep using `sbctl::subscription::...` unchanged.
 mod artifacts;
+pub mod managed;
 mod presets;
 mod profile;
 pub(crate) mod render;

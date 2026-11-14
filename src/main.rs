@@ -54,6 +54,8 @@ fn main() -> ExitCode {
         }
     };
     match command {
+        Command::Core { command } => cli::commands::managed::core(root, command),
+        Command::Group { command } => cli::commands::managed::group(root, command),
         Command::Protocol { command } => cli::commands::protocol::run(root, command),
         Command::Install { options } => install(root, options),
         Command::Menu => menu(root),
@@ -71,10 +73,17 @@ fn main() -> ExitCode {
             }
         },
         Command::Node {
+            command,
             links,
             protocol,
             qr,
-        } => print_nodes(root, links, protocol.map(Into::into), qr),
+        } => {
+            if let Some(command) = command {
+                cli::commands::managed::node(root, command)
+            } else {
+                print_nodes(root, links, protocol.map(Into::into), qr)
+            }
+        }
         Command::Restart { sing_box_bin } => restart(root, sing_box_bin),
         Command::Logs {
             unit,

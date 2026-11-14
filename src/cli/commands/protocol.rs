@@ -170,6 +170,10 @@ pub(crate) fn run(root: &Path, command: ProtocolCommand) -> ExitCode {
 }
 
 fn enable(root: &Path, input: &Path, binary: Option<&Path>) -> ExitCode {
+    if root.join(sbctl::nodes::SOURCE).exists() {
+        eprintln!("已迁移部署请使用 node add/edit 管理节点；旧组合源不再接受写入");
+        return ExitCode::from(2);
+    }
     let result = (|| -> Result<(), String> {
         let nodes = load(input)?;
         if root == Path::new("/") {

@@ -1,6 +1,22 @@
 # sbctl
 
-sbctl is a single-administrator tool for operating sing-box and providing a private subscription from one VPS.
+sbctl is a single-administrator tool for operating sing-box and Xray and providing private subscriptions from one VPS.
+
+**Managed node**:
+A stable-ID proxy listener in the versioned root-private node registry. Its display name, client tag, typed protocol preset, engine ownership and enabled state are separate. Multiple nodes may use one preset. After migration, legacy per-protocol fields are import/compatibility data, not a second writable node source.
+_Avoid_: One protocol equals one node, subscription credential
+
+**Node group**:
+An ordered list of managed node IDs selecting subscription content. Its stable ID forms the group subscription URL; its display name can change. It is not an authorization boundary.
+_Avoid_: User group, account isolation
+
+**Runtime mode**:
+The selected set of managed engines: sing-box, xray, or dual. Every enabled node belongs to exactly one selected engine. Engine capability and client-format compatibility are checked independently.
+_Avoid_: Subscription mode, client kernel version
+
+**Client generation**:
+A complete validated client artifact set selected by one committed generation pointer. It contains the compatibility catalog and group representations, never server configuration or private keys. Accounting state and subscription credentials are independent of historical generation rollback.
+_Avoid_: Per-request rendering, directory-wide atomic rename
 
 ## Language
 

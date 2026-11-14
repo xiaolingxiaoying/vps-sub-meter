@@ -15,7 +15,7 @@ use crate::cli::commands::{
         format_local_time, print_nodes, print_status, print_traffic, run_accounting_reset,
         traffic_set_used,
     },
-    system::{rotate_subscription_credential, system_info},
+    system::rotate_subscription_credential,
     update::{sing_box, uninstall, update},
 };
 use crate::cli::prompt::ConsolePrompts;
@@ -71,6 +71,8 @@ fn menu_page(root: &Path, page: Page) {
         }
         match navigation::select(&entries, &input) {
             Some(Action::Open(next)) => menu_page(root, next),
+            Some(Action::NodeManage) => managed_nodes_menu(root),
+            Some(Action::GroupManage) => managed_groups_menu(root),
             Some(action) => {
                 execute_action(root, action);
                 pause_menu();
@@ -84,25 +86,31 @@ fn menu_page(root: &Path, page: Page) {
 }
 
 fn print_menu_header(root: &Path) {
-    let (os, kernel, cpu, bbr) = system_info();
     let bar = sbctl::term::blue("-".repeat(70));
     println!("{bar}");
-    println!(
-        "{}",
-        sbctl::term::white("  sbctl  ·  私有 sing-box 订阅控制面")
-    );
+    println!("{}", sbctl::term::white("  sbctl  ·  节点与双内核订阅管理"));
     println!("{}", sbctl::term::blue("  快捷方式: ly"));
     println!(
         "{}",
         sbctl::term::blue("  项目: github.com/xiaolingxiaoying/vps-sub-meter")
     );
     println!("{bar}");
-    println!(
-        "{}",
-        sbctl::term::green(format!(
-            "系统: {os}   内核: {kernel}   处理器: {cpu}   BBR: {bbr}"
-        ))
-    );
+    match sbctl::nodes::read_optional(root) {
+        Ok(Some(registry)) => println!(
+            "运行模式: {}   启用节点: {}   节点组: {}",
+            registry.mode.label(),
+            registry.nodes.iter().filter(|n| n.enabled).count(),
+            registry.groups.len()
+        ),
+        Ok(None) => println!("节点仓库: 待迁移（节点管理中的修改会自动迁移）"),
+        Err(_) => println!("节点仓库: 需要修复，请检查权限或恢复事务"),
+    }
+    if root
+        .join("var/lib/sbctl/deployment-transaction.json")
+        .exists()
+    {
+        println!("状态: 存在未完成事务，请进入「内核与运行模式 → 恢复未完成事务」");
+    }
     let store = sbctl::config::DeploymentStore::new(root);
     match store.load() {
         Ok(config) => {
@@ -375,11 +383,13 @@ fn execute_action(root: &Path, action: Action) {
     match action {
         Open(page) => menu_page(root, page),
         Status => {
+            let (os, kernel, cpu, bbr) = crate::cli::commands::system::system_info();
+            println!("系统: {os}  内核: {kernel}  CPU: {cpu}  BBR: {bbr}");
             print_status(root);
         }
         Logs => menu_logs(root),
         KernelStatus => {
-            sing_box(root, SingBoxCommand::Status);
+            crate::cli::commands::managed::core(root, crate::cli::args::CoreCommand::Status);
         }
         Connections => {
             sing_box(root, SingBoxCommand::Connections);
@@ -404,6 +414,45 @@ fn execute_action(root: &Path, action: Action) {
             }
         }
         Topic(topic) => run_topic_wizard(root, topic),
+        NodeManage => managed_nodes_menu(root),
+        GroupManage => managed_groups_menu(root),
+        ManagedLinks => managed_links_menu(root),
+        CoreMode => managed_mode_menu(root),
+        CoreInstall => {
+            println!("1. sing-box\n2. Xray\n0. 返回");
+            let core = match read_menu_choice("选择内核: ").as_deref() {
+                Some("1") => sbctl::core::CoreKind::SingBox,
+                Some("2") => sbctl::core::CoreKind::Xray,
+                _ => return,
+            };
+            let Some(version) = read_menu_choice("固定版本（回车使用项目推荐版本）: ")
+            else {
+                return;
+            };
+            if confirm_menu_action("确认下载并校验官方内核？已运行的该内核将独立重启")
+            {
+                crate::cli::commands::managed::core(
+                    root,
+                    crate::cli::args::CoreCommand::Install {
+                        core,
+                        version: (!version.is_empty()).then_some(version),
+                    },
+                );
+            }
+        }
+        CoreApply => managed_edit(root, |_, _| Ok(true)),
+        CoreRecover => {
+            crate::cli::commands::managed::core(
+                root,
+                crate::cli::args::CoreCommand::Recover { boot: false },
+            );
+        }
+        CoreRollback => {
+            if confirm_menu_action("确认恢复最近一次部署？订阅凭据和流量账期不会回退")
+            {
+                crate::cli::commands::managed::core(root, crate::cli::args::CoreCommand::Rollback);
+            }
+        }
         Template => {
             let store = sbctl::config::DeploymentStore::new(root);
             let config = match store.load() {
@@ -796,6 +845,608 @@ fn diagnosis_probe_label(probe: &sbctl::system::ProbeDiagnosis) -> &'static str 
 
 fn required_menu_text(label: &str) -> Option<String> {
     read_menu_choice(label).filter(|value| !value.is_empty())
+}
+
+fn managed_edit(
+    root: &Path,
+    edit: impl FnOnce(
+        &sbctl::config::DeploymentConfig,
+        &mut sbctl::nodes::Registry,
+    ) -> sbctl::nodes::Result<bool>,
+) {
+    let result = (|| -> sbctl::nodes::Result<()> {
+        let (config, before) = crate::cli::commands::managed::draft(root)?;
+        let mut after = before.clone();
+        if !edit(&config, &mut after)? {
+            println!("已取消，草稿未保存");
+            return Ok(());
+        }
+        let plan = sbctl::deployment::plan(root, &config, &before, &after)?;
+        if !plan.requirements.is_empty() {
+            return Err(sbctl::nodes::Error(plan.requirements.join("；")));
+        }
+        println!(
+            "变更预览：\n{}",
+            serde_json::to_string_pretty(&plan).unwrap()
+        );
+        for n in &after.nodes {
+            if before.nodes.iter().find(|old| old.id == n.id) != Some(n) {
+                println!(
+                    "{} · {} · {} · {}:{} · {}（凭据隐藏）",
+                    n.id,
+                    n.name,
+                    n.core,
+                    n.listen,
+                    n.port(),
+                    if n.enabled { "启用" } else { "停用" }
+                );
+            }
+        }
+        if confirm_menu_action("应用以上变更？内核配置变化会中断受影响的连接")
+        {
+            sbctl::deployment::apply(
+                &sbctl::config::DeploymentStore::new(root),
+                &config,
+                &before,
+                after,
+            )?;
+            println!("已应用并发布订阅");
+        } else {
+            println!("已取消，草稿未保存");
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("操作失败：{error}");
+    }
+}
+fn select_managed_node(registry: &sbctl::nodes::Registry) -> Option<String> {
+    let mut page = 0usize;
+    loop {
+        println!(
+            "选择节点，第 {} 页（n 下一页 / p 上一页 / 0 返回，也可输入完整 ID）",
+            page + 1
+        );
+        for (i, n) in registry.nodes.iter().enumerate().skip(page * 20).take(20) {
+            println!(
+                "{}. {} · {} · {}:{}",
+                i + 1,
+                n.name,
+                n.core,
+                n.listen,
+                n.port()
+            );
+        }
+        let value = read_menu_choice("节点编号或 ID: ")?;
+        match value.as_str() {
+            "" | "0" => return None,
+            "n" => {
+                if (page + 1) * 20 < registry.nodes.len() {
+                    page += 1;
+                }
+            }
+            "p" => page = page.saturating_sub(1),
+            _ => {
+                if let Some(n) = value
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| registry.nodes.get(i))
+                {
+                    return Some(n.id.clone());
+                }
+                if registry.nodes.iter().any(|n| n.id == value) {
+                    return Some(value);
+                }
+                println!("节点不存在，请重新输入");
+            }
+        }
+    }
+}
+fn menu_port(label: &str) -> Option<Option<u16>> {
+    loop {
+        let value = read_menu_choice(label)?;
+        if value.is_empty() {
+            return Some(None);
+        }
+        if let Ok(port) = value.parse::<u16>()
+            && port >= 10000
+        {
+            return Some(Some(port));
+        }
+        println!("请输入 10000–65535，或回车保留 / 自动分配");
+    }
+}
+fn managed_nodes_menu(root: &Path) {
+    loop {
+        println!(
+            "\n节点与组合\n1. 筛选 / 分页查看节点\n2. 新增节点\n3. 编辑节点\n4. 复制节点\n5. 启用节点\n6. 停用节点\n7. 删除节点\n8. 迁移节点内核\n9. 校验节点与配置\n10. 分享链接与二维码\n11. 迁移现有部署到统一仓库\n12. 真实连接测试\n0. 返回"
+        );
+        let Some(choice) = read_menu_choice("选择: ") else {
+            return;
+        };
+        if choice.is_empty() || choice == "0" {
+            return;
+        }
+        if choice == "1" {
+            managed_list_menu(root);
+            continue;
+        }
+        if choice == "9" {
+            crate::cli::commands::managed::node(
+                root,
+                crate::cli::args::NodeCommand::Check { id: None },
+            );
+            pause_menu();
+            continue;
+        }
+        if choice == "12" {
+            if let Ok((_, registry)) = crate::cli::commands::managed::draft(root)
+                && let Some(id) = select_managed_node(&registry)
+            {
+                let Some(url) = read_menu_choice("HTTP(S) 测试 URL（回车使用已配置探测地址）: ")
+                else {
+                    return;
+                };
+                crate::cli::commands::managed::node(
+                    root,
+                    crate::cli::args::NodeCommand::Probe {
+                        id,
+                        url: (!url.is_empty()).then_some(url),
+                        client_bin: None,
+                    },
+                );
+            }
+            pause_menu();
+            continue;
+        }
+        if choice == "10" {
+            if let Ok((_, r)) = crate::cli::commands::managed::draft(root)
+                && let Some(id) = select_managed_node(&r)
+                && confirm_menu_action("显示该节点分享链接？链接包含节点凭据")
+            {
+                crate::cli::commands::managed::node(
+                    root,
+                    crate::cli::args::NodeCommand::Export { id, qr: true },
+                );
+            }
+            pause_menu();
+            continue;
+        }
+        managed_edit(root, |config, registry| {
+            if choice == "11" {
+                return Ok(true);
+            }
+            if choice == "2" {
+                let presets = [
+                    "vless-reality",
+                    "vmess-websocket",
+                    "hysteria2",
+                    "tuic",
+                    "anytls",
+                    "vless-xhttp-reality",
+                    "vless-xhttp-tls",
+                    "vless-ws-tls",
+                    "trojan-tcp-tls",
+                ];
+                for (i, preset) in presets.iter().enumerate() {
+                    println!("{}. {preset}", i + 1);
+                }
+                let preset = loop {
+                    let Some(v) = read_menu_choice("预设编号（0 返回）: ") else {
+                        return Ok(false);
+                    };
+                    if v == "0" {
+                        return Ok(false);
+                    }
+                    if let Some(preset) = v
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| presets.get(i))
+                    {
+                        break *preset;
+                    }
+                    println!("无效预设，请重试");
+                };
+                let Some(name) = required_menu_text("节点名称") else {
+                    return Ok(false);
+                };
+                let Some(port) = menu_port("端口（回车自动分配）: ") else {
+                    return Ok(false);
+                };
+                let node = sbctl::nodes::create(registry, config, preset, &name, port, None)?;
+                registry.nodes.push(node);
+                return Ok(true);
+            }
+            let Some(id) = select_managed_node(registry) else {
+                return Ok(false);
+            };
+            match choice.as_str() {
+                "3" => {
+                    let node = registry.node_mut(&id)?;
+                    let Some(name) = read_menu_choice("名称（回车保留）: ") else {
+                        return Ok(false);
+                    };
+                    if !name.is_empty() {
+                        node.name = name;
+                    }
+                    let Some(port) = menu_port("监听端口（回车保留）: ") else {
+                        return Ok(false);
+                    };
+                    if let Some(port) = port {
+                        node.patch("port", serde_json::json!(port))?;
+                    }
+                    for (key, label) in [
+                        ("server", "客户端连接主机（回车保留）: "),
+                        ("server_name", "TLS SNI（回车保留）: "),
+                    ] {
+                        let Some(value) = read_menu_choice(label) else {
+                            return Ok(false);
+                        };
+                        if !value.is_empty() {
+                            node.patch(key, serde_json::json!(value))?;
+                        }
+                    }
+                }
+                "4" => {
+                    let mut node = registry.node_mut(&id)?.clone();
+                    let Some(name) = required_menu_text("新节点名称") else {
+                        return Ok(false);
+                    };
+                    let Some(port) = menu_port("新端口（回车自动分配）: ") else {
+                        return Ok(false);
+                    };
+                    node.id = sbctl::nodes::new_id();
+                    node.tag = format!("node-{}", node.id);
+                    node.name = name;
+                    node.renew_secrets()?;
+                    node.patch(
+                        "port",
+                        serde_json::json!(
+                            port.map(Ok)
+                                .unwrap_or_else(|| sbctl::nodes::free_port(registry, config))?
+                        ),
+                    )?;
+                    registry.nodes.push(node);
+                }
+                "5" => registry.node_mut(&id)?.enabled = true,
+                "6" => registry.node_mut(&id)?.enabled = false,
+                "7" => {
+                    if registry.groups.iter().any(|g| g.members.contains(&id)) {
+                        return Err(sbctl::nodes::Error(
+                            "节点仍被分组引用，请先修改组成员".into(),
+                        ));
+                    }
+                    registry.nodes.retain(|n| n.id != id);
+                }
+                "8" => {
+                    println!("1. sing-box\n2. Xray\n0. 返回");
+                    let core = match read_menu_choice("目标内核: ").as_deref() {
+                        Some("1") => sbctl::core::CoreKind::SingBox,
+                        Some("2") => sbctl::core::CoreKind::Xray,
+                        _ => return Ok(false),
+                    };
+                    registry.node_mut(&id)?.core = core;
+                }
+                _ => return Ok(false),
+            }
+            Ok(true)
+        });
+        pause_menu();
+    }
+}
+fn managed_list_menu(root: &Path) {
+    let mut core = None;
+    let mut preset = None;
+    let mut group = None;
+    let mut enabled = None;
+    println!("过滤条件：0 全部 / 1 内核 / 2 预设 / 3 分组 ID / 4 启用状态");
+    match read_menu_choice("过滤 [0]: ").as_deref() {
+        Some("1") => {
+            core = match read_menu_choice("1 sing-box / 2 Xray: ").as_deref() {
+                Some("1") => Some(sbctl::core::CoreKind::SingBox),
+                Some("2") => Some(sbctl::core::CoreKind::Xray),
+                _ => return,
+            };
+        }
+        Some("2") => {
+            preset = required_menu_text("预设名称");
+            if preset.is_none() {
+                return;
+            }
+        }
+        Some("3") => {
+            group = required_menu_text("节点组 ID");
+            if group.is_none() {
+                return;
+            }
+        }
+        Some("4") => {
+            enabled = match read_menu_choice("1 启用 / 2 停用: ").as_deref() {
+                Some("1") => Some(true),
+                Some("2") => Some(false),
+                _ => return,
+            };
+        }
+        None => return,
+        _ => {}
+    }
+    let mut page = 1usize;
+    loop {
+        crate::cli::commands::managed::node(
+            root,
+            crate::cli::args::NodeCommand::List {
+                core,
+                preset: preset.clone(),
+                group: group.clone(),
+                enabled,
+                json: false,
+                page,
+                per_page: 20,
+            },
+        );
+        match read_menu_choice("n 下一页 / p 上一页 / 0 返回: ").as_deref() {
+            Some("n") => page = page.saturating_add(1),
+            Some("p") => page = page.saturating_sub(1).max(1),
+            _ => return,
+        }
+    }
+}
+fn select_managed_group(registry: &sbctl::nodes::Registry) -> Option<String> {
+    if registry.groups.is_empty() {
+        println!("还没有节点组，请先创建；全量订阅仍可使用");
+        return None;
+    }
+    for (i, g) in registry.groups.iter().enumerate() {
+        println!("{}. {} · {} 个节点", i + 1, g.name, g.members.len());
+    }
+    loop {
+        let value = read_menu_choice("组编号或 ID（0 返回）: ")?;
+        if value.is_empty() || value == "0" {
+            return None;
+        }
+        if let Some(g) = value
+            .parse::<usize>()
+            .ok()
+            .and_then(|i| i.checked_sub(1))
+            .and_then(|i| registry.groups.get(i))
+        {
+            return Some(g.id.clone());
+        }
+        if registry.groups.iter().any(|g| g.id == value) {
+            return Some(value);
+        }
+        println!("分组不存在，请重试");
+    }
+}
+fn managed_groups_menu(root: &Path) {
+    loop {
+        println!(
+            "\n节点组\n1. 查看节点组\n2. 新增节点组\n3. 编辑名称、成员与策略\n4. 删除节点组\n0. 返回"
+        );
+        let Some(choice) = read_menu_choice("选择: ") else {
+            return;
+        };
+        if choice.is_empty() || choice == "0" {
+            return;
+        }
+        if choice == "1" {
+            crate::cli::commands::managed::group(root, crate::cli::args::GroupCommand::List);
+            pause_menu();
+            continue;
+        }
+        managed_edit(root, |_, registry| {
+            let existing = if choice == "2" {
+                None
+            } else {
+                let Some(id) = select_managed_group(registry) else {
+                    return Ok(false);
+                };
+                Some(id)
+            };
+            if choice == "4" {
+                registry.groups.retain(|g| Some(&g.id) != existing.as_ref());
+                return Ok(true);
+            }
+            if !["2", "3"].contains(&choice.as_str()) {
+                return Ok(false);
+            }
+            let Some(name) = read_menu_choice("组名称（编辑时回车保留）: ") else {
+                return Ok(false);
+            };
+            println!("可用节点（成员按输入顺序保存）:");
+            for (i, n) in registry.nodes.iter().enumerate() {
+                println!("{}. {}  {}", i + 1, n.name, n.id);
+            }
+            let members = loop {
+                let Some(value) =
+                    read_menu_choice("节点编号或 ID，逗号分隔（编辑时回车保留，- 清空）: ")
+                else {
+                    return Ok(false);
+                };
+                if value.is_empty() && existing.is_some() {
+                    break None;
+                }
+                if value == "-" || value.is_empty() {
+                    break Some(Vec::new());
+                }
+                let mut ids = Vec::new();
+                let mut valid = true;
+                for input in value.split(',').map(str::trim) {
+                    let node = input
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| registry.nodes.get(i))
+                        .or_else(|| registry.nodes.iter().find(|n| n.id == input));
+                    if let Some(node) = node
+                        && !ids.contains(&node.id)
+                    {
+                        ids.push(node.id.clone());
+                    } else {
+                        valid = false;
+                        break;
+                    }
+                }
+                if valid {
+                    break Some(ids);
+                }
+                println!("成员不存在或重复，请在当前步骤重新输入");
+            };
+            let strategy = match read_menu_choice("策略：1 手动选择 / 2 自动测速（回车保留）: ")
+                .as_deref()
+            {
+                Some("1") => Some(sbctl::nodes::Strategy::Select),
+                Some("2") => Some(sbctl::nodes::Strategy::Urltest),
+                Some("") => None,
+                _ => return Ok(false),
+            };
+            if let Some(id) = existing {
+                let g = registry.groups.iter_mut().find(|g| g.id == id).unwrap();
+                if !name.is_empty() {
+                    g.name = name;
+                }
+                if let Some(members) = members {
+                    g.members = members;
+                }
+                if let Some(strategy) = strategy {
+                    g.strategy = strategy;
+                }
+            } else {
+                registry.groups.push(sbctl::nodes::Group {
+                    id: sbctl::nodes::new_id(),
+                    name,
+                    members: members.unwrap_or_default(),
+                    strategy: strategy.unwrap_or_default(),
+                });
+            }
+            Ok(true)
+        });
+        pause_menu();
+    }
+}
+fn managed_mode_menu(root: &Path) {
+    managed_edit(root, |_, registry| {
+        println!("1. sing-box\n2. Xray\n3. 双内核\n0. 返回");
+        let mode = match read_menu_choice("运行模式: ").as_deref() {
+            Some("1") => sbctl::nodes::Mode::SingBox,
+            Some("2") => sbctl::nodes::Mode::Xray,
+            Some("3") => sbctl::nodes::Mode::Dual,
+            _ => return Ok(false),
+        };
+        for n in registry
+            .nodes
+            .iter()
+            .filter(|n| n.enabled && !mode.allows(n.core))
+        {
+            println!("受影响：{} · {} · {}", n.id, n.name, n.preset());
+        }
+        let Some(disable) = read_menu_choice("需停用的节点 ID，逗号分隔（回车仅迁移兼容节点）: ")
+        else {
+            return Ok(false);
+        };
+        registry.switch(
+            mode,
+            &disable
+                .split(',')
+                .filter(|s| !s.trim().is_empty())
+                .map(|s| s.trim().to_owned())
+                .collect::<Vec<_>>(),
+        )?;
+        Ok(true)
+    });
+}
+fn managed_links_menu(root: &Path) {
+    let result = (|| -> sbctl::nodes::Result<()> {
+        let (config, registry) = crate::cli::commands::managed::draft(root)?;
+        println!("1. sing-box\n2. Mihomo / Clash\n3. Shadowrocket\n4. V2rayN / 通用 URI\n0. 返回");
+        let format = match read_menu_choice("客户端: ").as_deref() {
+            Some("1") => {
+                println!("0. 已固定的完整配置");
+                let profiles = sbctl::subscription::all_sing_box_version_profiles();
+                for (i, p) in profiles.iter().enumerate() {
+                    println!("{}. sing-box {}", i + 1, p.version);
+                }
+                let Some(v) = read_menu_choice("目标版本 [0]: ") else {
+                    return Ok(());
+                };
+                if v.is_empty() || v == "0" {
+                    sbctl::subscription::SubscriptionFormat::SingBoxFull
+                } else {
+                    let p = v
+                        .parse::<usize>()
+                        .ok()
+                        .and_then(|i| i.checked_sub(1))
+                        .and_then(|i| profiles.get(i))
+                        .ok_or_else(|| sbctl::nodes::Error("版本编号无效".into()))?;
+                    sbctl::subscription::SubscriptionFormat::SingBoxVersion(p.version)
+                }
+            }
+            Some("2") => sbctl::subscription::SubscriptionFormat::Clash,
+            Some("3") => sbctl::subscription::SubscriptionFormat::Shadowrocket,
+            Some("4") => sbctl::subscription::SubscriptionFormat::Base64Uri,
+            _ => return Ok(()),
+        };
+        let group = match read_menu_choice("范围：0 全量 / 1 选择节点组 [0]: ").as_deref()
+        {
+            Some("1") => {
+                let Some(id) = select_managed_group(&registry) else {
+                    return Ok(());
+                };
+                Some(id)
+            }
+            Some("0" | "") => None,
+            _ => return Ok(()),
+        };
+        println!("0. 默认订阅凭据");
+        let credentials: Vec<_> = config
+            .subscription_credentials
+            .iter()
+            .filter(|c| c.is_active(chrono::Utc::now().timestamp()))
+            .collect();
+        for (i, c) in credentials.iter().enumerate() {
+            println!("{}. {}", i + 1, c.name);
+        }
+        let Some(v) = read_menu_choice("设备凭据 [0]: ") else {
+            return Ok(());
+        };
+        let name = if v.is_empty() || v == "0" {
+            None
+        } else {
+            Some(
+                credentials
+                    .get(
+                        v.parse::<usize>()
+                            .ok()
+                            .and_then(|i| i.checked_sub(1))
+                            .ok_or_else(|| sbctl::nodes::Error("凭据编号无效".into()))?,
+                    )
+                    .ok_or_else(|| sbctl::nodes::Error("凭据编号无效".into()))?
+                    .name
+                    .as_str(),
+            )
+        };
+        if confirm_menu_action("显示订阅链接和二维码？其中包含订阅凭据") {
+            if root.join(sbctl::deployment::CURRENT).exists() {
+                crate::cli::commands::managed::links(
+                    root,
+                    &config,
+                    group.as_deref(),
+                    Some(format),
+                    name,
+                    true,
+                )?;
+            } else {
+                println!("现有部署尚未迁移，显示原全量订阅：");
+                print_subscription_urls(root, Some(format));
+            }
+        }
+        Ok(())
+    })();
+    if let Err(error) = result {
+        eprintln!("订阅获取失败：{error}");
+    }
 }
 fn menu_rule_kind(include_filter: bool) -> Option<CliRuleKind> {
     println!(

@@ -53,6 +53,48 @@ pub(crate) fn print_subscription_urls(
     root: &Path,
     format: Option<sbctl::subscription::SubscriptionFormat>,
 ) -> ExitCode {
+    if root.join(sbctl::deployment::CURRENT).exists() {
+        if let Some(format) = format {
+            let result = (|| -> sbctl::nodes::Result<String> {
+                let store = sbctl::config::DeploymentStore::new(root);
+                let config = store.load()?;
+                let generation = sbctl::deployment::current(root)?
+                    .ok_or_else(|| sbctl::nodes::Error("缺少订阅批次".into()))?;
+                if !generation
+                    .files
+                    .iter()
+                    .any(|n| n == format.artifact_name().as_ref())
+                {
+                    return Err(sbctl::nodes::Error("此格式没有兼容节点".into()));
+                }
+                sbctl::subscription::managed::format_url(
+                    &config,
+                    &config.subscription_credential,
+                    format,
+                )
+                .map_err(|e| sbctl::nodes::Error(e.to_string()))
+            })();
+            return match result {
+                Ok(url) => {
+                    println!("{url}");
+                    ExitCode::SUCCESS
+                }
+                Err(e) => {
+                    eprintln!("订阅链接不可用：{e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        return crate::cli::commands::managed::group(
+            root,
+            crate::cli::args::GroupCommand::Links {
+                id: None,
+                format,
+                credential_name: None,
+                qr: false,
+            },
+        );
+    }
     use sbctl::subscription::SubscriptionRoute;
     let store = sbctl::config::DeploymentStore::new(root);
     let result = store.load().and_then(|config| {
@@ -125,6 +167,21 @@ pub(crate) fn print_subscription_qr(
     format: Option<sbctl::subscription::SubscriptionFormat>,
     all: bool,
 ) -> ExitCode {
+    if root.join(sbctl::deployment::CURRENT).exists() {
+        return crate::cli::commands::managed::group(
+            root,
+            crate::cli::args::GroupCommand::Links {
+                id: None,
+                format: if all {
+                    None
+                } else {
+                    Some(format.unwrap_or(sbctl::subscription::SubscriptionFormat::SingBoxFull))
+                },
+                credential_name: None,
+                qr: true,
+            },
+        );
+    }
     use sbctl::subscription::SubscriptionFormat;
     let store = sbctl::config::DeploymentStore::new(root);
     let result = store.load().and_then(|config| {

@@ -124,6 +124,10 @@ const CERTBOT_DEPLOY_HOOK_MARKER: &str = "sbctl-managed Direct HTTPS certificate
 const CERTIFICATE_GROUP: &str = crate::certificate::CERTIFICATE_GROUP;
 
 const BACKED_UP_PATHS: &[&str] = &[
+    "etc/sbctl/nodes.json",
+    "etc/sbctl/protocol-presets.json",
+    "etc/sbctl-xray/config.json",
+    "etc/systemd/system/sbctl-xray.service",
     "etc/sbctl/config.toml",
     crate::email::CONFIG_PATH,
     "var/lib/sbctl/email-state.json",
@@ -290,6 +294,11 @@ pub fn restart_sing_box_service(root: &Path) -> Result<(), String> {
 }
 
 pub fn remove_managed_sing_box(root: &Path) -> Result<(), String> {
+    if let Some(registry) = crate::nodes::read_optional(root).map_err(|e| e.to_string())?
+        && registry.mode.allows(crate::core::CoreKind::SingBox)
+    {
+        return Err("请先切换到 Xray 单内核模式，再移除 sing-box".into());
+    }
     if !unit_has_marker(root, SING_BOX_UNIT, SING_BOX_UNIT_MARKER).map_err(|error| {
         format!("certificate published but data-plane unit check failed: {error}")
     })? {
@@ -306,7 +315,7 @@ pub fn start_services(root: &Path, direct: bool) -> Result<(), String> {
     prepare_daemon_storage(root, direct)?;
     systemctl(root, &["daemon-reload"])?;
     let mut arguments = vec!["enable", "--now"];
-    arguments.extend(managed_units(direct));
+    arguments.extend(deployment_units(root, direct)?);
     systemctl(root, &arguments)
 }
 
@@ -340,7 +349,7 @@ fn managed_units(direct: bool) -> Vec<&'static str> {
 /// immediately fails keeps the installation rolled back instead of leaving a
 /// misleading deployment.
 pub fn check_service_health(root: &Path, direct: bool) -> Result<(), String> {
-    for unit in managed_units(direct) {
+    for unit in deployment_units(root, direct)? {
         wait_for_stable_activation(root, unit)?;
     }
     // Direct mode reaches the subscription through the socket-activated
@@ -352,6 +361,30 @@ pub fn check_service_health(root: &Path, direct: bool) -> Result<(), String> {
         trigger_direct_socket()?;
     }
     Ok(())
+}
+
+fn deployment_units(root: &Path, direct: bool) -> Result<Vec<&'static str>, String> {
+    if let Some(cores) = managed_kernel_units(root)? {
+        let mut units = cores;
+        units.extend(["sbctl.service", "sbctl-accounting-reset.timer"]);
+        if direct {
+            units.push("sbctl-http.socket");
+        }
+        Ok(units)
+    } else {
+        Ok(managed_units(direct))
+    }
+}
+fn managed_kernel_units(root: &Path) -> Result<Option<Vec<&'static str>>, String> {
+    Ok(crate::nodes::read_optional(root)
+        .map_err(|e| e.to_string())?
+        .map(|r| {
+            [crate::core::CoreKind::SingBox, crate::core::CoreKind::Xray]
+                .into_iter()
+                .filter(|c| r.mode.allows(*c))
+                .map(crate::deployment::unit)
+                .collect()
+        }))
 }
 
 /// Probes a unit repeatedly and fails if it is ever seen not active.
@@ -992,7 +1025,30 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
         return Err("no sbctl-managed deployment configuration was found".to_owned());
     }
 
+    let xray_unit = "etc/systemd/system/sbctl-xray.service";
+    let xray_owned = unit_has_marker(root, xray_unit, "managed by sbctl")?
+        || unit_has_marker(root, xray_unit, "sbctl managed protocol companion")?;
+    if root.join(xray_unit).exists() && !xray_owned {
+        return Err("sbctl-xray.service 不属于本工具，拒绝卸载或清理".into());
+    }
     let backup = (!purge).then(|| backup_persistent_data(root)).transpose()?;
+    if xray_owned {
+        systemctl(root, &["disable", "--now", "sbctl-xray.service"])?;
+        remove_file_if_present(&root.join(xray_unit))?;
+        remove_file_if_present(&root.join("usr/local/bin/sbctl-xray"))?;
+        if purge {
+            remove_file_if_present(&root.join("etc/sbctl-xray/config.json"))?;
+            remove_empty_directory_if_present(&root.join("etc/sbctl-xray"))?;
+        }
+    }
+    if unit_has_marker(
+        root,
+        "etc/systemd/system/sbctl-recover.service",
+        "managed by sbctl",
+    )? {
+        systemctl(root, &["disable", "--now", "sbctl-recover.service"])?;
+        remove_file_if_present(&root.join("etc/systemd/system/sbctl-recover.service"))?;
+    }
     check_optional_units(root, &[EMAIL_UNIT, EMAIL_TIMER], EMAIL_MARKER)?;
     check_optional_units(
         root,
@@ -1052,6 +1108,8 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
             remove_empty_directory_if_present(&root.join("etc/sing-box"))?;
         }
         remove_file_if_present(&root.join("etc/sbctl/config.toml"))?;
+        remove_file_if_present(&root.join(crate::nodes::SOURCE))?;
+        remove_file_if_present(&root.join("etc/sbctl/protocol-presets.json"))?;
         remove_file_if_present(&root.join(crate::email::CONFIG_PATH))?;
         remove_directory_if_present(&root.join("var/lib/sbctl"))?;
         // The uninstall menu double-confirmation promises that --purge deletes
@@ -1124,6 +1182,38 @@ fn unit_has_marker(root: &Path, relative: &str, marker: &str) -> Result<bool, St
 /// Directory publication replaces sing-box's watched inode. Only the managed
 /// data plane needs refreshing; try-restart preserves an administrator's stop.
 pub fn refresh_certificate_consumer(root: &Path) -> Result<(), String> {
+    if let Some(registry) = crate::nodes::read_optional(root).map_err(|e| e.to_string())? {
+        if DeploymentStore::new(root)
+            .load()
+            .map_err(|e| e.to_string())?
+            .certificate_mode
+            != crate::config::CertificateMode::Domain
+        {
+            return Ok(());
+        }
+        for core in [crate::core::CoreKind::SingBox, crate::core::CoreKind::Xray] {
+            let consumes = registry.nodes.iter().any(|n| {
+                n.enabled
+                    && n.core == core
+                    && match &n.data {
+                        crate::nodes::Data::Legacy(
+                            crate::canonical::CanonicalNode::VlessReality { .. },
+                        ) => false,
+                        crate::nodes::Data::Combination(p) => !p.preset.is_reality(),
+                        _ => true,
+                    }
+            });
+            if !consumes {
+                continue;
+            }
+            let relative = format!("etc/systemd/system/{}", crate::deployment::unit(core));
+            if !unit_has_marker(root, &relative, "managed by sbctl")? {
+                return Err("证书消费内核服务不属于 sbctl，拒绝重启".into());
+            }
+            systemctl(root, &["try-restart", crate::deployment::unit(core)])?;
+        }
+        return Ok(());
+    }
     if !root.join(OWNERSHIP_MARKER).is_file() {
         return Ok(());
     }
@@ -1138,14 +1228,21 @@ pub fn refresh_certificate_consumer(root: &Path) -> Result<(), String> {
 }
 
 pub fn restart_services(root: &Path) -> Result<(), String> {
-    reconcile_sing_box_unit(root)?;
+    let cores = managed_kernel_units(root)?;
+    if cores.is_none() {
+        reconcile_sing_box_unit(root)?;
+    }
     migrate_credential_rotate_service(root)?;
     // Isolated deployment roots used by CLI tests and image builders do not
     // control the host's systemd units or sockets. Keep their historical
     // service-command behavior; socket reconciliation is for the live host.
     if root != Path::new("/") {
-        systemctl(root, &["restart", "sing-box.service", "sbctl.service"])?;
-        for unit in ["sing-box.service", "sbctl.service"] {
+        let mut units = cores.unwrap_or_else(|| vec!["sing-box.service"]);
+        units.push("sbctl.service");
+        let mut args = vec!["restart"];
+        args.extend(units.iter().copied());
+        systemctl(root, &args)?;
+        for unit in units {
             wait_for_stable_activation(root, unit)?;
         }
         return Ok(());
@@ -1159,7 +1256,10 @@ pub fn restart_services(root: &Path) -> Result<(), String> {
         })?;
     reconcile_subscription_units(root, direct)?;
 
-    systemctl(root, &["restart", "sing-box.service"])?;
+    let cores = cores.unwrap_or_else(|| vec!["sing-box.service"]);
+    for core in &cores {
+        systemctl(root, &["restart", core])?;
+    }
     if direct {
         // A socket-activated service must be started by a connection to its
         // socket. `systemctl restart sbctl.service` starts it without LISTEN_FDS,
@@ -1176,7 +1276,8 @@ pub fn restart_services(root: &Path) -> Result<(), String> {
     // A configuration change has to survive the same observation window as an
     // install, or the caller's rollback never triggers for a daemon that dies
     // just after `restart` returned.
-    let mut health_units = vec!["sing-box.service", "sbctl.service"];
+    let mut health_units = cores;
+    health_units.push("sbctl.service");
     if direct {
         health_units.push("sbctl-http.socket");
     }
@@ -1184,6 +1285,25 @@ pub fn restart_services(root: &Path) -> Result<(), String> {
         wait_for_stable_activation(root, unit)?;
     }
     Ok(())
+}
+
+pub fn restart_subscription_service(root: &Path) -> Result<(), String> {
+    if root != Path::new("/") {
+        return Ok(());
+    }
+    let config = DeploymentStore::new(root)
+        .load()
+        .map_err(|e| e.to_string())?;
+    let direct = config.subscription_mode == crate::config::SubscriptionMode::Direct;
+    reconcile_subscription_units(root, direct)?;
+    if direct {
+        systemctl(root, &["stop", "sbctl.service"])?;
+        systemctl(root, &["enable", "--now", "sbctl-http.socket"])?;
+        trigger_direct_socket()?;
+    } else {
+        systemctl(root, &["restart", "sbctl.service"])?;
+    }
+    wait_for_stable_activation(root, "sbctl.service")
 }
 
 /// Keeps the generated service/socket units in step with the committed
@@ -1287,7 +1407,19 @@ fn trigger_direct_socket() -> Result<(), String> {
         match TcpStream::connect_timeout(&address, timeout) {
             Ok(stream) => {
                 drop(stream);
-                return Ok(());
+                // connect() can complete before systemd has dispatched the
+                // socket activation job. In particular an HTTP-only restart
+                // has no core health window to mask that scheduling race.
+                for _ in 0..30 {
+                    if systemctl(Path::new("/"), &["is-active", "--quiet", "sbctl.service"]).is_ok()
+                    {
+                        return Ok(());
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                return Err(
+                    "sbctl HTTP socket activation did not complete within 3 seconds".into(),
+                );
             }
             Err(error) => last_error = Some(error),
         }
@@ -1299,21 +1431,25 @@ fn trigger_direct_socket() -> Result<(), String> {
 }
 
 pub fn service_status_entries(root: &Path) -> Vec<(&'static str, String)> {
-    [
+    let mut units = vec![
         "sing-box.service",
         "sbctl.service",
         "sbctl-http.socket",
         "sbctl-accounting-reset.timer",
-    ]
-    .into_iter()
-    .map(|unit| {
-        let state = match systemctl(root, &["is-active", "--quiet", unit]) {
-            Ok(()) => "active".to_owned(),
-            Err(_) => "inactive or unavailable".to_owned(),
-        };
-        (unit, state)
-    })
-    .collect()
+    ];
+    if root.join("etc/systemd/system/sbctl-xray.service").exists() {
+        units.push("sbctl-xray.service");
+    }
+    units
+        .into_iter()
+        .map(|unit| {
+            let state = match systemctl(root, &["is-active", "--quiet", unit]) {
+                Ok(()) => "active".to_owned(),
+                Err(_) => "inactive or unavailable".to_owned(),
+            };
+            (unit, state)
+        })
+        .collect()
 }
 
 pub fn service_status(root: &Path) -> String {
@@ -1621,6 +1757,9 @@ pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
         "var/lib/sbctl/ownership",
         "var/lib/sbctl/.operation.lock",
         "var/lib/sbctl/email-state.json",
+        "etc/sbctl/nodes.json",
+        "etc/sbctl/protocol-presets.json",
+        "var/lib/sbctl/current-generation.json",
     ] {
         let path = root.join(relative);
         if path.exists() {
@@ -1641,6 +1780,29 @@ pub fn prepare_daemon_storage(root: &Path, direct: bool) -> Result<(), String> {
                     .map_err(|e| e.to_string())?;
             }
         }
+    }
+    if let Some(registry) = crate::nodes::read_optional(root).map_err(|e| e.to_string())? {
+        for core in [crate::core::CoreKind::SingBox, crate::core::CoreKind::Xray] {
+            if !registry.mode.allows(core) {
+                continue;
+            }
+            let path = root.join(crate::deployment::active(core));
+            if let Some(parent) = path.parent()
+                && parent.exists()
+            {
+                crate::config::set_owner_mode_no_follow(root, parent, "root:sing-box", 0o750)
+                    .map_err(|e| e.to_string())?;
+            }
+            if path.exists() {
+                crate::config::enforce_live_file_owner(root, &path).map_err(|e| e.to_string())?;
+            }
+        }
+        if direct {
+            grant_certificate_storage(root)?;
+        } else {
+            grant_self_signed_certificate_access(root)?;
+        }
+        return Ok(());
     }
     // The /etc/sing-box directory is created private (0700 root:root). The
     // sing-box data plane runs as its own account, so grant that group

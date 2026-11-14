@@ -1,5 +1,7 @@
 # sbctl
 
+`dev` 新增统一节点、多实例节点组和 sing-box/Xray 三种运行模式；使用与迁移步骤见[统一节点与双内核管理](docs/managed-deployment.md)。
+
 `sbctl` 是 Debian/Ubuntu VPS 上的 sing-box 服务端管理工具，支持 VLESS Reality、VMess WebSocket、Hysteria 2、TUIC 和 AnyTLS，并生成 sing-box、Clash/Mihomo、Shadowrocket 和 URI 私有订阅。
 
 支持 Direct HTTPS、外部反向代理和 IP fallback 三种订阅模式，提供证书管理、流量统计、命名订阅凭据及签名更新。

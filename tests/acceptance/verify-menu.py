@@ -61,8 +61,8 @@ class Menu:
     def choose(self, number, expected):
         self.send(str(number))
         if expected in {
-            "概览与诊断", "部署与协议", "订阅与客户端", "流量与通知",
-            "服务与更新", "高级与维护", "主菜单",
+            "概览与诊断", "节点与组合", "节点组与订阅", "流量与通知",
+            "内核与运行模式", "高级与维护", "主菜单",
         }:
             expected = f"=== {expected} ==="
         text = self.wait(expected)
@@ -150,7 +150,7 @@ def navigation_and_deployment_visibility():
         root = Path(temp)
         menu = Menu(root)
         for number, title in enumerate(
-            ["概览与诊断", "部署与协议", "订阅与客户端", "流量与通知", "服务与更新", "高级与维护"], 1
+            ["概览与诊断", "节点与组合", "节点组与订阅", "内核与运行模式", "流量与通知", "高级与维护"], 1
         ):
             text = menu.choose(number, title)
             if number == 2:
@@ -165,7 +165,7 @@ def navigation_and_deployment_visibility():
 
         initialize(root)
         menu = Menu(root)
-        text = menu.choose(2, "部署与协议")
+        text = menu.choose(2, "节点与组合")
         assert "快速安装（默认五协议" not in text and "引导安装" not in text, "deployed root must hide fresh-install choices"
         menu.close()
     print("PASS menu navigation, invalid input, and deployment-aware choices", flush=True)
@@ -180,8 +180,8 @@ def template_paths():
         install_checker(root)
         original = snapshot(root)
         menu = Menu(root)
-        menu.choose(3, "订阅与客户端")
-        menu.choose(1, "客户端内容模板")
+        menu.choose(3, "节点组与订阅")
+        menu.choose(3, "客户端内容模板")
         menu.send("1")
         menu.wait("确认应用以上配置")
         menu.send("n")
@@ -192,8 +192,8 @@ def template_paths():
         menu.close()
 
         menu = Menu(root)
-        menu.choose(3, "订阅与客户端")
-        menu.choose(1, "客户端内容模板")
+        menu.choose(3, "节点组与订阅")
+        menu.choose(3, "客户端内容模板")
         menu.send("1")
         menu.wait("确认应用以上配置")
         menu.send("y")
@@ -218,8 +218,8 @@ def template_paths():
         )
         before = snapshot(root)
         menu = Menu(root)
-        menu.choose(3, "订阅与客户端")
-        menu.choose(1, "客户端内容模板")
+        menu.choose(3, "节点组与订阅")
+        menu.choose(3, "客户端内容模板")
         menu.send("1")
         menu.wait("确认应用以上配置")
         menu.send("y")
@@ -241,7 +241,7 @@ def damaged_configuration_and_read_only_diagnosis():
         contents = f'subscription_credential = "{secret}" unexpected\n'
         config.write_text(contents, encoding="utf-8")
         menu = Menu(root)
-        text = menu.choose(2, "部署与协议")
+        text = menu.choose(2, "节点与组合")
         assert "状态: 配置不可用" in text
         assert "状态: 未安装" not in text
         assert "快速安装（默认五协议" not in text and "引导安装" not in text
@@ -315,8 +315,8 @@ def refused_confirmations():
         menu = Menu(root)
 
         # Default credential rotation.
-        menu.choose(3, "订阅与客户端")
-        menu.choose(5, "确认轮换默认订阅凭据")
+        menu.choose(3, "节点组与订阅")
+        menu.choose(7, "确认轮换默认订阅凭据")
         menu.send("maybe")
         menu.wait("请输入 1 / 是 或 2 / 否")
         menu.send("否")
@@ -336,8 +336,8 @@ def refused_confirmations():
         menu.wait("=== 主菜单 ===")
 
         # Restart and reinstall are refused before any service operation.
-        menu.choose(5, "服务与更新")
-        menu.choose(1, "确认校验配置并重启服务")
+        menu.choose(4, "内核与运行模式")
+        menu.choose(6, "确认校验配置并重启服务")
         menu.send("n")
         menu.pause()
         menu.send("0")
@@ -370,9 +370,10 @@ def refused_confirmations():
     print("PASS refused rotation, restart, reinstall, uninstall, and double-confirm purge", flush=True)
 
 
-navigation_and_deployment_visibility()
-template_paths()
-damaged_configuration_and_read_only_diagnosis()
-signed_mrs_registration_keeps_the_behavior_prompt()
-refused_confirmations()
-print("PASS all menu acceptance checks", flush=True)
+if __name__ == '__main__':
+    navigation_and_deployment_visibility()
+    template_paths()
+    damaged_configuration_and_read_only_diagnosis()
+    signed_mrs_registration_keeps_the_behavior_prompt()
+    refused_confirmations()
+    print("PASS all menu acceptance checks", flush=True)

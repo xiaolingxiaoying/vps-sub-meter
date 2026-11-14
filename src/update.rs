@@ -726,6 +726,13 @@ pub fn apply(
     sbctl_candidate: &Path,
     sing_box_candidate: &Path,
 ) -> Result<PathBuf, UpdateError> {
+    if crate::nodes::read_optional(store.root())
+        .map_err(|e| UpdateError::Operation(e.to_string()))?
+        .is_some()
+    {
+        apply_manager(store, manifest, sbctl_candidate)?;
+        return Ok(store.root().join("var/lib/sbctl/deployment-rollback.json"));
+    }
     verify_trusted(manifest)?;
     // Read each candidate exactly once and verify the in-memory bytes, so the
     // installed binary is the very buffer that was hashed — no window for the
@@ -783,6 +790,19 @@ pub fn apply(
     // Ensure the loaded configuration was valid before acknowledging the update.
     config.validate()?;
     Ok(rollback)
+}
+
+pub fn apply_manager(
+    store: &DeploymentStore,
+    manifest: &ReleaseManifest,
+    candidate: &Path,
+) -> Result<(), UpdateError> {
+    verify_trusted(manifest)?;
+    let contents = read_verified_artifact("sbctl", candidate, &manifest.sbctl.sha256)?;
+    check_sbctl_candidate(candidate)?;
+    let _lock = store.acquire_operation_lock()?;
+    crate::deployment::install_manager_locked(store, candidate, &contents)
+        .map_err(|e| UpdateError::Operation(e.to_string()))
 }
 
 struct BackupEntry {

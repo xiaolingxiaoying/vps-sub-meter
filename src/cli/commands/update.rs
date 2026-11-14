@@ -7,6 +7,32 @@ use std::path::Path;
 use std::process::ExitCode;
 
 pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
+    if root.join(sbctl::nodes::SOURCE).exists() {
+        match command {
+            SingBoxCommand::Fetch { version, .. } => {
+                return crate::cli::commands::managed::core(
+                    root,
+                    crate::cli::args::CoreCommand::Install {
+                        core: sbctl::core::CoreKind::SingBox,
+                        version,
+                    },
+                );
+            }
+            SingBoxCommand::Update {
+                manifest: None,
+                artifact: None,
+            } => {
+                return crate::cli::commands::managed::core(
+                    root,
+                    crate::cli::args::CoreCommand::Update {
+                        core: sbctl::core::CoreKind::SingBox,
+                        version: None,
+                    },
+                );
+            }
+            _ => {}
+        }
+    }
     let result = match command {
         SingBoxCommand::PortHoppingFirewall { cleanup } => {
             sbctl::port_hopping::apply_firewall(root, cleanup)
@@ -504,6 +530,15 @@ fn update_impl(
             artifact
         }
     };
+    if root.join(sbctl::nodes::SOURCE).exists() {
+        sbctl::update::apply_manager(
+            &sbctl::config::DeploymentStore::new(root),
+            &manifest,
+            &sbctl_artifact,
+        )?;
+        drop(sbctl_guard);
+        return Ok("sbctl 已独立更新；sing-box / Xray 内核及订阅凭据保持不变".into());
+    }
     let sing_box_artifact = match sing_box_artifact {
         Some(path) => path.to_path_buf(),
         None => {

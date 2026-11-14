@@ -5,6 +5,7 @@ mod baseline;
 mod clash;
 mod singbox;
 mod uri;
+pub(crate) use singbox::existing_certificate_tls_config;
 
 // The refresh-interval parser is shared: the clash renderer converts it to
 // seconds for `interval:`, and the CLI validates an operator's answer with the

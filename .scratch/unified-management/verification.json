@@ -1,0 +1,317 @@
+{
+  "migration_uri_bytes_preserved": true,
+  "node_count": 9,
+  "mode": "dual",
+  "old_subscription_identity_preserved": true,
+  "private_source_unreadable_by_http_user": true,
+  "client_generation_excludes_servers": true,
+  "index_status": 200,
+  "xray_independent_unit": true,
+  "initial_real_forwarding": [
+    {
+      "id": "sbctl-vless-reality",
+      "passed": true
+    },
+    {
+      "id": "sbctl-vmess-websocket",
+      "passed": true
+    },
+    {
+      "id": "sbctl-hysteria2",
+      "passed": true
+    },
+    {
+      "id": "sbctl-tuic",
+      "passed": true
+    },
+    {
+      "id": "sbctl-anytls",
+      "passed": true
+    },
+    {
+      "id": "legacy-xray-0",
+      "passed": true
+    },
+    {
+      "id": "legacy-xray-1",
+      "passed": true
+    },
+    {
+      "id": "legacy-xray-2",
+      "passed": true
+    },
+    {
+      "id": "legacy-xray-3",
+      "passed": true
+    }
+  ],
+  "mode_transitions": [
+    "sing-box",
+    "xray",
+    "dual",
+    "xray",
+    "sing-box",
+    "dual"
+  ],
+  "http_pid_unchanged_across_modes": true,
+  "startup_failure_rolled_back": true,
+  "interrupted_apply_recovered": true,
+  "boot_recovery_hook_recovered": true,
+  "final_xray_only_probes": [
+    {
+      "id": "sbctl-vless-reality",
+      "client": "default",
+      "result": {
+        "id": "sbctl-vless-reality",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.671787
+      }
+    },
+    {
+      "id": "sbctl-vmess-websocket",
+      "client": "default",
+      "result": {
+        "id": "sbctl-vmess-websocket",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.310098
+      }
+    },
+    {
+      "id": "legacy-xray-0",
+      "client": "default",
+      "result": {
+        "id": "legacy-xray-0",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.643106
+      }
+    },
+    {
+      "id": "legacy-xray-1",
+      "client": "default",
+      "result": {
+        "id": "legacy-xray-1",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.358858
+      }
+    },
+    {
+      "id": "legacy-xray-2",
+      "client": "default",
+      "result": {
+        "id": "legacy-xray-2",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.283713
+      }
+    },
+    {
+      "id": "legacy-xray-3",
+      "client": "default",
+      "result": {
+        "id": "legacy-xray-3",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.273994
+      }
+    },
+    {
+      "id": "sbctl-vmess-websocket",
+      "client": "xray-explicit",
+      "result": {
+        "id": "sbctl-vmess-websocket",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.275151
+      }
+    }
+  ],
+  "final_dual_probes": [
+    {
+      "id": "sbctl-vless-reality",
+      "result": {
+        "id": "sbctl-vless-reality",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.526676
+      }
+    },
+    {
+      "id": "sbctl-vmess-websocket",
+      "result": {
+        "id": "sbctl-vmess-websocket",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.224754
+      }
+    },
+    {
+      "id": "sbctl-hysteria2",
+      "result": {
+        "id": "sbctl-hysteria2",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.30675
+      }
+    },
+    {
+      "id": "sbctl-tuic",
+      "result": {
+        "id": "sbctl-tuic",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.260489
+      }
+    },
+    {
+      "id": "sbctl-anytls",
+      "result": {
+        "id": "sbctl-anytls",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.319624
+      }
+    },
+    {
+      "id": "legacy-xray-0",
+      "result": {
+        "id": "legacy-xray-0",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.485997
+      }
+    },
+    {
+      "id": "legacy-xray-1",
+      "result": {
+        "id": "legacy-xray-1",
+        "core": "xray",
+        "http_status": 204,
+        "time_seconds": 0.318169
+      }
+    },
+    {
+      "id": "legacy-xray-2",
+      "result": {
+        "id": "legacy-xray-2",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.275103
+      }
+    },
+    {
+      "id": "legacy-xray-3",
+      "result": {
+        "id": "legacy-xray-3",
+        "core": "sing-box",
+        "http_status": 204,
+        "time_seconds": 0.26683
+      }
+    }
+  ],
+  "final_manager_sha256": "c82c55556002e502c5209c6a9cf91ae96b97158c9bacb6c0c907a5ef4a50199e",
+  "final_mode": "dual",
+  "group_routes_head_qr_rename_compatible_filter": true,
+  "named_credential_rotation_revocation_survives_rollback": true,
+  "credential_and_group_changes_keep_core_pids": true,
+  "runtime_templates_validated_without_core_restart": true,
+  "occupied_port_rejected_before_activation": true,
+  "udp_payload_forwarding": [
+    {
+      "id": "sbctl-hysteria2",
+      "udp_echo": true
+    },
+    {
+      "id": "sbctl-tuic",
+      "udp_echo": true
+    }
+  ],
+  "final_groups": [
+    {
+      "name": "\u5e38\u7528",
+      "members": 7,
+      "strategy": "urltest"
+    },
+    {
+      "name": "XHTTP",
+      "members": 2,
+      "strategy": "select"
+    }
+  ],
+  "final_original_node_and_link_identity_preserved": true,
+  "final_share_tls_flags_added_for_self_signed": 3,
+  "final_fault_recovery_retest": true,
+  "final_services": {
+    "sing-box.service": "active",
+    "sbctl-xray.service": "active",
+    "sbctl.service": "active"
+  },
+  "tested_os": "Ubuntu 22.04.5 LTS",
+  "real_machine_reboot_recovered_pending_transaction": true,
+  "post_boot_services": {
+    "sing-box.service": "active",
+    "sbctl-xray.service": "active",
+    "sbctl.service": "active",
+    "sbctl-recover.service": "active"
+  },
+  "official_xray_install_verified_and_sing_box_pid_unchanged": true,
+  "final_candidate_all_nodes_http204": [
+    {
+      "id": "sbctl-vless-reality",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.527501
+    },
+    {
+      "id": "sbctl-vmess-websocket",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.276001
+    },
+    {
+      "id": "sbctl-hysteria2",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.29898
+    },
+    {
+      "id": "sbctl-tuic",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.232103
+    },
+    {
+      "id": "sbctl-anytls",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.272908
+    },
+    {
+      "id": "legacy-xray-0",
+      "core": "xray",
+      "http_status": 204,
+      "time_seconds": 0.489717
+    },
+    {
+      "id": "legacy-xray-1",
+      "core": "xray",
+      "http_status": 204,
+      "time_seconds": 0.319648
+    },
+    {
+      "id": "legacy-xray-2",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.272031
+    },
+    {
+      "id": "legacy-xray-3",
+      "core": "sing-box",
+      "http_status": 204,
+      "time_seconds": 0.230875
+    }
+  ]
+}

@@ -2092,9 +2092,12 @@ pub(crate) fn set_open_file_owner_mode(
 /// its own policy instead.
 fn managed_ownership(relative: &str) -> (&'static str, &'static str, u32) {
     match relative {
-        "etc/sbctl/email.toml" | "var/lib/sbctl/email-state.json" => {
-            ("root", "root:root", 0o600u32)
-        }
+        "etc/sbctl/email.toml"
+        | "var/lib/sbctl/email-state.json"
+        | "etc/sbctl/nodes.json"
+        | "etc/sbctl/protocol-presets.json"
+        | "var/lib/sbctl/deployment-transaction.json"
+        | "var/lib/sbctl/deployment-rollback.json" => ("root", "root:root", 0o600u32),
         // A service with read access to a lock can hold flock and block root
         // certificate publication even though it cannot write certificate data.
         "var/lib/sbctl/certificates/.operation.lock" => ("root", "root:root", 0o600u32),
@@ -2104,11 +2107,16 @@ fn managed_ownership(relative: &str) -> (&'static str, &'static str, u32) {
             ("root", "root:root", 0o600u32)
         }
         "etc/sing-box/config.json" => ("sing-box", "sing-box:sing-box", 0o640u32),
+        "etc/sbctl-xray/config.json" => ("root", "root:sing-box", 0o640u32),
+        "var/lib/sbctl/current-generation.json" => ("root", "root:sbctl", 0o640u32),
+        _ if relative.starts_with("var/lib/sbctl/generations/") => ("root", "root:sbctl", 0o640u32),
         // The managed service binaries must stay root-owned and executable:
         // sbctl.service and sing-box.service run under their own accounts and
         // exec these paths, so treating them like state files (0600 sbctl:sbctl)
         // would leave every updated binary unexecutable and break the services.
-        "usr/local/bin/sbctl" | "usr/local/bin/sing-box" => ("root", "root:root", 0o755u32),
+        "usr/local/bin/sbctl" | "usr/local/bin/sing-box" | "usr/local/bin/sbctl-xray" => {
+            ("root", "root:root", 0o755u32)
+        }
         // systemd reads its units as root, so they are never delegated to a
         // service account: a restricted daemon must not own its own unit file.
         _ if relative.starts_with("etc/systemd/system/") => ("root", "root:root", 0o644u32),

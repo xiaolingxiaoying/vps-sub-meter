@@ -26,7 +26,7 @@ impl Preset {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Reality {
     pub private_key: String,
@@ -36,7 +36,7 @@ pub struct Reality {
 }
 
 /// Debug intentionally omitted: this document contains proxy credentials.
-#[derive(Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct Node {
     pub name: String,

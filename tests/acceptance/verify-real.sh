@@ -24,8 +24,9 @@ fake_sing_box="$work/sing-box"
 cat >"$fake_sing_box" <<'EOF'
 #!/bin/sh
 case "${1:-}" in
+  version) echo 'sing-box version 1.14.2' ;;
   check) exit 0 ;;
-  run) while :; do sleep 3600; done ;;
+  run) if grep -q '192.0.2.200' "$3"; then exit 23; fi; while :; do sleep 3600; done ;;
   *) exit 0 ;;
 esac
 EOF
@@ -183,6 +184,7 @@ test -f /etc/ufw/user.rules || {
   printf 'firewall\n' >/etc/ufw/user.rules
 }
 printf 'proxy\n' >/etc/nginx.conf
+SBCTL_MANAGED_SYSTEMD_TEST=1 python3 /usr/local/lib/sbctl-acceptance/verify-managed-systemd.py "$sbctl"
 $sbctl uninstall >/dev/null
 for unit in sbctl-credential-rotate.service sbctl-credential-rotate.timer; do
   test ! -e "/etc/systemd/system/$unit" || fail "uninstall left $unit"

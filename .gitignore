@@ -41,6 +41,8 @@ node_modules/
 
 # Local Linux artifacts built for the systemd acceptance suite (never committed).
 /.scratch/acceptance-bin/
+/.scratch/test-runtimes/
+/.scratch/managed-vps-private/
 # The pinned real cores used to validate each generated version profile:
 # ~200 MB of downloaded upstream binaries, reproducible from ci.yml's list.
 .scratch/sing-box-cores/

@@ -124,6 +124,55 @@ pub(crate) fn print_nodes(
     protocol: Option<sbctl::config::ManagedProtocol>,
     qr: bool,
 ) -> ExitCode {
+    if root.join(sbctl::nodes::SOURCE).is_file() {
+        if links {
+            let result = (|| -> sbctl::nodes::Result<()> {
+                let (config, registry) = super::managed::draft(root)?;
+                for node in registry.nodes.iter().filter(|n| n.enabled).filter(|n| {
+                    protocol
+                        .as_ref()
+                        .is_none_or(|p| n.preset() == p.to_string())
+                }) {
+                    println!(
+                        "{} · {} · {}:{}",
+                        node.name,
+                        node.core,
+                        node.listen,
+                        node.port()
+                    );
+                    let link = sbctl::subscription::managed::share_link(&config, node, false)
+                        .map_err(|e| sbctl::nodes::Error(e.to_string()))?;
+                    print!("{link}");
+                    if qr {
+                        print!(
+                            "{}",
+                            sbctl::qr::render_ansi(link.trim()).map_err(sbctl::nodes::Error)?
+                        );
+                    }
+                }
+                Ok(())
+            })();
+            return match result {
+                Ok(()) => ExitCode::SUCCESS,
+                Err(e) => {
+                    eprintln!("节点读取失败：{e}");
+                    ExitCode::from(2)
+                }
+            };
+        }
+        return super::managed::node(
+            root,
+            crate::cli::args::NodeCommand::List {
+                core: None,
+                preset: protocol.map(|p| p.to_string()),
+                group: None,
+                enabled: None,
+                json: false,
+                page: 1,
+                per_page: 20,
+            },
+        );
+    }
     match sbctl::config::DeploymentStore::new(root).load() {
         Ok(config) => {
             let protocol_name = protocol.as_ref().map(ToString::to_string);
@@ -189,6 +238,15 @@ pub(crate) fn print_status(root: &Path) -> ExitCode {
     match sbctl::config::DeploymentStore::new(root).load() {
         Ok(config) => {
             println!("{}", config.summary());
+            if root.join(sbctl::nodes::SOURCE).exists() {
+                match sbctl::deployment::status(root) {
+                    Ok(status) => println!(
+                        "\n托管内核状态:\n{}",
+                        serde_json::to_string_pretty(&status).unwrap()
+                    ),
+                    Err(e) => eprintln!("托管内核需要修复：{e}"),
+                }
+            }
             println!("\n{}", sbctl::lifecycle::service_status(root));
             if config.subscription_mode == sbctl::config::SubscriptionMode::Direct {
                 let status =
@@ -328,7 +386,7 @@ pub(crate) fn print_status_json(root: &Path) -> ExitCode {
             let kernel_version = super::config::resolve_sing_box_bin(root, None)
                 .and_then(|binary| sbctl::observe::kernel_version_string(&binary));
             let sing_box = sing_box_status_json(root);
-            let status = serde_json::json!({
+            let mut status = serde_json::json!({
                 "configured": true,
                 "mode": config.subscription_mode.to_string(),
                 "subscription_host": config.subscription_host,
@@ -350,6 +408,10 @@ pub(crate) fn print_status_json(root: &Path) -> ExitCode {
                 "sing_box": sing_box,
                 "kernel_version_warning": kernel_warning,
             });
+            if root.join(sbctl::nodes::SOURCE).exists() {
+                status["managed"] = sbctl::deployment::status(root)
+                    .unwrap_or_else(|e| serde_json::json!({"error":e.to_string()}));
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&status).expect("status JSON serializes")

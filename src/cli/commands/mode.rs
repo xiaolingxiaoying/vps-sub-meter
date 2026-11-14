@@ -78,6 +78,7 @@ fn desired(prior: &DeploymentConfig, options: &ModeOptions) -> Result<Deployment
 
 const UNITS: &[&str] = &[
     "sing-box.service",
+    "sbctl-xray.service",
     "sbctl.service",
     "sbctl-http.socket",
     "sbctl-accounting-reset.service",
@@ -138,11 +139,24 @@ impl Snapshot {
                 .filter(|&&name| {
                     matches!(
                         name,
-                        "sing-box.service" | "sbctl.service" | "sbctl-http.socket"
+                        "sing-box.service"
+                            | "sbctl-xray.service"
+                            | "sbctl.service"
+                            | "sbctl-http.socket"
                     )
                 })
                 .map(|unit| format!("etc/systemd/system/{unit}")),
         );
+        if root.join(sbctl::nodes::SOURCE).exists() {
+            paths.extend(
+                [
+                    sbctl::nodes::SOURCE,
+                    sbctl::deployment::CURRENT,
+                    "etc/sbctl-xray/config.json",
+                ]
+                .map(str::to_owned),
+            );
+        }
         let mut directories: Vec<String> = vec![
             "etc/sbctl".into(),
             "etc/sing-box".into(),
@@ -249,7 +263,17 @@ impl Snapshot {
         let root = store.root();
         let mut errors = Vec::new();
         if touched_services && root == Path::new("/") {
-            for unit in ["sbctl.service", "sing-box.service", "sbctl-http.socket"] {
+            for unit in [
+                "sbctl.service",
+                "sing-box.service",
+                "sbctl-xray.service",
+                "sbctl-http.socket",
+            ] {
+                if unit == "sbctl-xray.service"
+                    && !root.join("etc/systemd/system/sbctl-xray.service").exists()
+                {
+                    continue;
+                }
                 if let Err(e) = ctl(root, &["stop", unit]) {
                     errors.push(e);
                 }
