@@ -292,7 +292,7 @@ impl TemplateSpec {
             ],
             rule_sets: vec![
                 bases.both("geosite-private", RuleSetKind::Domain, "geosite/private"),
-                bases.both("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
+                bases.clash_only("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
                 bases.both("geosite-cn", RuleSetKind::Domain, "geosite/cn"),
                 bases.both("geoip-cn", RuleSetKind::IpCidr, "geoip/cn"),
             ],

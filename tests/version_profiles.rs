@@ -14,6 +14,67 @@ use sbctl::subscription::{
 };
 
 #[test]
+#[ignore = "requires official sing-box 1.14.4 and internet access to published rule sets"]
+fn sing_box_1_14_4_initializes_remote_rule_sets_without_a_cached_download() {
+    let binary = std::env::var_os("SING_BOX_BIN_1_14_4").expect("SING_BOX_BIN_1_14_4");
+    let root = tempfile::tempdir().unwrap();
+    let config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "127.0.0.1".into(),
+        None,
+        Some(2080),
+        "lo".into(),
+        vec![ManagedProtocol::VlessReality],
+        Some("www.cloudflare.com".into()),
+    )
+    .unwrap();
+    let artifacts = generated_artifacts(&config, root.path()).unwrap();
+    let text = &artifacts
+        .iter()
+        .find(|(name, _)| name == "subscription-sing-box-1.14.4.json")
+        .unwrap()
+        .1;
+    let mut profile: serde_json::Value = serde_json::from_str(text).unwrap();
+    // Exercise the real router's initial downloads without creating a host
+    // TUN, listeners, controller or persistent cache.
+    profile["inbounds"] = serde_json::json!([]);
+    profile["experimental"] = serde_json::json!({});
+    let path = root.path().join("client.json");
+    std::fs::write(&path, profile.to_string()).unwrap();
+    let log_path = root.path().join("startup.log");
+    let log = std::fs::File::create(&log_path).unwrap();
+    let mut child = std::process::Command::new(binary)
+        .args(["run", "-c"])
+        .arg(path)
+        .current_dir(root.path())
+        .stdout(log.try_clone().unwrap())
+        .stderr(log)
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    let result = loop {
+        let logs = std::fs::read_to_string(&log_path).unwrap();
+        if logs.contains("sing-box started") {
+            break Ok(());
+        }
+        if child.try_wait().unwrap().is_some() {
+            break Err(logs);
+        }
+        if std::time::Instant::now() >= deadline {
+            break Err(format!("startup timeout: {logs}"));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    };
+    let _ = child.kill();
+    let _ = child.wait();
+    assert!(
+        result.is_ok(),
+        "router initialization failed: {}",
+        result.unwrap_err()
+    );
+}
+
+#[test]
 #[ignore = "requires real sing-box cores; run by the CI sing-box-profiles job"]
 fn generated_profiles_pass_a_real_sing_box_check() {
     let root = tempfile::tempdir().expect("temporary root is created");

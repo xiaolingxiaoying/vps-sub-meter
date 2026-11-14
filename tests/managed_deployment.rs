@@ -27,6 +27,42 @@ fn fixture() -> (tempfile::TempDir, DeploymentConfig) {
     (root, config)
 }
 #[test]
+fn all_client_profiles_route_private_ips_without_a_remote_geoip_private_dependency() {
+    let (root, mut config) = fixture();
+    for template in [
+        subscription::ClientTemplate::Standard,
+        subscription::ClientTemplate::Compact,
+        subscription::ClientTemplate::Global,
+        subscription::ClientTemplate::Split,
+    ] {
+        config.client_template = template;
+        let registry = nodes::load_or_import(root.path(), &config).unwrap();
+        let artifacts = subscription::managed::generate(&config, root.path(), &registry).unwrap();
+        for (name, text) in artifacts
+            .iter()
+            .filter(|(name, _)| name.starts_with("subscription-sing-box-"))
+        {
+            let profile: Value = serde_json::from_str(text).unwrap();
+            assert!(
+                profile["route"]["rule_set"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .all(|s| s["tag"] != "geoip-private"),
+                "{name} must not download the nonexistent private-IP dataset"
+            );
+            assert!(
+                profile["route"]["rules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|r| r["ip_is_private"] == true && r["outbound"] == "DIRECT"),
+                "{name} must preserve private-IP direct routing"
+            );
+        }
+    }
+}
+#[test]
 fn migration_preserves_share_bytes_and_credentials_and_is_idempotent() {
     let (root, config) = fixture();
     let store = DeploymentStore::new(root.path());

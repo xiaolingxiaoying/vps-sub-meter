@@ -331,9 +331,7 @@
         "outbound": "DIRECT"
       },
       {
-        "rule_set": [
-          "geoip-private"
-        ],
+        "ip_is_private": true,
         "outbound": "DIRECT"
       },
       {
@@ -365,14 +363,6 @@
         "tag": "geoip-cn",
         "format": "binary",
         "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-cn.srs",
-        "download_detour": "DIRECT",
-        "update_interval": "1d"
-      },
-      {
-        "type": "remote",
-        "tag": "geoip-private",
-        "format": "binary",
-        "url": "https://cdn.jsdelivr.net/gh/SagerNet/sing-geoip@rule-set/geoip-private.srs",
         "download_detour": "DIRECT",
         "update_interval": "1d"
       }

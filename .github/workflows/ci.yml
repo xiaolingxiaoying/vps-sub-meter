@@ -103,7 +103,7 @@ jobs:
       - name: Download pinned sing-box cores
         run: |
           set -euo pipefail
-          for version in 1.10.7 1.11.15 1.12.25 1.13.21 1.14.1; do
+          for version in 1.10.7 1.11.15 1.12.25 1.13.21 1.14.1 1.14.4; do
             directory="sing-box-$version"
             mkdir -p "$directory"
             curl -fsSL --retry 3 -o "$directory/archive.tar.gz" \
@@ -138,6 +138,7 @@ jobs:
           SING_BOX_BIN_1_12: ${{ github.workspace }}/sing-box-1.12.25/sing-box
           SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
           SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
+          SING_BOX_BIN_1_14_4: ${{ github.workspace }}/sing-box-1.14.4/sing-box
           SBCTL_UPSTREAM_LATEST: ${{ steps.upstream.outputs.tag }}
         run: cargo test --test version_profiles -- --ignored --nocapture
       - name: Verify certificate generation refresh with a real sing-box core

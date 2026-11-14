@@ -1,0 +1,23 @@
+{
+  "manager_sha256": "3162ab8907bc5566b6ea52119909b16903c3531fe3f33d85b827454a6ba9ced0",
+  "version": "1.14.4",
+  "builtin_private_ip_direct": true,
+  "core_pids_unchanged": true,
+  "remote_rule_sets": [
+    {
+      "tag": "geosite-cn",
+      "status": 200,
+      "bytes": 57482
+    },
+    {
+      "tag": "geosite-private",
+      "status": 200,
+      "bytes": 788
+    },
+    {
+      "tag": "geoip-cn",
+      "status": 200,
+      "bytes": 34259
+    }
+  ]
+}

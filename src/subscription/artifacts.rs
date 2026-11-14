@@ -1810,7 +1810,7 @@ mod tests {
             2,
             "standard ships exactly the manual and automatic groups"
         );
-        assert_eq!(standard_rule_sets.len(), 4);
+        assert_eq!(standard_rule_sets.len(), 3);
 
         for template in [ClientTemplate::Global, ClientTemplate::Split] {
             let artifacts = render(

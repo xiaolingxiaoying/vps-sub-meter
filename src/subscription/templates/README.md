@@ -10,4 +10,6 @@ sing-box 使用 SagerNet SRS 规则集；显式规则镜像仍覆盖默认 URL�
 
 裸节点 `sing-box.json`、URI 和服务端配置保留原有生成契约。管理员覆写最后应用；旧覆写仍可能覆盖新模板默认值。
 
+2026-11-14：sing-box 的私有 IP 直连改用内置 `ip_is_private`，移除返回 404 的 SagerNet `geoip-private.srs` 依赖；其余远程规则集及规则顺序保留。Mihomo 的私有 IP MRS 不受此修正影响。
+
 交互选择器只显示精简 / 标准。`global` / `split` 继续作为序列化值与非交互 `sbctl config template global|split` 输入保留，供旧部署和脚本使用；它们不再是菜单中的新选项。
