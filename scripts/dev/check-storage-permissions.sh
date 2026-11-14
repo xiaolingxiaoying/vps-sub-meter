@@ -23,7 +23,8 @@ cleanup() {
   rm -rf "$work"
 }
 trap cleanup EXIT
-mkdir -p "$work"/{usr/bin,usr/sbin,usr/lib,usr/lib64,usr/local/bin,etc/sbctl,etc/pam.d,var/lib/sbctl,tmp,proc}
+mkdir -p "$work"/{dev,usr/bin,usr/sbin,usr/lib,usr/lib64,usr/local/bin,etc/sbctl,etc/pam.d,var/lib/sbctl,tmp,proc}
+mknod -m 0666 "$work/dev/null" c 1 3
 mount --bind /proc "$work/proc"
 mount -o remount,bind,ro "$work/proc"
 for directory in bin sbin lib lib64; do

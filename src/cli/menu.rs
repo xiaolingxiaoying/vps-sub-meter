@@ -261,7 +261,7 @@ fn menu_total_traffic_correction(root: &Path) {
     };
     match sbctl::traffic::parse_traffic_amount(&input) {
         Ok(bytes) => {
-            traffic_set_used(root, Some(bytes), None, None);
+            let _ = traffic_set_used(root, Some(bytes), None, None);
         }
         Err(error) => eprintln!("流量输入无效: {error}"),
     }
@@ -279,7 +279,7 @@ fn menu_direction_traffic_correction(root: &Path) {
         sbctl::traffic::parse_traffic_amount(&tx),
     ) {
         (Ok(rx), Ok(tx)) => {
-            traffic_set_used(root, None, Some(rx), Some(tx));
+            let _ = traffic_set_used(root, None, Some(rx), Some(tx));
         }
         (Err(error), _) | (_, Err(error)) => eprintln!("流量输入无效: {error}"),
     }
@@ -348,7 +348,7 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
 fn menu_logs(root: &Path) {
     // The journal view is a first-class verb now; the menu just keeps its
     // historical defaults (both units, last 50 lines).
-    crate::cli::commands::update::logs(root, crate::cli::args::LogUnit::All, 50, false);
+    let _ = crate::cli::commands::update::logs(root, crate::cli::args::LogUnit::All, 50, false);
 }
 
 pub(crate) fn confirm_menu_action(prompt: &str) -> bool {
@@ -385,32 +385,33 @@ fn execute_action(root: &Path, action: Action) {
         Status => {
             let (os, kernel, cpu, bbr) = crate::cli::commands::system::system_info();
             println!("系统: {os}  内核: {kernel}  CPU: {cpu}  BBR: {bbr}");
-            print_status(root);
+            let _ = print_status(root);
         }
         Logs => menu_logs(root),
         KernelStatus => {
-            crate::cli::commands::managed::core(root, crate::cli::args::CoreCommand::Status);
+            let _ =
+                crate::cli::commands::managed::core(root, crate::cli::args::CoreCommand::Status);
         }
         Connections => {
-            sing_box(root, SingBoxCommand::Connections);
+            let _ = sing_box(root, SingBoxCommand::Connections);
         }
         CertificateStatus => {
-            certificate::run_certificate(root, CertificateCommand::Status);
+            let _ = certificate::run_certificate(root, CertificateCommand::Status);
         }
         SubscriptionDiagnosis => menu_subscription_diagnosis(root),
         QuickInstall => {
-            menu_install(root, false);
+            let _ = menu_install(root, false);
         }
         GuidedInstall | Reinstall => {
-            menu_install(root, true);
+            let _ = menu_install(root, true);
         }
         Nodes => {
-            print_nodes(root, false, None, false);
+            let _ = print_nodes(root, false, None, false);
         }
         NodeLinks => {
             if confirm_menu_action("确认显示节点分享链接？其中包含 Proxy credential")
             {
-                print_nodes(root, true, None, false);
+                let _ = print_nodes(root, true, None, false);
             }
         }
         Topic(topic) => run_topic_wizard(root, topic),
@@ -431,7 +432,7 @@ fn execute_action(root: &Path, action: Action) {
             };
             if confirm_menu_action("确认下载并校验官方内核？已运行的该内核将独立重启")
             {
-                crate::cli::commands::managed::core(
+                let _ = crate::cli::commands::managed::core(
                     root,
                     crate::cli::args::CoreCommand::Install {
                         core,
@@ -442,7 +443,7 @@ fn execute_action(root: &Path, action: Action) {
         }
         CoreApply => managed_edit(root, |_, _| Ok(true)),
         CoreRecover => {
-            crate::cli::commands::managed::core(
+            let _ = crate::cli::commands::managed::core(
                 root,
                 crate::cli::args::CoreCommand::Recover { boot: false },
             );
@@ -450,7 +451,10 @@ fn execute_action(root: &Path, action: Action) {
         CoreRollback => {
             if confirm_menu_action("确认恢复最近一次部署？订阅凭据和流量账期不会回退")
             {
-                crate::cli::commands::managed::core(root, crate::cli::args::CoreCommand::Rollback);
+                let _ = crate::cli::commands::managed::core(
+                    root,
+                    crate::cli::args::CoreCommand::Rollback,
+                );
             }
         }
         Template => {
@@ -462,7 +466,7 @@ fn execute_action(root: &Path, action: Action) {
                     return;
                 }
             };
-            run_config(
+            let _ = run_config(
                 root,
                 ConfigCommand::Override {
                     command: OverrideCommand::Show,
@@ -471,7 +475,7 @@ fn execute_action(root: &Path, action: Action) {
             println!("这些覆写在切换后仍会生效；失效的组或 DNS 引用将拒绝应用。");
             match sbctl::wizard::run_template_selection(&config, &mut ConsolePrompts) {
                 Ok(sbctl::wizard::WizardOutcome::Changed(new)) => {
-                    commit_client_template(root, new.client_template, None);
+                    let _ = commit_client_template(root, new.client_template, None);
                 }
                 Ok(sbctl::wizard::WizardOutcome::Cancelled) => {
                     println!("模板切换已取消，原配置保留")
@@ -481,17 +485,17 @@ fn execute_action(root: &Path, action: Action) {
             }
         }
         SubscriptionUrls => {
-            print_subscription_urls(root, None);
+            let _ = print_subscription_urls(root, None);
         }
         Qr(format) => {
-            print_subscription_qr(root, Some(format), false);
+            let _ = print_subscription_qr(root, Some(format), false);
         }
         CredentialList => {
-            system::run_credential(root, CredentialCommand::List);
+            let _ = system::run_credential(root, CredentialCommand::List);
         }
         CredentialAdd => {
             if let Some(name) = required_menu_text("设备凭据名称: ") {
-                system::run_credential(root, CredentialCommand::Add { name });
+                let _ = system::run_credential(root, CredentialCommand::Add { name });
             }
         }
         CredentialRevoke => {
@@ -506,17 +510,17 @@ fn execute_action(root: &Path, action: Action) {
             if confirm_menu_action(
                 "确认吊销该凭据？其链接将在宽限期结束后失效，未设宽限期则立即失效",
             ) {
-                system::run_credential(root, CredentialCommand::Revoke { name, grace });
+                let _ = system::run_credential(root, CredentialCommand::Revoke { name, grace });
             }
         }
         Rotate => {
             if confirm_menu_action("确认轮换默认订阅凭据？旧默认订阅 URL 将立即失效")
             {
-                rotate_subscription_credential(root);
+                let _ = rotate_subscription_credential(root);
             }
         }
         Traffic => {
-            print_traffic(root);
+            let _ = print_traffic(root);
         }
         TotalCorrection => menu_total_traffic_correction(root),
         DirectionCorrection => menu_direction_traffic_correction(root),
@@ -524,16 +528,16 @@ fn execute_action(root: &Path, action: Action) {
             if confirm_menu_action(
                 "确认建立/刷新当前账期？仅在需要时建立新基线，不清空当前账期用量",
             ) {
-                run_accounting_reset(root);
+                let _ = run_accounting_reset(root);
             }
         }
         Restart => {
             if confirm_menu_action("确认校验配置并重启服务？") {
-                restart(root, None);
+                let _ = restart(root, None);
             }
         }
         ApiEnable => {
-            sing_box(
+            let _ = sing_box(
                 root,
                 SingBoxCommand::Api {
                     command: ApiCommand::Enable { port: None },
@@ -541,7 +545,7 @@ fn execute_action(root: &Path, action: Action) {
             );
         }
         ApiDisable => {
-            sing_box(
+            let _ = sing_box(
                 root,
                 SingBoxCommand::Api {
                     command: ApiCommand::Disable,
@@ -550,7 +554,7 @@ fn execute_action(root: &Path, action: Action) {
         }
         CertificateObtain => {
             if let Some(email) = required_menu_text("ACME 邮箱: ") {
-                certificate::run_certificate(
+                let _ = certificate::run_certificate(
                     root,
                     CertificateCommand::Obtain {
                         email: Some(email),
@@ -561,12 +565,12 @@ fn execute_action(root: &Path, action: Action) {
         }
         CertificateRenew => {
             if confirm_menu_action("确认续期 HTTPS 证书？") {
-                certificate::run_certificate(root, CertificateCommand::Renew);
+                let _ = certificate::run_certificate(root, CertificateCommand::Renew);
             }
         }
         Update => {
             if confirm_menu_action("确认更新 sbctl？将校验签名清单") {
-                update(root, false, None, None, None);
+                let _ = update(root, false, None, None, None);
             }
         }
         KernelUpdate => {
@@ -575,7 +579,7 @@ fn execute_action(root: &Path, action: Action) {
             } else if let Some((source, version)) = select_kernel()
                 && confirm_menu_action("确认更新/切换 sing-box 内核？")
             {
-                sing_box(root, SingBoxCommand::Fetch { source, version });
+                let _ = sing_box(root, SingBoxCommand::Fetch { source, version });
             }
         }
         EditServer | EditSingBox | EditClash => {
@@ -584,7 +588,7 @@ fn execute_action(root: &Path, action: Action) {
                 EditSingBox => CliOverrideTarget::SingBox,
                 _ => CliOverrideTarget::Clash,
             };
-            run_config(
+            let _ = run_config(
                 root,
                 ConfigCommand::Override {
                     command: OverrideCommand::Edit {
@@ -596,7 +600,7 @@ fn execute_action(root: &Path, action: Action) {
             );
         }
         OverrideShow => {
-            run_config(
+            let _ = run_config(
                 root,
                 ConfigCommand::Override {
                     command: OverrideCommand::Show,
@@ -604,7 +608,7 @@ fn execute_action(root: &Path, action: Action) {
             );
         }
         OverrideValidate => {
-            run_config(
+            let _ = run_config(
                 root,
                 ConfigCommand::Override {
                     command: OverrideCommand::Validate { sing_box_bin: None },
@@ -636,30 +640,30 @@ fn execute_action(root: &Path, action: Action) {
             } else {
                 ConfigCommand::Preview { format }
             };
-            run_config(root, command);
+            let _ = run_config(root, command);
         }
         FullWizard => {
-            run_config_wizard(root, None);
+            let _ = run_config_wizard(root, None);
         }
         Regenerate => {
             if confirm_menu_action("确认重新生成并校验全部配置工件？") {
-                regenerate(root, None);
+                let _ = regenerate(root, None);
             }
         }
         Uninstall => {
             if confirm_menu_action("确认卸载服务和二进制并保留备份？") {
-                uninstall(root, false);
+                let _ = uninstall(root, false);
             }
         }
         Purge => {
             if confirm_menu_action("确认彻底清理 sbctl 数据？此操作不可恢复")
                 && confirm_menu_action("再次确认：删除配置、状态、证书和备份？")
             {
-                uninstall(root, true);
+                let _ = uninstall(root, true);
             }
         }
         RuleList => {
-            rule::run_rule(root, RuleCommand::List { kind: None }, None);
+            let _ = rule::run_rule(root, RuleCommand::List { kind: None }, None);
         }
         RuleAdd | RuleRemove => {
             let Some(kind) = menu_rule_kind(true) else {
@@ -680,10 +684,10 @@ fn execute_action(root: &Path, action: Action) {
                     entries: vec![entry],
                 }
             };
-            rule::run_rule(root, command, None);
+            let _ = rule::run_rule(root, command, None);
         }
         RuleSetList => {
-            ruleset::list(root);
+            let _ = ruleset::list(root);
         }
         RuleSetAdd => {
             let Some(name) = required_menu_text("规则集名称: ") else {
@@ -704,11 +708,11 @@ fn execute_action(root: &Path, action: Action) {
             } else {
                 sbctl::config::RuleSetBehavior::Domain
             };
-            ruleset::add(root, &name, &url, target, behavior, None);
+            let _ = ruleset::add(root, &name, &url, target, behavior, None);
         }
         RuleSetRemove => {
             if let Some(name) = required_menu_text("要移除的规则集名称: ") {
-                ruleset::remove(root, &name, None);
+                let _ = ruleset::remove(root, &name, None);
             }
         }
         RuleImport => {
@@ -718,12 +722,12 @@ fn execute_action(root: &Path, action: Action) {
             let Some(target) = menu_rule_set_target() else {
                 return;
             };
-            ruleset::import_list(&url, target, root, None);
+            let _ = ruleset::import_list(&url, target, root, None);
         }
         RuleInterval => {
             if let Some(value) = required_menu_text("规则集刷新间隔（例如 12h / 1d）: ")
             {
-                ruleset::set_interval(root, &value, None);
+                let _ = ruleset::set_interval(root, &value, None);
             }
         }
         EmailConfigure | EmailStatus | EmailSend | EmailEnable | EmailDisable => {
@@ -739,7 +743,7 @@ fn execute_action(root: &Path, action: Action) {
                 EmailEnable => EmailCommand::Enable,
                 _ => EmailCommand::Disable,
             };
-            email::run_email(root, command);
+            let _ = email::run_email(root, command);
         }
     }
 }
@@ -973,7 +977,7 @@ fn managed_nodes_menu(root: &Path) {
             continue;
         }
         if choice == "9" {
-            crate::cli::commands::managed::node(
+            let _ = crate::cli::commands::managed::node(
                 root,
                 crate::cli::args::NodeCommand::Check { id: None },
             );
@@ -988,7 +992,7 @@ fn managed_nodes_menu(root: &Path) {
                 else {
                     return;
                 };
-                crate::cli::commands::managed::node(
+                let _ = crate::cli::commands::managed::node(
                     root,
                     crate::cli::args::NodeCommand::Probe {
                         id,
@@ -1005,7 +1009,7 @@ fn managed_nodes_menu(root: &Path) {
                 && let Some(id) = select_managed_node(&r)
                 && confirm_menu_action("显示该节点分享链接？链接包含节点凭据")
             {
-                crate::cli::commands::managed::node(
+                let _ = crate::cli::commands::managed::node(
                     root,
                     crate::cli::args::NodeCommand::Export { id, qr: true },
                 );
@@ -1174,7 +1178,7 @@ fn managed_list_menu(root: &Path) {
     }
     let mut page = 1usize;
     loop {
-        crate::cli::commands::managed::node(
+        let _ = crate::cli::commands::managed::node(
             root,
             crate::cli::args::NodeCommand::List {
                 core,
@@ -1232,7 +1236,8 @@ fn managed_groups_menu(root: &Path) {
             return;
         }
         if choice == "1" {
-            crate::cli::commands::managed::group(root, crate::cli::args::GroupCommand::List);
+            let _ =
+                crate::cli::commands::managed::group(root, crate::cli::args::GroupCommand::List);
             pause_menu();
             continue;
         }
@@ -1439,7 +1444,7 @@ fn managed_links_menu(root: &Path) {
                 )?;
             } else {
                 println!("现有部署尚未迁移，显示原全量订阅：");
-                print_subscription_urls(root, Some(format));
+                let _ = print_subscription_urls(root, Some(format));
             }
         }
         Ok(())

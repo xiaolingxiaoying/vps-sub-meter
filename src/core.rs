@@ -66,6 +66,7 @@ impl CoreKind {
         let output = Command::new(binary)
             .args(self.check_arguments())
             .arg(&path)
+            .stdin(std::process::Stdio::piped())
             .output()?;
         if output.status.success() {
             Ok(())
