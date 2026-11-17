@@ -1004,6 +1004,9 @@ pub fn rollback_fresh_installation(root: &Path, preexisting: PreexistingState) {
     // a rolled-back install leaves no trace.
     let _ = fs::remove_dir(root.join("var/lib/sbctl"));
     let directory = "etc/sing-box";
+    if let Err(error) = remove_staged_temp_files_if_present(&root.join(directory)) {
+        warnings.push(error);
+    }
     if let Err(error) = fs::remove_dir(root.join(directory))
         && error.kind() != std::io::ErrorKind::NotFound
     {
@@ -1031,15 +1034,12 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
     if root.join(xray_unit).exists() && !xray_owned {
         return Err("sbctl-xray.service 不属于本工具，拒绝卸载或清理".into());
     }
+    let xray_config_owned = xray_owned || !root.join(xray_unit).exists();
     let backup = (!purge).then(|| backup_persistent_data(root)).transpose()?;
     if xray_owned {
         systemctl(root, &["disable", "--now", "sbctl-xray.service"])?;
         remove_file_if_present(&root.join(xray_unit))?;
         remove_file_if_present(&root.join("usr/local/bin/sbctl-xray"))?;
-        if purge {
-            remove_file_if_present(&root.join("etc/sbctl-xray/config.json"))?;
-            remove_empty_directory_if_present(&root.join("etc/sbctl-xray"))?;
-        }
     }
     if unit_has_marker(
         root,
@@ -1103,9 +1103,23 @@ pub fn uninstall(root: &Path, purge: bool) -> Result<Option<std::path::PathBuf>,
         // A prior non-purge uninstall removes the unit but deliberately keeps
         // persistent configuration. Conversely, a replacement non-sbctl unit
         // signals a hand-managed deployment and must leave its config alone.
+        if xray_config_owned {
+            remove_file_if_present(&root.join("etc/sbctl-xray/config.json"))?;
+            remove_staged_temp_files_if_present(&root.join("etc/sbctl-xray"))?;
+            remove_empty_directory_if_present(&root.join("etc/sbctl-xray"))?;
+        }
         if sing_box_config_owned {
             remove_file_if_present(&root.join("etc/sing-box/config.json"))?;
+            remove_staged_temp_files_if_present(&root.join("etc/sing-box"))?;
             remove_empty_directory_if_present(&root.join("etc/sing-box"))?;
+        }
+        for directory in [
+            "etc/sbctl",
+            "etc/systemd/system",
+            "usr/local/bin",
+            "etc/letsencrypt/renewal-hooks/deploy",
+        ] {
+            remove_staged_temp_files_if_present(&root.join(directory))?;
         }
         remove_file_if_present(&root.join("etc/sbctl/config.toml"))?;
         remove_file_if_present(&root.join(crate::nodes::SOURCE))?;
@@ -1625,6 +1639,36 @@ fn remove_empty_directory_if_present(path: &Path) -> Result<(), String> {
         }
         Err(error) => Err(format!("could not remove {}: {error}", path.display())),
     }
+}
+
+fn remove_staged_temp_files_if_present(directory: &Path) -> Result<(), String> {
+    let Ok(metadata) = fs::symlink_metadata(directory) else {
+        return Ok(());
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(());
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("could not inspect {}: {error}", directory.display()))?;
+    for entry in entries {
+        let entry =
+            entry.map_err(|error| format!("could not inspect {}: {error}", directory.display()))?;
+        if !crate::managed_fs::is_staged_temp_name(&entry.file_name()) {
+            continue;
+        }
+        let path = entry.path();
+        let Ok(entry_metadata) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        if entry_metadata.is_file() {
+            match crate::managed_fs::remove_file(&path) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("could not remove {}: {error}", path.display())),
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn set_private_directory_permissions(path: &Path) -> Result<(), String> {

@@ -184,6 +184,8 @@ jobs:
         with:
           ref: ${{ needs.validate.outputs.commit }}
       - name: Download and verify the pinned sing-box runtime
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           # shellcheck source=/dev/null
@@ -196,14 +198,12 @@ jobs:
           esac
           archive="sing-box-$sing_box_version-linux-$arch.tar.gz"
           url="https://github.com/SagerNet/sing-box/releases/download/v$sing_box_version/$archive"
-          curl --fail --location --silent --show-error --retry 3 --proto '=https' \
+          curl --fail --location --silent --show-error --retry 5 --retry-delay 2 --proto '=https' \
             --output "$archive" "$url"
           printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
           # Cross-check the pinned digest against the GitHub API's own digest so
           # a stale pin cannot silently ship a different runtime.
-          api_digest=$(curl --fail --location --silent --show-error --retry 3 \
-            -H 'Accept: application/vnd.github+json' -H 'User-Agent: sbctl' \
-            "https://api.github.com/repos/SagerNet/sing-box/releases/tags/v$sing_box_version" \
+          api_digest=$(gh api "repos/SagerNet/sing-box/releases/tags/v$sing_box_version" \
             | jq -r --arg name "$archive" '.assets[] | select(.name == $name) | .digest // empty' \
             | sed -n 's/^sha256://p')
           if [ -z "$api_digest" ]; then

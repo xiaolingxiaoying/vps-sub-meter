@@ -208,7 +208,11 @@ pub fn existing_deployment_paths(root: &Path) -> Vec<String> {
         "var/lib/sbctl/acme-webroot",
     ]
     .into_iter()
-    .filter(|path| path_exists_including_symlink(&root.join(path)))
+    .filter(|path| {
+        let full = root.join(path);
+        path_exists_including_symlink(&full)
+            && !(*path == "etc/sing-box" && directory_has_only_staged_writes(&full))
+    })
     .map(str::to_owned)
     .collect::<Vec<_>>();
 
@@ -218,6 +222,35 @@ pub fn existing_deployment_paths(root: &Path) -> Vec<String> {
     paths.sort();
     paths.dedup();
     paths
+}
+
+fn directory_has_only_staged_writes(path: &Path) -> bool {
+    let Ok(metadata) = fs::symlink_metadata(path) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    let Ok(entries) = fs::read_dir(path) else {
+        return false;
+    };
+    let mut saw_staged = false;
+    for entry in entries {
+        let Ok(entry) = entry else {
+            return false;
+        };
+        if !crate::managed_fs::is_staged_temp_name(&entry.file_name()) {
+            return false;
+        }
+        let Ok(entry_metadata) = fs::symlink_metadata(entry.path()) else {
+            return false;
+        };
+        if !entry_metadata.is_file() {
+            return false;
+        }
+        saw_staged = true;
+    }
+    saw_staged
 }
 
 fn systemd_unit_matches(root: &Path) -> Vec<String> {
@@ -231,7 +264,11 @@ fn systemd_unit_matches(root: &Path) -> Vec<String> {
     .flat_map(|directory| files_below(&root.join(directory)))
     // SIGKILL can leave an atomic write staged beside a unit. systemd never
     // loads these temporary files, so their contents are not a deployment.
-    .filter(|path| !is_staged_unit_write(path))
+    .filter(|path| {
+        !path
+            .file_name()
+            .is_some_and(crate::managed_fs::is_staged_temp_name)
+    })
     .filter_map(|path| {
         fs::read_to_string(&path)
             .ok()
@@ -243,24 +280,6 @@ fn systemd_unit_matches(root: &Path) -> Vec<String> {
             })
     })
     .collect()
-}
-
-fn is_staged_unit_write(path: &Path) -> bool {
-    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    let Some(ids) = name
-        .strip_prefix(".sbctl.")
-        .and_then(|name| name.strip_suffix(".tmp"))
-    else {
-        return false;
-    };
-    let Some((pid, sequence)) = ids.split_once('.') else {
-        return false;
-    };
-    [pid, sequence]
-        .iter()
-        .all(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn files_below(directory: &Path) -> Vec<PathBuf> {
@@ -466,6 +485,31 @@ mod tests {
         );
         fs::remove_file(directory.join("proxy.service")).unwrap();
         fs::write(directory.join(".sbctl.custom.tmp"), contents).unwrap();
+        assert!(matches!(
+            preflight(fixture.path()),
+            Err(PreflightError::ExistingDeployment(_))
+        ));
+    }
+
+    #[test]
+    fn ignores_interrupted_sing_box_config_writes_but_still_detects_real_files() {
+        let fixture = supported_systemd_host();
+        let directory = fixture.path().join("etc/sing-box");
+        fs::create_dir_all(&directory).unwrap();
+        let temporary = directory.join(".sbctl.456.19.tmp");
+        fs::write(&temporary, "{}").unwrap();
+        assert_eq!(preflight(fixture.path()), Ok(()));
+        assert_eq!(fs::read_to_string(&temporary).unwrap(), "{}");
+
+        fs::write(directory.join("config.json"), "{}").unwrap();
+        assert_eq!(
+            preflight(fixture.path()),
+            Err(PreflightError::ExistingDeployment(
+                ExistingDeployment::from_artifacts(vec!["etc/sing-box".into()])
+            ))
+        );
+        fs::remove_file(directory.join("config.json")).unwrap();
+        fs::write(directory.join(".sbctl.custom.tmp"), "{}").unwrap();
         assert!(matches!(
             preflight(fixture.path()),
             Err(PreflightError::ExistingDeployment(_))

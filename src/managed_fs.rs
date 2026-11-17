@@ -24,6 +24,25 @@ pub(crate) fn validate_file_name(name: &OsStr) -> io::Result<()> {
     Ok(())
 }
 
+/// Returns true for temporary filenames staged by `atomic_write` (`.sbctl.<pid>.<seq>.tmp`).
+pub(crate) fn is_staged_temp_name(name: &OsStr) -> bool {
+    let Some(name) = name.to_str() else {
+        return false;
+    };
+    let Some(ids) = name
+        .strip_prefix(".sbctl.")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = ids.split_once('.') else {
+        return false;
+    };
+    [pid, sequence]
+        .iter()
+        .all(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 fn split_file(path: &Path) -> io::Result<(&Path, &OsStr)> {
     let name = path
         .file_name()

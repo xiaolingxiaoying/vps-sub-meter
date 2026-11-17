@@ -624,6 +624,44 @@ fn uninstall_does_not_touch_a_manual_sing_box_deployment_without_sbctl_ownership
 }
 
 #[test]
+fn uninstall_purge_removes_interrupted_staged_temp_files() {
+    let fixture = supported_systemd_host();
+    initialize_uninstall_fixture(&fixture);
+    write_systemctl_fixture(&fixture, true);
+    write_managed_file(&fixture, "etc/sbctl-xray/config.json", b"{}");
+    write_managed_file(&fixture, "etc/sing-box/.sbctl.456.19.tmp", b"{}");
+    write_managed_file(&fixture, "etc/sbctl-xray/.sbctl.456.20.tmp", b"{}");
+    write_managed_file(&fixture, "etc/sbctl/.sbctl.456.21.tmp", b"{}");
+    write_managed_file(
+        &fixture,
+        "etc/systemd/system/.sbctl.123.18.tmp",
+        b"[Service]\nExecStart=/usr/local/bin/sing-box run\n",
+    );
+
+    Command::cargo_bin("sbctl")
+        .expect("sbctl binary is built")
+        .args([
+            "--root",
+            fixture.path().to_str().expect("fixture path is UTF-8"),
+            "uninstall",
+            "--purge",
+        ])
+        .assert()
+        .success();
+
+    assert!(!fixture.path().join("etc/sing-box").exists());
+    assert!(!fixture.path().join("etc/sbctl-xray").exists());
+    assert!(!fixture.path().join("etc/sbctl/.sbctl.456.21.tmp").exists());
+    assert!(
+        !fixture
+            .path()
+            .join("etc/systemd/system/.sbctl.123.18.tmp")
+            .exists()
+    );
+    assert!(sbctl::preflight::existing_deployment_paths(fixture.path()).is_empty());
+}
+
+#[test]
 fn credential_rotate_invalidates_the_old_url_and_keeps_proxy_credentials() {
     let fixture = TempDir::new().expect("temporary root is created");
     let port = free_high_tcp_port();

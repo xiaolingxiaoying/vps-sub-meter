@@ -98,4 +98,7 @@ mode('dual')
 # writer happened to be killed between atomic writes rather than during one.
 Path('/etc/systemd/system/.sbctl.123.18.tmp').write_text(
     '[Service]\nExecStart=/usr/local/bin/sing-box run\n')
+Path('/etc/sing-box/.sbctl.456.19.tmp').write_text('{"inbounds":[]}\n')
+Path('/etc/sbctl-xray/.sbctl.456.20.tmp').write_text('{}\n')
+Path('/etc/sbctl/.sbctl.456.21.tmp').write_text('{}\n')
 print('PASS managed systemd modes, source permissions, startup failure rollback and interrupted recovery', flush=True)
