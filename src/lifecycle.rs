@@ -1288,6 +1288,9 @@ pub fn restart_services(root: &Path) -> Result<(), String> {
 }
 
 pub fn restart_subscription_service(root: &Path) -> Result<(), String> {
+    // Managed-node restarts bypass restart_services, but must still upgrade
+    // an existing rotation service before its next scheduled invocation.
+    migrate_credential_rotate_service(root)?;
     if root != Path::new("/") {
         return Ok(());
     }

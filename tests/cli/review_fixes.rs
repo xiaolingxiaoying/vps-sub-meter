@@ -323,6 +323,50 @@ fn uninstall_removes_opt_in_units_and_refuses_foreign_email_units() {
 }
 
 #[test]
+fn managed_restart_migrates_legacy_rotation_without_changing_timer_or_credentials() {
+    let (fixture, _) = mode_fixture(SubscriptionMode::ExternalProxy);
+    let root = fixture.path();
+    let store = DeploymentStore::new(root);
+    let config = store.load().unwrap();
+    let registry = sbctl::nodes::load_or_import(root, &config).unwrap();
+    sbctl::deployment::apply(&store, &config, &registry, registry.clone()).unwrap();
+    sbctl::lifecycle::set_credential_rotate_timer(root, true).unwrap();
+    let service = root.join("etc/systemd/system/sbctl-credential-rotate.service");
+    let timer = root.join("etc/systemd/system/sbctl-credential-rotate.timer");
+    let timer_before = fs::read(&timer).unwrap();
+    fs::write(
+        &service,
+        fs::read_to_string(&service)
+            .unwrap()
+            .replace("User=root", "User=sbctl")
+            .replace("Group=root", "Group=sbctl"),
+    )
+    .unwrap();
+    let config_before = fs::read(root.join("etc/sbctl/config.toml")).unwrap();
+    let state_before = fs::read(root.join("var/lib/sbctl/state.json")).unwrap();
+
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .arg("--root")
+        .arg(root)
+        .arg("restart")
+        .assert()
+        .success();
+
+    let migrated = fs::read_to_string(service).unwrap();
+    assert!(migrated.contains("User=root\nGroup=root\n"));
+    assert_eq!(fs::read(timer).unwrap(), timer_before);
+    assert_eq!(
+        fs::read(root.join("etc/sbctl/config.toml")).unwrap(),
+        config_before
+    );
+    assert_eq!(
+        fs::read(root.join("var/lib/sbctl/state.json")).unwrap(),
+        state_before
+    );
+}
+
+#[test]
 fn rotation_migration_never_enables_a_timer_or_installs_one_unasked() {
     let fixture = TempDir::new().unwrap();
     write_systemctl_fixture(&fixture, true);
