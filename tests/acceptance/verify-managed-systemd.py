@@ -94,4 +94,8 @@ for unit in ('sing-box.service', 'sbctl-xray.service'):
 assert (source.read_bytes(), pointer.read_bytes()) == before
 assert not journal.exists()
 mode('dual')
+# Make the subsequent purge/reinstall deterministic even when the interrupted
+# writer happened to be killed between atomic writes rather than during one.
+Path('/etc/systemd/system/.sbctl.123.18.tmp').write_text(
+    '[Service]\nExecStart=/usr/local/bin/sing-box run\n')
 print('PASS managed systemd modes, source permissions, startup failure rollback and interrupted recovery', flush=True)

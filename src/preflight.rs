@@ -229,6 +229,9 @@ fn systemd_unit_matches(root: &Path) -> Vec<String> {
     ]
     .into_iter()
     .flat_map(|directory| files_below(&root.join(directory)))
+    // SIGKILL can leave an atomic write staged beside a unit. systemd never
+    // loads these temporary files, so their contents are not a deployment.
+    .filter(|path| !is_staged_unit_write(path))
     .filter_map(|path| {
         fs::read_to_string(&path)
             .ok()
@@ -240,6 +243,24 @@ fn systemd_unit_matches(root: &Path) -> Vec<String> {
             })
     })
     .collect()
+}
+
+fn is_staged_unit_write(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let Some(ids) = name
+        .strip_prefix(".sbctl.")
+        .and_then(|name| name.strip_suffix(".tmp"))
+    else {
+        return false;
+    };
+    let Some((pid, sequence)) = ids.split_once('.') else {
+        return false;
+    };
+    [pid, sequence]
+        .iter()
+        .all(|id| !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 fn files_below(directory: &Path) -> Vec<PathBuf> {
@@ -423,6 +444,32 @@ mod tests {
             preflight(fixture.path()),
             Err(PreflightError::MissingSystemd)
         );
+    }
+
+    #[test]
+    fn ignores_interrupted_unit_writes_but_still_detects_installed_services() {
+        let fixture = supported_systemd_host();
+        let directory = fixture.path().join("etc/systemd/system");
+        fs::create_dir_all(&directory).unwrap();
+        let contents = "[Service]\nExecStart=/usr/local/bin/sing-box run\n";
+        let temporary = directory.join(".sbctl.123.18.tmp");
+        fs::write(&temporary, contents).unwrap();
+        assert_eq!(preflight(fixture.path()), Ok(()));
+        assert_eq!(fs::read_to_string(&temporary).unwrap(), contents);
+
+        fs::write(directory.join("proxy.service"), contents).unwrap();
+        assert_eq!(
+            preflight(fixture.path()),
+            Err(PreflightError::ExistingDeployment(
+                ExistingDeployment::from_artifacts(vec!["etc/systemd/system/proxy.service".into()])
+            ))
+        );
+        fs::remove_file(directory.join("proxy.service")).unwrap();
+        fs::write(directory.join(".sbctl.custom.tmp"), contents).unwrap();
+        assert!(matches!(
+            preflight(fixture.path()),
+            Err(PreflightError::ExistingDeployment(_))
+        ));
     }
 
     #[test]
