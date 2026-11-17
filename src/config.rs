@@ -31,6 +31,8 @@ const DEFAULT_PROTOCOL_SNI: &str = "www.bing.com";
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct DeploymentConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shared_tls: Option<crate::shared_tls::SharedTls>,
     pub subscription_mode: SubscriptionMode,
     pub subscription_host: String,
     pub proxy_host: Option<String>,
@@ -633,6 +635,7 @@ impl DeploymentConfig {
         let subscription_listen_port =
             (subscription_mode == SubscriptionMode::ExternalProxy).then_some(2080);
         let config = Self {
+            shared_tls: None,
             subscription_mode,
             subscription_host,
             proxy_host,
@@ -754,6 +757,7 @@ impl DeploymentConfig {
             None => generate_subscription_credential()?,
         };
         let config = Self {
+            shared_tls: existing.and_then(|c| c.shared_tls.clone()),
             subscription_mode: subscription_mode.clone(),
             subscription_host: subscription_host.to_ascii_lowercase(),
             proxy_host: proxy_host.as_ref().map(|host| host.to_ascii_lowercase()),
@@ -851,6 +855,9 @@ impl DeploymentConfig {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if let Some(shared) = &self.shared_tls {
+            shared.validate(self).map_err(ConfigError::InvalidValue)?;
+        }
         crate::port_hopping::validate(self)?;
         self.validate_deployment_identity()?;
         self.validate_protocols()?;

@@ -29,7 +29,7 @@
 
 替换多个资产不是原子操作；替换期间下载的清单与二进制可能暂时不一致，此时校验会失败，应在工作流成功后重试下载。已经安装相同版本号的部署应通过菜单重新安装管理程序，或手动替换二进制；仅比较版本号的更新检查可能不会提示更新。
 
-`scripts/prepare-installer.py` 将同一个生产公钥写入发布工件 `install.sh`。仓库里的 `scripts/install.sh` 是未配置的模板，直接执行会失败。README 的安装入口指向 `https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh`。发布会附上 `sbctl-linux-amd64`、`sbctl-linux-arm64`、两个 sing-box 运行时、两个签名 manifest、`install.sh` 与 `SHA256SUMS`。
+`scripts/prepare-installer.py` 将同一个生产公钥写入发布工件 `install.sh`。仓库里的 `scripts/install.sh` 是未配置的模板，直接执行会失败。README 的安装入口指向 `https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh`。发布会附上 `sbctl-linux-amd64`、`sbctl-linux-arm64`、两个签名 manifest、`install.sh`、`upgrade.sh`、`protocols.sh`、`share-443.sh` 与 `SHA256SUMS`。sing-box 运行时只作为构建阶段的验签输入，安装时从 SagerNet 官方下载，不作为本仓库 Release 附件。
 
 > 兼容区间写在该 pin 文件里（当前 `1.10.0:1.14.99`），与 CI `sing-box-profiles` job 覆盖的版本带一致；升级随包内核时同时更新版本、逐架构摘要与区间。
 

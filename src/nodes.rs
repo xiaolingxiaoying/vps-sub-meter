@@ -192,6 +192,34 @@ pub fn load_or_import(root: &Path, config: &DeploymentConfig) -> Result<Registry
     Ok(value)
 }
 impl Registry {
+    pub fn normalize_names(&mut self) {
+        let mut used: Vec<String> = self.groups.iter().map(|g| g.name.clone()).collect();
+        for node in &mut self.nodes {
+            let name = crate::catalog::unique_label(&node.preset(), used.clone());
+            used.push(name.clone());
+            node.name = name.clone();
+            node.tag = name;
+        }
+    }
+
+    /// Complete the same catalog on old and new deployments without deleting
+    /// extra nodes, changing ports/credentials, or rotating subscription URLs.
+    pub fn complete_catalog(&mut self, config: &DeploymentConfig) -> Result<()> {
+        self.switch(Mode::Dual, &[])?;
+        for protocol in crate::catalog::PROTOCOLS {
+            if let Some(node) = self.nodes.iter_mut().find(|n| n.preset() == protocol.key) {
+                node.enabled = true;
+                if protocol.key == "vless-reality" {
+                    node.core = CoreKind::SingBox;
+                }
+            } else {
+                let node = create(self, config, protocol.key, "", None, None)?;
+                self.nodes.push(node);
+            }
+        }
+        self.normalize_names();
+        self.validate(config)
+    }
     pub fn validate(&self, config: &DeploymentConfig) -> Result<()> {
         if self.schema_version != 1 || self.nodes.len() > 512 || self.groups.len() > 128 {
             return Err(Error(
@@ -231,8 +259,12 @@ impl Registry {
             {
                 return Err(Error("节点 ID、名称或客户端引用名称无效或重复".into()));
             }
-            if node.listen.parse::<std::net::IpAddr>().is_err() || node.port() < 10000 {
-                return Err(Error("节点监听地址无效或端口不在 10000–65535".into()));
+            if node.listen.parse::<std::net::IpAddr>().is_err()
+                || !crate::catalog::node_port(node.port())
+            {
+                return Err(Error(
+                    "节点监听地址无效；端口使用 443 或 10000–65535".into(),
+                ));
             }
             node.validate_data()?;
             let proxy_secrets = match &node.data {
@@ -254,14 +286,30 @@ impl Registry {
                     node.id
                 )));
             }
-            if !ports.insert(node.port())
-                || config.http_port == Some(node.port())
-                || config.subscription_listen_port == Some(node.port())
+            let binding = crate::shared_tls::binding(config, node);
+            let udp = crate::catalog::udp(&node.preset());
+            let namespace = if binding.port() == 443 {
+                if udp { 1 } else { 2 }
+            } else {
+                0
+            };
+            if !ports.insert((namespace, binding.port()))
+                || config.http_port == Some(binding.port())
+                || config.subscription_listen_port == Some(binding.port())
             {
                 return Err(Error("节点端口重复或与订阅监听器冲突".into()));
             }
+            if binding.port() == 443
+                && !udp
+                && config.subscription_mode == crate::config::SubscriptionMode::Direct
+            {
+                return Err(Error(
+                    "TCP 443 已用于 HTTPS 订阅；请使用 port share 配置 SNI 分流，或选择其他端口"
+                        .into(),
+                ));
+            }
             if let Some(api) = &config.server_clash_api
-                && api.port == node.port()
+                && api.port == binding.port()
             {
                 return Err(Error("节点端口与观察 API 冲突".into()));
             }
@@ -275,6 +323,31 @@ impl Registry {
                 && (hop.start..=hop.end).contains(&node.port())
             {
                 return Err(Error("节点端口与 Hy2 跳跃范围冲突".into()));
+            }
+        }
+        if let Some(shared) = &config.shared_tls {
+            shared.validate(config).map_err(|e| Error(e.into()))?;
+            for route in &shared.routes {
+                if let Some(id) = &route.node_id {
+                    let node = self
+                        .nodes
+                        .iter()
+                        .find(|n| &n.id == id)
+                        .ok_or_else(|| Error("443 路由指向不存在的节点".into()))?;
+                    if crate::catalog::udp(&node.preset())
+                        || node.port() != 443
+                        || !crate::shared_tls::sni(node).eq_ignore_ascii_case(&route.server_name)
+                    {
+                        return Err(Error(
+                            "443 TLS 路由必须指向 TCP 443 节点，SNI 必须与客户端配置一致".into(),
+                        ));
+                    }
+                } else if self.nodes.iter().any(|n| {
+                    !crate::catalog::udp(&n.preset())
+                        && crate::shared_tls::binding(config, n).port() == route.backend.port()
+                }) {
+                    return Err(Error("网站后端不能同时用作托管节点监听端口".into()));
+                }
             }
         }
         let mut group_ids = BTreeSet::new();
@@ -298,8 +371,18 @@ impl Registry {
                 return Err(Error("分组包含不存在或重复的节点 ID".into()));
             }
         }
-        if config.hysteria2_port_hopping.is_some() && !self.nodes.iter().any(|n|n.enabled&&n.core==CoreKind::SingBox&&matches!(&n.data,Data::Legacy(CanonicalNode::Hysteria2{port,..}) if config.hysteria2.as_ref().is_some_and(|h|h.listen_port==*port))) {
-            return Err(Error("Hy2 端口跳跃仍启用：请先在跳跃配置中关闭，再停用、移除或更改其基础监听节点".into()));
+        if config.hysteria2_port_hopping.is_some()
+            && self.mode.allows(CoreKind::SingBox)
+            && self.nodes.iter().any(|n| {
+                n.enabled
+                    && n.core == CoreKind::SingBox
+                    && matches!(&n.data, Data::Legacy(CanonicalNode::Hysteria2 { .. }))
+            })
+            && !self.has_active_sing_box_hysteria2(config)
+        {
+            return Err(Error(
+                "Hy2 端口跳跃仍启用：请先在跳跃配置中关闭，再更改其基础监听端口".into(),
+            ));
         }
         if config.certificate_mode == crate::config::CertificateMode::Domain {
             for n in &self.nodes {
@@ -327,6 +410,35 @@ impl Registry {
             .into_iter()
             .find(|c| self.mode.allows(*c) && node.supports(*c))
             .ok_or_else(|| Error("当前模式无法承载此组合；请先切换为 dual 或指定受支持内核".into()))
+    }
+    pub fn has_active_sing_box_hysteria2(&self, config: &DeploymentConfig) -> bool {
+        config.hysteria2_port_hopping.is_some()
+            && self.mode.allows(CoreKind::SingBox)
+            && self.nodes.iter().any(|n| {
+                n.enabled
+                    && n.core == CoreKind::SingBox
+                    && matches!(
+                        &n.data,
+                        Data::Legacy(CanonicalNode::Hysteria2 { port, .. })
+                            if config.hysteria2.as_ref().is_some_and(|h| h.listen_port == *port)
+                    )
+            })
+    }
+    pub fn incompatible_enabled_nodes(&self, mode: Mode) -> Vec<&Node> {
+        self.nodes
+            .iter()
+            .filter(|n| {
+                if !n.enabled || mode.allows(n.core) {
+                    return false;
+                }
+                let target = if mode == Mode::Xray {
+                    CoreKind::Xray
+                } else {
+                    CoreKind::SingBox
+                };
+                !n.supports(target)
+            })
+            .collect()
     }
     pub fn switch(&mut self, mode: Mode, disable: &[String]) -> Result<()> {
         for id in disable {
@@ -579,6 +691,9 @@ pub fn create(
     port: Option<u16>,
     core: Option<CoreKind>,
 ) -> Result<Node> {
+    let preset = crate::catalog::resolve(preset)
+        .map(|p| p.key)
+        .ok_or_else(|| Error("未知协议；使用 node catalog 查看可选协议".into()))?;
     let id = new_id();
     let port = port
         .map(Ok)
@@ -663,10 +778,22 @@ pub fn create(
             })
         }
     };
+    let label = crate::catalog::unique_label(
+        preset,
+        registry
+            .nodes
+            .iter()
+            .map(|n| n.tag.clone())
+            .chain(registry.groups.iter().map(|g| g.name.clone())),
+    );
     let mut node = Node {
         id: id.clone(),
-        tag: format!("node-{id}"),
-        name: name.into(),
+        tag: label.clone(),
+        name: if name.trim().is_empty() {
+            label
+        } else {
+            name.into()
+        },
         core: core.unwrap_or_default(),
         enabled: true,
         listen: "::".into(),

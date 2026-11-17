@@ -74,7 +74,7 @@ fn ask_client_template_fields<C: Prompts>(
     // external rule-sets are reachable (ADR-0022).
     config.client_template = ask_required(
         prompts,
-        "客户端内容模板（1 compact：精简，仅代理手动组 / 2 standard：审核模板与自动选择两组）",
+        "客户端内容模板（1 compact：精简规则集，保留代理与自动选择两组 / 2 standard：审核模板，代理与自动选择两组）",
         Some(config.client_template.to_string()),
         parse_client_template,
     )?;
@@ -163,9 +163,17 @@ pub fn run<C: Prompts>(
     default_interface: Option<String>,
     prompts: &mut C,
 ) -> Result<WizardOutcome, WizardError> {
+    run_with_host(existing, default_interface, None, prompts)
+}
+pub fn run_with_host<C: Prompts>(
+    existing: Option<&DeploymentConfig>,
+    default_interface: Option<String>,
+    default_host: Option<String>,
+    prompts: &mut C,
+) -> Result<WizardOutcome, WizardError> {
     prompts.report("=== sbctl 配置向导 ===");
 
-    let mode = ask_required(
+    let mut mode = ask_required(
         prompts,
         "订阅模式（1 自动 HTTPS / 2 外部反向代理 / 3 无域名 IP）",
         existing
@@ -176,10 +184,19 @@ pub fn run<C: Prompts>(
 
     let subscription_host = ask_required(
         prompts,
-        "订阅主机名（域名或 IP）",
-        existing.map(|config| config.subscription_host.clone()),
+        "订阅地址（域名；无域名可使用检测到的出口 IP）",
+        existing
+            .map(|config| config.subscription_host.clone())
+            .or(default_host),
         parse_host,
     )?;
+    if existing.is_none()
+        && mode == SubscriptionMode::Direct
+        && subscription_host.parse::<std::net::IpAddr>().is_ok()
+    {
+        mode = SubscriptionMode::IpFallback;
+        prompts.report("已选择无域名模式：订阅使用 HTTP，节点使用自动自签证书；请勿公开订阅链接。");
+    }
 
     let proxy_host = ask_value(
         prompts,
@@ -201,7 +218,12 @@ pub fn run<C: Prompts>(
         Some(ask_required(
             prompts,
             "IP fallback HTTP 端口（大于 1024）",
-            existing.and_then(|config| config.http_port.map(|port| port.to_string())),
+            Some(
+                existing
+                    .and_then(|config| config.http_port)
+                    .unwrap_or(2080)
+                    .to_string(),
+            ),
             parse_high_port,
         )?)
     } else {
@@ -212,8 +234,12 @@ pub fn run<C: Prompts>(
         Some(ask_required(
             prompts,
             "External proxy loopback 监听端口（大于 1024）",
-            existing
-                .and_then(|config| config.subscription_listen_port.map(|port| port.to_string())),
+            Some(
+                existing
+                    .and_then(|config| config.subscription_listen_port)
+                    .unwrap_or(2080)
+                    .to_string(),
+            ),
             parse_high_port,
         )?)
     } else {
@@ -289,8 +315,10 @@ pub fn run<C: Prompts>(
     let reality_decoy_sni = if enabled_protocols.contains(&ManagedProtocol::VlessReality) {
         Some(ask_required(
             prompts,
-            "Reality decoy SNI",
-            existing.and_then(|config| config.reality_decoy_sni.clone()),
+            "Reality 伪装域名（SNI，回车使用默认）",
+            existing
+                .and_then(|config| config.reality_decoy_sni.clone())
+                .or_else(|| Some("www.cloudflare.com".into())),
             parse_hostname,
         )?)
     } else {
@@ -500,7 +528,9 @@ fn ask_client_template_preset<C: Prompts>(
     existing: &DeploymentConfig,
     prompts: &mut C,
 ) -> Result<crate::subscription::ClientTemplate, WizardError> {
-    prompts.report("精简：一个代理手动组，保留 DNS/TUN 与必要分流；标准：审核模板与自动选择两组。");
+    prompts.report(
+        "精简：保留代理与自动选择两组，内联私有网络直连；标准：审核模板，包含代理与自动选择两组。",
+    );
     if matches!(
         existing.client_template,
         crate::subscription::ClientTemplate::Global | crate::subscription::ClientTemplate::Split
@@ -512,7 +542,7 @@ fn ask_client_template_preset<C: Prompts>(
     }
     ask_required(
         prompts,
-        "客户端内容模板（1 compact 精简，仅代理手动组 / 2 standard 审核模板与自动选择两组）",
+        "客户端内容模板（1 compact 精简规则集，代理与自动选择两组 / 2 standard 审核模板，代理与自动选择两组）",
         Some(existing.client_template.to_string()),
         parse_client_template,
     )

@@ -18,6 +18,76 @@ use crate::fixture::{
     write_systemctl_fixture, write_unsigned_release_manifest,
 };
 
+#[cfg(unix)]
+#[test]
+fn legacy_manager_only_upgrade_never_executes_the_broken_old_cli_or_changes_core_and_credentials() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = TempDir::new().unwrap();
+    initialize_update_fixture(&fixture);
+    write_managed_file(&fixture, "usr/local/bin/sbctl", b"#!/bin/sh\nexit 99\n");
+    write_managed_file(
+        &fixture,
+        "usr/local/bin/sing-box",
+        b"old kernel without version support",
+    );
+    write_managed_file(
+        &fixture,
+        "var/lib/sbctl/state.json",
+        b"accounting-preserved",
+    );
+    let config = fs::read(fixture.path().join("etc/sbctl/config.toml")).unwrap();
+    let candidate = fixture.path().join("new-sbctl");
+    let contents = b"#!/bin/sh\ncase \"$*\" in *--help*) echo --apply;; esac\nexit 0\n";
+    fs::write(&candidate, contents).unwrap();
+    fs::set_permissions(&candidate, fs::Permissions::from_mode(0o755)).unwrap();
+    let manifest = fixture.path().join("manifest.json");
+    write_release_manifest(
+        &manifest,
+        contents,
+        b"unavailable kernel, must never download",
+    );
+    Command::cargo_bin("sbctl")
+        .unwrap()
+        .arg("--root")
+        .arg(fixture.path())
+        .args(["update", "--manifest"])
+        .arg(&manifest)
+        .arg("--sbctl-artifact")
+        .arg(&candidate)
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("已独立更新"));
+    assert_eq!(
+        fs::read(fixture.path().join("usr/local/bin/sbctl")).unwrap(),
+        contents
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("usr/local/bin/sing-box")).unwrap(),
+        b"old kernel without version support"
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("etc/sbctl/config.toml")).unwrap(),
+        config
+    );
+    assert_eq!(
+        fs::read(fixture.path().join("var/lib/sbctl/state.json")).unwrap(),
+        b"accounting-preserved"
+    );
+    assert!(!fixture.path().join("etc/sbctl/nodes.json").exists());
+    sbctl::deployment::rollback(&sbctl::config::DeploymentStore::new(fixture.path())).unwrap();
+    assert_eq!(
+        fs::read(fixture.path().join("usr/local/bin/sbctl")).unwrap(),
+        b"#!/bin/sh\nexit 99\n"
+    );
+    assert_eq!(
+        sbctl::config::DeploymentStore::new(fixture.path())
+            .load()
+            .unwrap(),
+        toml::from_str::<sbctl::config::DeploymentConfig>(std::str::from_utf8(&config).unwrap())
+            .unwrap()
+    );
+}
+
 #[test]
 fn sing_box_install_refuses_an_unowned_binary_without_replacing_it() {
     let fixture = TempDir::new().expect("fixture");

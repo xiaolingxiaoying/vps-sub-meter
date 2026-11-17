@@ -13,6 +13,91 @@ use sbctl::subscription::{
 };
 
 #[test]
+fn orphaned_fake_ips_are_rejected_before_direct_or_proxy_routes_in_every_clash_profile() {
+    const GUARD: &str = "IP-CIDR,198.18.0.0/15,REJECT,no-resolve";
+    let assert_guard = |label: &str, text: &str| {
+        let value: serde_yaml::Value = serde_yaml::from_str(text).unwrap();
+        let rules = value["rules"].as_sequence().unwrap();
+        assert_eq!(rules[0].as_str(), Some(GUARD), "{label}");
+        assert_eq!(
+            rules
+                .iter()
+                .filter(|rule| rule.as_str() == Some(GUARD))
+                .count(),
+            1,
+            "{label}: the standalone guard must not be duplicated during rendering"
+        );
+        assert!(
+            rules
+                .iter()
+                .any(|rule| rule.as_str().unwrap().starts_with("MATCH,"))
+        );
+    };
+    assert_guard(
+        "standalone template",
+        include_str!("../src/subscription/templates/mihomo.yaml"),
+    );
+    for template in [
+        ClientTemplate::Standard,
+        ClientTemplate::Compact,
+        ClientTemplate::Global,
+        ClientTemplate::Split,
+    ] {
+        for rule_profile in [ClientRuleProfile::Standard, ClientRuleProfile::Minimal] {
+            let root = tempfile::tempdir().unwrap();
+            let mut config = DeploymentConfig::new(
+                SubscriptionMode::IpFallback,
+                "203.0.113.7".into(),
+                None,
+                Some(2080),
+                "ens3".into(),
+                vec![ManagedProtocol::VlessReality],
+                Some("www.cloudflare.com".into()),
+            )
+            .unwrap();
+            config.client_template = template.clone();
+            config.client_rule_profile = rule_profile.clone();
+            // A registered IP dataset is normally prepended to built-in rules;
+            // it must not supersede the guard even when it selects DIRECT.
+            config.client_extra_rule_sets = vec![sbctl::config::ExtraRuleSet {
+                name: "local-addresses".into(),
+                url: "https://example.test/private.mrs".into(),
+                outbound: "direct".into(),
+                behavior: sbctl::config::RuleSetBehavior::Ipcidr,
+            }];
+            let mut registry = sbctl::nodes::load_or_import(root.path(), &config).unwrap();
+            registry.groups.push(sbctl::nodes::Group {
+                id: "test-group".into(),
+                name: "test group".into(),
+                members: vec![registry.nodes[0].id.clone()],
+                strategy: Default::default(),
+            });
+            for (deployment, artifacts) in [
+                ("legacy", generated_artifacts(&config, root.path()).unwrap()),
+                (
+                    "managed",
+                    sbctl::subscription::managed::generate(&config, root.path(), &registry)
+                        .unwrap(),
+                ),
+            ] {
+                let mut checked = 0;
+                for (name, text) in artifacts
+                    .iter()
+                    .filter(|(name, _)| name.contains("clash") && name.ends_with(".yaml"))
+                {
+                    assert_guard(
+                        &format!("{deployment}/{template}/{rule_profile}/{name}"),
+                        text,
+                    );
+                    checked += 1;
+                }
+                assert_eq!(checked, if deployment == "managed" { 4 } else { 2 });
+            }
+        }
+    }
+}
+
+#[test]
 #[ignore = "requires a real mihomo binary; run by the CI mihomo-profiles job"]
 fn generated_clash_artifacts_load_in_a_real_mihomo() {
     let Ok(binary) = std::env::var("MIHOMO_BIN") else {

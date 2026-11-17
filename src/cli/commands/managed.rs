@@ -30,6 +30,12 @@ pub(crate) fn publish(
 ) -> Result<()> {
     let plan = sbctl::deployment::plan(root, config, before, &after)?;
     println!("{}", serde_json::to_string_pretty(&plan).unwrap());
+    for warning in &plan.warnings {
+        eprintln!(
+            "{}",
+            sbctl::term::yellow(format!("⚠️ 兼容性提示：{warning}"))
+        );
+    }
     if apply {
         if !plan.requirements.is_empty() {
             return Err(Error(plan.requirements.join("；")));
@@ -42,10 +48,44 @@ pub(crate) fn publish(
     Ok(())
 }
 pub(crate) fn node(root: &Path, command: NodeCommand) -> ExitCode {
+    if matches!(&command, NodeCommand::Catalog) {
+        for (i, p) in sbctl::catalog::PROTOCOLS.iter().enumerate() {
+            println!(
+                "{}. {} | {} | {}\n   CLI: {}",
+                i + 1,
+                p.label,
+                p.engine,
+                p.note,
+                p.key
+            );
+        }
+        return ExitCode::SUCCESS;
+    }
     finish((|| {
         let (config, before) = draft(root)?;
         let mut after = before.clone();
         let apply = match command {
+            NodeCommand::Catalog => {
+                for (i, p) in sbctl::catalog::PROTOCOLS.iter().enumerate() {
+                    println!(
+                        "{}. {}  | {} | {}\n   CLI: {}",
+                        i + 1,
+                        p.label,
+                        p.engine,
+                        p.note,
+                        p.key
+                    );
+                }
+                return Ok(());
+            }
+            NodeCommand::NormalizeNames { apply } => {
+                after.normalize_names();
+                apply
+            }
+            NodeCommand::Complete { apply } => {
+                after.complete_catalog(&config)?;
+                apply
+            }
             NodeCommand::Probe {
                 id,
                 url,
@@ -111,7 +151,7 @@ pub(crate) fn node(root: &Path, command: NodeCommand) -> ExitCode {
                             "{}  {}  {}  {}  {}:{}  {}",
                             n["id"].as_str().unwrap(),
                             n["name"].as_str().unwrap(),
-                            n["preset"].as_str().unwrap(),
+                            sbctl::catalog::label(n["preset"].as_str().unwrap()),
                             n["core"].as_str().unwrap(),
                             n["listen"].as_str().unwrap(),
                             n["port"],
@@ -463,8 +503,28 @@ pub(crate) fn core(root: &Path, command: CoreCommand) -> ExitCode {
                 sbctl::deployment::rollback(&store)?;
                 println!("已恢复最近部署；订阅凭据和流量账期未回退");
             }
-            CoreCommand::Install { core, version } | CoreCommand::Update { core, version } => {
-                sbctl::deployment::install_core(&store, core, version.as_deref())?;
+            CoreCommand::Install {
+                core,
+                version,
+                url,
+                sha256,
+            }
+            | CoreCommand::Update {
+                core,
+                version,
+                url,
+                sha256,
+            } => {
+                let source = url
+                    .as_deref()
+                    .zip(sha256.as_deref())
+                    .map(|(url, sha256)| sbctl::kernel_source::CustomSource { url, sha256 });
+                sbctl::deployment::install_core_from_source(
+                    &store,
+                    core,
+                    version.as_deref(),
+                    source.as_ref(),
+                )?;
                 println!("{core} 已校验并安装");
             }
             CoreCommand::Restart { core } => {

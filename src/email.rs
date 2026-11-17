@@ -82,9 +82,17 @@ pub fn load(root: &Path) -> Result<EmailConfig, String> {
 }
 
 #[derive(Default, Serialize, Deserialize)]
+#[serde(default)]
 struct DeliveryState {
     daily: Option<String>,
     reminder: Option<String>,
+    last_success: Option<String>,
+}
+pub fn last_delivery(root: &Path) -> Option<String> {
+    crate::config::read_managed_file_no_follow(&root.join(STATE_PATH))
+        .ok()
+        .and_then(|b| serde_json::from_slice::<DeliveryState>(&b).ok())
+        .and_then(|s| s.last_success)
 }
 
 fn due(
@@ -156,12 +164,16 @@ pub fn report(
     match crate::traffic::report(&DeploymentStore::new(root), config) {
         Ok(traffic) => {
             text.push_str(&format!(
-                "网卡：{}\nRX 入站：{} GiB\nTX 出站：{} GiB\n已用：{} GiB\n额度：{} GiB\n",
+                "网卡：{}\nRX 入站：{}\nTX 出站：{}\n已用：{}\n额度：{}\n",
                 traffic.interface,
                 crate::traffic::format_gib(traffic.received),
                 crate::traffic::format_gib(traffic.transmitted),
                 crate::traffic::format_gib(traffic.total()),
-                crate::traffic::format_gib(traffic.monthly_traffic_limit)
+                if traffic.monthly_traffic_limit == 0 {
+                    "不限额".into()
+                } else {
+                    crate::traffic::format_gib(traffic.monthly_traffic_limit)
+                }
             ));
             for (label, zone) in [
                 ("VPS 刷新", &config.accounting_timezone),
@@ -178,10 +190,46 @@ pub fn report(
     }
     if include_subscription {
         text.push_str("\n私有订阅链接（包含订阅凭据，请妥善保管）：\n");
-        for row in crate::subscription::available_subscription_matrix(config) {
+        let generation = crate::deployment::current(root).map_err(|_| "无法读取已发布订阅")?;
+        for row in crate::subscription::subscription_matrix() {
+            if generation
+                .as_ref()
+                .map_or(!row.format.has_compatible_nodes(config), |g| {
+                    !g.files
+                        .iter()
+                        .any(|n| n == row.format.artifact_name().as_ref())
+                })
+            {
+                continue;
+            }
             let url = crate::subscription::subscription_url(config, row.format)
                 .map_err(|_| "无法生成订阅链接")?;
             text.push_str(&format!("{}：{url}\n", row.format.display_label()));
+        }
+    }
+    if let Ok(Some(generation)) = crate::deployment::current(root)
+        && let Ok(catalog) = crate::subscription::managed::catalog(root, &generation)
+    {
+        text.push_str(&format!(
+            "\n托管节点：{} / {} 启用；运行模式 {}\n",
+            catalog
+                .nodes
+                .iter()
+                .filter(|n| n["enabled"] == true)
+                .count(),
+            catalog.nodes.len(),
+            catalog.mode.label()
+        ));
+        for report in catalog.reports.iter().filter(|r| {
+            r.group.is_none()
+                && ["sing-box-full.json", "clash.yaml", "uri"].contains(&r.format.as_str())
+        }) {
+            text.push_str(&format!(
+                "{}：可用 {}，兼容性排除 {}\n",
+                report.format,
+                report.included,
+                report.excluded.len()
+            ));
         }
     }
     Ok(text)
@@ -223,7 +271,7 @@ fn deliver(root: &Path, config: &EmailConfig, body: &str, reminder: bool) -> Res
     let scheme = if config.implicit_tls { "smtps" } else { "smtp" };
     // No shell interpolation, no password in process arguments. STARTTLS is
     // mandatory; libcurl verifies the CA chain and hostname for either mode.
-    write!(options, "url = {}\nuser = {}\nmail-from = {}\nmail-rcpt = {}\nupload-file = {}\nssl-reqd\nconnect-timeout = 15\nmax-time = 45\nsilent\nshow-error\n",
+    write!(options, "url = {}\nuser = {}\nmail-from = {}\nmail-rcpt = {}\nupload-file = {}\nproxy = \"\"\nssl-reqd\nconnect-timeout = 15\nmax-time = 45\nsilent\nshow-error\n",
         quoted(&format!("{scheme}://{}:{}", config.smtp_host, config.smtp_port)),
         quoted(&format!("{}:{}", config.username, config.password)), quoted(&config.from),
         quoted(&config.to), quoted(&mail.path().to_string_lossy())).map_err(|_| "无法写入 SMTP 配置")?;
@@ -242,8 +290,16 @@ fn deliver(root: &Path, config: &EmailConfig, body: &str, reminder: bool) -> Res
         .map_err(|_| "无法运行 curl，请安装 curl")?;
     if !output.status.success() {
         // SMTP responses may contain credentials or recipients; never log them.
+        let hint = match output.status.code() {
+            Some(6) => "SMTP 域名解析失败",
+            Some(7) => "无法连接 SMTP；检查端口与 VPS 出站限制",
+            Some(28) => "连接超时；检查出站端口或稍后重试",
+            Some(60) => "TLS 证书校验失败；检查系统时间和 CA",
+            Some(67) => "SMTP 登录失败；通常需要邮箱授权码，而非网页登录密码",
+            _ => "检查 SMTP、TLS、授权码与收件人",
+        };
         return Err(format!(
-            "SMTP 发送失败（退出码 {:?}），请检查服务器、TLS、授权码和收件人",
+            "SMTP 发送失败：{hint}（退出码 {:?}）；未记录服务器原始响应",
             output.status.code()
         ));
     }
@@ -251,14 +307,24 @@ fn deliver(root: &Path, config: &EmailConfig, body: &str, reminder: bool) -> Res
 }
 
 pub fn send(root: &Path, scheduled: bool) -> Result<bool, String> {
-    let config = load(root)?;
     let store = DeploymentStore::new(root);
-    let _lock = store
+    // Serialize only mail delivery, not the whole control plane during SMTP IO.
+    let directory = root.join("var/lib/sbctl/email-delivery");
+    let delivery_lock = crate::managed_fs::open_lock(&directory).map_err(|_| "无法锁定邮件发送")?;
+    if root == Path::new("/") {
+        crate::config::set_owner_mode_no_follow(root, &directory, "root:root", 0o700)
+            .map_err(|_| "邮件目录权限无效")?;
+        crate::config::set_open_file_owner_mode(root, &delivery_lock, "root:root", 0o600)
+            .map_err(|_| "邮件锁权限无效")?;
+    }
+    fs2::FileExt::lock_exclusive(&delivery_lock).map_err(|_| "无法锁定邮件发送")?;
+    let lock = store
         .acquire_operation_lock()
         .map_err(|_| "无法锁定邮件任务")?;
+    let config = load(root)?;
     let deployment = store.load().map_err(|_| "部署尚未初始化")?;
     let state_file = root.join(STATE_PATH);
-    let mut state: DeliveryState = match fs::read(state_file) {
+    let mut state: DeliveryState = match crate::config::read_managed_file_no_follow(&state_file) {
         Ok(bytes) => serde_json::from_slice(&bytes).map_err(|_| "邮件发送状态损坏")?,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => DeliveryState::default(),
         Err(_) => return Err("无法读取邮件发送状态".into()),
@@ -283,7 +349,12 @@ pub fn send(root: &Path, scheduled: bool) -> Result<bool, String> {
         config.include_subscription,
         scheduled && reminder,
     )?;
+    drop(lock);
     deliver(root, &config, &body, scheduled && reminder)?;
+    let _lock = store
+        .acquire_operation_lock()
+        .map_err(|_| "无法保存邮件发送状态")?;
+    state.last_success = Some(Utc::now().to_rfc3339());
     if scheduled {
         if daily {
             state.daily = Some(
@@ -300,13 +371,13 @@ pub fn send(root: &Path, scheduled: bool) -> Result<bool, String> {
         if reminder {
             state.reminder = next_reset.map(|reset| reset.to_rfc3339());
         }
-        store
-            .write_root_only_locked(
-                STATE_PATH,
-                &serde_json::to_vec(&state).map_err(|_| "无法序列化邮件状态")?,
-            )
-            .map_err(|_| "邮件已发送，但发送状态保存失败")?;
     }
+    store
+        .write_root_only_locked(
+            STATE_PATH,
+            &serde_json::to_vec(&state).map_err(|_| "无法序列化邮件状态")?,
+        )
+        .map_err(|_| "邮件已发送，但发送状态保存失败")?;
     Ok(true)
 }
 

@@ -61,7 +61,7 @@ class Menu:
     def choose(self, number, expected):
         self.send(str(number))
         if expected in {
-            "概览与诊断", "节点与组合", "节点组与订阅", "流量与通知",
+            "概览与诊断", "协议管理", "节点组与订阅", "流量与通知",
             "内核与运行模式", "高级与维护", "主菜单",
         }:
             expected = f"=== {expected} ==="
@@ -150,7 +150,7 @@ def navigation_and_deployment_visibility():
         root = Path(temp)
         menu = Menu(root)
         for number, title in enumerate(
-            ["概览与诊断", "节点与组合", "节点组与订阅", "内核与运行模式", "流量与通知", "高级与维护"], 1
+            ["概览与诊断", "协议管理", "节点组与订阅", "内核与运行模式", "流量与通知", "高级与维护"], 1
         ):
             text = menu.choose(number, title)
             if number == 2:
@@ -165,7 +165,7 @@ def navigation_and_deployment_visibility():
 
         initialize(root)
         menu = Menu(root)
-        text = menu.choose(2, "节点与组合")
+        text = menu.choose(2, "协议管理")
         assert "快速安装（默认五协议" not in text and "引导安装" not in text, "deployed root must hide fresh-install choices"
         menu.close()
     print("PASS menu navigation, invalid input, and deployment-aware choices", flush=True)
@@ -241,7 +241,7 @@ def damaged_configuration_and_read_only_diagnosis():
         contents = f'subscription_credential = "{secret}" unexpected\n'
         config.write_text(contents, encoding="utf-8")
         menu = Menu(root)
-        text = menu.choose(2, "节点与组合")
+        text = menu.choose(2, "协议管理")
         assert "状态: 配置不可用" in text
         assert "状态: 未安装" not in text
         assert "快速安装（默认五协议" not in text and "引导安装" not in text

@@ -5,7 +5,7 @@ use crate::{
     canonical::CanonicalNode,
     config::DeploymentConfig,
     core::{CoreKind, xray::CertificatePaths},
-    nodes::{Data, Node, Registry, Strategy},
+    nodes::{Data, Node, Registry},
 };
 use base64::Engine;
 use serde::{Deserialize, Serialize};
@@ -237,6 +237,8 @@ pub fn share_link(
     node: &Node,
     shadow: bool,
 ) -> Result<String, SubscriptionError> {
+    let node_config = config_for_node(config, node);
+    let config = &node_config;
     match &node.data {
         Data::Combination(n) => {
             let mut n = n.clone();
@@ -308,11 +310,7 @@ pub(crate) fn client_node(
     node: &Node,
     format: Format,
 ) -> Result<Value, SubscriptionError> {
-    let mut node_config = config.clone();
-    if !matches!(&node.data,Data::Legacy(CanonicalNode::Hysteria2{port,..}) if config.hysteria2.as_ref().is_some_and(|h|h.listen_port==*port))
-    {
-        node_config.hysteria2_port_hopping = None;
-    }
+    let node_config = config_for_node(config, node);
     let config = &node_config;
     let clash = matches!(format, Format::Clash | Format::ClashLegacy(_));
     let mut value = match &node.data {
@@ -365,6 +363,16 @@ pub(crate) fn client_node(
         value["server_port"] = json!(node.port());
     }
     Ok(value)
+}
+
+fn config_for_node(config: &DeploymentConfig, node: &Node) -> DeploymentConfig {
+    let mut config = config.clone();
+    if !matches!(&node.data, Data::Legacy(CanonicalNode::Hysteria2 { port, .. })
+        if config.hysteria2.as_ref().is_some_and(|h| h.listen_port == *port))
+    {
+        config.hysteria2_port_hopping = None;
+    }
+    config
 }
 fn replace_members(value: &mut Value, old: &str, tags: &[String]) {
     match value {
@@ -511,52 +519,41 @@ fn render_format(
     if yaml {
         value["proxies"] = json!(clients);
     } else {
-        value["outbounds"]
-            .as_array_mut()
-            .unwrap()
-            .retain(|v| v["tag"] != seed.tag());
-        value["outbounds"]
-            .as_array_mut()
-            .unwrap()
-            .splice(0..0, clients);
+        let outbounds = value["outbounds"].as_array_mut().unwrap();
+        if let Some(pos) = outbounds.iter().position(|v| v["tag"] == seed.tag()) {
+            outbounds.splice(pos..=pos, clients);
+        } else {
+            outbounds.extend(clients);
+        }
     }
     replace_members(&mut value, seed.tag(), &tags);
-    let groups: Vec<_> = registry
-        .groups
-        .iter()
-        .filter(|g| group.is_none_or(|one| one.id == g.id))
-        .collect();
-    for g in groups {
-        let members: Vec<_> = g
-            .members
-            .iter()
-            .filter_map(|id| selected.iter().find(|n| &n.id == id).map(|n| n.tag.clone()))
-            .collect();
-        if members.is_empty() {
-            continue;
-        }
-        let entry = if yaml {
-            json!({"name":g.name,"type":if g.strategy==Strategy::Select{"select"}else{"url-test"},"proxies":members,"url":config.client_latency_probe_url,"interval":300,"lazy":false})
-        } else {
-            let mut v = json!({"tag":g.name,"type":if g.strategy==Strategy::Select{"selector"}else{"urltest"},"outbounds":members});
-            if g.strategy == Strategy::Urltest {
-                v["url"] = json!(config.client_latency_probe_url);
-                v["interval"] = json!("5m");
-            }
-            v
-        };
-        let key = if yaml { "proxy-groups" } else { "outbounds" };
-        let items = value[key].as_array_mut().unwrap();
-        if let Some(main) = items
-            .iter_mut()
-            .find(|v| v[if yaml { "name" } else { "tag" }] == "代理")
-        {
-            main[if yaml { "proxies" } else { "outbounds" }]
+    if let Some(group) = group {
+        let automatic = group.strategy == crate::nodes::Strategy::Urltest;
+        if yaml {
+            let selector = value["proxy-groups"]
                 .as_array_mut()
                 .unwrap()
-                .push(json!(g.name));
+                .iter_mut()
+                .find(|g| g["name"] == super::render::SELECTOR_TAG)
+                .unwrap();
+            let members = selector["proxies"].as_array_mut().unwrap();
+            if automatic {
+                members.retain(|v| v != super::render::AUTO_TAG);
+                members.insert(0, json!(super::render::AUTO_TAG));
+            }
+        } else {
+            let selector = value["outbounds"]
+                .as_array_mut()
+                .unwrap()
+                .iter_mut()
+                .find(|g| g["tag"] == super::render::SELECTOR_TAG)
+                .unwrap();
+            selector["default"] = json!(if automatic {
+                super::render::AUTO_TAG
+            } else {
+                &tags[0]
+            });
         }
-        items.push(entry);
     }
     if let Some(template) = if yaml { &templates.1 } else { &templates.0 } {
         json_merge::deep_merge(&mut value, template);
@@ -714,6 +711,14 @@ pub fn servers(
     root: &Path,
     registry: &Registry,
 ) -> Result<Vec<(CoreKind, Value)>, SubscriptionError> {
+    servers_for_kernel(config, root, registry, None)
+}
+pub fn servers_for_kernel(
+    config: &DeploymentConfig,
+    root: &Path,
+    registry: &Registry,
+    legacy_sing_box: Option<bool>,
+) -> Result<Vec<(CoreKind, Value)>, SubscriptionError> {
     if !registry.mode.allows(CoreKind::SingBox)
         && let Some(document) = crate::override_template::Overrides::load(root)
             .map_err(|e| err(e.to_string()))?
@@ -730,14 +735,15 @@ pub fn servers(
             ));
         }
     }
-    let tls = super::render::existing_certificate_tls_config(config, root)?;
+    let tls = super::render::certificate_tls_paths(config, root);
     let cert = CertificatePaths {
         certificate: tls["certificate_path"].as_str().unwrap(),
         private_key: tls["key_path"].as_str().unwrap(),
     };
-    let legacy_server =
+    let legacy_server = legacy_sing_box.unwrap_or_else(|| {
         super::installed_kernel_version(&root.join(crate::deployment::binary(CoreKind::SingBox)))
-            .is_some_and(|v| v.major == 1 && v.minor == 10);
+            .is_some_and(|v| v.major == 1 && v.minor == 10)
+    });
     let mut result = Vec::new();
     for core in [CoreKind::SingBox, CoreKind::Xray] {
         if !registry.mode.allows(core) {
@@ -745,7 +751,7 @@ pub fn servers(
         }
         let mut server = if core == CoreKind::SingBox {
             parse(
-                &super::render::sing_box_server(config, &[], root, legacy_server)?,
+                &super::render::sing_box_server_with_paths(config, &[], root, legacy_server)?,
                 false,
             )?
         } else {
@@ -759,7 +765,7 @@ pub fn servers(
         {
             let mut inbound = match (&n.data, core) {
                 (Data::Legacy(node), CoreKind::SingBox) => parse(
-                    &super::render::sing_box_server(
+                    &super::render::sing_box_server_with_paths(
                         config,
                         std::slice::from_ref(node),
                         root,
@@ -796,7 +802,13 @@ pub fn servers(
                 }
             };
             inbound["tag"] = json!(n.tag);
-            inbound["listen"] = json!(n.listen);
+            let binding = crate::shared_tls::binding(config, n);
+            inbound["listen"] = json!(binding.ip().to_string());
+            inbound[if core == CoreKind::Xray {
+                "port"
+            } else {
+                "listen_port"
+            }] = json!(binding.port());
             inbounds.push(inbound);
         }
         server["inbounds"] = json!(inbounds);

@@ -59,7 +59,7 @@ case "${ID}" in
 esac
 
 apt-get update
-DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl jq openssl tar certbot
+DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates curl jq openssl tar unzip certbot
 
 # The first-release Ed25519 verification key, identical to the one embedded in
 # src/release.rs. The signature in the manifest covers the canonical JSON of
@@ -157,6 +157,19 @@ esac
 curl --fail --location --silent --show-error "$artifact_url" >"$work_dir/sbctl"
 printf '%s  %s\n' "$expected_sha" "$work_dir/sbctl" | sha256sum --check --status
 chmod 0755 "$work_dir/sbctl"
+
+# Upgrade with the authenticated candidate, never the potentially broken old
+# CLI. The candidate preserves nodes, credentials, traffic and both cores;
+# its durable transaction restores the old manager on a failed restart.
+if [[ -f /etc/sbctl/config.toml ]] && [[ "${SBCTL_UPGRADE_ONLY:-0}" == 1 || "$#" -eq 0 ]]; then
+  echo "发现已有部署：只升级管理程序，保留订阅链接、节点、流量和现有内核。"
+  "$work_dir/sbctl" config validate
+  run_installer "$work_dir/sbctl" update --manifest "$work_dir/manifest.json" --sbctl-bin "$work_dir/sbctl"
+fi
+if [[ "${SBCTL_UPGRADE_ONLY:-0}" == 1 ]]; then
+  echo "未发现 sbctl 部署；请先运行安装器完成首次安装。" >&2
+  exit 2
+fi
 
 # The read-only preflight runs the *candidate*, never an already installed
 # binary: `sbctl install` treats a non-terminal stdin as a preflight, so this

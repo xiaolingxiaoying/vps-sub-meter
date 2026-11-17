@@ -7,10 +7,9 @@
 //! subscription. Full profiles layer this policy catalog over the vendored
 //! mihomo-test settings (see the 2026-10-16 amendment to ADR-0022).
 //!
-//! `Global` and `Split` are the richer catalogs the axis exists for: eight
-//! declared policy groups instead of three (seven for sing-box, which has no
-//! failover outbound type), eight or nine external rule-sets instead of four,
-//! and one inline routing rule per verdict. Every rule-set entry carries an
+//! Every template uses the same manual and automatic policy groups, with a
+//! separate built-in direct outbound. `Global` and `Split` retain their richer
+//! rule-set catalogs and one inline routing rule per verdict. Every rule-set entry carries an
 //! inline twin (see [`InlineRule::minimal_twin`]) rendered from the compiled-in
 //! lists below, so `client_rule_profile = "minimal"` keeps making the same
 //! routing *decisions* while never naming a rule CDN — that is the regression
@@ -19,14 +18,14 @@
 //! The two templates differ where the owner's spec says they must:
 //!
 //! - `Global` is proxy-oriented. Only private/LAN destinations get a direct
-//!   verdict; the CN rule-set is routed to a dedicated proxy group instead of
+//!   verdict; the CN rule-set is routed to the manual proxy group instead of
 //!   direct, and DNS asks no rule-set which domains to resolve directly.
 //! - `Split` is split-routing oriented. CN domains and CN addresses go direct,
 //!   ads are rejected, and the remaining traffic is proxied.
 //!
 //! Neither changes the node list: `subscription-sing-box.json`, `uri`,
 //! `subscription-base64-uri.txt` and `subscription-shadowrocket.txt` stay
-//! byte-identical across all three templates (ADR-0022, and the test
+//! byte-identical across all templates (ADR-0022, and the test
 //! `the_node_list_artifacts_are_byte_identical_across_templates`).
 
 use std::fmt;
@@ -44,7 +43,8 @@ pub enum ClientTemplate {
     Standard,
     Global,
     Split,
-    /// A single manual proxy group containing real nodes and DIRECT only.
+    /// Unified two-group layout (`代理` + `自动选择`) with inline private rules
+    /// instead of remote private rule-sets.
     Compact,
 }
 
@@ -277,19 +277,7 @@ impl TemplateSpec {
     /// Every byte here is pinned by `the_generated_artifact_set_matches_the_pinned_goldens`.
     fn standard(bases: &RuleSetBases) -> Self {
         Self {
-            groups: vec![
-                group(
-                    GroupTag::Selector,
-                    GroupRole::Selector,
-                    &[
-                        GroupMember::AllNodes,
-                        GroupMember::Group(GroupTag::Auto),
-                        GroupMember::BuiltinDirect,
-                    ],
-                ),
-                group(GroupTag::Auto, GroupRole::UrlTest, ALL_NODES),
-                group(GroupTag::Direct, GroupRole::Direct, &[]),
-            ],
+            groups: standard_groups(),
             rule_sets: vec![
                 bases.both("geosite-private", RuleSetKind::Domain, "geosite/private"),
                 bases.clash_only("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
@@ -324,25 +312,22 @@ impl TemplateSpec {
         }
     }
 
-    /// Compact changes only proxy choice structure. It deliberately inherits
-    /// Standard DNS, TUN, routing rules and rule-set policy.
+    /// Compact keeps the unified two-group layout (`代理` + `自动选择`) and CN
+    /// routing while trimming remote private rule-sets in favor of inline LAN rules.
     fn compact(bases: &RuleSetBases) -> Self {
         let mut spec = Self::standard(bases);
-        spec.groups = vec![group(
-            GroupTag::Selector,
-            GroupRole::Selector,
-            &[GroupMember::AllNodes, GroupMember::BuiltinDirect],
-        )];
+        spec.rule_sets
+            .retain(|set| !matches!(set.tag, "geosite-private" | "geoip-private"));
         spec
     }
 
     /// 全局代理导向: everything except private/LAN is proxied, ads are
-    /// rejected, and the CN rule-set goes to a pin-able proxy group instead of
-    /// direct. `final` stays the manual selector so a client that discovers its
-    /// group through `route.final` keeps finding the same group as before.
+    /// rejected, and the CN rule-set goes to `代理` instead of direct. `final`
+    /// stays the manual selector so a client that discovers its group through
+    /// `route.final` keeps finding the same group as before.
     fn global(bases: &RuleSetBases) -> Self {
         Self {
-            groups: purpose_groups(),
+            groups: standard_groups(),
             rule_sets: vec![
                 bases.clash_only("geosite-private", RuleSetKind::Domain, "geosite/private"),
                 bases.clash_only("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
@@ -359,10 +344,9 @@ impl TemplateSpec {
                 bases.both("geosite-openai", RuleSetKind::Domain, "geosite/openai"),
                 bases.both("geosite-netflix", RuleSetKind::Domain, "geosite/netflix"),
                 bases.both("geosite-telegram", RuleSetKind::Domain, "geosite/telegram"),
-                // `geosite-cn` is kept (its domains get the proxy group, so an
-                // operator can pin a domestic node for them); `geoip-cn` is not,
-                // because a template with no CN-direct verdict has nothing for a
-                // CN address database to decide.
+                // `geosite-cn` is kept (its domains get routed to `代理`);
+                // `geoip-cn` is not, because a template with no CN-direct
+                // verdict has nothing for a CN address database to decide.
                 bases.both("geosite-cn", RuleSetKind::Domain, "geosite/cn"),
             ],
             inline_rules: vec![
@@ -383,48 +367,41 @@ impl TemplateSpec {
                     GroupTag::Reject,
                     RuleRenderers::Both,
                 ),
-                // The purpose groups come before the broad proxy list, or
-                // `geolocation-!cn` would swallow the traffic they exist to
-                // isolate (it contains `openai.com`, `netflix.com`, `t.me`…).
                 rule(
                     RuleMatcher::AiDomains,
                     None,
-                    GroupTag::Ai,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-openai"]),
                     Some(RuleMatcher::DomainSuffix(OPENAI_DOMAIN_SUFFIXES)),
-                    GroupTag::Ai,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-netflix"]),
                     Some(RuleMatcher::DomainSuffix(NETFLIX_DOMAIN_SUFFIXES)),
-                    GroupTag::Stream,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-telegram"]),
                     Some(RuleMatcher::DomainSuffix(TELEGRAM_DOMAIN_SUFFIXES)),
-                    GroupTag::Telegram,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-proxy"]),
                     Some(RuleMatcher::DomainSuffix(PROXY_DOMAIN_SUFFIXES)),
-                    GroupTag::Proxy,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
-                // CN: proxied, but in its own group rather than by falling
-                // through to `final`, so the verdict is explicit and pin-able.
-                // Its twin is domain-only on purpose: `global` has no
-                // CN-address verdict, and a CN IP reaching the proxy verdict is
-                // the template answering the question instead of dodging it.
+                // CN: explicitly routed to `代理` instead of direct.
                 rule(
                     RuleMatcher::RuleSet(&["geosite-cn"]),
                     Some(RuleMatcher::DomainSuffix(CN_DOMAIN_SUFFIXES)),
-                    GroupTag::Proxy,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
             ],
@@ -436,11 +413,11 @@ impl TemplateSpec {
         }
     }
 
-    /// 分流导向: CN and LAN go direct, ads die, the named services keep their
-    /// own pin-able group, and only the remainder is proxied.
+    /// 分流导向: CN and LAN go direct, ads die, and all remaining/matched proxy
+    /// traffic goes through `代理`.
     fn split(bases: &RuleSetBases) -> Self {
         Self {
-            groups: purpose_groups(),
+            groups: standard_groups(),
             rule_sets: vec![
                 bases.clash_only("geosite-private", RuleSetKind::Domain, "geosite/private"),
                 bases.clash_only("geoip-private", RuleSetKind::IpCidr, "geoip/private"),
@@ -476,25 +453,25 @@ impl TemplateSpec {
                 rule(
                     RuleMatcher::AiDomains,
                     None,
-                    GroupTag::Ai,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-openai"]),
                     Some(RuleMatcher::DomainSuffix(OPENAI_DOMAIN_SUFFIXES)),
-                    GroupTag::Ai,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-netflix"]),
                     Some(RuleMatcher::DomainSuffix(NETFLIX_DOMAIN_SUFFIXES)),
-                    GroupTag::Stream,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 rule(
                     RuleMatcher::RuleSet(&["geosite-telegram"]),
                     Some(RuleMatcher::DomainSuffix(TELEGRAM_DOMAIN_SUFFIXES)),
-                    GroupTag::Telegram,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 // The explicit "must never be intercepted domestically" list,
@@ -502,7 +479,7 @@ impl TemplateSpec {
                 rule(
                     RuleMatcher::RuleSet(&["geosite-proxy"]),
                     Some(RuleMatcher::DomainSuffix(PROXY_DOMAIN_SUFFIXES)),
-                    GroupTag::Proxy,
+                    GroupTag::Selector,
                     RuleRenderers::Both,
                 ),
                 // CN last among the direct verdicts: it is the broadest list and
@@ -520,26 +497,21 @@ impl TemplateSpec {
     }
 }
 
-/// The manual selector, the automatic group, the direct group, the clash-only
-/// failover group, and the four pin-able purpose groups. Eight declarations, of
-/// which sing-box renders seven (`故障转移` has no sing-box outbound type).
-fn purpose_groups() -> Vec<GroupSpec> {
+/// The unified two-group layout (`代理` manual selector + `自动选择` URL test)
+/// plus the built-in `DIRECT` outbound for sing-box.
+fn standard_groups() -> Vec<GroupSpec> {
     vec![
-        group(GroupTag::Selector, GroupRole::Selector, MANUAL_MEMBERS),
+        group(
+            GroupTag::Selector,
+            GroupRole::Selector,
+            &[
+                GroupMember::AllNodes,
+                GroupMember::Group(GroupTag::Auto),
+                GroupMember::BuiltinDirect,
+            ],
+        ),
         group(GroupTag::Auto, GroupRole::UrlTest, ALL_NODES),
         group(GroupTag::Direct, GroupRole::Direct, &[]),
-        // clash has a `fallback` outbound type and sing-box does not, so this
-        // group is declared for the format that can honour it.
-        group_with_renderers(
-            GroupTag::Fallback,
-            GroupRole::Fallback,
-            RuleRenderers::Clash,
-            ALL_NODES,
-        ),
-        group(GroupTag::Proxy, GroupRole::Selector, MANUAL_MEMBERS),
-        group(GroupTag::Ai, GroupRole::Selector, PINNABLE_MEMBERS),
-        group(GroupTag::Stream, GroupRole::Selector, PINNABLE_MEMBERS),
-        group(GroupTag::Telegram, GroupRole::Selector, PINNABLE_MEMBERS),
     ]
 }
 
@@ -646,17 +618,6 @@ impl RuleSetBases {
         }
     }
 }
-
-const MANUAL_MEMBERS: &[GroupMember] = &[
-    GroupMember::Group(GroupTag::Auto),
-    GroupMember::BuiltinDirect,
-    GroupMember::AllNodes,
-];
-
-/// A purpose group holds the automatic group and the nodes: pinning a node for
-/// ChatGPT must not silently offer "direct" as a member.
-const PINNABLE_MEMBERS: &[GroupMember] =
-    &[GroupMember::Group(GroupTag::Auto), GroupMember::AllNodes];
 
 const ALL_NODES: &[GroupMember] = &[GroupMember::AllNodes];
 
@@ -886,17 +847,33 @@ mod tests {
         let split = spec(ClientTemplate::Split);
         let compact = spec(ClientTemplate::Compact);
 
-        assert_eq!(standard.groups.len(), 3, "standard keeps its three groups");
+        for (label, template) in [
+            ("standard", &standard),
+            ("compact", &compact),
+            ("global", &global),
+            ("split", &split),
+        ] {
+            assert_eq!(
+                template.groups, standard.groups,
+                "{label} must share the unified two-group + DIRECT layout"
+            );
+            assert_eq!(template.groups.len(), 3, "{label} has 3 group entries");
+            assert_eq!(template.groups[0].tag, GroupTag::Selector);
+            assert_eq!(
+                template.groups[0].members,
+                vec![
+                    GroupMember::AllNodes,
+                    GroupMember::Group(GroupTag::Auto),
+                    GroupMember::BuiltinDirect,
+                ]
+            );
+            assert_eq!(template.groups[1].tag, GroupTag::Auto);
+            assert_eq!(template.groups[1].members, vec![GroupMember::AllNodes]);
+            assert_eq!(template.groups[2].tag, GroupTag::Direct);
+        }
+
         assert_eq!(standard.rule_sets.len(), 4);
-        assert_eq!(global.groups.len(), 8);
-        assert_eq!(split.groups.len(), 8);
-        assert_eq!(compact.groups.len(), 1);
-        assert_eq!(compact.groups[0].tag, GroupTag::Selector);
-        assert_eq!(
-            compact.groups[0].members,
-            vec![GroupMember::AllNodes, GroupMember::BuiltinDirect]
-        );
-        assert_eq!(compact.rule_sets, standard.rule_sets);
+        assert_eq!(compact.rule_sets.len(), 2);
         assert_eq!(compact.inline_rules, standard.inline_rules);
         assert_eq!(compact.dns, standard.dns);
         assert_eq!(global.rule_sets.len(), 8);
@@ -904,22 +881,6 @@ mod tests {
         assert_ne!(standard.inline_rules, global.inline_rules);
         assert_ne!(global.inline_rules, split.inline_rules);
         assert_ne!(global.dns, split.dns, "global has no CN DNS verdict");
-
-        for tag in [
-            GroupTag::Proxy,
-            GroupTag::Ai,
-            GroupTag::Stream,
-            GroupTag::Telegram,
-            GroupTag::Fallback,
-        ] {
-            assert!(
-                global
-                    .groups
-                    .iter()
-                    .any(|group| group.tag == tag && standard.groups.iter().all(|g| g.tag != tag)),
-                "{tag:?} must be declared by the richer templates only"
-            );
-        }
     }
 
     /// A `minimal` client that loses a rule-set but keeps no twin stops making
@@ -981,20 +942,29 @@ mod tests {
         );
     }
 
-    /// A fallback group is a clash concept: sing-box has no such outbound type,
-    /// so declaring it for both formats would make the artifact lie.
+    /// Every template declares only `Selector`, `Auto`, and `Direct` — no
+    /// `Fallback` or extra purpose groups are emitted for either format.
     #[test]
-    fn the_fallback_group_is_declared_for_clash_only() {
-        for template in [ClientTemplate::Global, ClientTemplate::Split] {
+    fn every_template_declares_only_selector_auto_and_direct() {
+        for template in [
+            ClientTemplate::Standard,
+            ClientTemplate::Compact,
+            ClientTemplate::Global,
+            ClientTemplate::Split,
+        ] {
             let spec = spec(template.clone());
-            let fallback = spec
-                .groups
-                .iter()
-                .find(|group| group.role == GroupRole::Fallback)
-                .expect("the richer templates declare a fallback group");
-            assert_eq!(fallback.tag, GroupTag::Fallback);
-            assert!(fallback.renderers.includes_clash());
-            assert!(!fallback.renderers.includes_sing_box());
+            let roles: Vec<GroupRole> = spec.groups.iter().map(|group| group.role).collect();
+            assert_eq!(
+                roles,
+                vec![GroupRole::Selector, GroupRole::UrlTest, GroupRole::Direct],
+                "{template} must declare only Selector, UrlTest, Direct"
+            );
+            assert!(
+                spec.groups.iter().all(|group| {
+                    group.renderers.includes_clash() && group.renderers.includes_sing_box()
+                }),
+                "{template} groups apply uniformly to both formats"
+            );
         }
     }
 }

@@ -18,8 +18,8 @@ with tempfile.TemporaryDirectory(prefix='sbctl-managed-menu-') as temp:
     original = source.read_bytes(), pointer.read_bytes()
 
     menu = Menu(root)
-    menu.choose(2, '节点与组合')
-    menu.choose(2, '1. 筛选 / 分页查看节点')
+    menu.choose(2, '协议管理')
+    menu.choose(2, '1. 查看节点')
     menu.send('2')
     menu.wait('预设编号')
     menu.send('bad')
@@ -29,7 +29,7 @@ with tempfile.TemporaryDirectory(prefix='sbctl-managed-menu-') as temp:
     menu.send('draft only')
     menu.wait('端口（回车自动分配）')
     menu.send('bad-port')
-    menu.wait('请输入 10000–65535')
+    menu.wait('请输入 443 或 10000–65535')
     menu.send('')
     menu.wait('应用以上变更')
     menu.send('2')
@@ -52,7 +52,7 @@ with tempfile.TemporaryDirectory(prefix='sbctl-managed-menu-') as temp:
     assert len(registry['nodes']) == 2
     assert registry['nodes'][1]['name'] == 'WS TLS'
     menu.send('0')
-    menu.wait('=== 节点与组合 ===')
+    menu.wait('=== 协议管理 ===')
     menu.send('0')
     menu.wait('=== 主菜单 ===')
     menu.close()

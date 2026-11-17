@@ -83,7 +83,7 @@ impl Node {
         {
             return Err(Error("server must be an ASCII hostname or IP address"));
         }
-        if self.port < 10000 {
+        if !crate::catalog::node_port(self.port) {
             return Err(Error("listener port must be in 10000-65535"));
         }
         if self.server_name.is_empty()

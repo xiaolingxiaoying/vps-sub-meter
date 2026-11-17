@@ -46,6 +46,11 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
+      - name: Check installation and recovery shell entry points
+        run: |
+          for script in scripts/install.sh scripts/upgrade.sh scripts/protocols.sh scripts/share-443.sh tests/acceptance/verify-bootstrap.sh; do
+            bash -n "$script"
+          done
       - name: Verify subscription page copy interactions
         run: node tests/index-copy.mjs
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -172,8 +177,11 @@ jobs:
           SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
           SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
         run: |
+          cargo test --test setup_ports -- --ignored --nocapture
+          cargo test --lib shared_tls_carries_a_real_node_request -- --ignored --nocapture
           cargo test --test managed_deployment -- --ignored --nocapture
           cargo test --test xray_core -- --ignored --nocapture
+          cargo test --test probe -- --ignored --nocapture
           cargo test --test preset_connections tls_presets_carry_http -- --ignored --nocapture
           SBCTL_CLIENT_BIN="$SING_BOX_BIN_1_14" cargo test --test preset_connections sing_box_compatible -- --ignored --nocapture
           SBCTL_CLIENT_BIN="$MIHOMO_BIN" cargo test --test preset_connections mihomo_compatible -- --ignored --nocapture

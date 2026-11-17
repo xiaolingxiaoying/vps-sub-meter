@@ -1,0 +1,712 @@
+{
+  "date": "2026-11-17",
+  "timezone": "Asia/Shanghai",
+  "candidate_sha256": "50466d95254e17dcef98593c67418cb01555f7e9ec3f70aebb7d02c0b865c50c",
+  "official_release": false,
+  "production_trust_anchor_preserved": true,
+  "hosts": {
+    "gtt": {
+      "health": {
+        "activated": true,
+        "candidate_sha256": "50466d95254e17dcef98593c67418cb01555f7e9ec3f70aebb7d02c0b865c50c",
+        "managed": false,
+        "subscription_url_preserved": true,
+        "share_bytes_preserved": true,
+        "config_bytes_preserved": true,
+        "node_parameters_preserved": true,
+        "groups_preserved": true,
+        "dns_preserved": true,
+        "egress_guard_active": true,
+        "xray_config_preserved": false,
+        "core_pids_before": {
+          "sing-box.service": "393005",
+          "sbctl-xray.service": "0"
+        },
+        "core_pids_after": {
+          "sing-box.service": "393213",
+          "sbctl-xray.service": "0"
+        },
+        "rollback_guard": "sbctl-deploy-20261117-final-1794888590",
+        "backup": "/root/sbctl-deploy-20261117",
+        "verified": true,
+        "subscriptions": {
+          "get": 13,
+          "head": 13,
+          "filtered": 0,
+          "qr": 1,
+          "sing_box_check": 1
+        },
+        "node_probes": [
+          {
+            "preset": "vless-reality",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "vmess-websocket",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "hysteria2",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "tuic",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "anytls",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          }
+        ],
+        "private_ip_and_domain_denied": true,
+        "committed": true,
+        "automatic_rollback_disarmed": true,
+        "final_client_fakeip_fix": true,
+        "production_release_signature_verified": true,
+        "manager_only_update_preserved_core_pids": true,
+        "final_health": true,
+        "services": {
+          "sbctl.service": {
+            "MainPID": "395035",
+            "NRestarts": "0",
+            "User": "sbctl",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          },
+          "sing-box.service": {
+            "MainPID": "393213",
+            "NRestarts": "0",
+            "User": "sing-box",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          }
+        },
+        "accounting_identity_preserved": true,
+        "accounting_counters_monotonic": true,
+        "core_binaries_preserved": true,
+        "accounting_timers_active": true,
+        "no_rollback_timers": true,
+        "config_permissions": "0o600",
+        "overlay_permissions": {
+          "20-local-dns.json": "0o600",
+          "90-egress-guard.json": "0o600"
+        },
+        "disk": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1       9.6G  4.1G  5.5G  44% /",
+        "unrelated_failed_units": "fwupd-refresh.service loaded failed failed Refresh fwupd metadata and update motd",
+        "firewall-result": {
+          "obsolete_tcp_rules_removed": [
+            43443,
+            45443
+          ],
+          "ssh_and_current_node_rules_preserved": true
+        }
+      },
+      "external_nodes": [
+        {
+          "host": "gtt",
+          "node": "sbctl-anytls",
+          "type": "anytls",
+          "server": "192.0.2.3",
+          "port": 36559,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 193,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.038484,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "gtt",
+          "node": "sbctl-hysteria2",
+          "type": "hysteria2",
+          "server": "192.0.2.3",
+          "port": 32896,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 3.080694,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "gtt",
+          "node": "sbctl-tuic",
+          "type": "tuic",
+          "server": "192.0.2.3",
+          "port": 58714,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 0.849505,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "gtt",
+          "node": "sbctl-vless-reality",
+          "type": "vless",
+          "server": "192.0.2.3",
+          "port": 24443,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 213,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 2.044994,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "gtt",
+          "node": "sbctl-vmess-websocket",
+          "type": "vmess",
+          "server": "192.0.2.3",
+          "port": 24444,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 212,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 2.174348,
+          "temporary_process_stopped": true
+        }
+      ],
+      "external_https": {
+        "ok": true,
+        "status": 200,
+        "tls_verification": true,
+        "tls_version": "TLSv1.3",
+        "seconds": 1.835
+      }
+    },
+    "ntt": {
+      "health": {
+        "activated": true,
+        "candidate_sha256": "50466d95254e17dcef98593c67418cb01555f7e9ec3f70aebb7d02c0b865c50c",
+        "managed": false,
+        "subscription_url_preserved": true,
+        "share_bytes_preserved": true,
+        "config_bytes_preserved": true,
+        "node_parameters_preserved": true,
+        "groups_preserved": true,
+        "dns_preserved": true,
+        "egress_guard_active": true,
+        "xray_config_preserved": false,
+        "core_pids_before": {
+          "sing-box.service": "537",
+          "sbctl-xray.service": "0"
+        },
+        "core_pids_after": {
+          "sing-box.service": "343554",
+          "sbctl-xray.service": "0"
+        },
+        "rollback_guard": "sbctl-deploy-20261117-final-1794888641",
+        "backup": "/root/sbctl-deploy-20261117",
+        "verified": true,
+        "subscriptions": {
+          "get": 13,
+          "head": 13,
+          "filtered": 0,
+          "qr": 1,
+          "sing_box_check": 1
+        },
+        "node_probes": [
+          {
+            "preset": "vless-reality",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "vmess-websocket",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "hysteria2",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "tuic",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "anytls",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          }
+        ],
+        "private_ip_and_domain_denied": true,
+        "committed": true,
+        "automatic_rollback_disarmed": true,
+        "final_client_fakeip_fix": true,
+        "production_release_signature_verified": true,
+        "manager_only_update_preserved_core_pids": true,
+        "final_health": true,
+        "services": {
+          "sbctl.service": {
+            "MainPID": "344549",
+            "NRestarts": "0",
+            "User": "sbctl",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          },
+          "sing-box.service": {
+            "MainPID": "343554",
+            "NRestarts": "0",
+            "User": "sing-box",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          }
+        },
+        "accounting_identity_preserved": true,
+        "accounting_counters_monotonic": true,
+        "core_binaries_preserved": true,
+        "accounting_timers_active": true,
+        "no_rollback_timers": true,
+        "config_permissions": "0o600",
+        "overlay_permissions": {
+          "20-local-dns.json": "0o600",
+          "90-egress-guard.json": "0o600"
+        },
+        "disk": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1       9.6G  3.9G  5.7G  41% /",
+        "unrelated_failed_units": ""
+      },
+      "external_nodes": [
+        {
+          "host": "ntt",
+          "node": "sbctl-anytls",
+          "type": "anytls",
+          "server": "192.0.2.4",
+          "port": 20245,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 183,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.035352,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "ntt",
+          "node": "sbctl-hysteria2",
+          "type": "hysteria2",
+          "server": "192.0.2.4",
+          "port": 57162,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.119762,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "ntt",
+          "node": "sbctl-tuic",
+          "type": "tuic",
+          "server": "192.0.2.4",
+          "port": 55075,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 0.864254,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "ntt",
+          "node": "sbctl-vless-reality",
+          "type": "vless",
+          "server": "192.0.2.4",
+          "port": 41250,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 232,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.404068,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "ntt",
+          "node": "sbctl-vmess-websocket",
+          "type": "vmess",
+          "server": "192.0.2.4",
+          "port": 16991,
+          "direct_tcp": {
+            "ok": true,
+            "ms": 217,
+            "local_ipv4": "10.202.193.53"
+          },
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.364773,
+          "temporary_process_stopped": true
+        }
+      ],
+      "external_https": {
+        "ok": true,
+        "status": 200,
+        "tls_verification": true,
+        "tls_version": "TLSv1.3",
+        "seconds": 3.293
+      }
+    },
+    "vmiss": {
+      "health": {
+        "activated": true,
+        "candidate_sha256": "50466d95254e17dcef98593c67418cb01555f7e9ec3f70aebb7d02c0b865c50c",
+        "managed": true,
+        "subscription_url_preserved": true,
+        "share_bytes_preserved": true,
+        "config_bytes_preserved": true,
+        "node_parameters_preserved": true,
+        "groups_preserved": true,
+        "dns_preserved": true,
+        "egress_guard_active": true,
+        "xray_config_preserved": true,
+        "core_pids_before": {
+          "sing-box.service": "223378",
+          "sbctl-xray.service": "154800"
+        },
+        "core_pids_after": {
+          "sing-box.service": "291295",
+          "sbctl-xray.service": "154800"
+        },
+        "rollback_guard": "sbctl-deploy-20261117-final-1794888724",
+        "backup": "/root/sbctl-deploy-20261117",
+        "verified": true,
+        "subscriptions": {
+          "get": 29,
+          "head": 29,
+          "filtered": 10,
+          "qr": 3,
+          "sing_box_check": 2
+        },
+        "node_probes": [
+          {
+            "preset": "vless-reality",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "vmess-websocket",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "hysteria2",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "tuic",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "anytls",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "vless-xhttp-reality",
+            "owner_core": "xray",
+            "client_core": "xray",
+            "status": 204
+          },
+          {
+            "preset": "vless-xhttp-tls",
+            "owner_core": "xray",
+            "client_core": "xray",
+            "status": 204
+          },
+          {
+            "preset": "vless-ws-tls",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          },
+          {
+            "preset": "trojan-tcp-tls",
+            "owner_core": "sing-box",
+            "client_core": "sing-box",
+            "status": 204
+          }
+        ],
+        "private_ip_and_domain_denied": true,
+        "committed": true,
+        "automatic_rollback_disarmed": true,
+        "final_client_fakeip_fix": true,
+        "production_release_signature_verified": true,
+        "manager_only_update_preserved_core_pids": true,
+        "final_health": true,
+        "services": {
+          "sbctl.service": {
+            "MainPID": "293261",
+            "NRestarts": "0",
+            "User": "sbctl",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          },
+          "sing-box.service": {
+            "MainPID": "291295",
+            "NRestarts": "0",
+            "User": "sing-box",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          },
+          "sbctl-xray.service": {
+            "MainPID": "154800",
+            "NRestarts": "0",
+            "User": "sing-box",
+            "NoNewPrivileges": "yes",
+            "ActiveState": "active",
+            "SubState": "running"
+          }
+        },
+        "accounting_identity_preserved": true,
+        "accounting_counters_monotonic": true,
+        "core_binaries_preserved": true,
+        "accounting_timers_active": true,
+        "no_rollback_timers": true,
+        "config_permissions": "0o600",
+        "overlay_permissions": {
+          "90-egress-guard.json": "0o600",
+          "20-local-dns.json": "0o600"
+        },
+        "disk": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1       9.6G  7.7G  1.9G  81% /",
+        "unrelated_failed_units": "",
+        "storage-result": {
+          "journal_backup_preserved": true,
+          "journal_backup_sha256": "6259190524fb86eea3770c97d8861001bf372e05c4c306b7ffcee148c6c9b450",
+          "retention_limit_mib": 256,
+          "journal_usage": "Archived and active journals take up 184.0M in the file system.",
+          "disk": "Filesystem      Size  Used Avail Use% Mounted on\n/dev/vda1       9.6G  7.7G  1.9G  81% /"
+        }
+      },
+      "external_nodes": [
+        {
+          "host": "vmiss",
+          "node": "Trojan TCP TLS",
+          "type": "trojan",
+          "server": "192.0.2.2",
+          "port": 38053,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6010,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.003128,
+          "failure": "tcp_connect_timeout",
+          "temporary_process_stopped": true,
+          "runtime_tcp_connect_timeout": true
+        },
+        {
+          "host": "vmiss",
+          "node": "VLESS WS TLS",
+          "type": "vless",
+          "server": "192.0.2.2",
+          "port": 49927,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6004,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.002748,
+          "failure": "tcp_connect_timeout",
+          "temporary_process_stopped": true,
+          "runtime_tcp_connect_timeout": true
+        },
+        {
+          "host": "vmiss",
+          "node": "VLESS XHTTP TLS",
+          "type": "vless",
+          "server": "192.0.2.2",
+          "port": 33477,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6014,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.002756,
+          "failure": "proxy_request_failed",
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "vmiss",
+          "node": "sbctl-anytls",
+          "type": "anytls",
+          "server": "192.0.2.2",
+          "port": 46812,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6007,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.002185,
+          "failure": "tcp_connect_timeout",
+          "temporary_process_stopped": true,
+          "runtime_tcp_connect_timeout": true
+        },
+        {
+          "host": "vmiss",
+          "node": "sbctl-hysteria2",
+          "type": "hysteria2",
+          "server": "192.0.2.2",
+          "port": 47526,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 1.006007,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "vmiss",
+          "node": "sbctl-tuic",
+          "type": "tuic",
+          "server": "192.0.2.2",
+          "port": 36185,
+          "ok": true,
+          "curl_exit": 0,
+          "http_status": "204",
+          "seconds": 0.86385,
+          "temporary_process_stopped": true
+        },
+        {
+          "host": "vmiss",
+          "node": "sbctl-vless-reality",
+          "type": "vless",
+          "server": "192.0.2.2",
+          "port": 51217,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6016,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.0022,
+          "failure": "tcp_connect_timeout",
+          "temporary_process_stopped": true,
+          "runtime_tcp_connect_timeout": true
+        },
+        {
+          "host": "vmiss",
+          "node": "sbctl-vmess-websocket",
+          "type": "vmess",
+          "server": "192.0.2.2",
+          "port": 50725,
+          "direct_tcp": {
+            "ok": false,
+            "ms": 6015,
+            "error": "TimeoutError",
+            "winerror": null
+          },
+          "ok": false,
+          "curl_exit": 35,
+          "http_status": "000",
+          "seconds": 5.002588,
+          "failure": "tcp_connect_timeout",
+          "temporary_process_stopped": true,
+          "runtime_tcp_connect_timeout": true
+        }
+      ],
+      "external_https": {
+        "ok": false,
+        "tls_verification": true,
+        "failure": "TimeoutError",
+        "seconds": 10.003
+      }
+    }
+  },
+  "fakeip_guard_behavior": {
+    "passed": true,
+    "mapped": {
+      "destination_ipv4": "198.18.0.4",
+      "curl_exit": 0,
+      "http_status": "204",
+      "seconds": 1.337377,
+      "received_204": true,
+      "curl_timed_out": false
+    },
+    "stale_outside_pool": {
+      "destination_ipv4": "198.18.255.250",
+      "curl_exit": 35,
+      "http_status": "000",
+      "seconds": 0.005642,
+      "received_204": false,
+      "curl_timed_out": false
+    },
+    "unallocated_inside_pool": {
+      "destination_ipv4": "198.18.0.250",
+      "curl_exit": 35,
+      "http_status": "000",
+      "seconds": 0.005587,
+      "received_204": false,
+      "curl_timed_out": false
+    },
+    "temporary_process_stopped": true,
+    "mapped_forward_match_logged": true,
+    "stale_reject_guard_logged": true,
+    "inside_pool_mapping_missing_logged": true
+  },
+  "redaction": "Public VPS and local egress IPv4 addresses replaced with documentation addresses; original evidence retained privately."
+}

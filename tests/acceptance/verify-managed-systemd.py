@@ -66,4 +66,32 @@ run('core', 'recover')
 assert (source.read_bytes(), pointer.read_bytes()) == before
 assert not journal.exists()
 mode('dual')
+
+# Exercise the boot entry point through its real oneshot. Both data planes
+# depend on it, so synchronous starts here would deadlock systemd. Simulate a
+# crash after disabling old services, then require enabled AND active recovery.
+with open(os.devnull, 'wb') as sink:
+    process = subprocess.Popen([binary, 'node', 'edit', node, '--name', 'boot-interrupted', '--apply'], stdout=sink, stderr=sink)
+    deadline = time.monotonic() + 15
+    while not journal.exists() and process.poll() is None and time.monotonic() < deadline:
+        time.sleep(0.005)
+    assert journal.exists(), 'boot-recovery journal was not persisted'
+    process.kill()
+    process.wait()
+for unit in ('sing-box.service', 'sbctl-xray.service'):
+    subprocess.run(['systemctl', 'disable', '--now', unit], check=True)
+subprocess.run(['systemctl', 'restart', 'sbctl-recover.service'], check=True, timeout=20)
+deadline = time.monotonic() + 15
+while time.monotonic() < deadline:
+    active = all(subprocess.run(['systemctl', 'is-active', '--quiet', unit]).returncode == 0
+                 for unit in ('sing-box.service', 'sbctl-xray.service'))
+    if active:
+        break
+    time.sleep(0.1)
+assert active, 'boot recovery did not restart both data planes'
+for unit in ('sing-box.service', 'sbctl-xray.service'):
+    subprocess.run(['systemctl', 'is-enabled', '--quiet', unit], check=True)
+assert (source.read_bytes(), pointer.read_bytes()) == before
+assert not journal.exists()
+mode('dual')
 print('PASS managed systemd modes, source permissions, startup failure rollback and interrupted recovery', flush=True)

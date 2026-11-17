@@ -25,6 +25,20 @@ generation selected by one atomic pointer; it never reads the node source or
 server configuration. Server documents/private keys are excluded from client
 generations. Historical rollback excludes subscription credentials and accounting.
 
+Historical recovery retains only an explicit allowlist of deployment settings;
+current subscription credentials and accounting settings/state remain authoritative.
+Boot recovery restores enabled states and queues service starts without waiting on
+units ordered after the recovery oneshot. Hy2 firewall reconciliation uses the
+candidate settings before activation and restores the previous rules on failure.
+
+Plans render certificate paths without writing key material. Managed ACME bootstrap
+journals only the subscription listener/configuration, leaving the node registry,
+data planes and public client generation unchanged until issuance succeeds.
+Group strategy selects the initial manual-group default while retaining both
+manual and automatic groups. Unreferenced flat client generations are reclaimed
+at the start of an operation after a five-minute reader grace period; current,
+rollback and pending-transaction generations are protected.
+
 The client target version is pinned at migration, independent of engine updates.
 Optional runtime client templates contain base settings; malformed existing
 templates fail closed. Node and strategy definitions come from the registry,

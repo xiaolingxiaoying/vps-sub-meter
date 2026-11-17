@@ -15,6 +15,8 @@ pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
                     crate::cli::args::CoreCommand::Install {
                         core: sbctl::core::CoreKind::SingBox,
                         version,
+                        url: None,
+                        sha256: None,
                     },
                 );
             }
@@ -27,6 +29,8 @@ pub(crate) fn sing_box(root: &Path, command: SingBoxCommand) -> ExitCode {
                     crate::cli::args::CoreCommand::Update {
                         core: sbctl::core::CoreKind::SingBox,
                         version: None,
+                        url: None,
+                        sha256: None,
                     },
                 );
             }
@@ -391,10 +395,11 @@ fn sing_box_connections(root: &Path) -> ExitCode {
 pub(crate) fn logs(root: &Path, unit: LogUnit, lines: u32, follow: bool) -> ExitCode {
     let unit = match unit {
         LogUnit::SingBox => "sing-box",
+        LogUnit::Xray => "xray",
         LogUnit::Sbctl => "sbctl",
         LogUnit::All => "all",
     };
-    let args = sbctl::observe::journalctl_args(unit, lines, follow);
+    let args = sbctl::observe::journalctl_args_for_root(root, unit, lines, follow);
     match sbctl::observe::run_journalctl(root, &args) {
         Ok(status) if status.success() => ExitCode::SUCCESS,
         Ok(status) => {
@@ -530,7 +535,7 @@ fn update_impl(
             artifact
         }
     };
-    if root.join(sbctl::nodes::SOURCE).exists() {
+    if root.join(sbctl::nodes::SOURCE).exists() || sing_box_artifact.is_none() {
         sbctl::update::apply_manager(
             &sbctl::config::DeploymentStore::new(root),
             &manifest,

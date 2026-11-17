@@ -130,6 +130,7 @@ proxy-groups:
   - node-03-hysteria2
   - node-04-tuic
 rules:
+- IP-CIDR,198.18.0.0/15,REJECT,no-resolve
 - DOMAIN,services.googleapis.cn,代理
 - DOMAIN-SUFFIX,msftconnecttest.com,DIRECT
 - DOMAIN-SUFFIX,msftncsi.com,DIRECT

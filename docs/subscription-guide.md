@@ -64,7 +64,7 @@ sbctl 在同一份节点模型上生成多种订阅格式。所有链接都在 `
 
 ## mihomo 差异（1.18 → 1.19）
 
-- `clash.yaml` 使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）。标准模板有 `代理`、`自动选择` 两个组；精简模板只输出 `代理`，成员为真实节点与 `DIRECT`。GLOBAL 由内核提供。
+- `clash.yaml` 标准档使用四个 `review-*` rule-providers（远程 `.mrs`，`@meta` 分支的 geosite/geoip cn/private）；精简档将私有 IP 规则集替换为内置列表。所有内置模板统一只有 `代理`、`自动选择` 两个策略组；手动组包含真实节点、`自动选择` 和 `DIRECT`，自动组只含兼容的真实节点。GLOBAL 由内核提供。
 - `clash-1.18.yaml` 通过内置域名/IP 列表保留直连分流，不引用远程规则集或自动下载地理数据库。
 - mihomo 1.18 不认识 `type: anytls`，会拒绝加载包含该类型的整份配置。旧版工件在生成代理组前排除 AnyTLS 节点；真实内核测试分别使用现行版本和 1.18.10，不能仅用新内核验证旧版兼容文件。
 
@@ -114,9 +114,9 @@ sbctl config override clear all    # 清除所有覆写
 
 - `client_dns_mode`：fake-ip（默认）/ redir-host
 - `client_template`：**compact / standard** —— 编译期内置的客户端结构（ADR-0022），不代表磁盘上的管理员模板文件。
-  - `compact`：单一手动 `代理` 组，只含真实节点与 `DIRECT`，不提供自动选择组。
+  - `compact`：保留 `代理` 与 `自动选择` 两组，精简私有网络远程规则集，改用内置私有地址直连。
   - `standard`（新部署默认）：手动 `代理` 组含真实节点、`自动选择` 与 `DIRECT`，并另有只含真实节点的测速组。
-  - 两种档位共享审阅过的 DNS、TUN、嗅探、规则顺序和规则集策略。`global` / `split` 保留序列化兼容，也可通过非交互 `sbctl config template global|split` 显式使用；交互选择器只显示精简与标准。
+  - 所有内置模板的组结构一致；`DIRECT` 保留为直连出口。`global` / `split` 保留各自分流策略和序列化兼容，也可通过非交互 `sbctl config template global|split` 显式使用；交互选择器只显示精简与标准。
 - `client_rule_profile`：standard（远程 rule-set，默认）/ minimal（全部内置规则，不访问规则 CDN）。
   `minimal` **只改获取方式，不改分流结果**：每个规则集支撑的规则都带一份编译期内联孪生，
   所以在 `minimal` 下 CN/私有目标仍然直连，而不是悄悄落到代理组。

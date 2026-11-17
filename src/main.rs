@@ -54,6 +54,7 @@ fn main() -> ExitCode {
         }
     };
     match command {
+        Command::Port { command } => cli::commands::ports::run(root, command),
         Command::Core { command } => cli::commands::managed::core(root, command),
         Command::Group { command } => cli::commands::managed::group(root, command),
         Command::Protocol { command } => cli::commands::protocol::run(root, command),

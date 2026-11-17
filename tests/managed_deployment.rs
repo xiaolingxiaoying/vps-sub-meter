@@ -137,7 +137,44 @@ fn duplicate_protocols_groups_and_stable_tags_share_one_source() {
             .count(),
         1
     );
-    assert_eq!(doc["outbounds"][0]["tag"], tag);
+    assert_eq!(doc["outbounds"][0]["tag"], "代理");
+    assert_eq!(doc["outbounds"][1]["tag"], "自动选择");
+    assert_eq!(doc["outbounds"][2]["tag"], tag);
+    for doc_name in generation
+        .files
+        .iter()
+        .filter(|name| name.contains("subscription-sing-box-") && name.ends_with(".json"))
+    {
+        let profile: Value = serde_json::from_str(
+            &sbctl::deployment::read_generation(root.path(), &generation, doc_name).unwrap(),
+        )
+        .unwrap();
+        let policy_tags: Vec<_> = profile["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|v| matches!(v["type"].as_str(), Some("selector") | Some("urltest")))
+            .map(|v| v["tag"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(policy_tags, vec!["代理", "自动选择"], "{doc_name}");
+    }
+    for clash_name in generation
+        .files
+        .iter()
+        .filter(|name| name.contains("subscription-clash") && name.ends_with(".yaml"))
+    {
+        let clash: serde_yaml::Value = serde_yaml::from_str(
+            &sbctl::deployment::read_generation(root.path(), &generation, clash_name).unwrap(),
+        )
+        .unwrap();
+        let group_names: Vec<_> = clash["proxy-groups"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|g| g["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(group_names, ["代理", "自动选择"], "{clash_name}");
+    }
     let registry = nodes::read_optional(root.path()).unwrap().unwrap();
     let mut rename = registry.clone();
     rename.node_mut(&id).unwrap().name = "改名".into();
@@ -479,4 +516,112 @@ fn managed_generations_pass_real_servers_and_every_client_profile() {
             }
         }
     }
+}
+
+#[test]
+fn self_signed_certificate_is_materialized_on_demand_when_missing() {
+    let (root, config) = fixture();
+    let store = DeploymentStore::new(root.path());
+    let cert_dir = root.path().join("var/lib/sbctl/certificates");
+    if cert_dir.exists() {
+        std::fs::remove_dir_all(&cert_dir).unwrap();
+    }
+    let before = nodes::load_or_import(root.path(), &config).unwrap();
+    let mut after = before.clone();
+    after.switch(Mode::Xray, &[]).unwrap();
+    sbctl::deployment::apply(&store, &config, &before, after).unwrap();
+    let leaf_dir = cert_dir.join(config.protocol_server_name());
+    assert!(leaf_dir.join("cert.pem").is_file());
+    assert!(leaf_dir.join("key.pem").is_file());
+}
+
+#[test]
+fn port_hopping_does_not_block_switching_to_xray_mode_or_disabling_hy2() {
+    let root = tempfile::tempdir().unwrap();
+    let mut config = DeploymentConfig::new(
+        SubscriptionMode::IpFallback,
+        "203.0.113.8".into(),
+        None,
+        Some(2080),
+        "ens3".into(),
+        vec![ManagedProtocol::VlessReality, ManagedProtocol::Hysteria2],
+        Some("www.cloudflare.com".into()),
+    )
+    .unwrap();
+    config.hysteria2_port_hopping = Some(sbctl::port_hopping::PortHopping {
+        start: 30000,
+        end: 30010,
+        interval_seconds: 10,
+    });
+    let store = DeploymentStore::new(root.path());
+    store.initialize(&config).unwrap();
+    subscription::regenerate(&store, &config, None, false).unwrap();
+
+    let before = nodes::load_or_import(root.path(), &config).unwrap();
+    assert!(before.has_active_sing_box_hysteria2(&config));
+    let mut after = before.clone();
+    let incompatible: Vec<String> = after
+        .incompatible_enabled_nodes(Mode::Xray)
+        .into_iter()
+        .map(|n| n.id.clone())
+        .collect();
+    assert_eq!(incompatible.len(), 1);
+    after.switch(Mode::Xray, &incompatible).unwrap();
+    assert!(!after.has_active_sing_box_hysteria2(&config));
+
+    let plan = sbctl::deployment::plan(root.path(), &config, &before, &after).unwrap();
+    assert!(
+        !plan.warnings.is_empty(),
+        "switching to Xray-only VLESS Reality should warn about excluded client formats"
+    );
+    sbctl::deployment::apply(&store, &config, &before, after).unwrap();
+}
+
+#[test]
+fn service_status_and_logs_follow_runtime_mode() {
+    let (root, config) = fixture();
+    let store = DeploymentStore::new(root.path());
+    let first = nodes::load_or_import(root.path(), &config).unwrap();
+    sbctl::deployment::apply(&store, &config, &first, first.clone()).unwrap();
+
+    let sing_status: Vec<&str> = sbctl::lifecycle::service_status_entries(root.path())
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect();
+    assert!(sing_status.contains(&"sing-box.service"));
+    assert!(!sing_status.contains(&"sbctl-xray.service"));
+    let sing_logs = sbctl::observe::journalctl_args_for_root(root.path(), "all", 50, false);
+    assert!(sing_logs.contains(&"sing-box.service".to_owned()));
+    assert!(!sing_logs.contains(&"sbctl-xray.service".to_owned()));
+
+    let current = nodes::read_optional(root.path()).unwrap().unwrap();
+    let mut xray_mode = current.clone();
+    xray_mode.switch(Mode::Xray, &[]).unwrap();
+    sbctl::deployment::apply(&store, &config, &current, xray_mode).unwrap();
+
+    let xray_status: Vec<&str> = sbctl::lifecycle::service_status_entries(root.path())
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect();
+    assert!(!xray_status.contains(&"sing-box.service"));
+    assert!(xray_status.contains(&"sbctl-xray.service"));
+    let xray_logs = sbctl::observe::journalctl_args_for_root(root.path(), "all", 50, false);
+    assert!(!xray_logs.contains(&"sing-box.service".to_owned()));
+    assert!(xray_logs.contains(&"sbctl-xray.service".to_owned()));
+
+    let current = nodes::read_optional(root.path()).unwrap().unwrap();
+    let mut dual_mode = current.clone();
+    dual_mode.switch(Mode::Dual, &[]).unwrap();
+    sbctl::deployment::apply(&store, &config, &current, dual_mode).unwrap();
+
+    let dual_status: Vec<&str> = sbctl::lifecycle::service_status_entries(root.path())
+        .into_iter()
+        .map(|(u, _)| u)
+        .collect();
+    assert!(dual_status.contains(&"sing-box.service"));
+    assert!(dual_status.contains(&"sbctl-xray.service"));
+    let dual_logs = sbctl::observe::journalctl_args_for_root(root.path(), "all", 50, false);
+    assert!(dual_logs.contains(&"sbctl.service".to_owned()));
+    assert!(dual_logs.contains(&"sing-box.service".to_owned()));
+    assert!(dual_logs.contains(&"sbctl-xray.service".to_owned()));
 }

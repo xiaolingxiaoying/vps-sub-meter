@@ -38,7 +38,11 @@ pub(crate) fn menu(root: &Path) -> ExitCode {
 fn menu_page(root: &Path, page: Page) {
     loop {
         clear_menu_screen();
-        print_menu_header(root);
+        if page == Page::Home {
+            print_menu_header(root);
+        } else {
+            println!("sbctl  /  {}", navigation::title(page));
+        }
         print_menu_section(navigation::title(page));
         let config = sbctl::config::DeploymentStore::new(root).load();
         // An unreadable existing deployment needs repair, not fresh-install
@@ -117,12 +121,16 @@ fn print_menu_header(root: &Path) {
             println!(
                 "{}",
                 sbctl::term::yellow(format!(
-                    "订阅模式: {}   订阅主机: {}   协议: {} 项",
+                    "订阅入口: {}   地址: {}   已配置节点: {}",
                     config.subscription_mode,
                     config.subscription_host,
-                    config.enabled_protocols.len()
+                    sbctl::nodes::read_optional(root).ok().flatten().map_or(
+                        config.enabled_protocols.len(),
+                        |r| r.nodes.iter().filter(|n| n.enabled).count()
+                    )
                 ))
             );
+            print_compatibility_summary(root, &config);
             let template = match config.client_template {
                 sbctl::subscription::ClientTemplate::Compact => "精简 (compact)",
                 sbctl::subscription::ClientTemplate::Standard => "标准 (standard)",
@@ -181,10 +189,9 @@ fn print_menu_header(root: &Path) {
             }
             println!("{}", sbctl::term::green("状态: 已部署"));
         }
-        Err(sbctl::config::ConfigError::Missing) => println!(
-            "{}",
-            sbctl::term::red("状态: 未安装，请进入「部署与协议」安装")
-        ),
+        Err(sbctl::config::ConfigError::Missing) => {
+            println!("{}", sbctl::term::red("状态: 未安装，请选择「首次安装」"))
+        }
         Err(_) => println!(
             "{}",
             sbctl::term::red(
@@ -193,6 +200,34 @@ fn print_menu_header(root: &Path) {
         ),
     }
     println!("{bar}");
+}
+
+fn print_compatibility_summary(root: &Path, config: &sbctl::config::DeploymentConfig) {
+    if let Ok(Some(generation)) = sbctl::deployment::current(root)
+        && let Ok(catalog) = sbctl::subscription::managed::catalog(root, &generation)
+    {
+        let counts: Vec<_> = [
+            ("sing-box", "sing-box-full.json"),
+            ("Mihomo", "clash.yaml"),
+            ("URI", "uri"),
+        ]
+        .into_iter()
+        .filter_map(|(label, format)| {
+            catalog
+                .reports
+                .iter()
+                .find(|r| r.group.is_none() && r.format == format)
+                .map(|r| format!("{label} {} 个", r.included))
+        })
+        .collect();
+        println!("客户端可用节点：{}", counts.join(" / "));
+        println!("数量不一致时先看兼容性与节点组；更新程序不会自动增删协议。");
+    } else {
+        println!(
+            "旧式部署：{} 个协议；可在协议管理中补齐到统一协议集。",
+            config.enabled_protocols.len()
+        );
+    }
 }
 
 fn clear_menu_screen() {
@@ -288,7 +323,7 @@ fn menu_direction_traffic_correction(root: &Path) {
 fn menu_install(root: &Path, guided: bool) -> ExitCode {
     let conflicts = sbctl::preflight::existing_deployment_paths(root);
     let replace_existing = if conflicts.is_empty() {
-        confirm_menu_action("安装时若有服务占用所需端口，是否停止并禁用这些服务？")
+        false
     } else {
         println!("发现旧部署或残留文件：\n  {}", conflicts.join("\n  "));
         if !confirm_menu_action(
@@ -298,8 +333,19 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
         }
         true
     };
-    let Some((_source, kernel_version)) = select_kernel() else {
-        return ExitCode::SUCCESS;
+    println!("安装方案：1 常用 5 协议（单内核，轻量） / 2 全部 9 种协议（双内核） / 0 返回");
+    let all_protocols = match read_menu_choice("方案 [1]: ").as_deref() {
+        Some("1" | "") => false,
+        Some("2") => true,
+        _ => return ExitCode::SUCCESS,
+    };
+    let kernel_version = if guided {
+        let Some((_source, version)) = select_kernel() else {
+            return ExitCode::SUCCESS;
+        };
+        version
+    } else {
+        Some("1.14.2".into())
     };
     let existing_config = if replace_existing {
         // Replacement must work even when an old configuration is unreadable.
@@ -315,6 +361,7 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
         Ok(_) | Err(sbctl::config::ConfigError::Missing) => install(
             root,
             InstallOptions {
+                all_protocols,
                 mode: CliSubscriptionMode::Direct,
                 guided,
                 subscription_host: None,
@@ -346,9 +393,17 @@ fn menu_install(root: &Path, guided: bool) -> ExitCode {
 }
 
 fn menu_logs(root: &Path) {
-    // The journal view is a first-class verb now; the menu just keeps its
-    // historical defaults (both units, last 50 lines).
-    let _ = crate::cli::commands::update::logs(root, crate::cli::args::LogUnit::All, 50, false);
+    let unit =
+        match read_menu_choice("日志单元（1 全部活跃服务 / 2 sbctl / 3 sing-box / 4 Xray）[1]: ")
+            .as_deref()
+        {
+            Some("2") => crate::cli::args::LogUnit::Sbctl,
+            Some("3") => crate::cli::args::LogUnit::SingBox,
+            Some("4") => crate::cli::args::LogUnit::Xray,
+            Some("1" | "") => crate::cli::args::LogUnit::All,
+            _ => return,
+        };
+    let _ = crate::cli::commands::update::logs(root, unit, 50, false);
 }
 
 pub(crate) fn confirm_menu_action(prompt: &str) -> bool {
@@ -430,18 +485,37 @@ fn execute_action(root: &Path, action: Action) {
             else {
                 return;
             };
-            if confirm_menu_action("确认下载并校验官方内核？已运行的该内核将独立重启")
-            {
+            let custom = read_menu_choice("下载来源：1 官方（推荐） / 2 自定义 HTTPS 链接 [1]: ");
+            let (url, sha256) = match custom.as_deref() {
+                Some("2") => {
+                    println!(
+                        "仅下载内核文件，不运行网页脚本。必须提供可信发布者给出的 SHA-256；相同哈希不代表官方来源。"
+                    );
+                    let Some(url) = required_menu_text("下载链接") else {
+                        return;
+                    };
+                    let Some(sha256) = required_menu_text("文件 SHA-256") else {
+                        return;
+                    };
+                    (Some(url), Some(sha256))
+                }
+                Some("" | "1") => (None, None),
+                _ => return,
+            };
+            if confirm_menu_action("确认下载、校验并安装内核？失败保留旧版本") {
                 let _ = crate::cli::commands::managed::core(
                     root,
                     crate::cli::args::CoreCommand::Install {
                         core,
                         version: (!version.is_empty()).then_some(version),
+                        url,
+                        sha256,
                     },
                 );
             }
         }
         CoreApply => managed_edit(root, |_, _| Ok(true)),
+        PortManage => ports_menu(root),
         CoreRecover => {
             let _ = crate::cli::commands::managed::core(
                 root,
@@ -737,7 +811,7 @@ fn execute_action(root: &Path, action: Action) {
                 return;
             }
             let command = match action {
-                EmailConfigure => EmailCommand::Configure,
+                EmailConfigure => EmailCommand::Setup,
                 EmailStatus => EmailCommand::Status,
                 EmailSend => EmailCommand::Send,
                 EmailEnable => EmailCommand::Enable,
@@ -873,6 +947,12 @@ fn managed_edit(
             "变更预览：\n{}",
             serde_json::to_string_pretty(&plan).unwrap()
         );
+        for warning in &plan.warnings {
+            println!(
+                "{}",
+                sbctl::term::yellow(format!("⚠️ 兼容性提示：{warning}"))
+            );
+        }
         for n in &after.nodes {
             if before.nodes.iter().find(|old| old.id == n.id) != Some(n) {
                 println!(
@@ -954,17 +1034,17 @@ fn menu_port(label: &str) -> Option<Option<u16>> {
             return Some(None);
         }
         if let Ok(port) = value.parse::<u16>()
-            && port >= 10000
+            && sbctl::catalog::node_port(port)
         {
             return Some(Some(port));
         }
-        println!("请输入 10000–65535，或回车保留 / 自动分配");
+        println!("请输入 443 或 10000–65535；回车自动分配。443 须先检查 TCP / UDP 归属。");
     }
 }
 fn managed_nodes_menu(root: &Path) {
     loop {
         println!(
-            "\n节点与组合\n1. 筛选 / 分页查看节点\n2. 新增节点\n3. 编辑节点\n4. 复制节点\n5. 启用节点\n6. 停用节点\n7. 删除节点\n8. 迁移节点内核\n9. 校验节点与配置\n10. 分享链接与二维码\n11. 迁移现有部署到统一仓库\n12. 真实连接测试\n0. 返回"
+            "\n协议管理\n1. 查看节点\n2. 添加协议\n3. 修改节点\n4. 复制节点\n5. 启用\n6. 停用\n7. 删除\n8. 切换内核\n9. 检查配置\n10. 分享与二维码\n11. 导入旧部署\n12. 测试连接\n13. 按协议统一名称\n14. 补齐全部 9 种协议\n0. 返回"
         );
         let Some(choice) = read_menu_choice("选择: ") else {
             return;
@@ -1018,23 +1098,31 @@ fn managed_nodes_menu(root: &Path) {
             continue;
         }
         managed_edit(root, |config, registry| {
+            if choice == "13" {
+                registry.normalize_names();
+                return Ok(true);
+            }
+            if choice == "14" {
+                registry.complete_catalog(config)?;
+                return Ok(true);
+            }
             if choice == "11" {
                 return Ok(true);
             }
             if choice == "2" {
                 let presets = [
-                    "vless-reality",
-                    "vmess-websocket",
-                    "hysteria2",
-                    "tuic",
-                    "anytls",
-                    "vless-xhttp-reality",
-                    "vless-xhttp-tls",
-                    "vless-ws-tls",
-                    "trojan-tcp-tls",
+                    ("vless-reality", "sing-box / xray（Xray 下仅 URI/V2rayN）"),
+                    ("vmess-websocket", "sing-box / xray"),
+                    ("hysteria2", "仅 sing-box"),
+                    ("tuic", "仅 sing-box"),
+                    ("anytls", "仅 sing-box >= 1.12"),
+                    ("vless-xhttp-reality", "仅 xray（URI / Mihomo 1.19+）"),
+                    ("vless-xhttp-tls", "仅 xray（URI / Clash）"),
+                    ("vless-ws-tls", "sing-box / xray（全客户端互通）"),
+                    ("trojan-tcp-tls", "sing-box / xray（全客户端互通）"),
                 ];
-                for (i, preset) in presets.iter().enumerate() {
-                    println!("{}. {preset}", i + 1);
+                for (i, (preset, hint)) in presets.iter().enumerate() {
+                    println!("{}. {}  [{}]", i + 1, sbctl::catalog::label(preset), hint);
                 }
                 let preset = loop {
                     let Some(v) = read_menu_choice("预设编号（0 返回）: ") else {
@@ -1043,7 +1131,7 @@ fn managed_nodes_menu(root: &Path) {
                     if v == "0" {
                         return Ok(false);
                     }
-                    if let Some(preset) = v
+                    if let Some((preset, _)) = v
                         .parse::<usize>()
                         .ok()
                         .and_then(|i| i.checked_sub(1))
@@ -1053,7 +1141,10 @@ fn managed_nodes_menu(root: &Path) {
                     }
                     println!("无效预设，请重试");
                 };
-                let Some(name) = required_menu_text("节点名称") else {
+                let Some(name) = read_menu_choice(&format!(
+                    "节点名称（回车：{}）: ",
+                    sbctl::catalog::label(preset)
+                )) else {
                     return Ok(false);
                 };
                 let Some(port) = menu_port("端口（回车自动分配）: ") else {
@@ -1137,6 +1228,94 @@ fn managed_nodes_menu(root: &Path) {
             }
             Ok(true)
         });
+        pause_menu();
+    }
+}
+
+fn ports_menu(root: &Path) {
+    use crate::cli::args::PortCommand;
+    loop {
+        println!(
+            "\n端口与 443\n1. 查看监听与归属\n2. 节点使用 TCP 443（SNI 分流）\n3. 网站使用 TCP 443（本机 HTTPS 后端）\n4. 移除分流\n0. 返回"
+        );
+        let Some(choice) = read_menu_choice("选择 [0]: ") else {
+            return;
+        };
+        let mut command = match choice.as_str() {
+            "1" => {
+                let _ = crate::cli::commands::ports::run(root, PortCommand::Status);
+                pause_menu();
+                continue;
+            }
+            "2" => {
+                let Ok((_, registry)) = crate::cli::commands::managed::draft(root) else {
+                    println!("请先安装部署");
+                    continue;
+                };
+                let Some(id) = select_managed_node(&registry) else {
+                    continue;
+                };
+                println!(
+                    "Hysteria2/TUIC 是 UDP，直接修改节点端口为 443 即可。TCP 节点须使用不同于订阅 / 网站的 SNI。"
+                );
+                PortCommand::Share {
+                    node: Some(id),
+                    website_sni: None,
+                    website_port: None,
+                    apply: false,
+                }
+            }
+            "3" => {
+                println!(
+                    "先让网站监听 127.0.0.1:8443，保留网站自己的 HTTPS 证书。本工具不修改其他应用配置。"
+                );
+                let Some(name) = required_menu_text("网站域名（不同于订阅和节点 SNI）")
+                else {
+                    continue;
+                };
+                let Some(port) = read_menu_choice("网站本机 HTTPS 端口 [8443]: ") else {
+                    continue;
+                };
+                let port = if port.is_empty() {
+                    8443
+                } else {
+                    match port.parse::<u16>() {
+                        Ok(p) if p >= 1024 && p != 443 => p,
+                        _ => {
+                            println!("请输入 1024–65535 的本机端口，不能是 443");
+                            continue;
+                        }
+                    }
+                };
+                PortCommand::Share {
+                    node: None,
+                    website_sni: Some(name),
+                    website_port: Some(port),
+                    apply: false,
+                }
+            }
+            "4" => {
+                let Some(name) = required_menu_text("要移除的 SNI") else {
+                    continue;
+                };
+                PortCommand::Remove {
+                    server_name: name,
+                    apply: false,
+                }
+            }
+            _ => return,
+        };
+        if crate::cli::commands::ports::run(root, command.clone()) == ExitCode::SUCCESS
+            && confirm_menu_action("确认应用端口方案？相关节点连接可能中断")
+        {
+            match &mut command {
+                PortCommand::Share { apply, .. } | PortCommand::Remove { apply, .. } => {
+                    *apply = true
+                }
+                _ => {}
+            }
+            let _ = crate::cli::commands::ports::run(root, command);
+        }
         pause_menu();
     }
 }
@@ -1299,7 +1478,7 @@ fn managed_groups_menu(root: &Path) {
                 }
                 println!("成员不存在或重复，请在当前步骤重新输入");
             };
-            let strategy = match read_menu_choice("策略：1 手动选择 / 2 自动测速（回车保留）: ")
+            let strategy = match read_menu_choice("默认策略：1 手动选择 / 2 自动测速（回车保留）: ")
                 .as_deref()
             {
                 Some("1") => Some(sbctl::nodes::Strategy::Select),
@@ -1340,31 +1519,45 @@ fn managed_mode_menu(root: &Path) {
             Some("3") => sbctl::nodes::Mode::Dual,
             _ => return Ok(false),
         };
+        let incompatible: Vec<String> = registry
+            .incompatible_enabled_nodes(mode)
+            .into_iter()
+            .map(|n| n.id.clone())
+            .collect();
         for n in registry
             .nodes
             .iter()
             .filter(|n| n.enabled && !mode.allows(n.core))
         {
-            println!("受影响：{} · {} · {}", n.id, n.name, n.preset());
+            let status = if incompatible.contains(&n.id) {
+                "不兼容（回车将自动停用）"
+            } else {
+                "兼容（将自动迁移内核）"
+            };
+            println!("受影响：{} · {} · {} -> {status}", n.id, n.name, n.preset());
         }
-        let Some(disable) = read_menu_choice("需停用的节点 ID，逗号分隔（回车仅迁移兼容节点）: ")
-        else {
+        let Some(disable) = read_menu_choice(
+            "需停用的节点 ID，逗号分隔（回车仅迁移兼容节点并自动停用不兼容节点）: ",
+        ) else {
             return Ok(false);
         };
-        registry.switch(
-            mode,
-            &disable
+        let disable_ids: Vec<String> = if disable.trim().is_empty() {
+            incompatible
+        } else {
+            disable
                 .split(',')
                 .filter(|s| !s.trim().is_empty())
                 .map(|s| s.trim().to_owned())
-                .collect::<Vec<_>>(),
-        )?;
+                .collect()
+        };
+        registry.switch(mode, &disable_ids)?;
         Ok(true)
     });
 }
 fn managed_links_menu(root: &Path) {
     let result = (|| -> sbctl::nodes::Result<()> {
         let (config, registry) = crate::cli::commands::managed::draft(root)?;
+        print_compatibility_summary(root, &config);
         println!("1. sing-box\n2. Mihomo / Clash\n3. Shadowrocket\n4. V2rayN / 通用 URI\n0. 返回");
         let format = match read_menu_choice("客户端: ").as_deref() {
             Some("1") => {

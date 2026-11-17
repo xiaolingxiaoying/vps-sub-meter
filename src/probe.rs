@@ -198,6 +198,10 @@ pub fn node(
             "5",
             "--max-time",
             "15",
+            // A probe must traverse this node even when the administrator's
+            // shell excludes the target (or every host) through NO_PROXY.
+            "--noproxy",
+            "",
             "--proxy",
         ])
         .arg(format!("socks5h://127.0.0.1:{port}"))

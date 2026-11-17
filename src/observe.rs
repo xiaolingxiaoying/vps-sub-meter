@@ -494,16 +494,40 @@ pub fn describe_connections(connections: &serde_json::Value) -> Vec<String> {
 /// length, and whether to follow. Split out so the exact command surface is
 /// unit-testable without a journald.
 pub fn journalctl_args(unit: &str, lines: u32, follow: bool) -> Vec<String> {
-    let mut args = Vec::new();
-    for selected in match unit {
+    let selected = match unit {
         "sing-box" => vec!["sing-box.service"],
+        "xray" => vec!["sbctl-xray.service"],
         "sbctl" => vec!["sbctl.service"],
         // "all" (and any other value the CLI validated away) matches the menu
         // behaviour: both units in one journalctl stream.
         _ => vec!["sbctl.service", "sing-box.service"],
-    } {
+    };
+    format_journalctl_args(&selected, lines, follow)
+}
+
+/// Like [`journalctl_args`], but resolves `"all"` against the managed runtime
+/// mode so `xray` and `dual` deployments inspect `sbctl-xray.service` too.
+pub fn journalctl_args_for_root(root: &Path, unit: &str, lines: u32, follow: bool) -> Vec<String> {
+    if unit == "all"
+        && let Ok(Some(registry)) = crate::nodes::read_optional(root)
+    {
+        let mut selected = vec!["sbctl.service"];
+        if registry.mode.allows(crate::core::CoreKind::SingBox) {
+            selected.push("sing-box.service");
+        }
+        if registry.mode.allows(crate::core::CoreKind::Xray) {
+            selected.push("sbctl-xray.service");
+        }
+        return format_journalctl_args(&selected, lines, follow);
+    }
+    journalctl_args(unit, lines, follow)
+}
+
+fn format_journalctl_args(selected: &[&str], lines: u32, follow: bool) -> Vec<String> {
+    let mut args = Vec::new();
+    for unit in selected {
         args.push("-u".to_owned());
-        args.push(selected.to_owned());
+        args.push((*unit).to_owned());
     }
     args.push("-n".to_owned());
     args.push(lines.to_string());
@@ -659,6 +683,10 @@ mod tests {
         assert_eq!(
             journalctl_args("sing-box", 100, true),
             ["-u", "sing-box.service", "-n", "100", "--no-pager", "-f"]
+        );
+        assert_eq!(
+            journalctl_args("xray", 25, true),
+            ["-u", "sbctl-xray.service", "-n", "25", "--no-pager", "-f"]
         );
     }
 }

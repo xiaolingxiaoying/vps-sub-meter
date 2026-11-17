@@ -42,27 +42,51 @@ pub(crate) fn protocol_ports(
     }
 }
 
-pub(crate) fn required_install_value(
-    value: Option<String>,
-    label: &str,
-) -> Result<String, sbctl::config::ConfigError> {
-    if let Some(value) = value.filter(|value| !value.trim().is_empty()) {
-        return Ok(value);
+pub(crate) fn secret(label: &str) -> io::Result<String> {
+    print!("{label}");
+    io::stdout().flush()?;
+    #[cfg(unix)]
+    struct EchoGuard(libc::termios);
+    #[cfg(unix)]
+    impl Drop for EchoGuard {
+        fn drop(&mut self) {
+            unsafe {
+                libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.0);
+            }
+        }
     }
-    print!("{label}: ");
-    io::stdout()
-        .flush()
-        .map_err(sbctl::config::ConfigError::Storage)?;
-    let mut value = String::new();
-    io::stdin()
-        .read_line(&mut value)
-        .map_err(sbctl::config::ConfigError::Storage)?;
-    let value = value.trim().to_owned();
-    (!value.is_empty()).then_some(value).ok_or_else(|| {
-        sbctl::config::ConfigError::StateContent(format!(
-            "{label} is required; supply it with the matching --flag or run interactively"
+    #[cfg(unix)]
+    let _guard = {
+        use std::io::IsTerminal;
+        if io::stdin().is_terminal() {
+            let mut old = std::mem::MaybeUninit::<libc::termios>::uninit();
+            if unsafe { libc::tcgetattr(libc::STDIN_FILENO, old.as_mut_ptr()) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let old = unsafe { old.assume_init() };
+            let mut hidden = old;
+            hidden.c_lflag &= !libc::ECHO;
+            if unsafe { libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &hidden) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+            Some(EchoGuard(old))
+        } else {
+            None
+        }
+    };
+    #[cfg(not(unix))]
+    {
+        Err(io::Error::other(
+            "请在 Linux VPS 使用邮件向导；开发环境可用 email configure 编辑配置",
         ))
-    })
+    }
+    #[cfg(unix)]
+    {
+        let mut value = String::new();
+        io::stdin().read_line(&mut value)?;
+        println!();
+        Ok(value.trim_end_matches(['\r', '\n']).to_owned())
+    }
 }
 
 pub(crate) struct ConsolePrompts;

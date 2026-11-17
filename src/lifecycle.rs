@@ -1431,15 +1431,28 @@ fn trigger_direct_socket() -> Result<(), String> {
 }
 
 pub fn service_status_entries(root: &Path) -> Vec<(&'static str, String)> {
-    let mut units = vec![
-        "sing-box.service",
+    let mut units = Vec::new();
+    match crate::nodes::read_optional(root).ok().flatten() {
+        Some(registry) => {
+            if registry.mode.allows(crate::core::CoreKind::SingBox) {
+                units.push("sing-box.service");
+            }
+            if registry.mode.allows(crate::core::CoreKind::Xray) {
+                units.push("sbctl-xray.service");
+            }
+        }
+        None => {
+            units.push("sing-box.service");
+            if root.join("etc/systemd/system/sbctl-xray.service").exists() {
+                units.push("sbctl-xray.service");
+            }
+        }
+    }
+    units.extend([
         "sbctl.service",
         "sbctl-http.socket",
         "sbctl-accounting-reset.timer",
-    ];
-    if root.join("etc/systemd/system/sbctl-xray.service").exists() {
-        units.push("sbctl-xray.service");
-    }
+    ]);
     units
         .into_iter()
         .map(|unit| {

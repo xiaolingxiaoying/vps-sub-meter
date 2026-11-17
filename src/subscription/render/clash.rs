@@ -14,6 +14,8 @@ const CLASH_DIRECT_TAG: &str = "DIRECT";
 /// verdict has always carried here: the pseudo-proxy, not the `全球直连`
 /// group that wraps it for the user.
 const CLASH_BUILTIN_DIRECT: &str = "DIRECT";
+/// An orphaned Fake-IP must never fall through to private-IP DIRECT or MATCH.
+const FAKE_IP_REJECT: &str = "IP-CIDR,198.18.0.0/15,REJECT,no-resolve";
 
 /// Maps a template group identity to the clash artifact's established tag.
 fn clash_tag(tag: GroupTag) -> &'static str {
@@ -165,15 +167,24 @@ fn clash_members(group: &GroupSpec, nodes: &[CanonicalNode]) -> Vec<String> {
 /// differ only in whether external rule-sets exist at all: mihomo 1.18 has no
 /// `.mrs` rule-providers to reference, which is precisely the `minimal` case, so
 /// the legacy artifact renders the twins and nothing else.
-fn clash_rules(_spec: &TemplateSpec, remote: bool, config: &DeploymentConfig) -> String {
-    let mut rules = String::from("rules:\n");
+fn clash_rules(spec: &TemplateSpec, remote: bool, config: &DeploymentConfig) -> String {
+    let has_private_ip_set = spec.rule_sets.iter().any(|set| set.tag == "geoip-private");
+    let mut rules = format!("rules:\n  - {FAKE_IP_REJECT}\n");
     if remote {
         rules.push_str(&clash_extra_rules(config));
     }
     for rule in super::baseline::MIHOMO["rules"].as_array().unwrap() {
         let rule = rule.as_str().unwrap();
-        if !remote && rule.starts_with("RULE-SET,") {
-            let tag = rule.split(',').nth(1).unwrap();
+        // The standalone template carries this too; emit it exactly once,
+        // before registered rule-sets as well as the built-in route rules.
+        if rule == FAKE_IP_REJECT {
+            continue;
+        }
+        if let Some(tag) = rule
+            .strip_prefix("RULE-SET,")
+            .and_then(|rest| rest.split(',').next())
+            && (!remote || (!has_private_ip_set && tag == "review-private-ip"))
+        {
             match tag {
                 "review-private-domain" => {
                     push_inline_domains(&mut rules, RuleMatcher::PRIVATE_DOMAINS, "DIRECT")
@@ -219,8 +230,11 @@ fn push_inline_cidrs(rules: &mut String, cidrs: &[&str], target: &str) {
 }
 
 /// The `rule-providers:` block for the rule-sets this template references.
-fn clash_rule_providers(_spec: &TemplateSpec, config: &DeploymentConfig) -> String {
+fn clash_rule_providers(spec: &TemplateSpec, config: &DeploymentConfig) -> String {
     let mut values = super::baseline::MIHOMO["rule-providers"].clone();
+    if !spec.rule_sets.iter().any(|set| set.tag == "geoip-private") {
+        values.as_object_mut().unwrap().remove("review-private-ip");
+    }
     let base = config.client_rule_set_base_url.trim_end_matches('/');
     for provider in values.as_object_mut().unwrap().values_mut() {
         let url = provider["url"].as_str().unwrap();

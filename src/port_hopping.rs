@@ -84,19 +84,32 @@ fn rules(config: &DeploymentConfig, replace: bool) -> String {
 /// Called only by the root systemd pre-start/post-stop hooks. Never flushes the
 /// host ruleset. nft applies deletion and replacement in one transaction.
 pub fn apply_firewall(root: &Path, cleanup: bool) -> Result<(), String> {
+    // Stop/recovery must be able to remove our table even if the registry or
+    // configuration is damaged. Neither source is needed for cleanup.
+    if cleanup {
+        return apply_firewall_config(root, None);
+    }
+    let config = DeploymentStore::new(root)
+        .load()
+        .map_err(|e| e.to_string())?;
+    config.validate().map_err(|e| e.to_string())?;
+    let registry = crate::nodes::read_optional(root).map_err(|e| e.to_string())?;
+    let active = registry
+        .as_ref()
+        .is_none_or(|r| r.has_active_sing_box_hysteria2(&config));
+    apply_firewall_config(root, active.then_some(&config))
+}
+
+/// Reconcile the exact candidate (or restored) settings under the operation
+/// lock, including range changes that need no data-plane process restart.
+pub(crate) fn apply_firewall_config(
+    root: &Path,
+    config: Option<&DeploymentConfig>,
+) -> Result<(), String> {
     #[cfg(unix)]
-    if unsafe { libc::geteuid() } != 0 {
+    if root == Path::new("/") && unsafe { libc::geteuid() } != 0 {
         return Err("Hy2 firewall hook requires root".into());
     }
-    let config = if cleanup {
-        None
-    } else {
-        let config = DeploymentStore::new(root)
-            .load()
-            .map_err(|e| e.to_string())?;
-        config.validate().map_err(|e| e.to_string())?;
-        Some(config)
-    };
     let enabled = config
         .as_ref()
         .is_some_and(|c| c.hysteria2_port_hopping.is_some());
@@ -114,7 +127,7 @@ pub fn apply_firewall(root: &Path, cleanup: bool) -> Result<(), String> {
         .lines()
         .any(|line| line.trim() == format!("table inet {TABLE}"));
     let script = if enabled {
-        rules(config.as_ref().unwrap(), exists)
+        rules(config.unwrap(), exists)
     } else if exists {
         format!("delete table inet {TABLE}\n")
     } else {
@@ -138,6 +151,12 @@ pub fn apply_firewall(root: &Path, cleanup: bool) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+pub(crate) fn has_firewall_runtime(root: &Path) -> bool {
+    root == Path::new("/")
+        || root.join("usr/bin/nft").is_file()
+        || root.join("usr/sbin/nft").is_file()
 }
 
 pub fn configure<C: crate::wizard::Prompts>(

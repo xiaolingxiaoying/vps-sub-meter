@@ -269,8 +269,8 @@ impl Snapshot {
                 "sbctl-xray.service",
                 "sbctl-http.socket",
             ] {
-                if unit == "sbctl-xray.service"
-                    && !root.join("etc/systemd/system/sbctl-xray.service").exists()
+                if matches!(unit, "sing-box.service" | "sbctl-xray.service")
+                    && !root.join(format!("etc/systemd/system/{unit}")).exists()
                 {
                     continue;
                 }
@@ -348,7 +348,11 @@ impl Snapshot {
             // Files and subscription mode are restored before the lifecycle code
             // starts the old service through its socket activation contract.
             if self.units.iter().any(|unit| {
-                unit.active && matches!(unit.name, "sbctl.service" | "sing-box.service")
+                unit.active
+                    && matches!(
+                        unit.name,
+                        "sbctl.service" | "sing-box.service" | "sbctl-xray.service"
+                    )
             }) && let Err(e) = sbctl::lifecycle::restart_services(root)
             {
                 errors.push(e);
@@ -509,12 +513,25 @@ pub(crate) fn switch_mode(root: &Path, options: ModeOptions) -> ExitCode {
             &new,
             options.listen_port.is_some() || options.http_port.is_some(),
         )?;
+        let managed_registry = sbctl::nodes::read_optional(root).map_err(|e| e.to_string())?;
         let binary = options
             .sing_box_bin
             .clone()
             .unwrap_or_else(|| root.join("usr/local/bin/sing-box"));
-        if !binary.is_file() {
+        let needs_sing_box = managed_registry
+            .as_ref()
+            .is_none_or(|r| r.mode.allows(sbctl::core::CoreKind::SingBox));
+        if needs_sing_box && !binary.is_file() {
             return Err("模式切换需要 sing-box 内核；用 --sing-box-bin 指定".into());
+        }
+        if let Some(ref reg) = managed_registry
+            && reg.mode.allows(sbctl::core::CoreKind::Xray)
+            && root == Path::new("/")
+            && !root
+                .join(sbctl::deployment::binary(sbctl::core::CoreKind::Xray))
+                .is_file()
+        {
+            return Err("模式切换检测到 Xray 托管模式；请先执行 core install xray 安装内核".into());
         }
         let mut cert_config = new.clone();
         cert_config.subscription_mode = SubscriptionMode::Direct;
@@ -562,41 +579,63 @@ pub(crate) fn switch_mode(root: &Path, options: ModeOptions) -> ExitCode {
             // Publish strict client artifacts. Only the server gets temporary
             // TLS material while the HTTP ACME challenge listener starts.
             let bootstrap = obtain && new.certificate_mode == CertificateMode::Domain;
-            let staged_server = if bootstrap {
-                let mut staged = new.clone();
-                staged.certificate_mode = CertificateMode::SelfSigned;
-                let staged = sbctl::subscription::generated_artifacts_for_kernel(
-                    &staged,
-                    root,
+            if managed_registry.is_some() {
+                if bootstrap {
+                    sbctl::deployment::begin_subscription_bootstrap_locked(&store, &new)
+                        .map_err(|e| e.to_string())?;
+                } else {
+                    sbctl::subscription::apply_config_transaction_locked(
+                        &store,
+                        &new,
+                        Some(&binary),
+                    )
+                    .map_err(|e| e.to_string())?;
+                }
+            } else {
+                let staged_server = if bootstrap {
+                    let mut staged = new.clone();
+                    staged.certificate_mode = CertificateMode::SelfSigned;
+                    let staged = sbctl::subscription::generated_artifacts_for_kernel(
+                        &staged,
+                        root,
+                        Some(&binary),
+                    )
+                    .map_err(|e| e.to_string())?;
+                    Some(
+                        staged
+                            .into_iter()
+                            .find(|(name, _)| name == "sing-box-server.json")
+                            .ok_or_else(|| "缺少临时服务端配置".to_owned())?
+                            .1,
+                    )
+                } else {
+                    None
+                };
+                sbctl::subscription::apply_config_transaction_with_server_locked(
+                    &store,
+                    &new,
                     Some(&binary),
+                    staged_server.as_deref(),
                 )
                 .map_err(|e| e.to_string())?;
-                Some(
-                    staged
-                        .into_iter()
-                        .find(|(name, _)| name == "sing-box-server.json")
-                        .ok_or_else(|| "缺少临时服务端配置".to_owned())?
-                        .1,
-                )
-            } else {
-                None
-            };
-            sbctl::subscription::apply_config_transaction_with_server_locked(
-                &store,
-                &new,
-                Some(&binary),
-                staged_server.as_deref(),
-            )
-            .map_err(|e| e.to_string())?;
+            }
             sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
             touched_services = true;
             if root != Path::new("/") && root.join("etc/systemd/system/sbctl.service").is_file() {
                 sbctl::lifecycle::reconcile_subscription_units(root, direct)?;
             }
-            sbctl::lifecycle::restart_services(root)?;
+            if managed_registry.is_some() && bootstrap && root == Path::new("/") {
+                sbctl::lifecycle::restart_subscription_service(root)?;
+            } else {
+                sbctl::lifecycle::restart_services(root)?;
+            }
             if obtain {
                 sbctl::certificate::obtain(&store, &new, new.certbot_email.as_deref())
                     .map_err(|e| e.to_string())?;
+                if managed_registry.is_some() && bootstrap {
+                    sbctl::deployment::finish_subscription_bootstrap_locked(&store)
+                        .map_err(|e| e.to_string())?;
+                }
                 sbctl::subscription::apply_config_transaction_locked(&store, &new, Some(&binary))
                     .map_err(|e| e.to_string())?;
                 sbctl::lifecycle::prepare_daemon_storage(root, direct)?;
@@ -605,6 +644,13 @@ pub(crate) fn switch_mode(root: &Path, options: ModeOptions) -> ExitCode {
             Ok(())
         })();
         if let Err(error) = commit {
+            if managed_registry.is_some()
+                && obtain
+                && new.certificate_mode == CertificateMode::Domain
+            {
+                sbctl::deployment::finish_subscription_bootstrap_locked(&store)
+                    .map_err(|e| format!("{error}；ACME 恢复失败：{e}；执行 core recover"))?;
+            }
             return Err(match snapshot.restore(&store, touched_services) {
                 Ok(()) => format!("{error}；旧部署已恢复"),
                 Err(recovery) => format!("{error}；部署恢复失败：{recovery}；请检查服务和配置"),

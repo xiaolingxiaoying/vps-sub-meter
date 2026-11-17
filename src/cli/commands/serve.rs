@@ -21,7 +21,12 @@ pub(crate) fn serve_subscription(
                 "{}:{}",
                 // An IPv6 bind address is only parseable bracketed; the stored
                 // host stays bare because the generated configs need it that way.
-                sbctl::canonical::uri_host(&config.subscription_host),
+                match config.subscription_host.parse::<std::net::IpAddr>() {
+                    Ok(ip) if ip.is_loopback() =>
+                        sbctl::canonical::uri_host(&config.subscription_host),
+                    Ok(std::net::IpAddr::V6(_)) => "[::]".into(),
+                    _ => "0.0.0.0".into(),
+                },
                 config.http_port.expect("validated IP fallback port")
             ),
             sbctl::config::SubscriptionMode::Direct => "0.0.0.0:0".to_owned(),

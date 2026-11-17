@@ -1754,12 +1754,10 @@ mod tests {
         }
     }
 
-    /// The richer templates have to actually be richer: more groups, more rule
-    /// sets, and a CN verdict that is theirs rather than `Standard`'s. Asserting
-    /// on counts *and* on named tags is what keeps a catalog that grew one entry
-    /// and renamed nothing honest.
+    /// Every template emits strictly the two policy groups (`代理` and `自动选择`),
+    /// while `Global` and `Split` keep their richer rule-sets and CN routing verdict.
     #[test]
-    fn the_richer_templates_add_groups_rule_sets_and_their_own_cn_verdict() {
+    fn all_templates_share_two_groups_while_retaining_their_routing_policy() {
         let fixture = TempDir::new().expect("temporary root is created");
         let standard = render(
             &fixture,
@@ -1806,13 +1804,13 @@ mod tests {
         let standard_groups = groups(&standard_value);
         let standard_rule_sets = rule_sets(&standard_value);
         assert_eq!(
-            standard_groups.len(),
-            2,
-            "standard ships exactly the manual and automatic groups"
+            standard_groups,
+            vec!["代理".to_owned(), "自动选择".to_owned()],
+            "standard ships strictly the manual and automatic groups"
         );
         assert_eq!(standard_rule_sets.len(), 3);
 
-        for template in [ClientTemplate::Global, ClientTemplate::Split] {
+        for template in all_templates() {
             let artifacts = render(
                 &fixture,
                 template.clone(),
@@ -1820,61 +1818,52 @@ mod tests {
             );
             let value = full(&artifacts);
             let tags = groups(&value);
-            let sets = rule_sets(&value);
-            assert!(
-                tags.len() > standard_groups.len(),
-                "{template} must declare more groups than standard: {tags:?}"
-            );
-            assert!(
-                sets.len() > standard_rule_sets.len(),
-                "{template} must reference more rule-sets than standard: {sets:?}"
-            );
-            for expected in [
-                "代理",
-                "自动选择",
-                "代理分组",
-                "AI服务",
-                "流媒体",
-                "Telegram",
-            ] {
-                assert!(
-                    tags.iter().any(|tag| tag == expected),
-                    "{template} must keep {expected} reachable as a group; got {tags:?}"
-                );
-            }
-            for expected in [
-                "geosite-ads",
-                "geosite-openai",
-                "geosite-netflix",
-                "geosite-telegram",
-            ] {
-                assert!(
-                    sets.iter().any(|tag| tag == expected),
-                    "{template} must download {expected}; got {sets:?}"
-                );
-            }
-            // The clash-only fallback group is a real difference between the
-            // formats, not an oversight: sing-box has no such outbound type.
-            let clash = artifact_yaml(&artifacts, "subscription-clash.yaml");
-            let clash_groups: Vec<&str> = clash["proxy-groups"]
-                .as_sequence()
-                .expect("proxy-groups is a sequence")
-                .iter()
-                .map(|group| group["name"].as_str().expect("a group has a name"))
-                .collect();
             assert_eq!(
-                clash_groups,
-                ["代理", "自动选择"],
-                "Mihomo always uses the supplied two-group layout"
+                tags,
+                vec!["代理".to_owned(), "自动选择".to_owned()],
+                "{template} sing-box must emit strictly 代理 and 自动选择"
             );
+            for clash_name in ["subscription-clash.yaml", "subscription-clash-1.18.yaml"] {
+                let clash = artifact_yaml(&artifacts, clash_name);
+                let clash_groups: Vec<&str> = clash["proxy-groups"]
+                    .as_sequence()
+                    .expect("proxy-groups is a sequence")
+                    .iter()
+                    .map(|group| group["name"].as_str().expect("a group has a name"))
+                    .collect();
+                assert_eq!(
+                    clash_groups,
+                    ["代理", "自动选择"],
+                    "{template} {clash_name} must use the unified two-group layout"
+                );
+            }
             assert!(
                 !artifact_text(&artifacts, "subscription-sing-box-full.json").contains("故障转移"),
                 "sing-box must not be handed a group it cannot build"
             );
+
+            if matches!(template, ClientTemplate::Global | ClientTemplate::Split) {
+                let sets = rule_sets(&value);
+                assert!(
+                    sets.len() > standard_rule_sets.len(),
+                    "{template} must reference more rule-sets than standard: {sets:?}"
+                );
+                for expected in [
+                    "geosite-ads",
+                    "geosite-openai",
+                    "geosite-netflix",
+                    "geosite-telegram",
+                ] {
+                    assert!(
+                        sets.iter().any(|tag| tag == expected),
+                        "{template} must download {expected}; got {sets:?}"
+                    );
+                }
+            }
         }
 
         // And the two templates disagree where the spec says they must: `split`
-        // sends China direct, `global` sends it to the proxy group.
+        // sends China direct, `global` sends it to `代理`.
         let global = full(&render(
             &fixture,
             ClientTemplate::Global,
@@ -1910,7 +1899,7 @@ mod tests {
             vec!["\"DIRECT\"".to_owned(); 2]
         );
         assert_eq!(cn_verdict(&split), vec!["\"DIRECT\"".to_owned()]);
-        assert_eq!(cn_verdict(&global), vec!["\"代理分组\"".to_owned()]);
+        assert_eq!(cn_verdict(&global), vec!["\"代理\"".to_owned()]);
     }
 
     /// The ADR-0022 regression this phase exists to close: `minimal` may never
@@ -2031,6 +2020,50 @@ mod tests {
                         .iter()
                         .map(|outbound| outbound["tag"].as_str().expect("an outbound has a tag"))
                         .collect();
+                    let groups: Vec<_> = value["outbounds"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|outbound| {
+                            matches!(
+                                outbound["type"].as_str(),
+                                Some("selector") | Some("urltest")
+                            )
+                        })
+                        .collect();
+                    assert_eq!(
+                        groups
+                            .iter()
+                            .map(|group| group["tag"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        ["代理", "自动选择"],
+                        "{template}/{rule_profile}/{name}: only two policy groups"
+                    );
+                    let node_tags: Vec<_> = value["outbounds"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|outbound| {
+                            matches!(
+                                outbound["type"].as_str(),
+                                Some("vless" | "vmess" | "hysteria2" | "tuic" | "anytls")
+                            )
+                        })
+                        .map(|outbound| outbound["tag"].clone())
+                        .collect();
+                    assert_eq!(
+                        groups[1]["outbounds"],
+                        serde_json::json!(node_tags),
+                        "{name}: automatic selection contains only real nodes"
+                    );
+                    let mut manual_members = node_tags;
+                    manual_members
+                        .extend([serde_json::json!("自动选择"), serde_json::json!("DIRECT")]);
+                    assert_eq!(
+                        groups[0]["outbounds"],
+                        serde_json::json!(manual_members),
+                        "{name}: manual selection contains nodes, automatic selection and direct"
+                    );
                     let sets: Vec<&str> = value["route"]["rule_set"]
                         .as_array()
                         .expect("rule_set is an array")
@@ -2174,6 +2207,36 @@ mod tests {
                 // is concerned, or the whole configuration is rejected at load.
                 for name in ["subscription-clash.yaml", "subscription-clash-1.18.yaml"] {
                     let clash = artifact_yaml(&artifacts, name);
+                    let groups = clash["proxy-groups"].as_sequence().expect("proxy-groups");
+                    assert_eq!(
+                        groups
+                            .iter()
+                            .map(|group| group["name"].as_str().unwrap())
+                            .collect::<Vec<_>>(),
+                        ["代理", "自动选择"],
+                        "{template}/{rule_profile}/{name}: only two policy groups"
+                    );
+                    let nodes: Vec<_> = clash["proxies"]
+                        .as_sequence()
+                        .unwrap()
+                        .iter()
+                        .map(|node| node["name"].clone())
+                        .collect();
+                    assert_eq!(
+                        groups[1]["proxies"].as_sequence().unwrap(),
+                        &nodes,
+                        "{name}: automatic selection contains only compatible real nodes"
+                    );
+                    let mut manual_members = nodes;
+                    manual_members.extend([
+                        serde_yaml::Value::from("自动选择"),
+                        serde_yaml::Value::from("DIRECT"),
+                    ]);
+                    assert_eq!(
+                        groups[0]["proxies"].as_sequence().unwrap(),
+                        &manual_members,
+                        "{name}: manual selection membership"
+                    );
                     assert_eq!(clash["mixed-port"].as_u64(), Some(7890), "{name}");
                     assert_eq!(clash["tun"]["mtu"].as_u64(), Some(1400), "{name}");
                     assert_eq!(clash["tcp-concurrent"].as_bool(), Some(true), "{name}");

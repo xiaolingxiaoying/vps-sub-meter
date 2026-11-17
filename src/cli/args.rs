@@ -19,6 +19,11 @@ pub(crate) struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum Command {
+    /// Inspect port ownership and share TCP 443 using TLS SNI passthrough.
+    Port {
+        #[command(subcommand)]
+        command: PortCommand,
+    },
     /// Validate and render protocol-combination candidates without changing a deployment.
     Protocol {
         #[command(subcommand)]
@@ -76,7 +81,7 @@ pub(crate) enum Command {
     },
     /// Show the managed services' journal (requires systemd/journald).
     Logs {
-        /// Which journal to read: sing-box, sbctl, or both (default).
+        /// Which journal to read: sing-box, xray, sbctl, or active services (default).
         #[arg(long, value_enum, default_value = "all")]
         unit: LogUnit,
         /// Number of most recent lines to print.
@@ -201,6 +206,26 @@ pub(crate) enum Command {
     },
 }
 
+#[derive(Clone, Debug, Subcommand)]
+pub(crate) enum PortCommand {
+    Status,
+    Share {
+        #[arg(long)]
+        node: Option<String>,
+        #[arg(long, requires = "website_port")]
+        website_sni: Option<String>,
+        #[arg(long, requires = "website_sni")]
+        website_port: Option<u16>,
+        #[arg(long)]
+        apply: bool,
+    },
+    Remove {
+        server_name: String,
+        #[arg(long)]
+        apply: bool,
+    },
+}
+
 #[derive(Debug, Subcommand)]
 pub(crate) enum ProtocolCommand {
     /// Publish already activated companion listeners into existing subscription URLs.
@@ -254,6 +279,9 @@ pub(crate) enum PresetFormat {
 /// of destructuring sixteen fields on both sides.
 #[derive(Debug, Args)]
 pub(crate) struct InstallOptions {
+    /// Install the full nine-protocol catalog (also installs official Xray).
+    #[arg(long)]
+    pub(crate) all_protocols: bool,
     #[arg(
         long,
         value_enum,
@@ -338,6 +366,7 @@ impl InstallOptions {
     /// considered here, so a future flag cannot fall out of this decision.
     pub(crate) fn is_bare(&self) -> bool {
         let Self {
+            all_protocols,
             mode,
             guided,
             subscription_host,
@@ -361,6 +390,7 @@ impl InstallOptions {
             no_start,
         } = self;
         matches!(mode, CliSubscriptionMode::Direct)
+            && !all_protocols
             && !guided
             && subscription_host.is_none()
             && proxy_host.is_none()
@@ -833,6 +863,7 @@ pub(crate) enum CliAccountingPolicy {
 #[derive(Clone, Debug, ValueEnum)]
 pub(crate) enum LogUnit {
     SingBox,
+    Xray,
     Sbctl,
     All,
 }
@@ -995,6 +1026,8 @@ pub(crate) enum KernelSource {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum EmailCommand {
+    /// Guided SMTP setup with defaults and a hidden authorization-code prompt.
+    Setup,
     /// Edit the root-only SMTP configuration; validate before saving.
     Configure,
     /// Show settings without the SMTP password.
@@ -1009,6 +1042,18 @@ pub(crate) enum EmailCommand {
 
 #[derive(Debug, Subcommand)]
 pub(crate) enum NodeCommand {
+    /// List protocol names, engines and client compatibility notes.
+    Catalog,
+    /// Rename nodes using protocol names; keeps IDs, ports and credentials.
+    NormalizeNames {
+        #[arg(long)]
+        apply: bool,
+    },
+    /// Fill the common nine-protocol catalog; requires both official engines.
+    Complete {
+        #[arg(long)]
+        apply: bool,
+    },
     /// Send a real HTTP(S) request through a temporary local client.
     Probe {
         id: String,
@@ -1125,6 +1170,7 @@ pub(crate) enum GroupCommand {
         name: String,
         #[arg(long, value_delimiter = ',')]
         members: Vec<String>,
+        /// Default selection within the manual group; both manual and automatic groups remain available.
         #[arg(long, value_enum, default_value = "select")]
         strategy: sbctl::nodes::Strategy,
         #[arg(long)]
@@ -1136,6 +1182,7 @@ pub(crate) enum GroupCommand {
         name: Option<String>,
         #[arg(long, value_delimiter = ',')]
         members: Option<Vec<String>>,
+        /// Change the default selection while retaining both client policy groups.
         #[arg(long, value_enum)]
         strategy: Option<sbctl::nodes::Strategy>,
         #[arg(long)]
@@ -1174,12 +1221,21 @@ pub(crate) enum CoreCommand {
         core: sbctl::core::CoreKind,
         #[arg(long)]
         version: Option<String>,
+        /// Optional direct HTTPS download (binary or official-format archive).
+        #[arg(long, requires = "sha256")]
+        url: Option<String>,
+        #[arg(long, requires = "url")]
+        sha256: Option<String>,
     },
     Update {
         #[arg(value_enum)]
         core: sbctl::core::CoreKind,
         #[arg(long)]
         version: Option<String>,
+        #[arg(long, requires = "sha256")]
+        url: Option<String>,
+        #[arg(long, requires = "url")]
+        sha256: Option<String>,
     },
     Restart {
         #[arg(value_enum)]

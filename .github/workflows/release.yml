@@ -286,12 +286,14 @@ jobs:
 
           SBCTL_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" \
             python3 scripts/prepare-installer.py dist/install.sh
+          cp scripts/upgrade.sh dist/upgrade.sh
+          cp scripts/protocols.sh scripts/share-443.sh dist/
           if grep -q '@SBCTL_RELEASE_PUBLIC_KEY_PEM@' dist/install.sh; then
             echo 'the published installer still carries the template placeholder' >&2
             exit 1
           fi
 
-          ( cd dist && sha256sum sbctl-linux-* manifest-*.json install.sh > SHA256SUMS )
+          ( cd dist && sha256sum sbctl-linux-* manifest-*.json install.sh upgrade.sh protocols.sh share-443.sh > SHA256SUMS )
           cat dist/SHA256SUMS
 
           if [ "$UPDATE_EXISTING" = true ]; then
@@ -313,7 +315,7 @@ jobs:
           # Replacement is opt-in and reaches here only after CI and signing.
           gh release upload "$TAG" dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
             dist/manifest-amd64.json dist/manifest-arm64.json \
-            dist/install.sh dist/SHA256SUMS --clobber
+            dist/install.sh dist/upgrade.sh dist/protocols.sh dist/share-443.sh dist/SHA256SUMS --clobber
           if [ "$UPDATE_EXISTING" != true ] && [ "$PUBLISH" = true ]; then
             gh release edit "$TAG" --draft=false --latest
           fi

@@ -123,3 +123,19 @@ the compact profile changes only its selector membership and omits the
 automatic group. The Mihomo standard profile keeps both supplied groups, while
 compact omits `自动选择` and removes it from `代理` membership. Bare node and
 URI artifacts remain byte-stable for every template.
+
+## Amendment — 2026-11-15: unified manual and automatic groups
+
+At the administrator's request, every built-in template (`standard`, `compact`,
+`global`, `split`) now emits exactly two policy groups: `代理` (manual selector)
+and `自动选择` (URL test). This supersedes the single-group compact layout and
+the additional purpose/fallback groups described above. Manual membership is
+the compatible real nodes, then `自动选择`, then `DIRECT`; automatic membership
+contains only those real nodes. `DIRECT` remains a direct outbound or built-in
+policy rather than an additional selector group.
+
+Global and Split retain their distinct routing verdicts, with proxy verdicts
+targeting `代理`. Compact retains its existing private-network rule-set
+reduction. The layout applies to versioned profiles, both Mihomo artifacts,
+and managed full/group subscriptions. Bare nodes and URI formats retain their
+contract; administrator overrides still apply last.

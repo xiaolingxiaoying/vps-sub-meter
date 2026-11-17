@@ -64,7 +64,7 @@ mod implementation {
         }
     }
 
-    fn entry_names(directory: &File) -> io::Result<Vec<OsString>> {
+    fn entry_names(directory: &File, limit: usize) -> io::Result<Vec<OsString>> {
         // A fresh open file description avoids sharing the directory offset.
         let raw = open_at(directory, c".", DIRECTORY_FLAGS)?.into_raw_fd();
         let pointer = unsafe { libc::fdopendir(raw) };
@@ -91,7 +91,7 @@ mod implementation {
             if bytes == b"." || bytes == b".." {
                 continue;
             }
-            if names.len() == MAX_ENTRIES {
+            if names.len() == limit {
                 return Err(io::Error::other(
                     "certificate directory has too many entries",
                 ));
@@ -112,10 +112,41 @@ mod implementation {
         Ok(file)
     }
 
+    pub(crate) fn directory_entries(path: &Path) -> io::Result<Vec<OsString>> {
+        entry_names(&open_directory(path, false)?, usize::MAX)
+    }
+
+    pub(crate) fn directory_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+        open_directory(path, false)?.metadata()
+    }
+
+    /// Client generations are flat. Never recurse into unexpected directories
+    /// or follow links, and unlink only relative to pinned directory handles.
+    pub(crate) fn remove_flat_directory(path: &Path) -> io::Result<()> {
+        let (parent, name) = super::super::split_file(path)?;
+        let parent = open_directory(parent, false)?;
+        let name = c_name(name)?;
+        let directory = open_at(&parent, &name, DIRECTORY_FLAGS)?;
+        let names = entry_names(&directory, 8192)?;
+        for name in &names {
+            regular_file(&directory, &c_name(name)?)?;
+        }
+        for name in names {
+            let name = c_name(&name)?;
+            if unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) } != 0 {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        parent.sync_all()
+    }
+
     fn cleanup_flat(parent: &File, name: &CStr, directory: &File) {
         // Never recurse through unexpected directories or follow a link. A
         // failed cleanup may leave private staging data; publication succeeded.
-        if let Ok(names) = entry_names(directory) {
+        if let Ok(names) = entry_names(directory, MAX_ENTRIES) {
             for name in names {
                 if let Ok(name) = c_name(&name) {
                     unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
@@ -221,7 +252,7 @@ mod implementation {
         let name = c_name(name)?;
         let previous = open_at(&parent, &name, DIRECTORY_FLAGS)?;
         let mut staged = StagingDirectory::new(&parent)?;
-        let entries = entry_names(&previous)?;
+        let entries = entry_names(&previous, MAX_ENTRIES)?;
         let retained = entries
             .iter()
             .filter(|entry| {
@@ -769,6 +800,34 @@ mod implementation {
     use std::path::PathBuf;
     use std::sync::atomic::Ordering;
 
+    pub(crate) fn directory_entries(path: &Path) -> io::Result<Vec<std::ffi::OsString>> {
+        existing_directory(path)?;
+        std::fs::read_dir(path)?
+            .map(|entry| entry.map(|e| e.file_name()))
+            .collect()
+    }
+
+    pub(crate) fn directory_metadata(path: &Path) -> io::Result<std::fs::Metadata> {
+        existing_directory(path)?;
+        std::fs::symlink_metadata(path)
+    }
+
+    pub(crate) fn remove_flat_directory(path: &Path) -> io::Result<()> {
+        let names = directory_entries(path)?;
+        for name in &names {
+            let file = crate::config::open_managed_path_no_follow(&path.join(name))?;
+            if !file.metadata()?.is_file() {
+                return Err(io::Error::other(
+                    "generation must contain regular files only",
+                ));
+            }
+        }
+        for name in names {
+            super::super::remove_file(path.join(name))?;
+        }
+        std::fs::remove_dir(path)
+    }
+
     fn existing_directory(path: &Path) -> io::Result<()> {
         for path in path.ancestors().filter(|path| !path.as_os_str().is_empty()) {
             let metadata = fs::symlink_metadata(path)?;
@@ -965,5 +1024,6 @@ mod implementation {
 }
 
 pub(crate) use implementation::{
-    clear_generation_marker, read_pair, replace_files_with_marker as replace_files,
+    clear_generation_marker, directory_entries, directory_metadata, read_pair,
+    remove_flat_directory, replace_files_with_marker as replace_files,
 };

@@ -13,6 +13,10 @@
 
 这些是客户端订阅设置，不是 VPS 代理服务的入站设置。需要改 VPS 本机服务时使用独立的 `server` 覆写目标。
 
+Mihomo 订阅默认在生成规则最前面拒绝 `198.18.0.0/15`，防止丢失映射的 Fake-IP 落入私网直连或最终代理规则；`no-resolve` 避免这条兜底规则主动解析普通域名。客户端需刷新订阅并使用规则模式；全局模式及管理员自行调整的覆写仍需单独检查。
+
+VPS 出站防护可参考 [sing-box 服务端示例](../examples/overrides/sing-box-server-egress-guard.json)，保存为 `/etc/sbctl/overrides/sing-box-server.d/90-egress-guard.json`，再按下文校验和应用。它仅适用于 sing-box 1.11+，会拒绝私网、保留地址与 Fake-IP，影响通过节点访问 VPS 本机或私网的请求。`rules_mode: append` 把拒绝规则放在现有 IPv4 `resolve` 规则之后，同时检查客户端提交的 IP 和解析结果；示例不复制生成器的解析规则。若当前配置没有 `resolve`，需先明确服务端域名解析策略，不能将字面 IP 拦截当作完整的解析结果防护。DNS 定制请保存在另一个不包含这些路由规则的层中，避免重复合并。此服务端覆写不保护 Xray；当前版本尚无 Xray 服务端覆写入口。
+
 ## 推荐：通过编辑命令应用
 
 在 VPS 上运行，粘贴相应示例内容后保存退出：
@@ -52,6 +56,8 @@ sudo sbctl regenerate
 - 不要把完整参考模板连同占位 `proxies`/`outbounds` 当作覆写直接粘贴，否则会追加示例节点或替换生成内容。参考模板中需要调整的基础设置可拆成覆写片段。
 - 裸节点 `sing-box.json` 和 URI/Shadowrocket 格式不应用客户端覆写。
 
+统一托管部署还会拒绝服务端覆写改变已有节点的 `type`、`listen`、`listen_port`、`users`、`tls` 或 `transport`。即使只在 Reality 的 `tls.reality.handshake` 内添加 `domain_resolver`，也属于修改 `tls`，会使 `core apply` 或迁移预览失败；旧部署保持不变。普通 DNS 定制可放在服务端顶层 `dns` 和 `route.default_domain_resolver`，不要通过覆写改写托管入站。迁移前应先调整此类历史覆写。
+
 ## 本地例外与远程规则集
 
 fake-ip 例外支持精确域名、域名后缀和关键词；不接受 IP-CIDR：
@@ -87,4 +93,4 @@ sudo sbctl update
 sudo sbctl config override validate
 ```
 
-以上更新命令会同时更新签名清单中的 sbctl 和 sing-box，并执行配置与服务健康检查；失败时回滚。无需在 VPS 编译 Rust，也不要用安装向导重建已有部署来代替更新。
+当前版本的 `sbctl update` 默认只更新管理程序并检查订阅服务；失败时回滚，sing-box、Xray 内核及订阅凭据保持不变。内核需通过 `sbctl core update sing-box` 或 `sbctl core update xray` 单独更新；旧版本的更新行为以对应版本文档为准。无需在 VPS 编译 Rust，也不要用安装向导重建已有部署来代替更新。

@@ -49,3 +49,11 @@ Mihomo 的初始监听可能早于 provider 就绪；本轮测试曾出现启动
 用户反馈 1.14.4 客户端在路由初始化时无法下载 `geoip-private`。VPS 确认 SagerNet 对应 SRS URL 返回 404；这是客户端模板问题，此前的 `check` 测试没有启动远程规则集下载，不能覆盖该故障。
 
 修正标准/精简模板为内置 `ip_is_private` 直连并移除该远程条目，保留其他分流与规则顺序。官方 sing-box 1.14.4（发行归档摘要校验通过）在空缓存下实际初始化路由成功；测试移除 TUN/监听器和控制器，只验证远程规则集加载。此测试已加入 CI。VPS 原订阅地址重新发布，保留的三个 SRS 均下载成功，两个代理进程无需重启。结果见[修正验证](../.scratch/unified-management/private-rule-fix-verification.json)。
+
+## 2026-11-15：统一两个客户端策略组并部署
+
+当前工作区经 WSL release 构建后部署到同一测试 VPS，程序 SHA-256 为 `1907a4052581e426e0c2312f14b95bf276e3674310426c9847834025abbed663`。全量及节点组订阅均只提供 `代理`、`自动选择` 两个策略组；手动组成员为兼容节点、自动选择和 DIRECT，自动组仅包含兼容节点。
+
+服务器验证 14 份 sing-box 配置、5 份 Mihomo 配置的组结构，29 个订阅的 GET/HEAD、3 个二维码均通过；实际 sing-box/Mihomo 配置检查通过。本机从公网验证完整 sing-box、Mihomo、总览页的 HTTPS GET/HEAD 均返回 200。9 个节点、两个节点组、订阅地址、节点凭据和 URI 字节保留。
+
+部署验收脚本的进程就绪等待、HTTP 响应头大小写及 YAML 字段缩进检查修正前触发过三次回退，回退期间代理服务短暂重启。最终部署无需重启代理内核，三项服务均正常，运行中的订阅服务程序摘要与候选一致。root 私有备份保留在 VPS `/root/sbctl-managed-20261114/two-groups-20261114-175438/`；目录时间为服务器 UTC，与本记录的客户端日期不同。详见[脱敏部署证据](../.scratch/unified-management/two-groups-deployment-verification.json)。

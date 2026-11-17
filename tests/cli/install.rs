@@ -451,7 +451,7 @@ fn install_arguments_that_carry_intent_never_report_a_preflight_as_success() {
             .assert()
             .code(2)
             .stdout(predicate::str::contains("install preflight passed").not())
-            .stderr(predicate::str::contains("is required"));
+            .stderr(predicate::str::contains("公网 IP"));
     }
 }
 

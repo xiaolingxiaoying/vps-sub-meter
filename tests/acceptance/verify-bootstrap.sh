@@ -184,4 +184,28 @@ grep -F -- '选择官方内核版本' "$work/management-only.out" >/dev/null \
   || fail 'management bootstrap did not explain kernel selection'
 rm -f /usr/local/bin/sing-box
 
+# Scenario 4: recovery upgrade runs the authenticated new CLI. A broken old CLI
+# cannot block it; the shell never reinstalls a deployment or touches its core.
+mkdir -p /etc/sbctl
+printf 'fixture legacy configuration\n' > /etc/sbctl/config.toml
+printf '#!/bin/sh\nexit 99\n' > /usr/local/bin/sbctl
+chmod 0755 /usr/local/bin/sbctl
+printf 'preserved old kernel\n' > /usr/local/bin/sing-box
+before=$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')
+rm -f /tmp/sbctl-bootstrap-arguments
+PATH="$work/bin:$PATH" SBCTL_UPGRADE_ONLY=1 SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
+  timeout 60 "$installer" </dev/null >"$work/recovery-upgrade.out" 2>&1
+grep -Fx -- 'validate' /tmp/sbctl-bootstrap-arguments >/dev/null \
+  || fail 'upgrade did not validate the configuration with the new CLI'
+grep -Fx -- 'update' /tmp/sbctl-bootstrap-arguments >/dev/null \
+  || fail 'upgrade did not invoke the new CLI transaction'
+! grep -Fx -- 'install' /tmp/sbctl-bootstrap-arguments >/dev/null \
+  || fail 'recovery upgrade attempted to reinstall the deployment'
+[ "$(cat /usr/local/bin/sing-box)" = 'preserved old kernel' ] || fail 'recovery bootstrap changed the kernel'
+# Our CLI stub records its arguments instead of performing the transaction, so
+# the shell itself must leave the manager untouched too.
+[ "$before" = "$(sha256sum /usr/local/bin/sbctl | awk '{print $1}')" ] \
+  || fail 'bootstrap replaced the manager outside the verified transaction'
+rm -f /etc/sbctl/config.toml /usr/local/bin/sing-box
+
 echo 'bootstrap acceptance passed'

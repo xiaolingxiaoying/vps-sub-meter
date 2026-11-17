@@ -83,6 +83,7 @@ pub(super) enum Action {
     CoreApply,
     CoreRollback,
     CoreRecover,
+    PortManage,
 }
 pub(super) struct Entry {
     pub label: String,
@@ -98,7 +99,7 @@ pub(super) fn title(page: Page) -> &'static str {
     match page {
         Page::Home => "主菜单",
         Page::Overview => "概览与诊断",
-        Page::Deployment => "节点与组合",
+        Page::Deployment => "协议管理",
         Page::Subscriptions => "节点组与订阅",
         Page::Formats => "订阅与客户端 / 链接与二维码",
         Page::Credentials => "订阅与客户端 / 命名订阅凭据",
@@ -117,14 +118,20 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
         Services, Subscriptions,
     };
     match page {
-        Home => vec![
-            entry("概览与诊断", Open(Overview)),
-            entry("节点与组合", Open(Deployment)),
-            entry("节点组与订阅", Open(Subscriptions)),
-            entry("内核与运行模式", Open(Services)),
-            entry("流量与通知", Open(Page::Traffic)),
-            entry("高级与维护", Open(Advanced)),
-        ],
+        Home => {
+            let mut entries = vec![
+                entry("概览与诊断", Open(Overview)),
+                entry("协议管理", Open(Deployment)),
+                entry("节点组与订阅", Open(Subscriptions)),
+                entry("内核与运行模式", Open(Services)),
+                entry("流量与通知", Open(Page::Traffic)),
+                entry("高级与维护", Open(Advanced)),
+            ];
+            if !installed {
+                entries.push(entry("首次安装（推荐默认配置）", QuickInstall));
+            }
+            entries
+        }
         Overview => vec![
             entry("完整部署状态", Status),
             entry("运行日志", Logs),
@@ -146,9 +153,9 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
             }
             result.extend([
                 entry("查看节点与监听端口", Nodes),
-                entry("管理节点（新增 / 编辑 / 复制 / 迁移 / 启停）", NodeManage),
+                entry("添加 / 修改协议", NodeManage),
                 entry(
-                    "协议启停、端口、SNI 和证书",
+                    "旧版协议设置（端口 / SNI / 证书）",
                     Topic(ConfigurationTopic::Protocols),
                 ),
                 entry("节点分享链接（含凭据，需确认）", NodeLinks),
@@ -156,6 +163,7 @@ pub(super) fn entries(page: Page, installed: bool) -> Vec<Entry> {
                     "Hy2 端口跳跃（UDP 范围与间隔）",
                     Topic(ConfigurationTopic::PortHopping),
                 ),
+                entry("端口与 443 共用（节点 / 网站 / 订阅）", PortManage),
             ]);
             result
         }
@@ -263,7 +271,9 @@ mod tests {
     #[test]
     fn six_sections_and_every_nested_choice_share_the_numbering_catalog() {
         let home = entries(Page::Home, false);
-        assert_eq!(home.len(), 6);
+        assert_eq!(home.len(), 7);
+        assert_eq!(entries(Page::Home, true).len(), 6);
+        assert_eq!(home.last().unwrap().action, Action::QuickInstall);
         let mut pending = vec![Page::Home];
         let mut seen = Vec::new();
         let mut leaves = Vec::new();
@@ -285,7 +295,7 @@ mod tests {
                     pending.push(next);
                 } else {
                     assert!(
-                        !leaves.contains(&row.action),
+                        row.action == Action::QuickInstall || !leaves.contains(&row.action),
                         "duplicate action {row:?}",
                         row = row.label
                     );

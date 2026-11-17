@@ -60,17 +60,15 @@ fn group_members<'a>(group: &GroupSpec, node_tags: &'a [&'a str]) -> Vec<&'a str
     members
 }
 
-/// Maps a template group identity to the sing-box tag vocabulary. `节点选择`,
-/// `自动选择` and `direct` are the tags every released artifact already
-/// carries; the rest are new groups the richer templates declare, and they share
-/// their spelling with clash because nothing has to translate them.
+/// Maps template identities to the shared `代理`, `自动选择` and `DIRECT`
+/// tags. Legacy identities remain available for source compatibility, but no
+/// built-in template declares additional policy groups.
 fn sing_box_tag(tag: GroupTag) -> &'static str {
     match tag {
         GroupTag::Selector => SELECTOR_TAG,
         GroupTag::Auto => AUTO_TAG,
         GroupTag::Direct => DIRECT_TAG,
-        // Never reached: `purpose_groups` declares the fallback group clash-only,
-        // and the referential test below would catch a rule naming it anyway.
+        // Built-in templates no longer declare these legacy policy groups.
         GroupTag::Fallback => FALLBACK_TAG,
         GroupTag::Proxy => PROXY_TAG,
         GroupTag::Ai => AI_TAG,
@@ -173,11 +171,7 @@ pub(crate) fn sing_box_full(
         )));
     }
     let nodes = &compatible_nodes;
-    if matches!(
-        &config.client_template,
-        crate::subscription::ClientTemplate::Standard
-            | crate::subscription::ClientTemplate::Compact
-    ) {
+    if config.client_template == crate::subscription::ClientTemplate::Standard {
         let spec = TemplateSpec::for_template(config, config.client_template.clone());
         return standard_full(config, nodes, profile, &spec);
     }
@@ -186,7 +180,7 @@ pub(crate) fn sing_box_full(
     let spec = TemplateSpec::for_template(config, config.client_template.clone());
     let remote_rule_sets = config.client_rule_profile == ClientRuleProfile::Standard;
     let node_tags: Vec<&str> = nodes.iter().map(CanonicalNode::tag).collect();
-    let mut outbounds = profile_outbounds(config, nodes, profile);
+    let mut outbounds = Vec::new();
     for group in spec
         .groups
         .iter()
@@ -199,6 +193,7 @@ pub(crate) fn sing_box_full(
                 "type": "selector",
                 "tag": tag,
                 "outbounds": members,
+                "default": AUTO_TAG,
                 "interrupt_exist_connections": false
             })),
             GroupRole::UrlTest => outbounds.push(json!({
@@ -210,18 +205,17 @@ pub(crate) fn sing_box_full(
                 "tolerance": 50,
                 "idle_timeout": "30m"
             })),
-            GroupRole::Direct => {
-                // A sing-box `direct` outbound takes no members: the template's
-                // member list is the clash group's `DIRECT` + node list.
-                outbounds.push(json!({"type": "direct", "tag": tag}));
-            }
-            GroupRole::Fallback => {
-                // sing-box has no failover outbound type, and quietly rendering
-                // the template's fallback group as a second urltest would give
-                // the artifact a group that does not behave like its name. The
-                // catalog declares this group clash-only; nothing to emit here.
-            }
+            GroupRole::Direct | GroupRole::Fallback => {}
         }
+    }
+    outbounds.extend(profile_outbounds(config, nodes, profile));
+    for group in spec
+        .groups
+        .iter()
+        .filter(|group| group.renderers.includes_sing_box() && group.role == GroupRole::Direct)
+    {
+        let tag = sing_box_tag(group.tag);
+        outbounds.push(json!({"type": "direct", "tag": tag}));
     }
     // A reject verdict on a pre-1.11 core needs the block outbound to exist;
     // counted after the loop because only the emitted rules know.
@@ -752,7 +746,17 @@ pub(crate) fn sing_box_server(
     root: &Path,
     legacy_route: bool,
 ) -> Result<String, SubscriptionError> {
-    let certificate = certificate_tls_config(config, root)?;
+    certificate_tls_config(config, root)?;
+    sing_box_server_with_paths(config, nodes, root, legacy_route)
+}
+
+pub(crate) fn sing_box_server_with_paths(
+    config: &DeploymentConfig,
+    nodes: &[CanonicalNode],
+    root: &Path,
+    legacy_route: bool,
+) -> Result<String, SubscriptionError> {
+    let certificate = certificate_tls_paths(config, root);
     let mut inbounds = Vec::new();
     let mut tags = Vec::new();
     for node in nodes {
@@ -862,8 +866,22 @@ pub(crate) fn certificate_tls_config(
     config: &DeploymentConfig,
     root: &Path,
 ) -> Result<Value, SubscriptionError> {
+    if config.certificate_mode == CertificateMode::SelfSigned {
+        ensure_self_signed_certificate(config, root)?;
+    }
+    Ok(certificate_tls_paths(config, root))
+}
+
+/// Describe server paths without creating certificate material during previews.
+pub(crate) fn certificate_tls_paths(config: &DeploymentConfig, root: &Path) -> Value {
     let (certificate_path, key_path) = match config.certificate_mode {
-        CertificateMode::SelfSigned => ensure_self_signed_certificate(config, root)?,
+        CertificateMode::SelfSigned => {
+            let directory = self_signed_certificate_directory(root, config.protocol_server_name());
+            (
+                directory.join("cert.pem").to_string_lossy().into_owned(),
+                directory.join("key.pem").to_string_lossy().into_owned(),
+            )
+        }
         CertificateMode::Domain => {
             let pinned = root
                 .join(crate::config::CERTIFICATES_RELATIVE_PATH)
@@ -895,28 +913,9 @@ pub(crate) fn certificate_tls_config(
             }
         }
     };
-    Ok(
-        json!({"enabled": true, "server_name": config.protocol_server_name(),
+    json!({"enabled": true, "server_name": config.protocol_server_name(),
         "certificate_path": certificate_path,
-        "key_path": key_path}),
-    )
-}
-
-pub(crate) fn existing_certificate_tls_config(
-    config: &DeploymentConfig,
-    root: &Path,
-) -> Result<Value, SubscriptionError> {
-    if config.certificate_mode == CertificateMode::SelfSigned {
-        let directory = self_signed_certificate_directory(root, config.protocol_server_name());
-        for name in ["cert.pem", "key.pem"] {
-            crate::config::open_managed_path_no_follow(&directory.join(name)).map_err(|_| {
-                SubscriptionError::Certificate(
-                    "请先通过安装或证书配置生成证书；预览不会生成证书".into(),
-                )
-            })?;
-        }
-    }
-    certificate_tls_config(config, root)
+        "key_path": key_path})
 }
 
 /// Generates and pins a long-lived self-signed certificate for the subscription

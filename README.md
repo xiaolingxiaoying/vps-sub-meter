@@ -10,6 +10,8 @@
 
 ## 安装
 
+首次安装默认值、无域名配置、旧版升级、统一协议及 443 共用见[安装与升级说明](docs/setup-and-upgrade.md)。
+
 需要 Debian 12 或 Ubuntu 22.04 及以上版本、amd64/arm64 架构、systemd 和 root 权限。使用 Direct HTTPS 时，请先将域名解析到 VPS，并放行公网 TCP 80/443；协议端口按安装菜单提示放行。
 
 ```bash

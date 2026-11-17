@@ -130,14 +130,23 @@ struct ConnectionLimits {
     global: Arc<Semaphore>,
     peers: Arc<Mutex<HashMap<IpAddr, usize>>>,
     per_peer: bool,
+    max_per_peer: usize,
 }
 
 impl ConnectionLimits {
     fn new(per_peer: bool) -> Self {
+        Self::with_capacity(
+            MAX_CONCURRENT_CONNECTIONS,
+            MAX_CONNECTIONS_PER_PEER,
+            per_peer,
+        )
+    }
+    fn with_capacity(global: usize, max_per_peer: usize, per_peer: bool) -> Self {
         Self {
-            global: Arc::new(Semaphore::new(MAX_CONCURRENT_CONNECTIONS)),
+            global: Arc::new(Semaphore::new(global)),
             peers: Arc::new(Mutex::new(HashMap::new())),
             per_peer,
+            max_per_peer,
         }
     }
 
@@ -149,7 +158,7 @@ impl ConnectionLimits {
         if let Some(peer) = peer {
             let mut peers = self.peers.lock().unwrap_or_else(|e| e.into_inner());
             let count = peers.entry(peer).or_default();
-            if *count >= MAX_CONNECTIONS_PER_PEER {
+            if *count >= self.max_per_peer {
                 return None;
             }
             *count += 1;
@@ -471,6 +480,7 @@ async fn serve_tls_listener_with_timeouts(
     let limits = ConnectionLimits::new(true);
     let counter = Arc::new(AtomicUsize::new(0));
     let metrics = Arc::new(TlsConnectionMetrics::default());
+    let relay_sessions = Arc::new(ConnectionLimits::with_capacity(256, 64, true));
     let (tls_sender, tls_receiver) = tokio::sync::watch::channel(None);
     let (initial_check_sender, initial_check_receiver) = tokio::sync::oneshot::channel();
     let reload_task = tokio::spawn(reload_tls_material(
@@ -501,13 +511,6 @@ async fn serve_tls_listener_with_timeouts(
         metrics.accepted.fetch_add(1, Ordering::Relaxed);
         let tls =
             tls_material_for_accept(tls_receiver.borrow().clone(), std::time::SystemTime::now());
-        let Some(tls) = tls else {
-            metrics
-                .certificate_unavailable
-                .fetch_add(1, Ordering::Relaxed);
-            drop(stream);
-            continue;
-        };
         let peer = stream.peer_addr().ok().map(|address| address.ip());
         let Some(permit) = limits.try_acquire(peer) else {
             metrics.capacity_rejected.fetch_add(1, Ordering::Relaxed);
@@ -519,8 +522,48 @@ async fn serve_tls_listener_with_timeouts(
         let budget = Arc::clone(&budget);
         let counter = Arc::clone(&counter);
         let metrics = Arc::clone(&metrics);
+        let relay_sessions = Arc::clone(&relay_sessions);
         connections.spawn(async move {
+            // Reload small routing settings so a committed node/port change
+            // takes effect without restarting the subscription listener.
+            let routes = store.load().ok().and_then(|c| c.shared_tls);
+            if let Some(routes) = routes
+                && !routes.routes.is_empty()
+            {
+                let name = match crate::shared_tls::server_name(&stream).await {
+                    Ok(name) => name,
+                    Err(_) => {
+                        counter.fetch_add(1, Ordering::Release);
+                        return;
+                    }
+                };
+                if let Some(route) = name.as_ref().and_then(|name| {
+                    routes
+                        .routes
+                        .iter()
+                        .find(|r| r.server_name.eq_ignore_ascii_case(name))
+                }) {
+                    let Some(session) = relay_sessions.try_acquire(peer) else {
+                        counter.fetch_add(1, Ordering::Release);
+                        return;
+                    };
+                    // The small preheader budget protects classification; long
+                    // proxy sessions have their own bounded concurrency budget.
+                    drop(permit);
+                    let _session = session;
+                    let _ = crate::shared_tls::forward(stream, route.backend).await;
+                    counter.fetch_add(1, Ordering::Release);
+                    return;
+                }
+            }
             let _permit = permit;
+            let Some(tls) = tls else {
+                metrics
+                    .certificate_unavailable
+                    .fetch_add(1, Ordering::Relaxed);
+                counter.fetch_add(1, Ordering::Release);
+                return;
+            };
             let outcome = serve_tls_connection(
                 stream,
                 tls,
@@ -2056,6 +2099,198 @@ mod tests {
         assert!(
             rejected > 0,
             "the listener must close at least one of 33 simultaneous incomplete requests"
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a real sing-box 1.14 core via SING_BOX_BIN_1_14"]
+    async fn shared_tls_carries_a_real_node_request_and_keeps_the_subscription_available() {
+        use crate::{
+            core::CoreKind,
+            nodes,
+            shared_tls::{Route, SharedTls},
+        };
+        struct Core(std::process::Child);
+        impl Drop for Core {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let binary = std::path::PathBuf::from(std::env::var_os("SING_BOX_BIN_1_14").unwrap());
+        let fixture = TempDir::new().unwrap();
+        let (store, mut config, credential) = seed_direct_subscription(&fixture);
+        config.protocol_sni = Some("node.example.test".into());
+        let mut registry = nodes::load_or_import(fixture.path(), &config).unwrap();
+        registry.nodes.clear();
+        let reservation = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let backend = reservation.local_addr().unwrap();
+        let mut node = nodes::create(
+            &registry,
+            &config,
+            "vmess-websocket",
+            "",
+            Some(backend.port()),
+            None,
+        )
+        .unwrap();
+        node.patch("server", serde_json::json!("127.0.0.1"))
+            .unwrap();
+        node.patch("port", serde_json::json!(443)).unwrap();
+        config.shared_tls = Some(SharedTls {
+            routes: vec![Route {
+                server_name: "node.example.test".into(),
+                backend,
+                node_id: Some(node.id.clone()),
+            }],
+        });
+        registry.nodes.push(node.clone());
+        registry.validate(&config).unwrap();
+        store.replace(&config).unwrap();
+        crate::subscription::render::certificate_tls_config(&config, fixture.path()).unwrap();
+        seed_direct_certificate(&fixture, &store, &config);
+        let document = crate::subscription::managed::servers(&config, fixture.path(), &registry)
+            .unwrap()
+            .remove(0)
+            .1;
+        CoreKind::SingBox
+            .check_config(&binary, &document.to_string())
+            .unwrap();
+        let path = fixture.path().join("server.json");
+        fs::write(&path, document.to_string()).unwrap();
+        drop(reservation);
+        let mut core = Core(
+            std::process::Command::new(&binary)
+                .args(["run", "-c"])
+                .arg(path)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+        loop {
+            if tokio::net::TcpStream::connect(backend).await.is_ok() {
+                break;
+            }
+            assert!(core.0.try_wait().unwrap().is_none(), "core exited");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "core did not listen"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store),
+            Arc::new(config.clone()),
+            super::fresh_budget(),
+            None,
+        ));
+        let origin = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let target = format!("http://{}", origin.local_addr().unwrap());
+        let origin_task = tokio::spawn(async move {
+            let (mut stream, _) = origin.accept().await.unwrap();
+            let _ = stream.read(&mut [0; 4096]).await.unwrap();
+            stream
+                .write_all(
+                    b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+        });
+        node.patch("port", serde_json::json!(port)).unwrap();
+        let root = fixture.path().to_path_buf();
+        let probe = tokio::task::spawn_blocking(move || {
+            crate::probe::node(&root, &config, &node, &target, Some(&binary))
+        });
+        let result = tokio::time::timeout(Duration::from_secs(20), probe)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.http_status, 204);
+        origin_task.await.unwrap();
+        assert!(
+            tls_get(port, &format!("/sub/{credential}/uri"))
+                .await
+                .contains("vless://")
+        );
+        handler.abort();
+    }
+
+    #[tokio::test]
+    async fn shared_listener_hot_loads_routes_while_preserving_subscription_tls() {
+        use crate::shared_tls::{Route, SharedTls};
+        let fixture = TempDir::new().unwrap();
+        let (store, mut config, credential) = seed_direct_subscription(&fixture);
+        seed_direct_certificate(&fixture, &store, &config);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handler = tokio::spawn(super::serve_tls_listener(
+            listener,
+            Arc::new(store.clone()),
+            Arc::new(config.clone()),
+            super::fresh_budget(),
+            None,
+        ));
+        // The listener starts with no routes; the committed configuration is
+        // picked up by new connections without restarting the HTTPS listener.
+        assert!(
+            tls_get(port, &format!("/sub/{credential}/uri"))
+                .await
+                .contains("vless://")
+        );
+        let backend = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        config.shared_tls = Some(SharedTls {
+            routes: vec![Route {
+                server_name: "web.example.test".into(),
+                backend: backend.local_addr().unwrap(),
+                node_id: None,
+            }],
+        });
+        store.replace(&config).unwrap();
+        let client_config = rustls::ClientConfig::builder()
+            .with_root_certificates(rustls::RootCertStore::empty())
+            .with_no_client_auth();
+        let mut client = rustls::ClientConnection::new(
+            Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from("web.example.test").unwrap(),
+        )
+        .unwrap();
+        let mut hello = Vec::new();
+        client.write_tls(&mut hello).unwrap();
+        let expected = hello.clone();
+        let receiver = tokio::spawn(async move {
+            let (mut stream, _) = backend.accept().await.unwrap();
+            let mut bytes = vec![0; expected.len()];
+            stream.read_exact(&mut bytes).await.unwrap();
+            assert_eq!(bytes, expected);
+            stream.write_all(b"backend").await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+        let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        stream.write_all(&hello).await.unwrap();
+        let mut response = [0; 7];
+        tokio::time::timeout(Duration::from_secs(3), stream.read_exact(&mut response))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(&response, b"backend");
+        stream.shutdown().await.unwrap();
+        receiver.await.unwrap();
+        let subscription = tls_get(port, &format!("/sub/{credential}/uri")).await;
+        assert!(subscription.starts_with("HTTP/1.1 200 OK"));
+        assert!(subscription.contains("vless://"));
+        assert!(
+            tls_handshake_sni(port, "unknown.example.test")
+                .await
+                .is_err()
         );
         handler.abort();
     }

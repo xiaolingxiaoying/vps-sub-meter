@@ -29,6 +29,7 @@ export MIHOMO_BIN="${MIHOMO_BIN:-$HOME/bin/mihomo}"
 cargo test --locked --workspace --features sbctl/test-signing --quiet
 cargo test --locked --test managed_deployment -- --ignored --nocapture
 cargo test --locked --test xray_core -- --ignored --nocapture
+cargo test --locked --test probe -- --ignored --nocapture
 cargo test --locked --test preset_connections tls_presets_carry_http -- --ignored --nocapture
 SBCTL_CLIENT_BIN="$SING_BOX_BIN_1_14" cargo test --locked --test preset_connections sing_box_compatible -- --ignored --nocapture
 python3 tests/acceptance/verify-menu.py "$CARGO_TARGET_DIR/debug/sbctl"

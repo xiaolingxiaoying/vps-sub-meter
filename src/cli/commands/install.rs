@@ -2,7 +2,7 @@
 //! prints, and the firewall commands that checklist offers to copy.
 
 use crate::cli::args::InstallOptions;
-use crate::cli::prompt::{protocol_ports, required_install_value, select_protocols};
+use crate::cli::prompt::{protocol_ports, select_protocols};
 use sbctl::wizard::Prompts;
 use std::io::{self, IsTerminal};
 use std::path::Path;
@@ -45,11 +45,8 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         return ExitCode::from(2);
     }
     if !options.guided
-        && let Err(error) = sbctl::preflight::preflight_install(
-            root,
-            matches!(&options.mode, crate::cli::args::CliSubscriptionMode::Direct),
-            options.replace_existing,
-        )
+        && let Err(error) =
+            sbctl::preflight::preflight_install(root, false, options.replace_existing)
     {
         eprintln!("install preflight failed: {error}");
         return ExitCode::from(2);
@@ -57,7 +54,8 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
     let guided_config = if options.guided {
         let default_interface = sbctl::traffic::detect_default_route_interface(root).ok();
         let mut prompts = crate::cli::prompt::ConsolePrompts;
-        match sbctl::wizard::run(None, default_interface, &mut prompts) {
+        let default_host = sbctl::egress::discover(root).ok().map(|ip| ip.to_string());
+        match sbctl::wizard::run_with_host(None, default_interface, default_host, &mut prompts) {
             Ok(sbctl::wizard::WizardOutcome::Changed(config)) => Some(config),
             Ok(sbctl::wizard::WizardOutcome::Cancelled) => {
                 println!("installation cancelled; the host was not changed");
@@ -79,8 +77,25 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         let mut config = if let Some(config) = guided_config {
             config
         } else {
-            let subscription_host =
-                required_install_value(options.subscription_host, "订阅主机名（域名或 IP）")?;
+            let mut subscription_host = options.subscription_host.unwrap_or_default();
+            if subscription_host.is_empty() && io::stdin().is_terminal() {
+                let mut prompts = crate::cli::prompt::ConsolePrompts;
+                subscription_host = prompts.ask("订阅域名（无域名回车自动检测出口 IP）", None)?;
+            }
+            if subscription_host.trim().is_empty() || subscription_host.trim() == "auto" {
+                subscription_host = sbctl::egress::discover(root)
+                    .map_err(sbctl::config::ConfigError::StateContent)?
+                    .to_string();
+                println!("检测到出口 IP：{subscription_host}；NAT 主机请确认入站端口映射。");
+            }
+            let mode = if subscription_host.parse::<std::net::IpAddr>().is_ok()
+                && matches!(options.mode, crate::cli::args::CliSubscriptionMode::Direct)
+            {
+                println!("无域名：使用 IP 订阅（HTTP），协议 SNI 与证书自动配置。");
+                sbctl::config::SubscriptionMode::IpFallback
+            } else {
+                options.mode.into()
+            };
             let interface = options.interface.map(Ok).unwrap_or_else(|| {
                 sbctl::traffic::detect_default_route_interface(root).map_err(|error| {
                     sbctl::config::ConfigError::StateContent(format!(
@@ -92,18 +107,21 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
             let needs_reality_sni =
                 protocols.contains(&sbctl::config::ManagedProtocol::VlessReality);
             let reality_decoy_sni = if needs_reality_sni {
-                Some(required_install_value(
-                    options.reality_decoy_sni,
-                    "Reality 伪装域名",
-                )?)
+                Some(
+                    options
+                        .reality_decoy_sni
+                        .unwrap_or_else(|| "www.cloudflare.com".into()),
+                )
             } else {
                 None
             };
             let mut config = sbctl::config::DeploymentConfig::new_with_ports(
-                options.mode.into(),
+                mode.clone(),
                 subscription_host,
                 options.proxy_host,
-                options.http_port,
+                options
+                    .http_port
+                    .or((mode == sbctl::config::SubscriptionMode::IpFallback).then_some(2080)),
                 interface,
                 protocols,
                 reality_decoy_sni,
@@ -136,7 +154,7 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                 ));
             }
         }
-        if options.guided {
+        {
             sbctl::preflight::preflight_install(
                 root,
                 config.subscription_mode == sbctl::config::SubscriptionMode::Direct,
@@ -179,6 +197,7 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
         // certificate away instead of leaving a directory that makes preflight
         // refuse every later install.
         installation_started = true;
+        let mut _downloaded_core = None;
         let sing_box_bin = match options.sing_box_bin {
             Some(path) => path,
             None => match options.manifest {
@@ -193,12 +212,10 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                     sbctl::update::download_sing_box(&manifest, download.path()).map_err(
                         |error| sbctl::config::ConfigError::StateContent(error.to_string()),
                     )?;
-                    download
-                        .keep()
-                        .map_err(|error| {
-                            sbctl::config::ConfigError::StateContent(error.to_string())
-                        })?
-                        .1
+                    let temporary = download.into_temp_path();
+                    let path = temporary.to_path_buf();
+                    _downloaded_core = Some(temporary);
+                    path
                 }
                 None => {
                     // 默认：直接从官方 SagerNet 仓库安装最新稳定版 sing-box 内核。
@@ -216,15 +233,21 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
                     sbctl::update::download_sing_box_official(&version, download.path()).map_err(
                         |error| sbctl::config::ConfigError::StateContent(error.to_string()),
                     )?;
-                    download
-                        .keep()
-                        .map_err(|error| {
-                            sbctl::config::ConfigError::StateContent(error.to_string())
-                        })?
-                        .1
+                    let temporary = download.into_temp_path();
+                    let path = temporary.to_path_buf();
+                    _downloaded_core = Some(temporary);
+                    path
                 }
             },
         };
+        if options.all_protocols
+            && sbctl::subscription::installed_kernel_version(&sing_box_bin)
+                .is_some_and(|v| v.major == 1 && v.minor < 12)
+        {
+            return Err(sbctl::config::ConfigError::StateContent(
+                "全部 9 协议包含 AnyTLS，需要 sing-box 1.12 或更新版本；建议使用默认内核".into(),
+            ));
+        }
         let store = sbctl::config::DeploymentStore::new(root);
         // Serialize artifact generation and the configuration commit with every
         // other sbctl writer. A second install that started before the winner
@@ -348,6 +371,29 @@ pub(crate) fn install(root: &Path, options: InstallOptions) -> ExitCode {
     }
     match result {
         Ok((config, certificate)) => {
+            if root == Path::new("/") && !options.no_start {
+                let prepare = (|| -> sbctl::nodes::Result<()> {
+                    let store = sbctl::config::DeploymentStore::new(root);
+                    if options.all_protocols {
+                        sbctl::deployment::install_core(&store, sbctl::core::CoreKind::Xray, None)?;
+                    }
+                    let before = sbctl::nodes::load_or_import(root, &config)?;
+                    let mut after = before.clone();
+                    if options.all_protocols {
+                        after.complete_catalog(&config)?;
+                    } else {
+                        after.normalize_names();
+                    }
+                    sbctl::deployment::apply(&store, &config, &before, after)?;
+                    Ok(())
+                })();
+                if let Err(error) = prepare {
+                    eprintln!(
+                        "基础部署已保存；协议集准备失败：{error}。可运行 protocols.sh --apply 重试，无需重装或重置链接。"
+                    );
+                    return ExitCode::from(2);
+                }
+            }
             print_post_install_checklist_with(&config, certificate, options.manage_firewall);
             if let Some(backup) = replacement_backup {
                 println!("旧部署备份保存在 {}", backup.archive_path().display());

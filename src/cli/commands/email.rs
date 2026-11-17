@@ -5,6 +5,9 @@ pub(crate) fn run_email(root: &Path, command: EmailCommand) -> ExitCode {
     let result = (|| -> Result<(), String> {
         let store = sbctl::config::DeploymentStore::new(root);
         match command {
+            EmailCommand::Setup => {
+                setup(root)?;
+            }
             EmailCommand::Status => {
                 let config = sbctl::email::load(root)?;
                 println!(
@@ -26,6 +29,10 @@ pub(crate) fn run_email(root: &Path, command: EmailCommand) -> ExitCode {
                     } else {
                         "关闭"
                     }
+                );
+                println!(
+                    "最近成功发送：{}",
+                    sbctl::email::last_delivery(root).unwrap_or_else(|| "尚未发送".into())
                 );
             }
             EmailCommand::Configure => {
@@ -89,4 +96,75 @@ pub(crate) fn run_email(root: &Path, command: EmailCommand) -> ExitCode {
             ExitCode::from(2)
         }
     }
+}
+
+fn setup(root: &Path) -> Result<(), String> {
+    use sbctl::wizard::Prompts;
+    sbctl::preflight::require_install_privileges(root).map_err(|e| e.to_string())?;
+    let store = sbctl::config::DeploymentStore::new(root);
+    store.load().map_err(|_| "请先安装部署")?;
+    let mut config = sbctl::email::load(root).unwrap_or_default();
+    let mut prompts = crate::cli::prompt::ConsolePrompts;
+    println!(
+        "邮件通知（可跳过，不影响代理）\n使用 SMTP 授权码；默认 TLS 465，密码输入不显示。订阅链接默认不发送。"
+    );
+    fn value(p: &mut impl Prompts, label: &str, default: &str) -> Result<String, String> {
+        let s = p.ask(label, Some(default)).map_err(|e| e.to_string())?;
+        Ok(if s.trim().is_empty() {
+            default.into()
+        } else {
+            s.trim().into()
+        })
+    }
+    config.from = value(&mut prompts, "发件邮箱", &config.from)?;
+    config.username = value(&mut prompts, "SMTP 用户名", &config.from)?;
+    config.smtp_host = value(
+        &mut prompts,
+        "SMTP 服务器（以邮箱服务商说明为准）",
+        &config.smtp_host,
+    )?;
+    config.smtp_port = value(
+        &mut prompts,
+        "SMTP 端口（465=TLS / 587=STARTTLS）",
+        &config.smtp_port.to_string(),
+    )?
+    .parse()
+    .map_err(|_| "端口无效")?;
+    config.implicit_tls = match config.smtp_port {
+        465 => true,
+        587 => false,
+        _ => prompts
+            .confirm("此端口使用隐式 TLS？（否=强制 STARTTLS）", true)
+            .map_err(|e| e.to_string())?,
+    };
+    let password =
+        crate::cli::prompt::secret("SMTP 授权码（回车保留现有）: ").map_err(|e| e.to_string())?;
+    if !password.is_empty() {
+        config.password = password;
+    }
+    config.to = value(&mut prompts, "收件邮箱", &config.from)?;
+    config.daily_report = prompts
+        .confirm("启用每日状态报告？", true)
+        .map_err(|e| e.to_string())?;
+    config.include_subscription = prompts
+        .confirm("邮件包含私有订阅链接？（邮箱可读到凭据）", false)
+        .map_err(|e| e.to_string())?;
+    config.validate()?;
+    if !prompts
+        .confirm("保存邮件配置？", false)
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(());
+    }
+    let _lock = store.acquire_operation_lock().map_err(|e| e.to_string())?;
+    store
+        .write_root_only_locked(
+            sbctl::email::CONFIG_PATH,
+            toml::to_string_pretty(&config)
+                .map_err(|_| "配置序列化失败")?
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+    println!("已保存。使用 email send 发送测试邮件；email enable 启用定时通知。");
+    Ok(())
 }

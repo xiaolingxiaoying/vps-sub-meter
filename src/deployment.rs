@@ -1,5 +1,6 @@
 //! Durable managed-deployment transaction. The public generation pointer is the
-//! commit point; neither accounting nor subscription credentials are snapshotted.
+//! commit point. Historical rollback preserves current accounting and subscription
+//! credentials; interrupted in-flight operations restore their locked snapshot.
 use crate::{
     config::{DeploymentConfig, DeploymentStore},
     core::CoreKind,
@@ -30,6 +31,8 @@ struct Journal {
     states: Vec<(String, bool, bool)>,
     applied_revision: u64,
     committed: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rollback_config: Option<toml::Table>,
 }
 #[derive(Serialize)]
 pub struct Plan {
@@ -41,6 +44,8 @@ pub struct Plan {
     pub client_artifacts_changed: Vec<String>,
     pub client_artifacts_removed: Vec<String>,
     pub requirements: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
     pub added: Vec<String>,
     pub removed: Vec<String>,
     pub changed: Vec<String>,
@@ -207,6 +212,25 @@ pub fn plan(
             }
         }
     }
+    let mut warnings = Vec::new();
+    if after.nodes.iter().any(|n| n.enabled) {
+        let missing: Vec<&str> = [
+            ("sing-box", "subscription-sing-box-full.json"),
+            ("clash", "subscription-clash.yaml"),
+            ("shadowrocket", "subscription-shadowrocket.txt"),
+            ("uri", "subscription-uri.txt"),
+        ]
+        .into_iter()
+        .filter(|(_, artifact)| !clients.iter().any(|(name, _)| name == artifact))
+        .map(|(label, _)| label)
+        .collect();
+        if !missing.is_empty() {
+            warnings.push(format!(
+                "当前启用节点仅生成部分客户端订阅（缺失: {}）；例如 Xray 下的 vless-reality / vless-xhttp 节点会从不兼容客户端保守排除。如需全客户端互通，建议启用 vless-ws-tls 或 trojan-tcp-tls",
+                missing.join(", ")
+            ));
+        }
+    }
     Ok(Plan {
         previous_mode: before.mode,
         mode: after.mode,
@@ -216,6 +240,7 @@ pub fn plan(
         client_artifacts_changed,
         client_artifacts_removed,
         requirements,
+        warnings,
         added: after
             .nodes
             .iter()
@@ -240,13 +265,19 @@ pub fn plan(
     })
 }
 fn systemctl(root: &Path, args: &[&str]) -> Result<()> {
-    if root != Path::new("/") {
-        return Ok(());
+    // Isolated deployment roots historically skip data-plane systemd calls.
+    // A dedicated fixture executable opts into recording these transactions;
+    // do not reuse lifecycle's systemctl stub, which has a different contract.
+    let status = if root == Path::new("/") {
+        Command::new("systemctl").args(args).status()
+    } else {
+        let fixture = root.join("usr/bin/sbctl-deployment-systemctl");
+        if !fixture.is_file() {
+            return Ok(());
+        }
+        Command::new(fixture).args(args).status()
     }
-    let status = Command::new("systemctl")
-        .args(args)
-        .status()
-        .map_err(|_| Error("无法执行 systemctl".into()))?;
+    .map_err(|_| Error("无法执行 systemctl".into()))?;
     if !status.success() {
         return Err(Error(format!(
             "systemctl {} 失败",
@@ -287,7 +318,7 @@ fn unit_text(core: CoreKind, hopping: bool) -> String {
     };
     format!(
         "[Unit]\nDescription={core} data plane managed by sbctl\nAfter=network-online.target sbctl-recover.service\nWants=network-online.target\nRequires=sbctl-recover.service\n\n[Service]\nType=simple\nUser=sing-box\nGroup=sing-box\nExecStart=/{program} run -c /{config}\n{extra}Restart=on-failure\nRestartSec=2\nNoNewPrivileges=true\nPrivateTmp=true\nProtectHome=true\nProtectSystem=strict\n\n[Install]\nWantedBy=multi-user.target\n"
-    )
+    ).replace("NoNewPrivileges=true\n", "AmbientCapabilities=CAP_NET_BIND_SERVICE\nCapabilityBoundingSet=CAP_NET_BIND_SERVICE\nNoNewPrivileges=true\n")
 }
 fn health(root: &Path, name: &str) -> Result<()> {
     if root != Path::new("/") {
@@ -355,21 +386,27 @@ fn snapshot(root: &Path, paths: &[String], revision: u64) -> Result<Journal> {
             })
         })
         .collect::<Result<_>>()?;
-    let states = [CoreKind::SingBox, CoreKind::Xray]
-        .into_iter()
-        .map(|c| {
-            (
-                unit(c).into(),
-                state(root, unit(c), "is-enabled"),
-                state(root, unit(c), "is-active"),
-            )
-        })
-        .collect();
+    let states = [
+        unit(CoreKind::SingBox),
+        unit(CoreKind::Xray),
+        "sbctl.service",
+        "sbctl-http.socket",
+    ]
+    .into_iter()
+    .map(|name| {
+        (
+            name.into(),
+            state(root, name, "is-enabled"),
+            state(root, name, "is-active"),
+        )
+    })
+    .collect();
     Ok(Journal {
         files,
         states,
         applied_revision: revision,
         committed: false,
+        rollback_config: None,
     })
 }
 fn restore(store: &DeploymentStore, record: &Journal, boot: bool) -> Result<()> {
@@ -384,6 +421,16 @@ fn restore(store: &DeploymentStore, record: &Journal, boot: bool) -> Result<()> 
             })
         })
         .collect();
+    let mut affected_units: Vec<&str> = affected.iter().map(|c| unit(*c)).collect();
+    for name in ["sbctl.service", "sbctl-http.socket"] {
+        if record
+            .files
+            .iter()
+            .any(|f| f.path == format!("etc/systemd/system/{name}"))
+        {
+            affected_units.push(name);
+        }
+    }
     // Stop only owned data planes; never stop the subscription service.
     if !boot {
         for c in &affected {
@@ -396,6 +443,38 @@ fn restore(store: &DeploymentStore, record: &Journal, boot: bool) -> Result<()> 
             }
         }
     }
+    // Disable before removing a newly-created unit, while systemd can still
+    // resolve its [Install] section and remove the corresponding wants links.
+    for (name, enabled, _) in &record.states {
+        if affected_units.contains(&name.as_str())
+            && !enabled
+            && root.join(format!("etc/systemd/system/{name}")).exists()
+        {
+            systemctl(root, &["disable", name])?;
+        }
+        if boot
+            && affected_units.contains(&name.as_str())
+            && !enabled
+            && !record
+                .states
+                .iter()
+                .any(|(n, _, active)| n == name && *active)
+            && root.join(format!("etc/systemd/system/{name}")).exists()
+        {
+            systemctl(root, &["--no-block", "stop", name])?;
+        }
+    }
+    let subscription_changed = record.files.iter().any(|f| {
+        f.path == "usr/local/bin/sbctl"
+            || f.path == "etc/systemd/system/sbctl.service"
+            || f.path == "etc/systemd/system/sbctl-http.socket"
+            || (f.path == crate::config::CONFIG_RELATIVE_PATH
+                && optional(root, &f.path)
+                    .ok()
+                    .flatten()
+                    .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+                    != f.contents)
+    });
     for entry in &record.files {
         // Journal paths are fixed owned paths, never arbitrary JSON path input.
         if !allowed_snapshot(&entry.path) {
@@ -414,25 +493,64 @@ fn restore(store: &DeploymentStore, record: &Journal, boot: bool) -> Result<()> 
             io(crate::managed_fs::remove_file(root.join(&entry.path)))?;
         }
     }
+    let restored_config = if root.join(crate::config::CONFIG_RELATIVE_PATH).is_file() {
+        Some(store.load()?)
+    } else {
+        None
+    };
+    if root == Path::new("/")
+        && record
+            .files
+            .iter()
+            .any(|f| f.path == crate::config::CONFIG_RELATIVE_PATH)
+        && root.join("etc/systemd/system/sbctl.service").is_file()
+        && let Some(config) = &restored_config
+    {
+        // A delivery-mode change also changes certificate group access. Restore
+        // that policy before starting either non-root consumer of the old files.
+        crate::lifecycle::prepare_daemon_storage(
+            root,
+            config.subscription_mode == crate::config::SubscriptionMode::Direct,
+        )
+        .map_err(Error)?;
+    }
+    if crate::port_hopping::has_firewall_runtime(root) && affected.contains(&CoreKind::SingBox) {
+        let hopping = if let Some(config) = &restored_config {
+            nodes::read_optional(root)?.map_or(config.hysteria2_port_hopping.is_some(), |r| {
+                r.has_active_sing_box_hysteria2(config)
+            })
+        } else {
+            false
+        };
+        crate::port_hopping::apply_firewall_config(
+            root,
+            restored_config.as_ref().filter(|_| hopping),
+        )
+        .map_err(Error)?;
+    }
     systemctl(root, &["daemon-reload"])?;
-    if !boot {
-        for (name, enabled, active) in &record.states {
-            if !affected.iter().any(|c| unit(*c) == name) {
-                continue;
-            }
-            if *enabled {
-                systemctl(root, &["enable", name])?;
-            } else if root.join(format!("etc/systemd/system/{name}")).exists() {
-                systemctl(root, &["disable", name])?;
-            }
-            if *active {
-                systemctl(root, &["start", name])?;
-                health(root, name)?;
-            }
+    for (name, enabled, active) in &record.states {
+        if !affected_units.contains(&name.as_str()) {
+            continue;
         }
-        if record.files.iter().any(|f| f.path == "usr/local/bin/sbctl") {
-            crate::lifecycle::restart_subscription_service(root).map_err(Error)?;
+        if *enabled {
+            systemctl(root, &["enable", name])?;
         }
+        if boot && (*enabled || *active) {
+            // The units are ordered After this recovery oneshot. Waiting
+            // synchronously here would deadlock the boot transaction.
+            if name != "sbctl.service"
+                || store.load()?.subscription_mode != crate::config::SubscriptionMode::Direct
+            {
+                systemctl(root, &["--no-block", "start", name])?;
+            }
+        } else if !boot && *active && affected.iter().any(|c| unit(*c) == name) {
+            systemctl(root, &["start", name])?;
+            health(root, name)?;
+        }
+    }
+    if !boot && subscription_changed {
+        crate::lifecycle::restart_subscription_service(root).map_err(Error)?;
     }
     Ok(())
 }
@@ -442,6 +560,10 @@ fn allowed_snapshot(path: &str) -> bool {
         || path == nodes::SOURCE
         || path == CURRENT
         || path == RECOVERY_UNIT
+        || path == "etc/systemd/system/sbctl.service"
+        || path == "etc/systemd/system/sbctl-http.socket"
+        || path == crate::lifecycle::CERTBOT_DEPLOY_HOOK_RELATIVE_PATH
+        || path == "var/lib/sbctl/artifacts/sing-box-server.json"
         || [CoreKind::SingBox, CoreKind::Xray].into_iter().any(|c| {
             path == active(c)
                 || path == binary(c)
@@ -475,6 +597,30 @@ fn recover_locked(store: &DeploymentStore, boot: bool) -> Result<bool> {
     io(crate::managed_fs::remove_file(store.root().join(JOURNAL)))?;
     Ok(true)
 }
+
+/// Bootstrap only the ACME subscription listener. Keep the running data planes,
+/// registry and published clients untouched until a domain certificate exists.
+pub fn begin_subscription_bootstrap_locked(
+    store: &DeploymentStore,
+    config: &DeploymentConfig,
+) -> Result<()> {
+    recover_locked(store, false)?;
+    let paths = [
+        crate::config::CONFIG_RELATIVE_PATH,
+        "etc/systemd/system/sbctl.service",
+        "etc/systemd/system/sbctl-http.socket",
+        crate::lifecycle::CERTBOT_DEPLOY_HOOK_RELATIVE_PATH,
+    ]
+    .map(str::to_owned);
+    let record = snapshot(store.root(), &paths, 0)?;
+    journal(store, &record)?;
+    store.replace_locked(config)?;
+    Ok(())
+}
+pub fn finish_subscription_bootstrap_locked(store: &DeploymentStore) -> Result<()> {
+    recover_locked(store, false)?;
+    Ok(())
+}
 /// Caller holds the same operation lock as legacy credential/config writers.
 pub fn apply_locked(
     store: &DeploymentStore,
@@ -503,6 +649,14 @@ fn apply_with_config_locked(
         .ok_or_else(|| Error("节点仓库修订号溢出".into()))?;
     next.validate(config)?;
     let root = store.root();
+    // Before a new transaction: retain its original generation through any
+    // outer activation rollback, and give in-flight readers a grace period.
+    if let Err(error) = prune_generations(root) {
+        eprintln!("warning: 旧订阅批次清理失败：{error}");
+    }
+    // Certificate creation belongs to the locked apply path, never to plan.
+    crate::subscription::render::certificate_tls_config(config, root)
+        .map_err(|e| Error(e.to_string()))?;
     let plan = plan(root, config, expected, &next)?;
     let artifacts = crate::subscription::managed::generate(config, root, &next)
         .map_err(|e| Error(e.to_string()))?;
@@ -536,7 +690,7 @@ fn apply_with_config_locked(
             }
         }
     }
-    check_ports(root, expected, &next)?;
+    check_ports(root, expected_config, config, expected, &next)?;
     validate_current_client(root, &next, &artifacts)?;
     let paths = snapshot_paths();
     let mut record = snapshot(root, &paths, next.revision)?;
@@ -570,19 +724,30 @@ fn apply_with_config_locked(
             )
             .map_err(Error)?;
         }
-        for c in &changed {
-            if root
-                .join(format!("etc/systemd/system/{}", unit(*c)))
-                .exists()
+        let active_hopping = next.has_active_sing_box_hysteria2(config);
+        let sing_box_unit_changed = next.mode.allows(CoreKind::SingBox)
+            && optional(
+                root,
+                &format!("etc/systemd/system/{}", unit(CoreKind::SingBox)),
+            )?
+            .as_deref()
+                != Some(unit_text(CoreKind::SingBox, active_hopping).as_bytes());
+        for c in [CoreKind::SingBox, CoreKind::Xray] {
+            let needs_stop =
+                changed.contains(&c) || (c == CoreKind::SingBox && sing_box_unit_changed);
+            if needs_stop
+                && root
+                    .join(format!("etc/systemd/system/{}", unit(c)))
+                    .exists()
             {
-                systemctl(root, &["stop", unit(*c)])?;
+                systemctl(root, &["stop", unit(c)])?;
             }
         }
         for c in [CoreKind::SingBox, CoreKind::Xray] {
             if next.mode.allows(c) {
                 store.write_relative_locked(
                     &format!("etc/systemd/system/{}", unit(c)),
-                    unit_text(c, config.hysteria2_port_hopping.is_some()).as_bytes(),
+                    unit_text(c, active_hopping).as_bytes(),
                 )?;
                 let text = &artifacts
                     .iter()
@@ -614,19 +779,28 @@ fn apply_with_config_locked(
             )
             .map_err(Error)?;
         }
+        // Pre-start hooks must read the candidate configuration. Range-only
+        // changes do not change server bytes, so reconcile nftables explicitly.
+        if expected_config != config {
+            store.replace_locked(config)?;
+        }
+        if crate::port_hopping::has_firewall_runtime(root) {
+            crate::port_hopping::apply_firewall_config(root, active_hopping.then_some(config))
+                .map_err(Error)?;
+        }
         for c in [CoreKind::SingBox, CoreKind::Xray] {
             if next.mode.allows(c) {
                 systemctl(root, &["enable", unit(c)])?;
-                if changed.contains(&c) || !state(root, unit(c), "is-active") {
+                if changed.contains(&c)
+                    || (c == CoreKind::SingBox && sing_box_unit_changed)
+                    || !state(root, unit(c), "is-active")
+                {
                     systemctl(root, &["start", unit(c)])?;
                     health(root, unit(c))?;
                 } else {
                     systemctl(root, &["is-active", "--quiet", unit(c)])?;
                 }
             }
-        }
-        if expected_config != config {
-            store.replace_locked(config)?;
         }
         store.write_relative_locked(CURRENT, &json(&generation))?;
         record.committed = true;
@@ -638,6 +812,7 @@ fn apply_with_config_locked(
         historical
             .files
             .retain(|f| f.path != crate::config::CONFIG_RELATIVE_PATH);
+        historical.rollback_config = Some(rollback_settings(expected_config)?);
         if store
             .write_root_only_locked(LAST, &json(&historical))
             .is_err()
@@ -673,6 +848,51 @@ fn snapshot_paths() -> Vec<String> {
     )
     .collect()
 }
+
+fn prune_generations(root: &Path) -> Result<()> {
+    let mut retained = std::collections::BTreeSet::new();
+    if let Some(generation) = current(root)? {
+        retained.insert(generation.id);
+    }
+    for name in [LAST, JOURNAL] {
+        if let Some(bytes) = optional(root, name)? {
+            let record: Journal = serde_json::from_slice(&bytes)
+                .map_err(|_| Error("恢复记录损坏，暂停清理批次".into()))?;
+            for saved in record.files.iter().filter(|f| f.path == CURRENT) {
+                if let Some(contents) = &saved.contents {
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(contents)
+                        .map_err(|_| Error("恢复批次指针损坏".into()))?;
+                    let generation: Generation = serde_json::from_slice(&bytes)
+                        .map_err(|_| Error("恢复批次指针损坏".into()))?;
+                    retained.insert(generation.id);
+                }
+            }
+        }
+    }
+    let directory = root.join("var/lib/sbctl/generations");
+    let names = match crate::managed_fs::directory_entries(&directory) {
+        Ok(names) => names,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e.into()),
+    };
+    for name in names {
+        let Some(id) = name.to_str() else { continue };
+        if id.len() != 32 || !id.bytes().all(|b| b.is_ascii_hexdigit()) || retained.contains(id) {
+            continue;
+        }
+        let path = directory.join(&name);
+        let metadata = io(crate::managed_fs::directory_metadata(&path))?;
+        if !metadata.is_dir()
+            || io(metadata.modified())?.elapsed().unwrap_or_default()
+                < std::time::Duration::from_secs(300)
+        {
+            continue;
+        }
+        io(crate::managed_fs::remove_flat_directory(&path))?;
+    }
+    Ok(())
+}
 pub fn apply_config_change_locked(
     store: &DeploymentStore,
     new: &DeploymentConfig,
@@ -690,8 +910,42 @@ pub fn apply_config_change_locked(
             "已迁移部署的节点由 nodes.json 管理；请使用 node 命令修改协议、端口和凭据".into(),
         ));
     }
+    let mut next = registry.clone();
+    let old_host = old.proxy_host.as_deref().unwrap_or(&old.subscription_host);
+    let new_host = new.proxy_host.as_deref().unwrap_or(&new.subscription_host);
+    let old_sni = old.protocol_server_name();
+    let new_sni = new.protocol_server_name();
+    for node in &mut next.nodes {
+        if old_host != new_host {
+            let current_host = match &node.data {
+                nodes::Data::Legacy(n) => n.host(),
+                nodes::Data::Combination(n) => n.server.as_str(),
+            };
+            if current_host == old_host {
+                node.patch("server", serde_json::json!(new_host))?;
+            }
+        }
+        let is_reality = matches!(
+            &node.data,
+            nodes::Data::Legacy(crate::canonical::CanonicalNode::VlessReality { .. })
+        ) || matches!(&node.data, nodes::Data::Combination(n) if n.preset.is_reality());
+        if !is_reality
+            && (old_sni != new_sni
+                || new.certificate_mode == crate::config::CertificateMode::Domain)
+        {
+            let current_sni = match &node.data {
+                nodes::Data::Legacy(n) => n.tls_server_name(),
+                nodes::Data::Combination(n) => n.server_name.as_str(),
+            };
+            if current_sni == old_sni
+                || new.certificate_mode == crate::config::CertificateMode::Domain
+            {
+                node.patch("server_name", serde_json::json!(new_sni))?;
+            }
+        }
+    }
     let backup = snapshot(store.root(), &snapshot_paths(), registry.revision + 1)?;
-    apply_with_config_locked(store, &old, new, &registry, registry.clone())?;
+    apply_with_config_locked(store, &old, new, &registry, next)?;
     Ok(json(&backup))
 }
 pub fn restore_snapshot_locked(store: &DeploymentStore, bytes: &[u8]) -> Result<()> {
@@ -708,27 +962,44 @@ pub fn apply(
     let _lock = store.acquire_operation_lock()?;
     apply_locked(store, config, expected, next)
 }
-fn check_ports(root: &Path, before: &Registry, next: &Registry) -> Result<()> {
+pub fn apply_config_and_nodes(
+    store: &DeploymentStore,
+    expected_config: &DeploymentConfig,
+    config: &DeploymentConfig,
+    expected: &Registry,
+    next: Registry,
+) -> Result<Plan> {
+    let _lock = store.acquire_operation_lock()?;
+    config.validate()?;
+    apply_with_config_locked(store, expected_config, config, expected, next)
+}
+fn check_ports(
+    root: &Path,
+    previous_config: &DeploymentConfig,
+    config: &DeploymentConfig,
+    before: &Registry,
+    next: &Registry,
+) -> Result<()> {
     if root != Path::new("/") {
         return Ok(());
     }
     for node in next.nodes.iter().filter(|n| n.enabled) {
-        if before
-            .nodes
-            .iter()
-            .any(|n| n.enabled && n.port() == node.port())
-        {
+        if before.nodes.iter().any(|n| {
+            n.enabled
+                && crate::shared_tls::binding(previous_config, n).port()
+                    == crate::shared_tls::binding(config, node).port()
+                && crate::catalog::udp(&n.preset()) == crate::catalog::udp(&node.preset())
+        }) {
             continue;
         }
-        let addr: std::net::IpAddr = node
-            .listen
-            .parse()
-            .map_err(|_| Error("监听地址无效".into()))?;
-        let socket = std::net::SocketAddr::new(addr, node.port());
-        let _tcp = std::net::TcpListener::bind(socket)
-            .map_err(|_| Error(format!("端口 {} TCP 已被占用", node.port())))?;
-        let _udp = std::net::UdpSocket::bind(socket)
-            .map_err(|_| Error(format!("端口 {} UDP 已被占用", node.port())))?;
+        let socket = crate::shared_tls::binding(config, node);
+        if crate::catalog::udp(&node.preset()) {
+            let _guard = std::net::UdpSocket::bind(socket)
+                .map_err(|_| Error(format!("UDP {} 已被占用", socket.port())))?;
+        } else {
+            let _guard = std::net::TcpListener::bind(socket)
+                .map_err(|_| Error(format!("TCP {} 已被占用", socket.port())))?;
+        }
     }
     Ok(())
 }
@@ -756,17 +1027,74 @@ pub fn rollback(store: &DeploymentStore) -> Result<()> {
     let bytes = optional(store.root(), LAST)?.ok_or_else(|| Error("没有可用恢复点".into()))?;
     let mut record: Journal =
         serde_json::from_slice(&bytes).map_err(|_| Error("恢复点损坏".into()))?;
-    let current =
-        nodes::read_optional(store.root())?.ok_or_else(|| Error("没有托管节点仓库".into()))?;
-    if current.revision != record.applied_revision {
+    let current_revision = nodes::read_optional(store.root())?.map_or(0, |r| r.revision);
+    if current_revision != record.applied_revision {
         return Err(Error("恢复点已过期，拒绝覆盖后续修改".into()));
     }
+    let mut config =
+        toml::Table::try_from(store.load()?).map_err(|_| Error("部署配置序列化失败".into()))?;
+    if let Some(settings) = record.rollback_config.take() {
+        for key in ROLLBACK_SETTINGS {
+            config.remove(*key);
+        }
+        config.extend(settings);
+    }
+    let config_text = toml::to_string(&config).map_err(|_| Error("恢复配置无效".into()))?;
+    let restored: DeploymentConfig =
+        toml::from_str(&config_text).map_err(|_| Error("恢复配置无效".into()))?;
+    restored.validate()?;
+    if let Some(saved) = record.files.iter().find(|f| f.path == nodes::SOURCE)
+        && let Some(contents) = &saved.contents
+    {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(contents)
+            .map_err(|_| Error("恢复点损坏".into()))?;
+        let registry: Registry =
+            serde_json::from_slice(&bytes).map_err(|_| Error("恢复节点仓库无效".into()))?;
+        registry.validate(&restored)?;
+    }
+    record.files.push(Saved {
+        path: crate::config::CONFIG_RELATIVE_PATH.into(),
+        contents: Some(base64::engine::general_purpose::STANDARD.encode(config_text)),
+    });
     record.committed = false;
     journal(store, &record)?;
     restore(store, &record, false)?;
     io(crate::managed_fs::remove_file(store.root().join(JOURNAL)))?;
     io(crate::managed_fs::remove_file(store.root().join(LAST)))?;
     Ok(())
+}
+
+// Only deployment settings roll back. Subscription credentials, accounting
+// settings/state and legacy import credentials are never historical authority.
+const ROLLBACK_SETTINGS: &[&str] = &[
+    "shared_tls",
+    "subscription_mode",
+    "subscription_host",
+    "proxy_host",
+    "http_port",
+    "subscription_listen_port",
+    "certbot_email",
+    "certificate_mode",
+    "protocol_sni",
+    "ipv4_only",
+    "hysteria2_port_hopping",
+    "server_clash_api",
+    "client_clash_api_secret",
+    "client_dns_mode",
+    "client_dns_preset",
+    "client_rule_profile",
+    "client_template",
+    "client_rule_set_base_url",
+    "client_extra_rule_sets",
+    "client_rule_set_update_interval",
+    "client_latency_probe_url",
+];
+fn rollback_settings(config: &DeploymentConfig) -> Result<toml::Table> {
+    let mut settings =
+        toml::Table::try_from(config).map_err(|_| Error("部署配置序列化失败".into()))?;
+    settings.retain(|key, _| ROLLBACK_SETTINGS.contains(&key));
+    Ok(settings)
 }
 pub fn status(root: &Path) -> Result<serde_json::Value> {
     let registry = nodes::read_optional(root)?;
@@ -864,7 +1192,16 @@ pub fn install_manager_locked(
     let revision = nodes::read_optional(store.root())?
         .map(|r| r.revision)
         .unwrap_or(0);
-    let mut record = snapshot(store.root(), &["usr/local/bin/sbctl".into()], revision)?;
+    let mut record = snapshot(
+        store.root(),
+        &[
+            "usr/local/bin/sbctl".into(),
+            "etc/systemd/system/sbctl.service".into(),
+            "etc/systemd/system/sbctl-http.socket".into(),
+            crate::lifecycle::CERTBOT_DEPLOY_HOOK_RELATIVE_PATH.into(),
+        ],
+        revision,
+    )?;
     journal(store, &record)?;
     let result = (|| -> Result<()> {
         store.write_relative_locked("usr/local/bin/sbctl", contents)?;
@@ -928,6 +1265,14 @@ pub fn xray_archive(architecture: &str) -> Result<(&'static str, &'static str)> 
     }
 }
 pub fn install_core(store: &DeploymentStore, core: CoreKind, version: Option<&str>) -> Result<()> {
+    install_core_from_source(store, core, version, None)
+}
+pub fn install_core_from_source(
+    store: &DeploymentStore,
+    core: CoreKind,
+    version: Option<&str>,
+    source: Option<&crate::kernel_source::CustomSource<'_>>,
+) -> Result<()> {
     if !cfg!(target_os = "linux") {
         return Err(Error(
             "官方服务端内核安装需要 Linux；Windows 仅用于开发与测试".into(),
@@ -940,7 +1285,21 @@ pub fn install_core(store: &DeploymentStore, core: CoreKind, version: Option<&st
     } else {
         "1.14.2"
     });
-    if core == CoreKind::Xray {
+    if let Some(source) = source {
+        if (core == CoreKind::Xray && version != crate::core::xray::BASELINE_VERSION)
+            || (core == CoreKind::SingBox
+                && ![
+                    "1.10.7", "1.11.15", "1.12.25", "1.13.21", "1.14.1", "1.14.2", "1.14.4",
+                ]
+                .contains(&version))
+        {
+            return Err(Error("自定义来源仍须使用已验证的内核版本".into()));
+        }
+        eprintln!(
+            "自定义来源：请确认链接与 SHA-256 来自可信发布者。文件一致性不等于官方来源；下载后仍检查版本、配置与服务，失败自动回滚。"
+        );
+        crate::kernel_source::download(source, &candidate, core, version).map_err(Error)?;
+    } else if core == CoreKind::Xray {
         if version != crate::core::xray::BASELINE_VERSION {
             return Err(Error("该 Xray 版本尚未通过项目兼容验证".into()));
         }
@@ -949,6 +1308,7 @@ pub fn install_core(store: &DeploymentStore, core: CoreKind, version: Option<&st
         let url = format!("https://github.com/XTLS/Xray-core/releases/download/v{version}/{asset}");
         let status = Command::new("curl")
             .args([
+                "--disable",
                 "--fail",
                 "--location",
                 "--silent",
@@ -1017,24 +1377,66 @@ pub fn install_core(store: &DeploymentStore, core: CoreKind, version: Option<&st
     } else {
         format!("sing-box version {version}")
     };
-    if !output.status.success() || !String::from_utf8_lossy(&output.stdout).starts_with(&expected) {
+    let identity = String::from_utf8_lossy(&output.stdout);
+    if !output.status.success()
+        || !identity.starts_with(&expected)
+        || identity[expected.len()..]
+            .chars()
+            .next()
+            .is_some_and(|c| !c.is_whitespace())
+    {
         return Err(Error("候选内核身份或版本不匹配".into()));
     }
     let _lock = store.acquire_operation_lock()?;
     recover_locked(store, false)?;
     owned(store.root(), core)?;
+    let mut migrated_server = None;
     if let Some(text) = optional(store.root(), active(core))? {
-        let text = String::from_utf8(text).map_err(|_| Error("活动配置编码错误".into()))?;
+        let mut text = String::from_utf8(text).map_err(|_| Error("活动配置编码错误".into()))?;
+        if core == CoreKind::SingBox {
+            let config = store.load()?;
+            let registry = nodes::load_or_import(store.root(), &config)?;
+            if let Some((_, document)) = crate::subscription::managed::servers_for_kernel(
+                &config,
+                store.root(),
+                &registry,
+                Some(version.starts_with("1.10.")),
+            )
+            .map_err(|e| Error(e.to_string()))?
+            .into_iter()
+            .find(|(c, _)| *c == core)
+            {
+                text = serde_json::to_string_pretty(&document)
+                    .map_err(|_| Error("内核配置序列化失败".into()))?;
+                migrated_server = Some(text.clone());
+            }
+        }
         core.check_config(&candidate, &text)
             .map_err(|_| Error("新内核不接受当前活动配置，旧内核保持运行".into()))?;
     }
     let revision = nodes::read_optional(store.root())?
         .map(|r| r.revision)
         .unwrap_or(0);
-    let mut record = snapshot(store.root(), &[binary(core).into()], revision)?;
+    let mut paths = vec![binary(core).into()];
+    if migrated_server.is_some() {
+        paths.push(active(core).into());
+        if nodes::read_optional(store.root())?.is_none() {
+            paths.push("var/lib/sbctl/artifacts/sing-box-server.json".into());
+        }
+    }
+    let mut record = snapshot(store.root(), &paths, revision)?;
     journal(store, &record)?;
     let result = (|| -> Result<()> {
         store.write_relative_locked(binary(core), &io(std::fs::read(&candidate))?)?;
+        if let Some(server) = &migrated_server {
+            store.write_relative_locked(active(core), server.as_bytes())?;
+            if nodes::read_optional(store.root())?.is_none() {
+                store.write_relative_locked(
+                    "var/lib/sbctl/artifacts/sing-box-server.json",
+                    server.as_bytes(),
+                )?;
+            }
+        }
         if state(store.root(), unit(core), "is-active") {
             systemctl(store.root(), &["restart", unit(core)])?;
             health(store.root(), unit(core))?;

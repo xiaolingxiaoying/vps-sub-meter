@@ -421,3 +421,119 @@ fn direct_acme_bootstrap_success_and_failure_are_transactional() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn managed_acme_keeps_published_clients_and_data_planes_until_certificate_issuance() {
+    use std::os::unix::fs::PermissionsExt;
+    for succeeds in [true, false] {
+        let (fixture, binary) = mode_fixture(SubscriptionMode::ExternalProxy);
+        let root = fixture.path();
+        fs::remove_dir_all(root.join("etc/letsencrypt/live")).unwrap();
+        Command::cargo_bin("sbctl")
+            .unwrap()
+            .args([
+                "--root",
+                root.to_str().unwrap(),
+                "node",
+                "migrate",
+                "--apply",
+            ])
+            .assert()
+            .success();
+        let before_config = fs::read(root.join("etc/sbctl/config.toml")).unwrap();
+        let before_pointer = fs::read(root.join(sbctl::deployment::CURRENT)).unwrap();
+        let before_source = fs::read(root.join(sbctl::nodes::SOURCE)).unwrap();
+        let before_server = fs::read(root.join("etc/sing-box/config.json")).unwrap();
+        for (name, bytes) in [
+            ("before-pointer", &before_pointer),
+            ("before-source", &before_source),
+            ("before-server", &before_server),
+        ] {
+            fs::write(root.join(name), bytes).unwrap();
+        }
+        let certificate =
+            rcgen::generate_simple_self_signed(vec!["sub.example.test".into()]).unwrap();
+        fs::write(root.join("issued.pem"), certificate.cert.pem()).unwrap();
+        fs::write(
+            root.join("issued.key"),
+            certificate.signing_key.serialize_pem(),
+        )
+        .unwrap();
+        let certbot = root.join("usr/bin/certbot");
+        let mut script = String::from(
+            r#"#!/bin/sh
+set -eu
+root=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
+cmp "$root/before-pointer" "$root/var/lib/sbctl/current-generation.json"
+cmp "$root/before-source" "$root/etc/sbctl/nodes.json"
+cmp "$root/before-server" "$root/etc/sing-box/config.json"
+grep -q 'certificate_mode = "domain"' "$root/etc/sbctl/config.toml"
+touch "$root/checked-bootstrap"
+"#,
+        );
+        if succeeds {
+            script.push_str(
+                r#"mkdir -p "$root/etc/letsencrypt/live/sub.example.test"
+cp "$root/issued.pem" "$root/etc/letsencrypt/live/sub.example.test/fullchain.pem"
+cp "$root/issued.key" "$root/etc/letsencrypt/live/sub.example.test/privkey.pem"
+"#,
+            );
+        } else {
+            script.push_str("exit 1\n");
+        }
+        fs::write(&certbot, script).unwrap();
+        fs::set_permissions(&certbot, fs::Permissions::from_mode(0o700)).unwrap();
+        let mut command = switch(&fixture, &binary, "direct", free_high_tcp_port());
+        command.args([
+            "--certificate-mode",
+            "domain",
+            "--protocol-sni",
+            "sub.example.test",
+            "--certbot-email",
+            "admin@example.test",
+        ]);
+        if succeeds {
+            command.assert().success();
+            let store = DeploymentStore::new(root);
+            let config = store.load().unwrap();
+            assert_eq!(config.certificate_mode, CertificateMode::Domain);
+            let clients = sbctl::subscription::read_authorized(
+                &store,
+                &config,
+                &config.subscription_credential,
+                sbctl::subscription::SubscriptionFormat::SingBox,
+            )
+            .unwrap();
+            assert!(clients.contains("\"insecure\": false"));
+            sbctl::nodes::load_or_import(root, &config).unwrap();
+        } else {
+            command
+                .assert()
+                .code(2)
+                .stderr(predicate::str::contains("旧部署已恢复"));
+            assert_eq!(
+                fs::read(root.join("etc/sbctl/config.toml")).unwrap(),
+                before_config
+            );
+            assert_eq!(
+                fs::read(root.join(sbctl::deployment::CURRENT)).unwrap(),
+                before_pointer
+            );
+            assert_eq!(
+                fs::read(root.join(sbctl::nodes::SOURCE)).unwrap(),
+                before_source
+            );
+            assert_eq!(
+                fs::read(root.join("etc/sing-box/config.json")).unwrap(),
+                before_server
+            );
+        }
+        assert!(root.join("checked-bootstrap").is_file());
+        assert!(
+            !root
+                .join("var/lib/sbctl/deployment-transaction.json")
+                .exists()
+        );
+    }
+}
