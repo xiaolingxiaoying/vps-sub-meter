@@ -164,7 +164,7 @@ chmod 0755 "$work_dir/sbctl"
 if [[ -f /etc/sbctl/config.toml ]] && [[ "${SBCTL_UPGRADE_ONLY:-0}" == 1 || "$#" -eq 0 ]]; then
   echo "发现已有部署：只升级管理程序，保留订阅链接、节点、流量和现有内核。"
   "$work_dir/sbctl" config validate
-  run_installer "$work_dir/sbctl" update --manifest "$work_dir/manifest.json" --sbctl-bin "$work_dir/sbctl"
+  run_installer "$work_dir/sbctl" update --manifest "$work_dir/manifest.json" --sbctl-artifact "$work_dir/sbctl"
 fi
 if [[ "${SBCTL_UPGRADE_ONLY:-0}" == 1 ]]; then
   echo "未发现 sbctl 部署；请先运行安装器完成首次安装。" >&2

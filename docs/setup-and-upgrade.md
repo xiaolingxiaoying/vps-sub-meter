@@ -22,6 +22,7 @@ SNI 是 TLS 握手中的服务器名称，不是订阅地址，也不要求等�
 以下脚本随新 Release 发布。源码中的 `install.sh` 只有公钥占位符，不能直接安装。
 
 ```bash
+curl -fL -o upgrade.sh https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/upgrade.sh
 sudo bash upgrade.sh --check       # 仅检查是否存在旧部署
 sudo bash upgrade.sh               # 官方签名校验，新程序执行升级
 bash protocols.sh                 # 预览补齐协议和名称

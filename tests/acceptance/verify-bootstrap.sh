@@ -72,6 +72,13 @@ if [ "$#" -eq 1 ] && [ "$1" = "install" ]; then
   exit 2
 fi
 printf '%s\n' "$@" >> /tmp/sbctl-bootstrap-arguments
+if [ "$1" = update ]; then
+  # Parse the bootstrap arguments and verify the manifest with the real CLI.
+  # --check keeps the synthetic configuration out of the systemd transaction.
+  [ "$#" -eq 5 ] && [ "$2" = --manifest ] && [ -f "$3" ] &&
+    [ "$4" = --sbctl-artifact ] && cmp "$5" "$0" || exit 2
+  exec /opt/sbctl-test/sbctl "$@" --check
+fi
 exit 0
 EOF
 chmod 0755 "$work/existing-sbctl"
