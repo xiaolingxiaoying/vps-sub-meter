@@ -59,13 +59,11 @@ pub(crate) fn run(root: &Path, command: PortCommand) -> ExitCode {
                     if sbctl::catalog::udp(&existing.preset()) {
                         return Err(Error("Hysteria2 / TUIC 是 UDP：直接将节点端口设为 443，可与网站 TCP 443 共存，无需 TLS 分流".into()));
                     }
-                    let backend_port = shared.node_route(&id).map(|r| r.backend.port()).unwrap_or(
-                        if existing.port() >= 10000 {
-                            existing.port()
-                        } else {
-                            nodes::free_port(&after, &config)?
-                        },
-                    );
+                    let backend_port = match shared.node_route(&id) {
+                        Some(route) => route.backend.port(),
+                        None if existing.port() >= 10000 => existing.port(),
+                        None => nodes::free_port(&after, &config)?,
+                    };
                     let server_name = sbctl::shared_tls::sni(existing).to_string();
                     shared.routes.retain(|r| r.node_id.as_deref() != Some(&id));
                     shared.routes.push(Route {

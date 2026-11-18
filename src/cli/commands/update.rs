@@ -323,10 +323,7 @@ fn sing_box_api(root: &Path, command: ApiCommand) -> ExitCode {
                 None => println!("当前状态: 未启用（服务端配置保持生成原样）"),
                 Some(api) => {
                     println!("监听: {}", api.listener());
-                    println!(
-                        "密钥: {}…（保存在 /etc/sbctl/config.toml，0600）",
-                        &api.secret[..6.min(api.secret.len())]
-                    );
+                    println!("密钥已配置（保存在 /etc/sbctl/config.toml）");
                     match sbctl::observe::clash_api_memory(api) {
                         Ok(bytes) => println!("接口可达，当前内存: {bytes} 字节"),
                         Err(error) => println!("接口尚未响应: {error}（服务重启后生效）"),

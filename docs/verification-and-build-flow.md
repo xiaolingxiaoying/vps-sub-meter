@@ -27,6 +27,10 @@ wsl -d Ubuntu-22.04 -- bash /mnt/c/Users/ranly/Documents/ChatGPT/vps-sub-meter/s
 
 ## 固定真实内核
 
+CI 在 Ubuntu 22.04 构建一次生产模式的 amd64 程序，systemd 验收下载同一次运行的工件并恢复可执行权限，再单独构建测试签名程序。正式 Release 分别为 amd64 和 arm64 注入生产公钥构建，通过完整 CI 后才签名打包。
+
+在 Linux amd64 的临时工作目录中，可用 `bash /path/to/scripts/dev/ci-cores.sh sing-box` 下载 CI 使用的六个 sing-box 版本。参数 `managed` 准备 Xray 与 Mihomo 互通基线，`mihomo` 准备两版订阅解析器。脚本先核对归档 SHA-256 再提取可执行文件。更换版本时需同时更新此脚本的摘要和工作流传入测试的路径。
+
 普通 `cargo test` 会跳过需要外部内核的测试；它们通过不代表完整兼容性矩阵已经执行。
 
 准备固定版本后运行 `scripts/dev/verify-managed.sh`，脚本所需的 Xray 归档、sing-box/Mihomo 路径见脚本和 [CI 配置](../.github/workflows/ci.yml)。仅执行托管矩阵时：

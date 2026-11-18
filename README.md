@@ -10,6 +10,15 @@
 
 ## 安装
 
+| 职责 | 入口 | 实现位置 |
+| --- | --- | --- |
+| 安装、升级、补齐协议、预览 443 分流 | Release 随附的 Bash 脚本 | `scripts/install.sh`、`upgrade.sh`、`protocols.sh`、`share-443.sh` |
+| 配置与节点管理 | `sbctl` CLI 和交互菜单 | `src/cli/` 接收操作，`config.rs`、`nodes.rs` 校验，`deployment.rs` 提交托管变更与回滚 |
+| 订阅、证书和流量 | sbctl 服务及 systemd 定时任务 | `src/subscription/`、`certificate.rs`、`traffic.rs` |
+| 协议流量转发 | sing-box，按协议选用 Xray | `src/core/` 及订阅模块根据已启用节点生成内核配置 |
+
+Bash 负责下载、调用 CLI 和编排验证。涉及凭据、端口分配或部署回滚的更改统一交给 sbctl。运维者可通过 `sbctl port status` 查看声明的监听，通过 `sudo ss -lntu` 核对主机实际占用。
+
 首次安装默认值、无域名配置、旧版升级、统一协议及 443 共用见[安装与升级说明](docs/setup-and-upgrade.md)。
 
 需要 Debian 12 或 Ubuntu 22.04 及以上版本、amd64/arm64 架构、systemd 和 root 权限。使用 Direct HTTPS 时，请先将域名解析到 VPS，并放行公网 TCP 80/443；协议端口按安装菜单提示放行。

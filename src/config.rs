@@ -884,14 +884,22 @@ impl DeploymentConfig {
                 "interface must be a Linux interface name",
             ));
         }
-        if self
-            .server_clash_api
-            .as_ref()
-            .is_some_and(|api| api.port == 0)
-        {
-            return Err(ConfigError::InvalidValue(
-                "server clash api port must not be zero",
-            ));
+        if let Some(api) = &self.server_clash_api {
+            if api.port == 0
+                || self.http_port == Some(api.port)
+                || self.subscription_listen_port == Some(api.port)
+                || (self.subscription_mode == SubscriptionMode::Direct
+                    && matches!(api.port, 80 | 443))
+            {
+                return Err(ConfigError::InvalidValue(
+                    "server clash api requires a nonzero port separate from subscription listeners",
+                ));
+            }
+            if api.secret.is_empty() || !api.secret.bytes().all(|b| b.is_ascii_graphic()) {
+                return Err(ConfigError::InvalidValue(
+                    "server clash api secret must contain only visible ASCII without whitespace",
+                ));
+            }
         }
         for (field, url) in [
             ("client_rule_set_base_url", &self.client_rule_set_base_url),

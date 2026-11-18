@@ -660,6 +660,11 @@ fn valid_uuid(s: &str) -> bool {
 pub fn free_port(registry: &Registry, config: &DeploymentConfig) -> Result<u16> {
     for port in 20000..=65535 {
         if registry.nodes.iter().any(|n| n.port() == port)
+            || config
+                .shared_tls
+                .iter()
+                .flat_map(|s| &s.routes)
+                .any(|r| r.backend.port() == port)
             || config.http_port == Some(port)
             || config.subscription_listen_port == Some(port)
             || config

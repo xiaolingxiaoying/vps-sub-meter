@@ -44,6 +44,8 @@ sudo bash protocols.sh --apply     # 需要时安装官方内核，再提交
 订阅的端口与节点端口独立。443 上 TCP 和 UDP 可以并存；Hysteria2 与 TUIC 都用 UDP，
 二者不能同时占同一地址的 UDP 443。
 
+若现有网站已经占用 TCP 443，最少改动的做法是选择外部反向代理订阅模式，让现有网站代理到 sbctl 的本机监听端口。若由 sbctl 接管 TCP 443，请先安排网站后端和不同的 SNI，再预览下面的分流配置。节点自动分配会避开配置中的分流后端，即使网站或节点暂时停机；观察 API 须独占本机端口。
+
 自动 HTTPS 订阅模式可以按不同 SNI 分流 TCP 443，无需另装 NGINX 或 HAProxy：
 
 ```bash

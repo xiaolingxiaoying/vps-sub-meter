@@ -30,6 +30,13 @@ impl SharedTls {
         let mut names = std::collections::BTreeSet::new();
         let mut nodes = std::collections::BTreeSet::new();
         for route in &self.routes {
+            if config
+                .server_clash_api
+                .as_ref()
+                .is_some_and(|api| api.port == route.backend.port())
+            {
+                return Err("443 分流后端不能使用本机观察 API 端口");
+            }
             if !crate::config::hostname_is_valid(&route.server_name)
                 || route
                     .server_name

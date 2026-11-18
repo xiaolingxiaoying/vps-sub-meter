@@ -177,6 +177,45 @@ fn tcp_mux_udp_443_and_https_subscription_have_distinct_real_listeners() {
     assert_eq!(clients["outbounds"][0]["server_port"], 443);
 }
 #[test]
+fn shared_backends_reserve_ports_even_when_offline_and_cannot_target_the_api() {
+    let (_root, mut config, registry, _, _) = shared_fixture();
+    let available = nodes::free_port(&registry, &config).unwrap();
+    config.shared_tls.as_mut().unwrap().routes[1]
+        .backend
+        .set_port(available);
+    assert_ne!(nodes::free_port(&registry, &config).unwrap(), available);
+    config.server_clash_api = Some(sbctl::config::ServerClashApi {
+        port: available,
+        secret: "test-secret".into(),
+    });
+    assert!(
+        config
+            .shared_tls
+            .as_ref()
+            .unwrap()
+            .validate(&config)
+            .is_err()
+    );
+}
+
+#[test]
+fn observation_api_requires_a_header_safe_secret_and_a_separate_port() {
+    let (_root, mut config) = fixture();
+    let mut api = sbctl::config::generate_server_clash_api().unwrap();
+    for secret in ["", "two words", "invalid\r\nheader"] {
+        api.secret = secret.into();
+        config.server_clash_api = Some(api.clone());
+        assert!(config.validate().is_err());
+    }
+    api.secret = "valid-token".into();
+    for port in [80, 443] {
+        api.port = port;
+        config.server_clash_api = Some(api.clone());
+        assert!(config.validate().is_err());
+    }
+}
+
+#[test]
 fn mux_rejects_duplicate_sni_remote_backends_subscription_recursion_and_unrouted_tcp_443() {
     let (_, config, registry, _, _) = shared_fixture();
     for name in ["SUB.EXAMPLE.TEST", "www.cloudflare.com"] {
