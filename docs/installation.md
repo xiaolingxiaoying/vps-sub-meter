@@ -9,11 +9,9 @@
 公开 GitHub Release 可直接由 VPS 匿名下载；如果使用其他下载站，请确保 manifest 和
 对应工件均可公开访问。
 
-```bash
-curl -fL -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
-sudo bash /tmp/sbctl-install.sh
-```
+在 VPS 的交互终端以 `root` 执行 [README 中的一行安装命令](../README.md#安装与升级)。
+如果要先检查脚本或传入部署参数，可下载到本地后运行 `sudo bash install.sh`。
+[下载 install.sh](https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh)
 
 取**发布工件**里的 `install.sh`，不要从 `raw.githubusercontent.com` 拿仓库中的那一份：
 仓库里的是模板，`SBCTL_PUBLIC_KEY_PEM` 还是 `@SBCTL_RELEASE_PUBLIC_KEY_PEM@` 占位符，
@@ -35,7 +33,7 @@ SBCTL_MANIFEST_URL=https://发布地址/manifest-{arch}.json \
 
 bootstrap 脚本只安装并校验 sbctl；它不会接管已有的 sing-box 部署，也不会修改防火墙。
 
-安装完成后，运行 `sbctl menu`（或 `sbctl m`）可重新打开管理菜单，无需再次下载安装脚本。
+安装完成后，运行 `ly` 或 `sbctl menu` 可重新打开管理菜单。
 菜单可查看状态、VPS 流量、节点端口和订阅地址，也可在确认后重启服务或卸载 sbctl（默认保留备份和配置）。
 
 首次部署可在菜单中选择“引导式安装”，一次完成订阅模式、域名/IP、协议、端口和流量账期设置；安装前会显示脱敏摘要并要求确认，取消不会写入部署配置。命令行可用 `sbctl install --guided` 打开同一向导。菜单中的“快速安装”保留较短的默认配置路径。

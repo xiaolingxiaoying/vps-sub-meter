@@ -20,6 +20,12 @@ mkdir -p "$work/bin"
 printf '#!/bin/sh\nexit 0\n' > "$work/bin/apt-get"
 chmod 0755 "$work/bin/apt-get"
 
+# An interrupted stream must fail before even printing the installer banner.
+if sed '/^apt-get update$/q' "$installer" | bash >"$work/truncated.out" 2>"$work/truncated.err"; then
+  fail 'the truncated installer unexpectedly succeeded'
+fi
+[ ! -s "$work/truncated.out" ] || fail 'the truncated installer started executing'
+
 printf '#!/bin/sh\nprintf "%%s\\n" "$@" > /tmp/sbctl-bootstrap-arguments\n' > "$work/sbctl"
 printf '#!/bin/sh\nexit 0\n' > "$work/sing-box"
 chmod 0755 "$work/sbctl" "$work/sing-box"
@@ -122,7 +128,7 @@ import time
 
 pid, terminal = pty.fork()
 if pid == 0:
-    os.execv(sys.argv[1], [sys.argv[1], "--guided"])
+    os.execlp("bash", "bash", "-o", "pipefail", "-c", 'cat "$1" | bash -s -- --guided', "bash", sys.argv[1])
 
 output = bytearray()
 answered = False
@@ -172,13 +178,13 @@ grep -Fx -- '--replace-existing' /tmp/sbctl-bootstrap-arguments >/dev/null \
 cmp "$work/existing-sbctl" /usr/local/bin/sbctl >/dev/null \
   || fail 'explicit replacement did not install the candidate management binary'
 
-# Scenario 3: no-argument bootstrap installs management only, even with an
+# Scenario 3: a piped no-argument bootstrap installs management only, even with an
 # existing kernel. No deployment preflight, no kernel download/replacement.
 printf 'keep existing kernel\n' > /usr/local/bin/sing-box
 kernel_before=$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')
 rm -f /tmp/sbctl-bootstrap-arguments
-PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
-  timeout 60 "$installer" </dev/null >"$work/management-only.out" 2>&1
+cat "$installer" | PATH="$work/bin:$PATH" SBCTL_MANIFEST_URL="file://$work/manifest-existing-{arch}.json" \
+  timeout 60 bash >"$work/management-only.out" 2>&1
 cmp "$work/existing-sbctl" /usr/local/bin/sbctl >/dev/null \
   || fail 'default bootstrap did not install the verified management binary'
 kernel_after=$(sha256sum /usr/local/bin/sing-box | awk '{print $1}')

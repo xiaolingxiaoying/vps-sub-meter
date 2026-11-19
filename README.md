@@ -1,34 +1,35 @@
 # sbctl
 
-`dev` 新增统一节点、多实例节点组和 sing-box/Xray 三种运行模式；使用与迁移步骤见[统一节点与双内核管理](docs/managed-deployment.md)。
+`sbctl` 是 Debian/Ubuntu VPS 上的 sing-box 和 Xray 服务端管理工具。它支持 VLESS Reality、VMess WebSocket、Hysteria 2、TUIC、AnyTLS 等协议，以及 sing-box、Clash/Mihomo、Shadowrocket 和 URI 私有订阅。
 
-`sbctl` 是 Debian/Ubuntu VPS 上的 sing-box 服务端管理工具，支持 VLESS Reality、VMess WebSocket、Hysteria 2、TUIC 和 AnyTLS，并生成 sing-box、Clash/Mihomo、Shadowrocket 和 URI 私有订阅。
+## 安装与升级
 
-支持 Direct HTTPS、外部反向代理和 IP fallback 三种订阅模式，提供证书管理、流量统计、命名订阅凭据及签名更新。
-
-公网 HTTP、HTTPS 和 ACME 监听器各限制 32 个活动连接、同一来源最多 8 个，在握手和请求头读取前生效；超出额度的连接直接关闭。共享公网 IP 的客户端共享来源额度。外部反向代理模式仅保留后端全局限制，按真实来源的限制由前置代理配置。此限制不能替代网络层的分布式攻击防护。
-
-## 安装
-
-首次安装默认值、无域名配置、旧版升级、统一协议及 443 共用见[安装与升级说明](docs/setup-and-upgrade.md)。
-
-需要 Debian 12 或 Ubuntu 22.04 及以上版本、amd64/arm64 架构、systemd 和 root 权限。使用 Direct HTTPS 时，请先将域名解析到 VPS，并放行公网 TCP 80/443；协议端口按安装菜单提示放行。
+在 Debian 12 或 Ubuntu 22.04 及以上版本的 VPS 上运行。支持 amd64 和 arm64，需要 systemd。用 SSH 登录后，以 `root` 执行下列命令。普通用户可先运行 `sudo -i`。
 
 ```bash
-sudo apt-get update && sudo apt-get install -y ca-certificates curl
-curl -fL --retry 3 -o /tmp/sbctl-install.sh \
-  https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh
-test -s /tmp/sbctl-install.sh && sudo bash /tmp/sbctl-install.sh
+curl -fsSL https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh | bash
 ```
 
-已登录为 `root` 时去掉命令中的 `sudo`。
+如果系统缺少 `curl` 或 CA 证书，先运行 `apt-get update && apt-get install -y curl ca-certificates`。也可以从 Release 下载脚本，检查后运行 `bash install.sh`。[下载 install.sh](https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/install.sh)
 
-安装器会验证发布清单签名和文件摘要，并打开交互菜单选择内核与部署配置；VPS 无需安装 Rust。已有部署安装新版管理程序时，保留现有内核、服务、配置和订阅凭据。
+安装器验证发布清单签名和管理程序的 SHA-256 摘要，VPS 无需安装 Rust。首次运行会安装 `sbctl` 和快捷命令 `ly`，并打开交互菜单。选择「首次安装」，按提示配置内核、协议和订阅。使用 Direct HTTPS 时，先将域名解析到 VPS 并放行公网 TCP 80/443，再按菜单提示放行协议端口。没有域名可选择 IP 模式。
 
-修改客户端 DNS、TUN 或分流无需重编译，参见[文件覆写与现成示例](docs/client-overrides.md)。
+已有 sbctl 部署可运行同一条命令升级管理程序，保留现有内核、配置、订阅凭据和流量账期。首次安装默认值、旧版恢复升级和 443 端口共用步骤见[安装与升级说明](docs/setup-and-upgrade.md)。
 
-交互管理入口和各菜单项对应的 CLI、验证证据见[菜单与验证指南](docs/menu-validation.md)；客户端模板、订阅格式和版本差异见[订阅指南](docs/subscription-guide.md)与[内置模板说明](src/subscription/templates/README.md)。
+## 日常管理
 
-日常可用 `sbctl status` 查看剩余流量及重置时间，`sbctl credential list` 查看各设备凭据的宽限期，或从菜单「概览与诊断」检查订阅入口。订阅支持 GET 与 HEAD，便于使用 `curl -I` 检查响应头；链接仍使用路径凭据并拒绝查询参数。
+| 命令 | 用途 |
+| --- | --- |
+| `ly` | 打开管理菜单，包括部署、协议、订阅和诊断 |
+| `sbctl status` | 查看流量用量、剩余额度和重置时间 |
+| `sbctl credential list` | 查看各设备的订阅凭据及宽限期 |
+| `sbctl port status` | 查看监听端口和 TCP/UDP 归属 |
 
-内核只从 [SagerNet 官方发布](https://github.com/SagerNet/sing-box/releases) 下载，菜单提供数字选项。可在「部署与协议」启用 [Hy2 端口跳跃](docs/hy2-port-hopping.md)，VMess 等 TLS 协议的证书由工具生成或复用，无需手工粘贴。
+支持 Direct HTTPS、外部反向代理和 IP fallback 三种订阅模式。订阅链接使用路径凭据，支持 GET 和 HEAD，可以用 `curl -I` 检查响应头。
+
+公网 HTTP、HTTPS 和 ACME 监听器各限制 32 个活动连接，同一来源最多 8 个。限制在握手和读取请求头前生效，超额连接直接关闭。共享公网 IP 的客户端共用来源额度。外部反向代理模式由前置代理按真实来源设限，后端保留全局限制。
+
+- 统一节点、节点组、sing-box/Xray 双内核和旧配置迁移。[统一节点与双内核管理](docs/managed-deployment.md)
+- 菜单项、对应的 CLI 命令、证书和诊断操作。[菜单与验证指南](docs/menu-validation.md)
+- 私有订阅格式、客户端兼容性，以及 DNS、TUN 和分流覆写。[订阅指南](docs/subscription-guide.md) · [文件覆写与示例](docs/client-overrides.md) · [内置模板说明](src/subscription/templates/README.md)
+- 在「部署与协议」中选择官方内核版本、生成或复用 TLS 证书，以及启用 Hy2 端口跳跃。[Hy2 端口跳跃说明](docs/hy2-port-hopping.md)

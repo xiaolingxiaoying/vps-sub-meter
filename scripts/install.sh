@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# Bash parses the entire group before executing a streamed or local installer.
+# Keep every installation step inside it so truncated downloads cannot run.
+{
 set -euo pipefail
 
 # Replaced by prepare-installer.py in the authenticated release packaging job.
@@ -270,3 +273,4 @@ if [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; then
   resolve_installer_input
   run_installer /usr/local/bin/sbctl menu <"$installer_input"
 fi
+}

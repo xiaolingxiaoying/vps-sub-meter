@@ -7,7 +7,8 @@
 
 ## 首次安装
 
-从官方 Release 下载安装器，运行后选择「首次安装」。默认使用官方 sing-box、
+在 VPS 的交互终端以 `root` 执行 [README 中的一行安装命令](../README.md#安装与升级)，
+然后选择「首次安装」。默认使用官方 sing-box、
 常用 5 协议；选择全部 9 协议会另装官方 Xray，增加一个常驻进程。
 有域名时填订阅域名并按提示配置 DNS；没有域名时可接受自动探测的公网出口 IP。
 IP 模式默认使用 2080 提供 HTTP 订阅，链接含私密凭据，不能当作公开链接分享。
@@ -19,7 +20,8 @@ SNI 是 TLS 握手中的服务器名称，不是订阅地址，也不要求等�
 
 ## 旧版升级与统一协议
 
-以下脚本随新 Release 发布。源码中的 `install.sh` 只有公钥占位符，不能直接安装。
+已有 sbctl 部署可运行同一条安装命令升级管理程序。也可以下载 Release 中的
+`upgrade.sh`，先检查旧部署再执行升级。`protocols.sh` 用于另外补齐协议。
 
 ```bash
 curl -fL -o upgrade.sh https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/upgrade.sh
