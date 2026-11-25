@@ -1,15 +1,16 @@
-## Agent skills
+## Project Overview
 
-### Issue tracker
+`vps-sub-meter` (aliases `vsm`, `ly`) is a streamlined dual-core (Xray + sing-box) PQC proxy and private subscription control plane written in Rust, paired with external config/templates and modular Bash operational scripts.
 
-Issues and specs are local Markdown files under `.scratch/`. See `docs/agents/issue-tracker.md`.
+## Domain Docs
 
-### Triage labels
+See `CONTEXT.md` at the repository root.
 
-Uses the default five canonical triage labels. See `docs/agents/triage-labels.md`.
+## Local Build & Test
 
-### Domain docs
-
-Uses the single-context layout. See `docs/agents/domain.md`.
+- Format check: `cargo fmt --all -- --check`
+- Lint: `cargo clippy --all-targets --all-features -- -D warnings`
+- Unit & integration tests: `cargo test --all-targets --features test-signing`
+- Shell syntax check: `bash -n scripts/*.sh`
 
 ## 使用中文回答我

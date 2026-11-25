@@ -1,0 +1,199 @@
+# Mihomo (Clash Meta) 通用完整配置模板 (vps-sub-meter v2)
+# 可直接编辑 /etc/vps-sub-meter/templates/mihomo.yaml 后执行 `vsm apply` 生效。
+#
+# 已整合国内直连抗阻塞优化：
+# 1) tun.auto-detect-interface: false + 排除引导 DNS IP，避免 TUN 自动探测环路卡死；
+# 2) default-nameserver 使用裸 IP (223.5.5.5 / 119.29.29.29)，直连 DoH 优先腾讯 1.12.12.12；
+# 3) rules 首条固定拦截孤儿 Fake-IP (198.18.0.0/15)，防止回退到 private-ip 或 MATCH 超时；
+# 4) tcp-concurrent: false / find-process-mode: strict / force-dns-mapping: false 降低并发开销。
+
+mixed-port: 7890
+socks-port: 7891
+port: 7892
+redir-port: 0
+tproxy-port: 0
+allow-lan: false
+bind-address: 127.0.0.1
+mode: rule
+log-level: info
+ipv6: false
+unified-delay: true
+tcp-concurrent: false
+find-process-mode: strict
+external-controller: ''
+secret: ''
+profile:
+  store-selected: true
+  store-fake-ip: true
+rule-providers:
+  review-private-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/private.mrs
+    path: ./ruleset/review-private-domain.mrs
+    interval: 86400
+  review-cn-domain:
+    type: http
+    behavior: domain
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geosite/cn.mrs
+    path: ./ruleset/review-cn-domain.mrs
+    interval: 86400
+  review-private-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/private.mrs
+    path: ./ruleset/review-private-ip.mrs
+    interval: 86400
+  review-cn-ip:
+    type: http
+    behavior: ipcidr
+    format: mrs
+    url: https://cdn.jsdelivr.net/gh/MetaCubeX/meta-rules-dat@meta/geo/geoip/cn.mrs
+    path: ./ruleset/review-cn-ip.mrs
+    interval: 86400
+proxies: []
+proxy-groups: []
+rules:
+- IP-CIDR,198.18.0.0/15,REJECT,no-resolve
+- DOMAIN,services.googleapis.cn,代理
+- DOMAIN-SUFFIX,msftconnecttest.com,DIRECT
+- DOMAIN-SUFFIX,msftncsi.com,DIRECT
+- DOMAIN-SUFFIX,captive.apple.com,DIRECT
+- DOMAIN-SUFFIX,connectivitycheck.gstatic.com,DIRECT
+- DOMAIN-SUFFIX,detectportal.firefox.com,DIRECT
+- DOMAIN-SUFFIX,connectivity-check.ubuntu.com,DIRECT
+- DOMAIN-SUFFIX,networkcheck.kde.org,DIRECT
+- DOMAIN-SUFFIX,chatgpt.com,代理
+- DOMAIN-SUFFIX,openai.com,代理
+- DOMAIN-SUFFIX,oaistatic.com,代理
+- DOMAIN-SUFFIX,oaiusercontent.com,代理
+- DOMAIN-SUFFIX,x.com,代理
+- DOMAIN-SUFFIX,twitter.com,代理
+- DOMAIN-SUFFIX,twimg.com,代理
+- DOMAIN-SUFFIX,lan,DIRECT
+- DOMAIN-SUFFIX,local,DIRECT
+- DOMAIN-SUFFIX,home.arpa,DIRECT
+- RULE-SET,review-private-domain,DIRECT
+- RULE-SET,review-cn-domain,DIRECT
+- RULE-SET,review-private-ip,DIRECT,no-resolve
+- RULE-SET,review-cn-ip,DIRECT
+- MATCH,代理
+dns:
+  enable: true
+  ipv6: false
+  enhanced-mode: fake-ip
+  fake-ip-range: 198.18.0.1/16
+  fake-ip-filter-mode: blacklist
+  fake-ip-filter:
+  - rule-set:review-private-domain
+  - +.lan
+  - +.local
+  - +.home.arpa
+  - +.msftconnecttest.com
+  - +.msftncsi.com
+  - +.captive.apple.com
+  - +.connectivitycheck.gstatic.com
+  - +.detectportal.firefox.com
+  - +.connectivity-check.ubuntu.com
+  - +.networkcheck.kde.org
+  - +.time.windows.com
+  - +.time.apple.com
+  - +.time.android.com
+  - +.ntp.org
+  - stun.*.*
+  - +.stun.*.*
+  use-hosts: false
+  use-system-hosts: false
+  respect-rules: false
+  default-nameserver:
+  - 223.5.5.5
+  - 119.29.29.29
+  nameserver-policy:
+    +.lan,+.local,+.home.arpa,+.in-addr.arpa,+.ip6.arpa:
+    - system
+    rule-set:review-private-domain:
+    - system
+    +.msftconnecttest.com,+.msftncsi.com,+.captive.apple.com,+.connectivitycheck.gstatic.com,+.detectportal.firefox.com,+.connectivity-check.ubuntu.com,+.networkcheck.kde.org:
+    - https://1.12.12.12/dns-query
+    - https://223.5.5.5/dns-query
+    rule-set:review-cn-domain:
+    - https://1.12.12.12/dns-query
+    - https://223.5.5.5/dns-query
+  nameserver:
+  - https://1.1.1.1/dns-query#代理
+  - https://8.8.8.8/dns-query#代理
+  direct-nameserver:
+  - https://1.12.12.12/dns-query
+  - https://223.5.5.5/dns-query
+  direct-nameserver-follow-policy: true
+  proxy-server-nameserver:
+  - https://1.12.12.12/dns-query
+  - https://223.5.5.5/dns-query
+sniffer:
+  enable: true
+  parse-pure-ip: true
+  force-dns-mapping: false
+  override-destination: false
+  sniff:
+    HTTP:
+      ports:
+      - 80
+      - 8080
+      override-destination: false
+    TLS:
+      ports:
+      - 443
+      - 8443
+      override-destination: false
+    QUIC:
+      ports:
+      - 443
+      - 8443
+      override-destination: false
+  skip-domain:
+  - +.push.apple.com
+  - +.msftconnecttest.com
+  - +.msftncsi.com
+  - +.captive.apple.com
+  - +.connectivitycheck.gstatic.com
+  - +.detectportal.firefox.com
+  - +.connectivity-check.ubuntu.com
+  - +.networkcheck.kde.org
+  skip-dst-address:
+  - 91.105.192.0/23
+  - 91.108.4.0/22
+  - 91.108.8.0/21
+  - 91.108.16.0/21
+  - 91.108.56.0/22
+  - 95.161.64.0/20
+  - 149.154.160.0/20
+  - 185.76.151.0/24
+tun:
+  enable: true
+  stack: mixed
+  device: Mihomo
+  mtu: 1400
+  auto-route: true
+  auto-redirect: false
+  auto-detect-interface: false
+  strict-route: true
+  dns-hijack:
+  - any:53
+  - tcp://any:53
+  route-exclude-address:
+  - 223.5.5.5/32
+  - 119.29.29.29/32
+  route-exclude-address-set: []
+  inet4-route-exclude-address: []
+  inet6-route-exclude-address: []
+geo-auto-update: false
+geo-update-interval: 24
+geodata-mode: false
+geox-url:
+  geoip: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip-lite.dat
+  geosite: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat
+  mmdb: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.metadb
+  asn: https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/GeoLite2-ASN.mmdb

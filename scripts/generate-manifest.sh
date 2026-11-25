@@ -1,81 +1,41 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# usage: generate-manifest.sh OWNER/REPO TAG SING_BOX_VERSION ARCH SBCTL_FILE SING_BOX_FILE OUTPUT [MIN:MAX]
-#
-# Builds a versioned, Ed25519-signed release manifest. The signature covers the
-# canonical JSON (every field except `signature`, compact, keys sorted) exactly
-# as the Rust update logic verifies it. The manifest is signed by the sbctl
-# binary via `sbctl release sign`; the signing key seed is read from
-# SBCTL_SIGNING_KEY (required, no development-key fallback) and the signer from
-# SBCTL_SIGNER (default: sbctl on PATH).
-
-if [[ "$#" -lt 7 || "$#" -gt 8 ]]; then
-  echo "usage: generate-manifest.sh OWNER/REPO TAG SING_BOX_VERSION ARCH SBCTL_FILE SING_BOX_FILE OUTPUT [MIN:MAX]" >&2
+# usage: generate-manifest.sh OWNER/REPO TAG ARCH BIN_FILE BUNDLE_FILE OUTPUT
+if [[ "$#" -ne 6 ]]; then
+  echo "usage: generate-manifest.sh OWNER/REPO TAG ARCH BIN_FILE BUNDLE_FILE OUTPUT" >&2
   exit 2
 fi
 
 repo=$1
 tag=$2
-sing_box_version=$3
-arch=$4
-sbctl_file=$5
-sing_box_file=$6
-output=$7
+arch=$3
+bin_file=$4
+bundle_file=$5
+output=$6
 
-# The bundled runtime version and the compatibility band are recorded in one
-# reviewed file (`scripts/release-runtime-pins.txt`) so a release cannot declare
-# a runtime it does not ship, and cannot silently collapse the matrix to
-# "exactly this version" - the generated client profiles are validated against
-# every core in the band by the CI real-core matrix.
-pins_file=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)/release-runtime-pins.txt
-pins_value() {
-  local key=$1
-  ( set -a; . "$pins_file"; printf '%s' "${!key}" )
-}
-pinned_version=$(pins_value sing_box_version)
-if [[ "$sing_box_version" != "$pinned_version" ]]; then
-  echo "generate-manifest.sh: sing-box $sing_box_version does not match the pinned runtime $pinned_version in scripts/release-runtime-pins.txt" >&2
-  exit 2
-fi
-if [[ "$#" -ge 8 ]]; then
-  compat=$8
-else
-  compat="$(pins_value sing_box_compat_min):$(pins_value sing_box_compat_max)"
-fi
-min_version=${compat%%:*}
-max_version=${compat##*:}
-if [[ -z "$min_version" || -z "$max_version" ]]; then
-  echo "generate-manifest.sh: the compatibility band must be MIN:MAX, got $compat" >&2
-  exit 2
-fi
+signing_key=${VSM_SIGNING_KEY:-${SBCTL_SIGNING_KEY:?set VSM_SIGNING_KEY or SBCTL_SIGNING_KEY}}
+signer=${VSM_SIGNER:-${SBCTL_SIGNER:-$(command -v vps-sub-meter || true)}}
+[[ -n "$signer" ]] || { echo "missing vps-sub-meter signer binary" >&2; exit 2; }
 
-signing_key=${SBCTL_SIGNING_KEY:?set SBCTL_SIGNING_KEY to a private production key file}
-signer=${SBCTL_SIGNER:-$(command -v sbctl || true)}
-if [[ -z "$signer" ]]; then
-  echo "no sbctl binary available for signing; build one or set SBCTL_SIGNER" >&2
-  exit 2
-fi
-
-sbctl_sha=$(sha256sum "$sbctl_file" | awk '{print $1}')
-sing_box_sha=$(sha256sum "$sing_box_file" | awk '{print $1}')
+bin_sha=$(sha256sum "$bin_file" | awk '{print $1}')
+bundle_sha=$(sha256sum "$bundle_file" | awk '{print $1}')
 base="https://github.com/${repo}/releases/download/${tag}"
+ver=${tag#v}
+ver=${ver#sbctl-v}
+
 unsigned="$output.unsigned.tmp"
 trap 'rm -f "$unsigned"' EXIT
 
 jq -n \
   --argjson schema 1 \
-  --arg sbctl_version "${tag#sbctl-v}" \
-  --arg sbctl_url "$base/sbctl-linux-$arch" \
-  --arg sbctl_sha "$sbctl_sha" \
-  --arg sing_box_version "$sing_box_version" \
-  --arg sing_box_url "https://github.com/SagerNet/sing-box/releases/download/v$sing_box_version/sing-box-$sing_box_version-linux-$arch.tar.gz" \
-  --arg sing_box_sha "$sing_box_sha" \
-  --arg min "$min_version" \
-  --arg max "$max_version" \
-  '{schema:$schema,sbctl:{version:$sbctl_version,url:$sbctl_url,sha256:$sbctl_sha},sing_box:{version:$sing_box_version,url:$sing_box_url,sha256:$sing_box_sha},sing_box_compatibility:[{min:$min,max:$max}]}' \
+  --arg ver "$ver" \
+  --arg bin_url "$base/vps-sub-meter-linux-$arch" \
+  --arg bin_sha "$bin_sha" \
+  --arg bundle_url "$base/vps-sub-meter-bundle.tar.gz" \
+  --arg bundle_sha "$bundle_sha" \
+  '{schema:$schema,vps_sub_meter:{version:$ver,url:$bin_url,sha256:$bin_sha},bundle:{version:$ver,url:$bundle_url,sha256:$bundle_sha}}' \
   > "$unsigned"
 
 "$signer" release sign --manifest "$unsigned" --private-key "$signing_key" --output "$output"
-# Detect a mismatched key before publishing either architecture manifest.
 "$signer" release verify --manifest "$output"

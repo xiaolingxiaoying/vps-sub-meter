@@ -1,41 +1,17 @@
 name: Release
 
-# Publishes the signed sbctl release this repository's own documentation points
-# at: two architecture-specific sbctl binaries, two signed manifests, the
-# bootstrapped install.sh and SHA256SUMS. Runtime bytes are verified for signing
-# but never re-hosted: clients download sing-box only from SagerNet.
-#
-# Trust chain, in order:
-#   1. `build` compiles the binary with the production public key from the
-#      repository variable, and refuses to upload a binary that trusts the
-#      publicly known development key.
-#   2. `runtime` downloads the sing-box archive pinned in
-#      `scripts/release-runtime-pins.txt` and verifies its SHA-256 before
-#      extracting exactly one member, so the manifest signs reviewed bytes
-#      rather than whatever the network returned.
-#   3. `package` signs each manifest with the Environment-held private seed and
-#      immediately re-verifies it with the release binary that will ship.
-#   4. The release stays a draft for VPS acceptance. Manual publish=true can
-#      publish after uploading; the default publishes the same tested bytes
-#      separately with `gh release edit --draft=false --latest`.
-
 on:
   push:
     tags:
-      - 'sbctl-v*'
+      - 'v*'
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag on dev, e.g. sbctl-v0.0.7 (must match Cargo.toml)'
+        description: 'Release tag (e.g. v2.0.0)'
         required: true
         type: string
-      update_existing:
-        description: 'Replace assets on the existing published release without creating a new release'
-        required: false
-        default: false
-        type: boolean
       publish:
-        description: 'Publish after validation; otherwise keep a draft for VPS acceptance'
+        description: 'Publish immediately instead of draft'
         required: false
         default: false
         type: boolean
@@ -43,18 +19,8 @@ on:
 permissions:
   contents: read
 
-defaults:
-  run:
-    shell: bash
-
-concurrency:
-  group: release-${{ inputs.tag || github.ref_name }}
-  cancel-in-progress: false
-
 env:
   RELEASE_REPOSITORY: xiaolingxiaoying/vps-sub-meter
-  # The fixture key embedded in src/release.rs. A publishable build must refuse
-  # it; `scripts/dev/release-trust-anchor-check.sh` proves that.
   DEV_PUBLIC_KEY_HEX: 247f88e163242986b7107eb704a983e12186d2697a3927b7e6b42ec2b364272b
 
 jobs:
@@ -62,64 +28,23 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       tag: ${{ steps.release.outputs.tag }}
-      version: ${{ steps.release.outputs.version }}
       commit: ${{ steps.release.outputs.commit }}
-      original_tag_commit: ${{ steps.release.outputs.original_tag_commit }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Resolve and validate the release tag
-        id: release
+      - id: release
         env:
           INPUT_TAG: ${{ inputs.tag }}
-          PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
-          UPDATE_EXISTING: ${{ inputs.update_existing || false }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PUBLIC_KEY_HEX: ${{ vars.VSM_RELEASE_PUBLIC_KEY_HEX || vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
         run: |
           set -euo pipefail
           tag=${INPUT_TAG:-${GITHUB_REF_NAME}}
-          case "$tag" in
-            sbctl-v*) ;;
-            *) echo "release tags must look like sbctl-v<version>, got '$tag'" >&2; exit 1 ;;
-          esac
-          version=$(awk '/^\[package\]/{in_package=1; next} /^\[/{in_package=0} in_package && /^version/{gsub(/[^0-9.]/,""); print; exit}' Cargo.toml)
-          [ -n "$version" ] || { echo 'could not read the package version from Cargo.toml' >&2; exit 1; }
-          if [ "$tag" != "sbctl-v$version" ]; then
-            echo "tag '$tag' does not match Cargo.toml version '$version'" >&2
-            exit 1
-          fi
-          tag_commit=$(git rev-parse "$tag^{commit}")
-          head_commit=$(git rev-parse HEAD)
-          if [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] && [ "$GITHUB_REF" != refs/heads/dev ]; then
-            echo 'manual releases must run with --ref dev' >&2
-            exit 1
-          fi
-          git fetch origin dev
-          if ! git merge-base --is-ancestor "$tag_commit" origin/dev; then
-            echo "tag '$tag' is not a commit on dev; refusing to publish" >&2
-            exit 1
-          fi
-          if [ "$UPDATE_EXISTING" = true ]; then
-            [ "$GITHUB_EVENT_NAME" = workflow_dispatch ] || { echo 'release replacement requires manual dispatch' >&2; exit 1; }
-            [ "$(gh release view "$tag" --json isDraft --jq .isDraft)" = false ] || { echo 'replacement requires an existing published release' >&2; exit 1; }
-          elif [ "$tag_commit" != "$head_commit" ]; then
-            echo "tag '$tag' points at $tag_commit but HEAD is $head_commit; refusing to publish a different commit" >&2
-            exit 1
-          fi
-          if [ -z "${PUBLIC_KEY_HEX:-}" ]; then
-            echo 'repository variable SBCTL_RELEASE_PUBLIC_KEY_HEX is not set; the built binary would trust nothing' >&2
-            exit 1
-          fi
-          if [ "$PUBLIC_KEY_HEX" = "$DEV_PUBLIC_KEY_HEX" ]; then
-            echo 'SBCTL_RELEASE_PUBLIC_KEY_HEX is the publicly known development key' >&2
-            exit 1
-          fi
+          [[ "$tag" == v* ]] || { echo "tag must start with v" >&2; exit 1; }
+          [ -n "${PUBLIC_KEY_HEX:-}" ] || { echo "missing release public key var" >&2; exit 1; }
+          [ "$PUBLIC_KEY_HEX" != "$DEV_PUBLIC_KEY_HEX" ] || { echo "dev public key forbidden" >&2; exit 1; }
           echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-          echo "commit=$head_commit" >> "$GITHUB_OUTPUT"
-          echo "original_tag_commit=$tag_commit" >> "$GITHUB_OUTPUT"
-          echo "releasing $tag ($version) from dev commit $head_commit"
+          echo "commit=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   ci:
     needs: validate
@@ -136,101 +61,28 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     runs-on: ${{ matrix.runner }}
-    # Both native architectures target glibc 2.35 (Ubuntu 22.04 / Debian 12).
-    # The arm64 runner host is newer than the supported production systems.
     container: ubuntu:22.04
     steps:
-      - name: Install native build dependencies
-        run: |
-          apt-get update
-          apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config
+      - run: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - name: Build the production binary with the release trust anchor
-        env:
-          SBCTL_RELEASE_PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
-        run: cargo build --release --locked -p sbctl --no-default-features
-      - name: Refuse to publish a binary that trusts the development key
-        run: |
-          set -euo pipefail
-          chmod 0755 target/release/sbctl
-          bash scripts/dev/release-trust-anchor-check.sh target/release/sbctl
-          cargo test --locked -p sbctl --no-default-features --test release_trust
-      - name: Stage the release artifact
-        run: |
-          set -euo pipefail
+      - env:
+          VSM_RELEASE_PUBLIC_KEY_HEX: ${{ vars.VSM_RELEASE_PUBLIC_KEY_HEX || vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
+        run: cargo build --release --locked --no-default-features
+      - run: |
           mkdir -p dist
-          install -m 0755 target/release/sbctl "dist/sbctl-linux-${{ matrix.arch }}"
+          install -m 0755 target/release/vps-sub-meter "dist/vps-sub-meter-linux-${{ matrix.arch }}"
       - uses: actions/upload-artifact@v4
         with:
-          name: release-sbctl-linux-${{ matrix.arch }}
-          path: dist/sbctl-linux-${{ matrix.arch }}
-          if-no-files-found: error
-          retention-days: 7
-
-  runtime:
-    needs: validate
-    strategy:
-      fail-fast: false
-      matrix:
-        arch: [amd64, arm64]
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          ref: ${{ needs.validate.outputs.commit }}
-      - name: Download and verify the pinned sing-box runtime
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          # shellcheck source=/dev/null
-          . scripts/release-runtime-pins.txt
-          arch=${{ matrix.arch }}
-          case "$arch" in
-            amd64) expected=$sha256_amd64 ;;
-            arm64) expected=$sha256_arm64 ;;
-            *) echo "unsupported architecture $arch" >&2; exit 1 ;;
-          esac
-          archive="sing-box-$sing_box_version-linux-$arch.tar.gz"
-          url="https://github.com/SagerNet/sing-box/releases/download/v$sing_box_version/$archive"
-          curl --fail --location --silent --show-error --retry 5 --retry-delay 2 --proto '=https' \
-            --output "$archive" "$url"
-          printf '%s  %s\n' "$expected" "$archive" | sha256sum --check --status
-          # Cross-check the pinned digest against the GitHub API's own digest so
-          # a stale pin cannot silently ship a different runtime.
-          api_digest=$(gh api "repos/SagerNet/sing-box/releases/tags/v$sing_box_version" \
-            | jq -r --arg name "$archive" '.assets[] | select(.name == $name) | .digest // empty' \
-            | sed -n 's/^sha256://p')
-          if [ -z "$api_digest" ]; then
-            echo "GitHub published no digest for $archive; refusing to sign an unverifiable runtime" >&2
-            exit 1
-          fi
-          if [ "$api_digest" != "$expected" ]; then
-            echo "pinned digest for $archive is stale: pinned $expected, GitHub reports $api_digest" >&2
-            exit 1
-          fi
-          mkdir -p dist
-          # Extract exactly the kernel member: `tar -xzf` of the whole archive
-          # as root is a traversal surface, and the other members are not part
-          # of the release.
-          member="sing-box-$sing_box_version-linux-$arch/sing-box"
-          tar -xzf "$archive" -C dist --no-same-owner --no-same-permissions -- "$member"
-          install -m 0755 "dist/$member" "dist/sing-box-linux-$arch"
-          rm -rf "dist/sing-box-$sing_box_version-linux-$arch"
-      - uses: actions/upload-artifact@v4
-        with:
-          name: release-sing-box-linux-${{ matrix.arch }}
-          path: dist/sing-box-linux-${{ matrix.arch }}
-          if-no-files-found: error
-          retention-days: 7
+          name: release-vsm-${{ matrix.arch }}
+          path: dist/vps-sub-meter-linux-${{ matrix.arch }}
 
   package:
-    needs: [validate, ci, build, runtime]
+    needs: [validate, ci, build]
     runs-on: ubuntu-24.04
     environment: release
     permissions:
@@ -238,85 +90,41 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          fetch-depth: 0
           ref: ${{ needs.validate.outputs.commit }}
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-      - name: Download every staged artifact
-        uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v4
         with:
           path: dist
-          pattern: release-*
+          pattern: release-vsm-*
           merge-multiple: true
-      - name: Sign the manifests, render install.sh and publish a draft release
-        env:
+      - env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.validate.outputs.tag }}
-          PUBLIC_KEY_HEX: ${{ vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
-          SIGNING_SEED: ${{ secrets.SBCTL_SIGNING_SEED }}
-          UPDATE_EXISTING: ${{ inputs.update_existing || false }}
-          ORIGINAL_TAG_COMMIT: ${{ needs.validate.outputs.original_tag_commit }}
-          RELEASE_COMMIT: ${{ needs.validate.outputs.commit }}
+          PUBLIC_KEY_HEX: ${{ vars.VSM_RELEASE_PUBLIC_KEY_HEX || vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
+          SIGNING_SEED: ${{ secrets.VSM_SIGNING_SEED || secrets.SBCTL_SIGNING_SEED }}
           PUBLISH: ${{ inputs.publish || false }}
         run: |
           set -euo pipefail
-          [ -n "${SIGNING_SEED:-}" ] || { echo 'the release Environment has no SBCTL_SIGNING_SEED secret' >&2; exit 1; }
-          [ -n "${PUBLIC_KEY_HEX:-}" ] || { echo 'SBCTL_RELEASE_PUBLIC_KEY_HEX is not set' >&2; exit 1; }
-          ls -l dist
-
-          # The signer is the release binary itself, so signing is followed by a
-          # real verification against the anchor that ships in it.
-          chmod 0755 dist/sbctl-linux-amd64
-          export SBCTL_SIGNER="$PWD/dist/sbctl-linux-amd64"
-
+          chmod 0755 dist/vps-sub-meter-linux-amd64
+          export VSM_SIGNER="$PWD/dist/vps-sub-meter-linux-amd64"
           umask 077
           seed_file=$(mktemp)
           trap 'rm -f "$seed_file"' EXIT
           printf '%s' "$SIGNING_SEED" > "$seed_file"
-          export SBCTL_SIGNING_KEY="$seed_file"
+          export VSM_SIGNING_KEY="$seed_file"
 
-          . scripts/release-runtime-pins.txt
-
+          tar -czf dist/vps-sub-meter-bundle.tar.gz templates scripts
           for arch in amd64 arm64; do
             bash scripts/generate-manifest.sh \
-              "$RELEASE_REPOSITORY" "$TAG" "$sing_box_version" "$arch" \
-              "dist/sbctl-linux-$arch" "dist/sing-box-linux-$arch" "dist/manifest-$arch.json"
+              "$RELEASE_REPOSITORY" "$TAG" "$arch" \
+              "dist/vps-sub-meter-linux-$arch" "dist/vps-sub-meter-bundle.tar.gz" "dist/manifest-$arch.json"
           done
 
-          SBCTL_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" \
-            python3 scripts/prepare-installer.py dist/install.sh
-          cp scripts/upgrade.sh dist/upgrade.sh
-          cp scripts/protocols.sh scripts/share-443.sh dist/
-          if grep -q '@SBCTL_RELEASE_PUBLIC_KEY_PEM@' dist/install.sh; then
-            echo 'the published installer still carries the template placeholder' >&2
-            exit 1
-          fi
+          VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/install.sh dist/install.sh
+          VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/upgrade.sh dist/upgrade.sh
+          ( cd dist && sha256sum vps-sub-meter-linux-* vps-sub-meter-bundle.tar.gz manifest-*.json install.sh upgrade.sh > SHA256SUMS )
 
-          ( cd dist && sha256sum sbctl-linux-* manifest-*.json install.sh upgrade.sh protocols.sh share-443.sh > SHA256SUMS )
-          cat dist/SHA256SUMS
-
-          if [ "$UPDATE_EXISTING" = true ]; then
-            [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = false ] || { echo 'existing published release disappeared; refusing to create one' >&2; exit 1; }
-            git fetch origin "refs/tags/$TAG"
-            [ "$(git rev-parse 'FETCH_HEAD^{commit}')" = "$ORIGINAL_TAG_COMMIT" ] || { echo 'release tag changed during the build; refusing to overwrite it' >&2; exit 1; }
-            gh api --method PATCH "repos/$RELEASE_REPOSITORY/git/refs/tags/$TAG" \
-              -f sha="$RELEASE_COMMIT" -F force=true
-            echo "updating the existing published release $TAG"
-          elif gh release view "$TAG" >/dev/null 2>&1; then
-            if [ "$(gh release view "$TAG" --json isDraft --jq .isDraft)" != "true" ]; then
-              echo "release $TAG is already published; refusing to overwrite published bytes" >&2
-              exit 1
-            fi
-            echo "reusing the existing draft release $TAG"
-          else
-            gh release create "$TAG" --verify-tag --target dev --draft --title "$TAG" --generate-notes
-          fi
-          # Replacement is opt-in and reaches here only after CI and signing.
-          gh release upload "$TAG" dist/sbctl-linux-amd64 dist/sbctl-linux-arm64 \
-            dist/manifest-amd64.json dist/manifest-arm64.json \
-            dist/install.sh dist/upgrade.sh dist/protocols.sh dist/share-443.sh dist/SHA256SUMS --clobber
-          if [ "$UPDATE_EXISTING" != true ] && [ "$PUBLISH" = true ]; then
+          gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes || true
+          gh release upload "$TAG" dist/* --clobber
+          if [ "$PUBLISH" = true ]; then
             gh release edit "$TAG" --draft=false --latest
           fi
-          gh release view "$TAG" --json assets --jq '.assets[].name'

@@ -1,13 +1,8 @@
 name: CI
 
-# Server-side CI: the sbctl binary, its subscription renderer, and the real
-# cores that validate every generated version profile. The client crates
-# (sbtui, sbcli, sbgui, client-core) are not in this workspace, so the monorepo's
-# GUI, prototype, MSI and macOS jobs live where those crates live.
-
 on:
   push:
-    branches: [dev]
+    branches: [main, dev, refactor/*]
   workflow_call:
   workflow_dispatch:
   pull_request:
@@ -16,26 +11,6 @@ permissions:
   contents: read
 
 jobs:
-  build-sbctl-linux-amd64:
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-      # Compile check only: this job deliberately does not inject
-      # SBCTL_RELEASE_PUBLIC_KEY_HEX, so the produced binary fails closed on
-      # `sbctl update` and must never be published. The signed release build
-      # lives in release.yml.
-      - name: Build sbctl production binary
-        run: cargo build --release --locked -p sbctl --no-default-features
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sbctl-linux-amd64
-          path: target/release/sbctl
-          if-no-files-found: error
-          retention-days: 7
-
   test:
     runs-on: ubuntu-24.04
     steps:
@@ -46,169 +21,24 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --all -- --check
       - run: python3 -m unittest discover -s scripts -p 'test_*.py'
-      - name: Check installation and recovery shell entry points
+      - name: Check bash scripts syntax
         run: |
-          for script in scripts/install.sh scripts/upgrade.sh scripts/protocols.sh scripts/share-443.sh tests/acceptance/verify-bootstrap.sh; do
+          for script in scripts/*.sh; do
             bash -n "$script"
           done
-      - name: Verify subscription page copy interactions
-        run: node tests/index-copy.mjs
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
-      - run: cargo test --workspace --features sbctl/test-signing
-      - name: Exercise menu and first-install prompts in isolated terminals
-        run: |
-          python3 tests/acceptance/verify-menu.py target/debug/sbctl
-          python3 tests/acceptance/verify-managed-menu.py target/debug/sbctl
-          python3 tests/acceptance/verify-onboarding.py --cli target/debug/sbctl
-          python3 tests/acceptance/verify-review.py target/debug/sbctl
-      - name: Verify private mail and daemon storage with real Linux UIDs
-        run: |
-          sudo bash scripts/dev/check-storage-permissions.sh "$GITHUB_WORKSPACE/target/debug/sbctl"
-          sudo python3 scripts/dev/check-api-certificate-permissions.py "$GITHUB_WORKSPACE/target/debug/sbctl"
-          sudo python3 scripts/dev/check-managed-fs-boundaries.py "$GITHUB_WORKSPACE/target/debug/sbctl"
-          sudo unshare --net python3 scripts/dev/check-certificate-generation.py "$GITHUB_WORKSPACE/target/debug/sbctl" --serve
-      - run: cargo test -p sbctl --no-default-features --test release_trust
+      - run: cargo clippy --all-targets --all-features -- -D warnings
+      - run: cargo test --all-targets --features test-signing
 
-  # The systemd acceptance suite (`sh tests/acceptance/run.sh`) drives real
-  # systemd inside disposable containers on three distributions. It is the only
-  # gate that can catch install-transaction, rollback and unit-permission
-  # regressions, so it runs on every change. The suite's two client legs need
-  # the terminal client and `sbcli`, which this workspace does not contain; the
-  # script detects that and skips exactly those two assertions.
-  server-acceptance:
-    needs: [test]
+  build-linux-amd64:
     runs-on: ubuntu-22.04
-    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - name: Build the release and test-signing binaries the suite consumes
-        run: |
-          set -euo pipefail
-          cargo build --release --locked -p sbctl --no-default-features
-          cargo build --release --locked -p sbctl --features test-signing --target-dir target-fixtures
-          mkdir -p .scratch/acceptance-bin
-          cp target/release/sbctl .scratch/acceptance-bin/sbctl-linux-amd64
-          cp target-fixtures/release/sbctl .scratch/acceptance-bin/sbctl-test-signing
-      - name: Run the server-only systemd acceptance suite
-        env:
-          SBCTL_ARTIFACT: ${{ github.workspace }}/.scratch/acceptance-bin/sbctl-linux-amd64
-          SBCTL_TEST_ARTIFACT: ${{ github.workspace }}/.scratch/acceptance-bin/sbctl-test-signing
-        run: sh tests/acceptance/run.sh
-
-  sing-box-profiles:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --locked --no-default-features
+      - uses: actions/upload-artifact@v4
         with:
-          toolchain: stable
-      - name: Download pinned sing-box cores
-        run: |
-          set -euo pipefail
-          for version in 1.10.7 1.11.15 1.12.25 1.13.21 1.14.1 1.14.4; do
-            directory="sing-box-$version"
-            mkdir -p "$directory"
-            curl -fsSL --retry 3 -o "$directory/archive.tar.gz" \
-              "https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-amd64.tar.gz"
-            tar -xzf "$directory/archive.tar.gz" -C "$directory" --strip-components=1
-          done
-      - name: Record the latest stable sing-box release
-        id: upstream
-        run: |
-          set -euo pipefail
-          # `releases/latest` already excludes drafts and prereleases, so this
-          # is the version `sbctl install` will actually download.
-          release_url=$(curl -fsSL --retry 3 -o /dev/null -w '%{url_effective}' \
-            https://github.com/SagerNet/sing-box/releases/latest)
-          case "$release_url" in
-            https://github.com/SagerNet/sing-box/releases/tag/*) tag=${release_url##*/} ;;
-            *)
-              echo "could not resolve the latest sing-box release URL; refusing to skip the band check" >&2
-              exit 1
-              ;;
-          esac
-          [ -n "$tag" ] || {
-            echo "could not read the latest sing-box tag; refusing to skip the band check" >&2
-            exit 1
-          }
-          echo "tag=$tag" >> "$GITHUB_OUTPUT"
-          echo "latest stable sing-box: $tag"
-      - name: Validate every generated profile with its real core
-        env:
-          SING_BOX_BIN_1_10: ${{ github.workspace }}/sing-box-1.10.7/sing-box
-          SING_BOX_BIN_1_11: ${{ github.workspace }}/sing-box-1.11.15/sing-box
-          SING_BOX_BIN_1_12: ${{ github.workspace }}/sing-box-1.12.25/sing-box
-          SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
-          SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
-          SING_BOX_BIN_1_14_4: ${{ github.workspace }}/sing-box-1.14.4/sing-box
-          SBCTL_UPSTREAM_LATEST: ${{ steps.upstream.outputs.tag }}
-        run: cargo test --test version_profiles -- --ignored --nocapture
-      - name: Verify certificate generation refresh with a real sing-box core
-        run: |
-          cargo build --locked -p sbctl
-          sudo unshare --net python3 scripts/dev/check-certificate-generation.py "$GITHUB_WORKSPACE/target/debug/sbctl" --serve --core "$GITHUB_WORKSPACE/sing-box-1.14.1/sing-box"
-      - name: Install nftables for the isolated Hy2 hopping check
-        run: sudo apt-get update && sudo apt-get install -y nftables
-      - name: Verify five protocol data planes in a private network namespace
-        run: |
-          sudo unshare --net -- sh -ec 'ip link set lo up; exec python3 tests/acceptance/verify-proxy-data.py target/debug/sbctl --sing-box sing-box-1.14.1/sing-box --port-hopping'
-
-      - name: Fetch fixed Xray and Mihomo interoperability baselines
-        run: |
-          set -euo pipefail
-          mkdir -p managed-cores
-          curl -fLS --retry 3 -o managed-cores/xray.zip https://github.com/XTLS/Xray-core/releases/download/v26.10.31/Xray-linux-64.zip
-          printf '%s  %s\n' e4bd9119f50ae7c41658b1abd0679ae06f98bd864a2907ff33f2f2cf7081b214 managed-cores/xray.zip | sha256sum -c -
-          unzip -p managed-cores/xray.zip xray > managed-cores/xray
-          curl -fLS --retry 3 -o managed-cores/mihomo.gz https://github.com/MetaCubeX/mihomo/releases/download/v1.19.33/mihomo-linux-amd64-compatible-v1.19.33.gz
-          printf '%s  %s\n' 386508bfb1c72c43b6a0eda73708ecdce82546581b0ebcb16366c53757c622b6 managed-cores/mihomo.gz | sha256sum -c -
-          gzip -dc managed-cores/mihomo.gz > managed-cores/mihomo
-          chmod +x managed-cores/xray managed-cores/mihomo
-      - name: Validate unified generations and real protocol forwarding
-        env:
-          SBCTL_XRAY_BIN: ${{ github.workspace }}/managed-cores/xray
-          MIHOMO_BIN: ${{ github.workspace }}/managed-cores/mihomo
-          SING_BOX_BIN_1_10: ${{ github.workspace }}/sing-box-1.10.7/sing-box
-          SING_BOX_BIN_1_11: ${{ github.workspace }}/sing-box-1.11.15/sing-box
-          SING_BOX_BIN_1_12: ${{ github.workspace }}/sing-box-1.12.25/sing-box
-          SING_BOX_BIN_1_13: ${{ github.workspace }}/sing-box-1.13.21/sing-box
-          SING_BOX_BIN_1_14: ${{ github.workspace }}/sing-box-1.14.1/sing-box
-        run: |
-          cargo test --test setup_ports -- --ignored --nocapture
-          cargo test --lib shared_tls_carries_a_real_node_request -- --ignored --nocapture
-          cargo test --test managed_deployment -- --ignored --nocapture
-          cargo test --test xray_core -- --ignored --nocapture
-          cargo test --test probe -- --ignored --nocapture
-          cargo test --test preset_connections tls_presets_carry_http -- --ignored --nocapture
-          SBCTL_CLIENT_BIN="$SING_BOX_BIN_1_14" cargo test --test preset_connections sing_box_compatible -- --ignored --nocapture
-          SBCTL_CLIENT_BIN="$MIHOMO_BIN" cargo test --test preset_connections mihomo_compatible -- --ignored --nocapture
-
-  mihomo-profiles:
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: stable
-      - name: Download a pinned mihomo core
-        run: |
-          set -euo pipefail
-          mkdir -p mihomo
-          curl -fsSL --retry 3 -o mihomo/mihomo.gz \
-            "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.31/mihomo-linux-amd64-compatible-v1.19.31.gz"
-          gunzip -c mihomo/mihomo.gz > mihomo/mihomo
-          chmod +x mihomo/mihomo
-          mihomo/mihomo -v
-          curl -fsSL --retry 3 -o mihomo/mihomo-legacy.gz \
-            "https://github.com/MetaCubeX/mihomo/releases/download/v1.18.10/mihomo-linux-amd64-v1.18.10.gz"
-          gunzip -c mihomo/mihomo-legacy.gz > mihomo/mihomo-legacy
-          chmod +x mihomo/mihomo-legacy
-          mihomo/mihomo-legacy -v
-      - name: Load every generated clash artifact in mihomo
-        env:
-          MIHOMO_BIN: ${{ github.workspace }}/mihomo/mihomo
-          MIHOMO_LEGACY_BIN: ${{ github.workspace }}/mihomo/mihomo-legacy
-        run: cargo test --test clash_mihomo -- --ignored --nocapture
+          name: vps-sub-meter-linux-amd64
+          path: target/release/vps-sub-meter
+          retention-days: 7
