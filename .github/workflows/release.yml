@@ -123,8 +123,20 @@ jobs:
           VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/upgrade.sh dist/upgrade.sh
           ( cd dist && sha256sum vps-sub-meter-linux-* vps-sub-meter-bundle.tar.gz manifest-*.json install.sh upgrade.sh > SHA256SUMS )
 
-          gh release create "$TAG" --verify-tag --draft --title "vps-sub-meter $TAG" --generate-notes || true
-          gh release upload "$TAG" dist/* --clobber
+          retry() {
+            for n in 1 2 3 4 5; do
+              if "$@"; then return 0; fi
+              sleep $((n * 3))
+            done
+            return 1
+          }
+
+          if ! gh release view "$TAG" >/dev/null 2>&1; then
+            retry gh release create "$TAG" --verify-tag --draft --title "vps-sub-meter $TAG" --generate-notes
+          fi
+          for f in dist/*; do
+            retry gh release upload "$TAG" "$f" --clobber
+          done
           if [ "$PUBLISH" = true ]; then
-            gh release edit "$TAG" --draft=false --latest
+            retry gh release edit "$TAG" --draft=false --latest
           fi
