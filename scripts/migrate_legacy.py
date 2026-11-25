@@ -25,10 +25,12 @@ import os
 from pathlib import Path
 import re
 import shlex
+import socket
 import subprocess
 import sys
 import time
 import urllib.parse
+import urllib.request
 from zoneinfo import ZoneInfo
 
 try:
@@ -188,10 +190,14 @@ def detect_default_interface(root: Path, preferred: str = "") -> str:
     return cand or "eth0"
 
 
-def detect_public_ip(root: Path, candidate: str = "") -> str:
+def detect_public_ip(root: Path, candidate: str = "", domain: str = "") -> str:
     c = candidate.strip()
     if c and is_ip_literal(c):
-        return c
+        try:
+            if not ipaddress.ip_address(c).is_private:
+                return c
+        except ValueError:
+            pass
     if root == Path("/"):
         try:
             out = subprocess.check_output(
@@ -205,7 +211,21 @@ def detect_public_ip(root: Path, candidate: str = "") -> str:
                 return m.group(1)
         except Exception:
             pass
-    return "203.0.113.10"
+        for url in ("https://api.ipify.org", "https://checkip.amazonaws.com"):
+            try:
+                ip_txt = urllib.request.urlopen(url, timeout=3).read().decode("utf-8").strip()
+                if is_ip_literal(ip_txt) and not ipaddress.ip_address(ip_txt).is_private:
+                    return ip_txt
+            except Exception:
+                pass
+        if domain:
+            try:
+                resolved = socket.gethostbyname(domain.strip())
+                if is_ip_literal(resolved) and not ipaddress.ip_address(resolved).is_private:
+                    return resolved
+            except Exception:
+                pass
+    return c if (c and is_ip_literal(c)) else "203.0.113.10"
 
 
 def read_sysfs_counter(root: Path, iface: str, kind: str) -> int:
@@ -418,7 +438,7 @@ def migrate_sbctl(root: Path, check_only: bool) -> dict:
         public_ip = sub_host if is_ip_literal(sub_host) else detect_public_ip(root, proxy_host)
     else:
         domain = sub_host
-        public_ip = detect_public_ip(root, proxy_host)
+        public_ip = detect_public_ip(root, proxy_host, domain)
 
     interface = detect_default_interface(root, str(raw.get("interface", "eth0")))
     ipv4_only = bool(raw.get("ipv4_only", False))
@@ -774,7 +794,7 @@ def migrate_sub_srv_v1(root: Path, check_only: bool) -> dict:
         public_ip = raw_host if is_ip_literal(raw_host) else detect_public_ip(root)
     else:
         domain = raw_host
-        public_ip = detect_public_ip(root)
+        public_ip = detect_public_ip(root, "", domain)
 
     interface = detect_default_interface(root, conf.get("IFACE", "eth0"))
     try:

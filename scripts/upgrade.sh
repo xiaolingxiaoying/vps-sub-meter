@@ -45,12 +45,14 @@ while [[ $# -gt 0 ]]; do
 done
 
 detect_local_generation() {
-  if [[ -f /etc/vps-sub-meter/config.toml ]]; then
+  if [[ -f /etc/vps-sub-meter/config.toml && -f /var/lib/vps-sub-meter/current.json ]]; then
     echo "v2"
   elif [[ -f /etc/sbctl/config.toml ]]; then
     echo "sbctl"
   elif [[ -f /etc/sub-srv/config.conf ]]; then
     echo "sub-srv-v1"
+  elif [[ -f /etc/vps-sub-meter/config.toml ]]; then
+    echo "v2"
   else
     echo "none"
   fi
@@ -211,12 +213,55 @@ fi
 # 5. Reconcile certificates & cleanly retire Gen 1 / Gen 2 services before `vsm apply`
 DOMAIN_VAL=$(awk -F'"' '/^domain[[:space:]]*=/{print $2; exit}' /etc/vps-sub-meter/config.toml || true)
 PUBLIC_IP_VAL=$(awk -F'"' '/^public_ip[[:space:]]*=/{print $2; exit}' /etc/vps-sub-meter/config.toml || true)
+LEGACY_CERT_MODE=""
+if [[ -r /etc/sbctl/config.toml ]]; then
+  LEGACY_CERT_MODE=$(awk -F'"' '/^certificate_mode[[:space:]]*=/{print $2; exit}' /etc/sbctl/config.toml || true)
+fi
+
+cert_pair_valid() {
+  local sni=$1
+  local dir="/var/lib/vps-sub-meter/certificates/${sni}"
+  [[ -s "${dir}/fullchain.pem" && -s "${dir}/privkey.pem" ]] || return 1
+  local p1 p2
+  p1=$(openssl x509 -in "${dir}/fullchain.pem" -noout -pubkey 2>/dev/null | openssl md5 2>/dev/null || true)
+  p2=$(openssl pkey -in "${dir}/privkey.pem" -pubout 2>/dev/null | openssl md5 2>/dev/null || true)
+  [[ -n "$p1" && "$p1" == "$p2" ]]
+}
+
+import_legacy_sbctl_cert() {
+  local sni=$1
+  local src="/var/lib/sbctl/certificates/${sni}"
+  local dst="/var/lib/vps-sub-meter/certificates/${sni}"
+  [[ -d "$src" ]] || return 1
+  local fc="" pk=""
+  if [[ -r "${src}/fullchain.pem" && -r "${src}/privkey.pem" ]]; then
+    fc="${src}/fullchain.pem"
+    pk="${src}/privkey.pem"
+  elif [[ -r "${src}/cert.pem" && -r "${src}/key.pem" ]]; then
+    fc="${src}/cert.pem"
+    pk="${src}/key.pem"
+  else
+    return 1
+  fi
+  getent group vsm-cert >/dev/null || groupadd --system vsm-cert
+  mkdir -p "$dst"
+  chown root:vsm-cert "$dst"
+  chmod 0750 "$dst"
+  install -m 0640 -o root -g vsm-cert -L "$fc" "${dst}/fullchain.pem" 2>/dev/null \
+    || cat "$fc" > "${dst}/fullchain.pem"
+  install -m 0640 -o root -g vsm-cert -L "$pk" "${dst}/privkey.pem" 2>/dev/null \
+    || cat "$pk" > "${dst}/privkey.pem"
+  chown root:vsm-cert "${dst}/fullchain.pem" "${dst}/privkey.pem"
+  chmod 0640 "${dst}/fullchain.pem" "${dst}/privkey.pem"
+}
 
 if [[ "$EXISTING_GEN" == "sbctl" ]]; then
   if [[ -n "$DOMAIN_VAL" && -r "/etc/letsencrypt/live/${DOMAIN_VAL}/fullchain.pem" ]]; then
-    bash /usr/local/lib/vps-sub-meter/cert.sh sync "$DOMAIN_VAL"
-  elif [[ -d /var/lib/sbctl/certificates ]]; then
-    cp -a /var/lib/sbctl/certificates/. /var/lib/vps-sub-meter/certificates/ 2>/dev/null || true
+    bash /usr/local/lib/vps-sub-meter/cert.sh sync "$DOMAIN_VAL" || true
+  elif [[ -n "$DOMAIN_VAL" ]]; then
+    import_legacy_sbctl_cert "$DOMAIN_VAL" || true
+  elif [[ -d /var/lib/sbctl/certificates/www.bing.com ]]; then
+    import_legacy_sbctl_cert "www.bing.com" || true
   fi
   bash /usr/local/lib/vps-sub-meter/migrate-sbctl.sh
   if grep -q '^enabled = true' /etc/vps-sub-meter/config.toml \
@@ -231,6 +276,8 @@ elif [[ "$EXISTING_GEN" == "sub-srv-v1" ]]; then
     if [[ -r "$caddy_crt" && -r "$caddy_key" ]]; then
       dest="/var/lib/vps-sub-meter/certificates/${DOMAIN_VAL}"
       mkdir -p "$dest"
+      chown root:vsm-cert "$dest"
+      chmod 0750 "$dest"
       install -m 0640 -o root -g vsm-cert "$caddy_crt" "${dest}/fullchain.pem"
       install -m 0640 -o root -g vsm-cert "$caddy_key" "${dest}/privkey.pem"
     fi
@@ -241,20 +288,31 @@ elif [[ "$EXISTING_GEN" == "sub-srv-v1" ]]; then
            caddy.service sb.service sing-box.service; do
     systemctl disable --now "$u" 2>/dev/null || true
   done
-  if [[ -n "$DOMAIN_VAL" && ! -s "/var/lib/vps-sub-meter/certificates/${DOMAIN_VAL}/fullchain.pem" ]]; then
-    bash /usr/local/lib/vps-sub-meter/cert.sh issue "$DOMAIN_VAL"
-  fi
 fi
 
 if [[ -z "$DOMAIN_VAL" ]]; then
-  bash /usr/local/lib/vps-sub-meter/cert.sh self-signed "www.bing.com"
-elif [[ ! -s "/var/lib/vps-sub-meter/certificates/${DOMAIN_VAL}/fullchain.pem" ]]; then
-  if [[ -r "/etc/letsencrypt/live/${DOMAIN_VAL}/fullchain.pem" ]]; then
-    bash /usr/local/lib/vps-sub-meter/cert.sh sync "$DOMAIN_VAL"
+  if ! cert_pair_valid "www.bing.com"; then
+    rm -f /var/lib/vps-sub-meter/certificates/www.bing.com/{fullchain,privkey}.pem
+    bash /usr/local/lib/vps-sub-meter/cert.sh self-signed "www.bing.com"
+  fi
+elif ! cert_pair_valid "$DOMAIN_VAL"; then
+  rm -f "/var/lib/vps-sub-meter/certificates/${DOMAIN_VAL}/"{fullchain,privkey}.pem
+  if [[ -r "/etc/letsencrypt/live/${DOMAIN_VAL}/fullchain.pem" && -r "/etc/letsencrypt/live/${DOMAIN_VAL}/privkey.pem" ]]; then
+    bash /usr/local/lib/vps-sub-meter/cert.sh sync "$DOMAIN_VAL" || true
+  elif [[ "$LEGACY_CERT_MODE" == "self-signed" ]]; then
+    bash /usr/local/lib/vps-sub-meter/cert.sh self-signed "$DOMAIN_VAL"
   else
-    bash /usr/local/lib/vps-sub-meter/cert.sh issue "$DOMAIN_VAL"
+    if ! bash /usr/local/lib/vps-sub-meter/cert.sh issue "$DOMAIN_VAL"; then
+      echo "警告: 自动申请 ACME 证书失败（可能受防火墙 80 端口或 CDN 代理影响），已自动签发临时自签证书以确保服务可用。" >&2
+      bash /usr/local/lib/vps-sub-meter/cert.sh self-signed "$DOMAIN_VAL"
+    fi
   fi
 fi
+
+# Ensure certificate readability by vsm-cert group (xray / sing-box / vps-sub-meter)
+chown -R root:vsm-cert /var/lib/vps-sub-meter/certificates
+find /var/lib/vps-sub-meter/certificates -type d -exec chmod 0750 {} +
+find /var/lib/vps-sub-meter/certificates -type f -exec chmod 0640 {} +
 
 # 6. Apply & verify dual-core configs transactionally
 /usr/local/bin/vsm apply

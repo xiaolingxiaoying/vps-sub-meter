@@ -46,7 +46,7 @@ LEGACY_UNITS=(
 )
 while IFS= read -r extra_unit; do
   [[ -n "$extra_unit" ]] && LEGACY_UNITS+=("$extra_unit")
-done < <(systemctl list-unit-files '*argo-sub*' --no-legend 2>/dev/null | awk '{print $1}' || true)
+done < <(systemctl list-unit-files 'sbctl*' '*argo-sub*' --no-legend 2>/dev/null | awk '{print $1}' || true)
 for u in "${LEGACY_UNITS[@]}"; do
   systemctl disable --now "$u" 2>/dev/null || true
 done

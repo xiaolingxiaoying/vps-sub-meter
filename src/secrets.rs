@@ -32,6 +32,7 @@ pub struct SubscriptionToken {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct VlessRealitySecrets {
     pub uuid: String,
     pub x25519_private_key: String,
@@ -44,6 +45,7 @@ pub struct VlessRealitySecrets {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct VlessXhttpSecrets {
     pub uuid: String,
     pub path: String,
@@ -52,23 +54,27 @@ pub struct VlessXhttpSecrets {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct AnytlsSecrets {
     pub password: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct Hysteria2Secrets {
     pub password: String,
     pub obfs_password: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct TuicSecrets {
     pub uuid: String,
     pub password: String,
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(default)]
 pub struct ArgoWsSecret {
     pub uuid: String,
     pub path: String,
@@ -418,5 +424,13 @@ Authentication: ML-KEM-768, Post-Quantum
         assert!(s.matches_token("test_token_0123456789abcdef0123456789"));
         assert!(!s.matches_token("wrong_token"));
         assert!(!s.matches_token(""));
+    }
+
+    #[test]
+    fn partial_empty_secrets_deserialize_with_defaults() {
+        let s1: Secrets = serde_json::from_str(r#"{"tokens":[]}"#).unwrap();
+        assert!(s1.tokens.is_empty());
+        let s2: Secrets = serde_json::from_str(r#"{"vless_reality_pqc":{}}"#).unwrap();
+        assert!(s2.vless_reality_pqc.uuid.is_empty());
     }
 }

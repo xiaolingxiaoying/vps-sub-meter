@@ -44,6 +44,8 @@ install_xray() {
   unzip -p "$work/$asset" xray > "$work/xray"
   chmod 0755 "$work/xray"
   mv -f "$work/xray" /usr/local/bin/xray
+  mkdir -p /usr/local/share/xray
+  unzip -oq "$work/$asset" geoip.dat geosite.dat -d /usr/local/share/xray 2>/dev/null || true
   echo "Xray v${XRAY_VERSION} 安装完成"
 }
 

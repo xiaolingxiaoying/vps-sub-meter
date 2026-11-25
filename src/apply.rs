@@ -27,8 +27,8 @@ pub enum ApplyError {
     Compile(#[from] compiler::CompileError),
     #[error("文件系统错误: {0}")]
     Io(#[from] std::io::Error),
-    #[error("{0} 内核配置校验失败，已拒绝应用（现网服务未受影响）")]
-    KernelCheck(&'static str),
+    #[error("{0} 内核配置校验失败（现网服务未受影响）: {1}")]
+    KernelCheck(&'static str, String),
     #[error("执行系统操作失败: {0}")]
     System(String),
 }
@@ -99,15 +99,33 @@ pub fn check_kernel_config(binary: &Path, is_xray: bool, json_doc: &str) -> Resu
     } else {
         &["check", "-c"]
     };
-    let out = Command::new(binary).args(args).arg(tmp.path()).output()?;
+    let mut cmd = Command::new(binary);
+    cmd.args(args).arg(tmp.path());
+    if is_xray {
+        cmd.env("XRAY_LOCATION_ASSET", "/usr/local/share/xray");
+    }
+    let out = cmd.output()?;
     if out.status.success() {
         Ok(())
     } else {
-        Err(ApplyError::KernelCheck(if is_xray {
-            "xray"
-        } else {
-            "sing-box"
-        }))
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let detail = stderr
+            .lines()
+            .chain(stdout.lines())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" | ");
+        Err(ApplyError::KernelCheck(
+            if is_xray { "xray" } else { "sing-box" },
+            if detail.is_empty() {
+                format!("exit={}", out.status)
+            } else {
+                detail
+            },
+        ))
     }
 }
 
