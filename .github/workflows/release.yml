@@ -13,7 +13,7 @@ on:
       publish:
         description: 'Publish immediately instead of draft'
         required: false
-        default: false
+        default: true
         type: boolean
 
 permissions:
@@ -63,7 +63,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     container: ubuntu:22.04
     steps:
-      - run: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates curl git pkg-config
+      - run: apt-get update && apt-get install -y --no-install-recommends build-essential ca-certificates cmake curl git pkg-config
       - uses: actions/checkout@v4
         with:
           ref: ${{ needs.validate.outputs.commit }}
@@ -101,7 +101,7 @@ jobs:
           TAG: ${{ needs.validate.outputs.tag }}
           PUBLIC_KEY_HEX: ${{ vars.VSM_RELEASE_PUBLIC_KEY_HEX || vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
           SIGNING_SEED: ${{ secrets.VSM_SIGNING_SEED || secrets.SBCTL_SIGNING_SEED }}
-          PUBLISH: ${{ inputs.publish || false }}
+          PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           set -euo pipefail
           chmod 0755 dist/vps-sub-meter-linux-amd64
@@ -123,7 +123,7 @@ jobs:
           VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/upgrade.sh dist/upgrade.sh
           ( cd dist && sha256sum vps-sub-meter-linux-* vps-sub-meter-bundle.tar.gz manifest-*.json install.sh upgrade.sh > SHA256SUMS )
 
-          gh release create "$TAG" --verify-tag --draft --title "$TAG" --generate-notes || true
+          gh release create "$TAG" --verify-tag --draft --title "vps-sub-meter $TAG" --generate-notes || true
           gh release upload "$TAG" dist/* --clobber
           if [ "$PUBLISH" = true ]; then
             gh release edit "$TAG" --draft=false --latest
