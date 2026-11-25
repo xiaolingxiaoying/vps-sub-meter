@@ -79,8 +79,10 @@ pub fn open_lock(dir: &Path) -> io::Result<File> {
         opts.custom_flags(libc::O_NOFOLLOW);
         let file = opts.open(&lock_path)?;
         fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
-        return Ok(file);
+        Ok(file)
     }
     #[cfg(not(unix))]
-    opts.open(&lock_path)
+    {
+        opts.open(&lock_path)
+    }
 }
