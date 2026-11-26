@@ -76,10 +76,16 @@ ensure_accounts_and_dirs() {
 
 install_from_dir() {
   local src=$1
+  if [[ ! -f "$src/scripts/ly.sh" ]]; then
+    red "安装包缺少 scripts/ly.sh，已中止安装。" >&2
+    exit 2
+  fi
+  install -m 0755 "$src/scripts/ly.sh" /usr/local/lib/vps-sub-meter/.ly.sh.new
+  mv -fT /usr/local/lib/vps-sub-meter/.ly.sh.new /usr/local/lib/vps-sub-meter/ly.sh
   install -m 0755 "$src/vps-sub-meter" /usr/local/bin/.vps-sub-meter.new
   mv -f /usr/local/bin/.vps-sub-meter.new /usr/local/bin/vps-sub-meter
   ln -sf /usr/local/bin/vps-sub-meter /usr/local/bin/vsm
-  ln -sf /usr/local/bin/vps-sub-meter /usr/local/bin/ly
+  ln -sfn /usr/local/lib/vps-sub-meter/ly.sh /usr/local/bin/ly
 
   for s in cores.sh cert.sh net.sh argo.sh migrate-sbctl.sh migrate_legacy.py upgrade.sh; do
     if [[ -f "$src/scripts/$s" ]]; then
@@ -152,7 +158,9 @@ green "vps-sub-meter 已安装（快捷命令: vsm / ly）"
 
 if [[ ${#PASS_ARGS[@]} -gt 0 ]]; then
   /usr/local/bin/vps-sub-meter "${PASS_ARGS[@]}"
-elif [[ -t 0 ]] || { : </dev/tty; } 2>/dev/null; then
-  /usr/local/bin/vps-sub-meter menu </dev/tty
+elif [[ -t 0 ]]; then
+  /usr/local/bin/ly
+elif { : </dev/tty; } 2>/dev/null; then
+  /usr/local/bin/ly </dev/tty
 fi
 }

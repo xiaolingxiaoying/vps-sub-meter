@@ -9,4 +9,4 @@
 - **ServeAuth (`/var/lib/vps-sub-meter/serve-auth.json`)**：由 `vsm apply` 派生的只读运行时授权文件（仅含 Token 的 SHA-256 摘要与 Argo WS 客户端凭证），供非 root 守护进程 `vps-sub-meter.service` 使用。
 - **ClientBundle / Generation**：每次 `vsm apply` 通过真实 `xray run -test` 与 `sing-box check` 校验后，原子发布的 4 个精简客户端工件（`clash.yaml`、`sing-box.json`、`shadowrocket.txt`、`uri.txt`）。
 - **TrafficSnapshot**：严格按客户端视角映射（VPS `rx_bytes` = 客户端 `upload`，VPS `tx_bytes` = 客户端 `download`），结合 `boot_id` 防重启清零与双时区（`reset_tz` 计算账期，`display_tz` 展示）实时计算。
-- **0 返回交互约束**：`src/prompt.rs` 将 `0` 作为一等取消信号（`PromptError::Cancelled`），所有菜单与向导步骤输入 `0` 立即无副作用退回上一层。
+- **0 返回交互约束**：Bash 菜单 `scripts/ly.sh` 在确认前接受 `0` 或 EOF 并取消操作。Rust CLI 负责校验与写入，`config prepare` 在确认前只生成候选配置。

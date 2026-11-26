@@ -33,4 +33,4 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 sudo bash /usr/local/lib/vps-sub-meter/upgrade.sh --force-templates
 ```
 
-> 交互式菜单 `ly` -> `7. 系统维护与组件更新` -> `5. 在线检查并升级 vps-sub-meter 主程序` 同样调用 `/usr/local/lib/vps-sub-meter/upgrade.sh`。
+> 已安装的部署可直接执行 `sudo /usr/local/lib/vps-sub-meter/upgrade.sh`。升级会把 `ly` 切换到随包提供的 Bash 菜单，原来的 `vsm menu` 仍可打开同一菜单。

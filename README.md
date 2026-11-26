@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 
 ## 目录布局
 
-- 主程序与快捷命令：`/usr/local/bin/vps-sub-meter`（软链接 `vsm`、`ly`）
+- 主程序：`/usr/local/bin/vps-sub-meter`（快捷命令 `vsm`）。`ly` 指向外置 Bash 菜单 `/usr/local/lib/vps-sub-meter/ly.sh`。
 - 主配置：`/etc/vps-sub-meter/config.toml`（修改后运行 `vsm apply` 校验并生效）。主配置完整时可独立读取。旧配置缺少必填字段时，用默认模板补齐，主配置中已填写的值优先。
 - 默认配置模板：仓库的 `templates/default-config.toml` 安装到 `/etc/vps-sub-meter/templates/default-config.toml`。新装向导从这里读取默认值，确认后保存到主配置。升级默认保留已安装模板。
 - 密钥仓库：`/etc/vps-sub-meter/secrets.json`（`0600 root:root`，绝不进入订阅目录）
@@ -69,9 +69,25 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 ## 常用命令
 
 ```sh
-ly                     # 打开单屏 8 项交互菜单（任一步输入 0 立即返回）
-vsm status             # 查看当前双核状态与实时流量
+ly                     # 初始化、查订阅、管理 Token、轮换节点密钥或应用配置
+vsm status             # 查看订阅批次与实时流量
 vsm sub --qr           # 输出订阅链接与终端二维码
 vsm apply              # 校验外部配置/模板，检查官方内核后平滑生效
 vsm traffic checkpoint # 立即刷新流量账本到磁盘
+```
+
+节点、Argo 和流量账期在 `config.toml` 中编辑，保存后执行 `vsm apply`。Argo 隧道部署用 `argo.sh setup`。组件更新用 `cores.sh update`，证书续期用 `cert.sh renew`，内核参数调优用 `net.sh tune-sysctl`。这些脚本安装在 `/usr/local/lib/vps-sub-meter/`。
+
+## 脚本接口
+
+`vsm status --json` 返回字节数、重置时间戳和当前批次。管理员可用 `vsm sub --json` 读取 `direct` 及可选的 `argo` 订阅链接。这些链接含私有凭据。用 `--token-name 名称` 选择指定设备，用 `--qr-format clash|sing-box|shadowrocket` 选择终端二维码格式。
+
+`vsm token list --json` 只输出脱敏列表。`vsm token add 名称` 新增凭据，`vsm token rotate` 轮换默认凭据，`vsm token revoke 名称` 吊销指定凭据。`vsm keys rotate --yes` 轮换节点密钥并应用，客户端随后需要刷新订阅。
+
+`vsm config show` 输出当前配置 JSON，`--defaults` 读取新装模板。`vsm config prepare` 生成并校验候选配置。提交其 `.config` 字段给 `vsm config write` 可保存所预览的端口和设置。覆盖已有主配置需要显式指定 `--replace`，随后运行 `vsm apply`。
+
+```bash
+vsm config prepare --domain sub.example.com --public-ip 203.0.113.20 \
+  --interface eth0 --monthly-gib 500 --reset-day 1 --ports random > candidate.json
+jq -c '.config' candidate.json | vsm config write
 ```

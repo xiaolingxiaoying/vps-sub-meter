@@ -7,7 +7,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use vps_sub_meter::{apply, config::Config, menu, prompt::ConsoleIo, release, serve, traffic};
+use vps_sub_meter::{apply, config::Config, release, serve, traffic};
 
 #[derive(Parser)]
 #[command(
@@ -115,11 +115,7 @@ fn main() -> ExitCode {
 
 fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
     match command.unwrap_or(Commands::Menu) {
-        Commands::Menu => {
-            let mut io = ConsoleIo;
-            menu::run(root, &mut io);
-            Ok(())
-        }
+        Commands::Menu => launch_menu(root),
         Commands::Serve => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -256,5 +252,28 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
                 Ok(())
             }
         },
+    }
+}
+
+fn launch_menu(root: &Path) -> Result<(), String> {
+    let script = root.join("usr/local/lib/vps-sub-meter/ly.sh");
+    if !script.is_file() {
+        return Err(format!("找不到 {}，请重新安装菜单脚本", script.display()));
+    }
+    let mut command = std::process::Command::new("/bin/bash");
+    command.arg(script).arg("--root").arg(root);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        Err(command.exec().to_string())
+    }
+    #[cfg(not(unix))]
+    {
+        let status = command.status().map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("ly 退出: {status}"))
+        }
     }
 }

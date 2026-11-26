@@ -39,6 +39,11 @@ impl Sandbox {
     }
 
     fn cli(&self, args: &[&str], input: Option<&Value>) -> Output {
+        let input = input.map(Value::to_string);
+        self.cli_with_input(args, input.as_deref())
+    }
+
+    fn cli_with_input(&self, args: &[&str], input: Option<&str>) -> Output {
         let mut process = Command::new(env!("CARGO_BIN_EXE_vps-sub-meter"))
             .arg("--root")
             .arg(self.root())
@@ -57,7 +62,7 @@ impl Sandbox {
                 .stdin
                 .take()
                 .unwrap()
-                .write_all(input.to_string().as_bytes())
+                .write_all(input.as_bytes())
                 .unwrap();
         }
         process.wait_with_output().unwrap()
@@ -250,4 +255,65 @@ fn node_rotation_requires_confirmation_and_keeps_deployment_on_failed_preflight(
     assert_eq!(sandbox.json(&["sub", "--json"]), links);
     assert_ne!(sandbox.file(SECRETS_REL), secrets);
     assert_ne!(sandbox.file(CURRENT_REL), generation);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let script_path = "usr/local/lib/vps-sub-meter/ly.sh";
+    sandbox.write(script_path, include_str!("../scripts/ly.sh"));
+    let executable = sandbox.root().join("usr/local/bin/vps-sub-meter");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink(env!("CARGO_BIN_EXE_vps-sub-meter"), executable).unwrap();
+    let mut defaults: toml::Table =
+        toml::from_str(include_str!("../templates/default-config.toml")).unwrap();
+    defaults["nodes"]["vless_reality_pqc"]["enabled"] = toml::Value::Boolean(false);
+    defaults["nodes"]["vless_xhttp_pqc"]["enabled"] = toml::Value::Boolean(false);
+    sandbox.write(DEFAULT_CONFIG_REL, &toml::to_string(&defaults).unwrap());
+
+    let inputs = [
+        "1\n",
+        "sub.example.com\n",
+        "203.0.113.20\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+        "\n",
+    ];
+    let mut prefix = String::new();
+    for input in inputs {
+        for attempt in [prefix.clone(), format!("{prefix}0\n0\n")] {
+            let output = sandbox.cli_with_input(&["menu"], Some(&attempt));
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for path in [CONFIG_REL, SECRETS_REL, CURRENT_REL, SERVE_AUTH_REL] {
+                assert!(!sandbox.root().join(path).exists(), "{path}");
+            }
+        }
+        prefix.push_str(input);
+    }
+
+    let output = sandbox.cli_with_input(&["menu"], Some(&format!("{prefix}0\n")));
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty() || !String::from_utf8_lossy(&output.stderr).contains("错误:"));
+    let screen = String::from_utf8(output.stdout).unwrap();
+    let config = sandbox.json(&["config", "show"]);
+    for node in config["nodes"].as_object().unwrap().values() {
+        let name = node["name"].as_str().unwrap();
+        let port = node["port"].as_u64().unwrap();
+        assert!(screen.contains(&format!("{name}: {port}")));
+        assert!((20000..=29999).contains(&port));
+    }
+    assert!(sandbox.root().join(CURRENT_REL).exists());
+
+    let output = sandbox.cli_with_input(&[], Some("1\n\n\n\n\n\n\n\n0\n"));
+    assert!(output.status.success());
+    assert_eq!(sandbox.json(&["config", "show"]), config);
 }
