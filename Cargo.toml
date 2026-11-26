@@ -1,6 +1,6 @@
 [package]
 name = "vps-sub-meter"
-version = "2.1.1"
+version = "2.1.2"
 edition = "2024"
 license = "MIT OR Apache-2.0"
 description = "Dual-core (Xray + sing-box) PQC proxy & private subscription control plane"
