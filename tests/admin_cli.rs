@@ -406,8 +406,14 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     assert!(output.status.success());
     assert_eq!(sandbox.json(&["config", "show"]), config);
 
-    let cancelled = run_menu("11\n3\n36041\n0\n0\n");
+    let cancelled = run_menu("99\n11\n8\n3\n36041\n0\n0\n");
     assert!(cancelled.status.success());
+    let prompts = String::from_utf8_lossy(&cancelled.stderr);
+    assert!(prompts.contains("请输入 0–12 之间的编号"));
+    assert!(prompts.contains("请输入 0–7 之间的编号"));
+    let screen = String::from_utf8_lossy(&cancelled.stdout);
+    assert!(screen.contains("端口预览"));
+    assert!(!screen.contains('\u{1b}'));
     assert_eq!(sandbox.json(&["config", "show"]), config);
     let changed = run_menu("11\n3\n36041\n1\n0\n");
     assert!(changed.status.success());
