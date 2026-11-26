@@ -304,6 +304,10 @@ impl Config {
         }
     }
 
+    pub fn argo_subscription_base_url(&self, token: &str) -> String {
+        format!("https://{}/sub/{token}", self.argo.sub_domain.trim())
+    }
+
     pub fn subscription_base_url(&self, token: &str) -> String {
         if self.is_ip_mode() {
             let host = format_url_host(&self.public_ip);

@@ -10,13 +10,15 @@ use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, VAR_DIR};
+use crate::config::{Config, ConfigError, TrafficConfig, VAR_DIR};
 use crate::store;
 
 pub const TRAFFIC_REL: &str = "var/lib/vps-sub-meter/traffic-state.json";
 
 #[derive(Debug, thiserror::Error)]
 pub enum TrafficError {
+    #[error(transparent)]
+    Config(#[from] ConfigError),
     #[error("读取网卡流量统计失败: {0}")]
     Io(#[from] std::io::Error),
     #[error("解析流量状态失败: {0}")]
@@ -174,8 +176,53 @@ pub fn load_state(root: &Path) -> Result<Option<TrafficState>, TrafficError> {
 
 pub fn save_state(root: &Path, state: &TrafficState) -> Result<(), TrafficError> {
     let bytes = serde_json::to_vec_pretty(state).map_err(|e| TrafficError::Parse(e.to_string()))?;
-    store::write_atomic(&state_path(root), &bytes, 0o640)?;
+    let path = state_path(root);
+    store::write_atomic(&path, &bytes, 0o640)?;
+    if root == Path::new("/") {
+        store::chown_name(&path, Some("vps-sub-meter"), Some("vps-sub-meter"));
+    }
     Ok(())
+}
+
+/// Updates traffic settings and reschedules the active cycle without changing its counters.
+pub fn configure(root: &Path, edit: impl FnOnce(&mut TrafficConfig)) -> Result<bool, TrafficError> {
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    let mut config = Config::load(root)?;
+    let previous = config.traffic.clone();
+    edit(&mut config.traffic);
+    if config.traffic == previous {
+        return Ok(false);
+    }
+    config.validate()?;
+
+    if config.traffic.reset_day != previous.reset_day
+        || config.traffic.reset_time != previous.reset_time
+        || config.traffic.reset_tz != previous.reset_tz
+    {
+        let now = Utc::now();
+        if let Some(state) = load_state(root)?
+            && state.interface == config.interface
+            && now.timestamp() < state.cycle_next_reset_ts
+        {
+            let next_reset = next_reset_after(&config, now)?;
+            if next_reset != state.cycle_next_reset_ts {
+                let updated = TrafficState {
+                    cycle_next_reset_ts: next_reset,
+                    ..state.clone()
+                };
+                save_state(root, &updated)?;
+                if let Err(error) = config.save(root) {
+                    save_state(root, &state).map_err(|rollback| {
+                        TrafficError::Schedule(format!("{error}，恢复原账期失败: {rollback}"))
+                    })?;
+                    return Err(error.into());
+                }
+                return Ok(true);
+            }
+        }
+    }
+    config.save(root)?;
+    Ok(true)
 }
 
 /// Pure read-only live traffic calculation for HTTP responses and menu status.
@@ -235,6 +282,14 @@ pub fn checkpoint_at(
     now: DateTime<Utc>,
 ) -> Result<TrafficSnapshot, TrafficError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    checkpoint_locked(root, config, now)
+}
+
+fn checkpoint_locked(
+    root: &Path,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> Result<TrafficSnapshot, TrafficError> {
     let (rx, tx) = read_iface_counters(root, &config.interface)?;
     let boot_id = read_boot_id(root);
     let next_reset = next_reset_after(config, now)?;
@@ -284,6 +339,12 @@ pub fn checkpoint(root: &Path, config: &Config) -> Result<TrafficSnapshot, Traff
     checkpoint_at(root, config, Utc::now())
 }
 
+pub fn checkpoint_current(root: &Path) -> Result<TrafficSnapshot, TrafficError> {
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    let config = Config::load(root)?;
+    checkpoint_locked(root, &config, Utc::now())
+}
+
 /// Manually sets the current cycle's client upload (VPS rx) and download (VPS tx) bytes.
 pub fn set_used(
     root: &Path,
@@ -292,6 +353,25 @@ pub fn set_used(
     download_bytes: u64,
 ) -> Result<TrafficSnapshot, TrafficError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    set_used_locked(root, config, upload_bytes, download_bytes)
+}
+
+pub fn set_used_current(
+    root: &Path,
+    upload_bytes: u64,
+    download_bytes: u64,
+) -> Result<TrafficSnapshot, TrafficError> {
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    let config = Config::load(root)?;
+    set_used_locked(root, &config, upload_bytes, download_bytes)
+}
+
+fn set_used_locked(
+    root: &Path,
+    config: &Config,
+    upload_bytes: u64,
+    download_bytes: u64,
+) -> Result<TrafficSnapshot, TrafficError> {
     let (rx, tx) = read_iface_counters(root, &config.interface)?;
     let boot_id = read_boot_id(root);
     let next_reset = next_reset_after(config, Utc::now())?;

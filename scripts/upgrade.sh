@@ -267,10 +267,6 @@ if [[ "$EXISTING_GEN" == "sbctl" ]]; then
     import_legacy_sbctl_cert "www.bing.com" || true
   fi
   bash /usr/local/lib/vps-sub-meter/migrate-sbctl.sh
-  if grep -q '^enabled = true' /etc/vps-sub-meter/config.toml \
-     && [[ -r /etc/cloudflared/sbctl-argo.token ]]; then
-    bash /usr/local/lib/vps-sub-meter/argo.sh setup "$(cat /etc/cloudflared/sbctl-argo.token)"
-  fi
 elif [[ "$EXISTING_GEN" == "sub-srv-v1" ]]; then
   # Copy Caddy certificate if present before stopping Caddy
   if [[ -n "$DOMAIN_VAL" ]]; then
@@ -319,6 +315,10 @@ find /var/lib/vps-sub-meter/certificates -type f -exec chmod 0640 {} +
 
 # 6. Apply & verify dual-core configs transactionally
 /usr/local/bin/vsm apply
+if [[ "$EXISTING_GEN" == sbctl && -s /etc/cloudflared/sbctl-argo.token ]] \
+   && /usr/local/bin/vsm config show | jq -e '.argo.enabled' >/dev/null; then
+  bash /usr/local/lib/vps-sub-meter/argo.sh setup --token-stdin <<<"$(cat /etc/cloudflared/sbctl-argo.token)"
+fi
 /usr/local/bin/vsm status
 echo "升级完成！可运行 \`vsm sub --qr\` 获取订阅，或运行 \`ly\` 打开交互菜单。"
 }

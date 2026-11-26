@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::json;
 use vps_sub_meter::{
     apply,
-    config::{Config, ConfigError, VAR_DIR, pct},
+    config::{Config, ConfigError, VAR_DIR, check_node_port, pct},
     qr,
     secrets::{Secrets, SubscriptionToken, random_urlsafe},
     store,
@@ -28,6 +28,8 @@ pub enum ConfigCmd {
         #[arg(long)]
         replace: bool,
     },
+    /// 从标准输入读取候选配置，校验并应用，失败时恢复原配置
+    Apply,
 }
 
 #[derive(Args)]
@@ -44,12 +46,46 @@ pub struct PrepareArgs {
     reset_day: Option<u8>,
     #[arg(long)]
     ports: Option<Ports>,
+    /// 覆盖单个节点端口，可重复指定，例如 anytls_tcp=24443
+    #[arg(long = "port", value_parser = parse_node_port, value_name = "节点=端口")]
+    node_ports: Vec<(NodeName, u16)>,
 }
 
 #[derive(Clone, ValueEnum)]
 enum Ports {
     Keep,
+    Defaults,
     Random,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+#[value(rename_all = "snake_case")]
+enum NodeName {
+    VlessRealityPqc,
+    VlessXhttpPqc,
+    AnytlsTcp,
+    Hysteria2Hop,
+    TuicBbr,
+}
+
+impl NodeName {
+    fn port(self, config: &mut Config) -> &mut u16 {
+        match self {
+            Self::VlessRealityPqc => &mut config.nodes.vless_reality_pqc.port,
+            Self::VlessXhttpPqc => &mut config.nodes.vless_xhttp_pqc.port,
+            Self::AnytlsTcp => &mut config.nodes.anytls_tcp.port,
+            Self::Hysteria2Hop => &mut config.nodes.hysteria2_hop.port,
+            Self::TuicBbr => &mut config.nodes.tuic_bbr.port,
+        }
+    }
+}
+
+fn parse_node_port(value: &str) -> Result<(NodeName, u16), String> {
+    let (name, port) = value.split_once('=').ok_or("端口格式应为 节点=端口")?;
+    let name = NodeName::from_str(name, false)?;
+    let port = port.parse().map_err(|_| "端口必须是 1–65535 之间的整数")?;
+    check_node_port(port).map_err(|e| e.to_string())?;
+    Ok((name, port))
 }
 
 #[derive(Subcommand)]
@@ -69,7 +105,7 @@ pub enum TokenCmd {
 
 #[derive(Args)]
 pub struct SubArgs {
-    #[arg(long, conflicts_with_all = ["qr", "qr_format"])]
+    #[arg(long, conflicts_with_all = ["qr", "qr_format", "argo"])]
     json: bool,
     #[arg(long)]
     qr: bool,
@@ -77,6 +113,9 @@ pub struct SubArgs {
     qr_format: Option<QrFormat>,
     #[arg(long)]
     token_name: Option<String>,
+    /// 输出 Argo 隧道订阅及其二维码
+    #[arg(long)]
+    argo: bool,
 }
 
 #[derive(Clone, ValueEnum)]
@@ -111,12 +150,24 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
             config.interface = args.interface.unwrap_or(config.interface);
             config.traffic.monthly_gb = args.monthly_gib.unwrap_or(config.traffic.monthly_gb);
             config.traffic.reset_day = args.reset_day.unwrap_or(config.traffic.reset_day);
-            if matches!(
-                args.ports
-                    .unwrap_or(if fresh { Ports::Random } else { Ports::Keep }),
-                Ports::Random
-            ) {
-                randomize_node_ports(&mut config, root == Path::new("/"))?;
+            match args
+                .ports
+                .unwrap_or(if fresh && args.node_ports.is_empty() {
+                    Ports::Random
+                } else {
+                    Ports::Keep
+                }) {
+                Ports::Keep => {}
+                Ports::Defaults => {
+                    let mut defaults = Config::load_defaults(root).map_err(|e| e.to_string())?;
+                    for &node in NodeName::value_variants() {
+                        *node.port(&mut config) = *node.port(&mut defaults);
+                    }
+                }
+                Ports::Random => randomize_node_ports(&mut config, root == Path::new("/"))?,
+            }
+            for (node, port) in args.node_ports {
+                *node.port(&mut config) = port;
             }
             config.validate().map_err(|e| e.to_string())?;
             let mode = if config.is_ip_mode() {
@@ -129,8 +180,7 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
             print_json(&json!({"config": config, "mode": mode, "tls_sni": config.tls_sni()}))
         }
         ConfigCmd::Write { replace } => {
-            let config: Config = serde_json::from_reader(io::stdin().lock())
-                .map_err(|e| format!("配置 JSON 无效: {e}"))?;
+            let config = read_candidate_config()?;
             config.validate().map_err(|e| e.to_string())?;
             let _lock = store::lock_exclusive(&root.join(VAR_DIR)).map_err(|e| e.to_string())?;
             if !replace {
@@ -142,7 +192,17 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
             }
             config.save(root).map_err(|e| e.to_string())
         }
+        ConfigCmd::Apply => {
+            let config = read_candidate_config()?;
+            let report = apply::apply_candidate(root, config).map_err(|e| e.to_string())?;
+            println!("已应用并发布批次 {}", report.generation_id);
+            Ok(())
+        }
     }
+}
+
+fn read_candidate_config() -> Result<Config, String> {
+    serde_json::from_reader(io::stdin().lock()).map_err(|e| format!("配置 JSON 无效: {e}"))
 }
 
 pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
@@ -223,18 +283,27 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
         Some(name) => &secrets.tokens[token_index(&secrets.tokens, &name)?].token,
         None => secrets.primary_token().ok_or("尚未生成订阅凭据")?,
     };
-    let base = config.subscription_base_url(token);
+    let direct_base = config.subscription_base_url(token);
     if args.json {
-        let argo = config.argo.enabled.then(|| {
-            subscription_links(&format!(
-                "https://{}/sub/{token}",
-                config.argo.sub_domain.trim()
-            ))
-        });
-        return print_json(&json!({"direct": subscription_links(&base), "argo": argo}));
+        let argo = config
+            .argo
+            .enabled
+            .then(|| subscription_links(&config.argo_subscription_base_url(token)));
+        return print_json(&json!({"direct": subscription_links(&direct_base), "argo": argo}));
     }
 
-    if config.is_ip_mode() {
+    let (base, profile_name) = if args.argo {
+        if !config.argo.enabled {
+            return Err("Argo 隧道订阅尚未启用".into());
+        }
+        (
+            config.argo_subscription_base_url(token),
+            &config.argo.profile_name,
+        )
+    } else {
+        (direct_base, &config.profile_name)
+    };
+    if !args.argo && config.is_ip_mode() {
         eprintln!(
             "提示: 当前未配置域名，订阅使用明文 HTTP，存在泄露风险；请运行 ly 选择「6. 配置 / 切换域名 (HTTPS)」绑定域名。"
         );
@@ -250,7 +319,7 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
             QrFormat::SingBox => format!(
                 "sing-box://import-remote-profile?url={}#{}",
                 pct(&format!("{base}/sing-box.json")),
-                pct(&config.profile_name)
+                pct(profile_name)
             ),
             QrFormat::Shadowrocket => format!("{base}/shadowrocket.txt"),
         };

@@ -213,7 +213,7 @@ enum LoopMode {
 
 pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::load(&root)?;
-    let _ = traffic::checkpoint(&root, &config);
+    let _ = traffic::checkpoint_current(&root);
 
     let budget = Arc::new(Mutex::new(IpBudget::new()));
     let mut handles = Vec::new();
@@ -225,9 +225,7 @@ pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error +
         interval.tick().await;
         loop {
             interval.tick().await;
-            if let Ok(cfg) = Config::load(&ckpt_root) {
-                let _ = traffic::checkpoint(&ckpt_root, &cfg);
-            }
+            let _ = traffic::checkpoint_current(&ckpt_root);
         }
     });
 
@@ -559,7 +557,7 @@ fn route_request(
     let userinfo = snap.as_ref().map(|s| s.userinfo_header());
     let (base_url, profile_title) = if is_argo {
         (
-            format!("https://{}/sub/{token}", config.argo.sub_domain.trim()),
+            config.argo_subscription_base_url(token),
             config.argo.profile_name.as_str(),
         )
     } else {

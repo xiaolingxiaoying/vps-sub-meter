@@ -108,6 +108,34 @@ fn config_preview_and_write_share_validated_ports() {
     let fixed = sandbox.prepare(&["--ports", "keep"]);
     assert_eq!(fixed["config"]["nodes"], defaults["nodes"]);
     assert_eq!(fixed["mode"], "https-shared");
+    let customized = sandbox.prepare(&[
+        "--ports",
+        "defaults",
+        "--port",
+        "anytls_tcp=24443",
+        "--port",
+        "vless_reality_pqc=24444",
+    ]);
+    assert_eq!(customized["config"]["nodes"]["anytls_tcp"]["port"], 24443);
+    assert_eq!(
+        customized["config"]["nodes"]["vless_reality_pqc"]["port"],
+        24444
+    );
+    assert_eq!(customized["mode"], "https");
+    assert!(
+        !sandbox
+            .cli(
+                &[
+                    "config",
+                    "prepare",
+                    "--domain=sub.example.com",
+                    "--port=anytls_tcp=2053"
+                ],
+                None
+            )
+            .status
+            .success()
+    );
     let preview = sandbox.prepare(&["--monthly-gib", "0", "--reset-day", "11"]);
     assert_eq!(preview["mode"], "https-shared");
     assert_eq!(preview["config"]["nodes"]["vless_reality_pqc"]["port"], 443);
@@ -188,6 +216,12 @@ fn subscriptions_and_tokens_use_published_auth() {
     ] {
         assert!(sandbox.ok(args, None).contains("\u{1b}["));
     }
+    let argo_link = original["argo"]["shadowrocket"].as_str().unwrap();
+    let direct_link = original["direct"]["shadowrocket"].as_str().unwrap();
+    let output = sandbox.ok(&["sub", "--argo", "--qr-format", "shadowrocket"], None);
+    assert!(output.contains(argo_link));
+    assert!(!output.contains(direct_link));
+    assert!(output.contains(&vps_sub_meter::qr::render_ansi(argo_link).unwrap()));
 
     sandbox.ok(&["token", "add", "phone"], None);
     assert!(
@@ -331,7 +365,7 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
         "203.0.113.20\n",
         "\n",
         "\n",
-        "\n",
+        "2\n",
         "\n",
         "\n",
     ];
@@ -371,6 +405,95 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     let output = run_menu("1\n\n\n\n\n\n\n\n0\n");
     assert!(output.status.success());
     assert_eq!(sandbox.json(&["config", "show"]), config);
+
+    let cancelled = run_menu("11\n3\n36041\n0\n0\n");
+    assert!(cancelled.status.success());
+    assert_eq!(sandbox.json(&["config", "show"]), config);
+    let changed = run_menu("11\n3\n36041\n1\n0\n");
+    assert!(changed.status.success());
+    let mut expected = config;
+    expected["nodes"]["anytls_tcp"]["port"] = json!(36041);
+    assert_eq!(sandbox.json(&["config", "show"]), expected);
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_menu_updates_traffic_schedule_without_losing_usage() {
+    use std::os::unix::fs::symlink;
+    use vps_sub_meter::traffic::TRAFFIC_REL;
+
+    let sandbox = Sandbox::new();
+    let script = sandbox.write(
+        "usr/local/lib/vps-sub-meter/ly.sh",
+        include_str!("../scripts/ly.sh"),
+    );
+    let executable = sandbox.root().join("usr/local/bin/vps-sub-meter");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink(env!("CARGO_BIN_EXE_vps-sub-meter"), executable).unwrap();
+    let mut config = sandbox.prepare(&["--ports", "keep"])["config"].clone();
+    config["traffic"]["reset_day"] = json!(11);
+    sandbox.ok(&["config", "write"], Some(&config));
+
+    let run_menu = |input: &str| {
+        let mut process = Command::new("/bin/bash")
+            .arg(&script)
+            .arg("--root")
+            .arg(sandbox.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    };
+
+    let calibration = run_menu("10\n2\n0.0\n2.5\n1\n0\n");
+    assert!(String::from_utf8_lossy(&calibration.stdout).contains("已校准"));
+    sandbox.write("sys/class/net/eth0/statistics/rx_bytes", "1300");
+    let before = sandbox.json(&["status", "--json"]);
+    let original_state = sandbox.file(TRAFFIC_REL);
+    run_menu("10\n1\n0.0\n23\n09:45\nUTC\nAsia/Tokyo\n0\n0\n");
+    let invalid = run_menu("10\n1\n0.0\n23\n09:45\nInvalid/Zone\nAsia/Tokyo\n1\n0\n");
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("不是有效 IANA 时区"));
+    assert_eq!(sandbox.file(TRAFFIC_REL), original_state);
+    assert_eq!(sandbox.json(&["config", "show"]), config);
+
+    let changed = run_menu("10\n1\n0.0\n23\n09:45\nUTC\nAsia/Tokyo\n1\n0\n");
+    assert!(String::from_utf8_lossy(&changed.stdout).contains("流量设置已生效"));
+    let after = sandbox.json(&["status", "--json"]);
+    assert_eq!(after["traffic"]["upload_bytes"], 300);
+    assert_eq!(after["traffic"]["download_bytes"], 2_684_354_560_u64);
+    assert_eq!(after["traffic"]["monthly_limit_bytes"], 0);
+    assert_eq!(after["traffic"]["display_tz"], "Asia/Tokyo");
+    assert_ne!(
+        after["traffic"]["next_reset_ts"],
+        before["traffic"]["next_reset_ts"]
+    );
+    let date =
+        chrono::DateTime::from_timestamp(after["traffic"]["next_reset_ts"].as_i64().unwrap(), 0)
+            .unwrap();
+    assert_eq!(date.format("%d %H:%M").to_string(), "23 09:45");
+    assert_eq!(sandbox.json(&["config", "show"])["nodes"], config["nodes"]);
+    assert!(!sandbox.root().join(CURRENT_REL).exists());
+
+    let checkpoint = run_menu("10\n3\n1\n0\n");
+    assert!(String::from_utf8_lossy(&checkpoint.stdout).contains("已保存流量账本"));
+    assert_eq!(
+        sandbox.json(&["status", "--json"])["traffic"],
+        after["traffic"]
+    );
 }
 
 #[cfg(unix)]

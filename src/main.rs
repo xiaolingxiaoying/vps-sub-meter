@@ -72,6 +72,19 @@ enum TrafficCmd {
     Checkpoint,
     /// 手动校准已用上传和下载 GiB
     Set { upload_gib: f64, download_gib: f64 },
+    /// 更新月流量上限与重置时间
+    Configure {
+        #[arg(long)]
+        monthly_gib: Option<f64>,
+        #[arg(long)]
+        reset_day: Option<u8>,
+        #[arg(long)]
+        reset_time: Option<String>,
+        #[arg(long)]
+        reset_tz: Option<String>,
+        #[arg(long)]
+        display_tz: Option<String>,
+    },
 }
 
 fn main() -> ExitCode {
@@ -193,10 +206,9 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
             Ok(())
         }
         Commands::Traffic { cmd } => {
-            let cfg = Config::load(root).map_err(|e| e.to_string())?;
             match cmd {
                 TrafficCmd::Checkpoint => {
-                    let s = traffic::checkpoint(root, &cfg).map_err(|e| e.to_string())?;
+                    let s = traffic::checkpoint_current(root).map_err(|e| e.to_string())?;
                     println!(
                         "已保存流量账本: 上传 {}, 下载 {}",
                         traffic::format_iec(s.upload_bytes),
@@ -215,9 +227,8 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
                         return Err("流量必须是非负数字".into());
                     }
                     let gib = 1024.0 * 1024.0 * 1024.0;
-                    let s = traffic::set_used(
+                    let s = traffic::set_used_current(
                         root,
-                        &cfg,
                         (upload_gib * gib) as u64,
                         (download_gib * gib) as u64,
                     )
@@ -226,6 +237,36 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
                         "已校准: 上传 {}, 下载 {}",
                         traffic::format_iec(s.upload_bytes),
                         traffic::format_iec(s.download_bytes)
+                    );
+                }
+                TrafficCmd::Configure {
+                    monthly_gib,
+                    reset_day,
+                    reset_time,
+                    reset_tz,
+                    display_tz,
+                } => {
+                    let changed = traffic::configure(root, |cfg| {
+                        cfg.monthly_gb = monthly_gib.unwrap_or(cfg.monthly_gb);
+                        cfg.reset_day = reset_day.unwrap_or(cfg.reset_day);
+                        if let Some(value) = reset_time {
+                            cfg.reset_time = value;
+                        }
+                        if let Some(value) = reset_tz {
+                            cfg.reset_tz = value;
+                        }
+                        if let Some(value) = display_tz {
+                            cfg.display_tz = value;
+                        }
+                    })
+                    .map_err(|e| e.to_string())?;
+                    println!(
+                        "{}",
+                        if changed {
+                            "流量设置已生效"
+                        } else {
+                            "流量设置未修改"
+                        }
                     );
                 }
             }

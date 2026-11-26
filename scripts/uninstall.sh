@@ -166,7 +166,7 @@ fi
 
 # 4. 清理 certbot deploy hook（绝不删除 /etc/letsencrypt/live/*）与 Argo token
 rm -f "${prefix}/etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook"
-rm -f "${prefix}/etc/cloudflared/vps-sub-meter-argo.token"
+rm -f "${prefix}/etc/cloudflared/vps-sub-meter-argo.token" "${prefix}/etc/cloudflared/vps-sub-meter-argo.yml"
 if [[ -d "${prefix}/etc/cloudflared" ]]; then
   rmdir "${prefix}/etc/cloudflared" 2>/dev/null || true
 fi

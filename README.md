@@ -14,11 +14,11 @@
 | 4 | `hysteria2-hop` | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
 | 5 | `tuic-bbr` | sing-box `1.14+` | 随机 UDP | TUIC v5 + BBR + 0-RTT + Native UDP |
 
-全新安装时，端口方案默认采用「`vless-reality-pqc` 优先使用 `443/tcp`（域名模式下与订阅 HTTPS 通过 SNI 复用 `443/tcp`，若本机 `443` 已被占用则自动回退到随机高位端口），其余 4 个节点在 `20000–29999` 内随机分配」，确认后写入 `/etc/vps-sub-meter/config.toml`。后续应用和升级会沿用已保存的端口，重新运行向导时默认也会保留现有端口。证书管理采用纯 Shell `acme.sh`，新装部署无需 Python 依赖。
+新装向导可使用模板默认端口、随机端口，或逐个手动输入端口。随机方案让 `vless-reality-pqc` 优先使用可用的 `443/tcp`，其余节点使用 `20000–29999`。域名模式下 REALITY 可与订阅 HTTPS 通过 SNI 复用 `443/tcp`。已有部署可通过 `ly` 的 `11. 节点端口设置` 修改单个节点、套用模板或重新随机分配。证书管理采用纯 Shell `acme.sh`，新装部署无需 Python 依赖。
 
 REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
 
-另可选原生集成 **Cloudflare Argo 隧道优选订阅**（在 `vsm apply` 时读取 `/etc/vps-sub-meter/argo-ips.txt` 预编译并展开优选 IP，更新优选 IP 后执行一次 `vsm apply` 即可生效）。
+另可选原生集成 **Cloudflare Argo 隧道优选订阅**。`ly` 的 `2. 查看订阅与二维码` 可以先选直连或 Argo，再选客户端格式。`7. 管理 Argo 隧道` 可检查本机与公网订阅。节点和订阅域名的 DNS 需指向该隧道，域名相同时本机生成的回源规则按 URL 路径分流。若在 Cloudflare 控制台配置了回源规则，也应将 `/sub/…` 指向订阅监听端口，并将节点 WebSocket 路径指向对应 WS 入站。更新 `/etc/vps-sub-meter/argo-ips.txt` 后运行 `vsm apply` 可重新生成优选订阅。
 
 ## 快速安装与全版本平滑升级
 
@@ -92,15 +92,19 @@ vsm apply              # 校验外部配置/模板，检查官方内核后平滑
 vsm traffic checkpoint # 立即刷新流量账本到磁盘
 ```
 
-节点、Argo 和流量账期在 `config.toml` 中编辑，保存后执行 `vsm apply`。Argo 隧道部署用 `argo.sh setup`。组件更新用 `cores.sh update`，证书续期用 `cert.sh renew`，内核参数调优用 `net.sh tune-sysctl`。这些脚本安装在 `/usr/local/lib/vps-sub-meter/`。
+运行 `ly`，选择 `10. 流量账期与校准`，可修改月流量上限、每月重置日、时间和时区，也可校准已用上传和下载或立即保存流量账本。修改重置日程时保留本期已用流量。
+
+`ly` 的 `12. 证书管理` 显示当前证书的签发者和有效期，也可续期、同步或申请域名证书。IP 模式可补齐自签证书。
+
+节点和 Argo 在 `config.toml` 中编辑，保存后执行 `vsm apply`。Argo 隧道部署用 `argo.sh setup`。组件更新用 `cores.sh update`，证书续期用 `cert.sh renew`，内核参数调优用 `net.sh tune-sysctl`。这些脚本安装在 `/usr/local/lib/vps-sub-meter/`。
 
 ## 脚本接口
 
-`vsm status --json` 返回字节数、重置时间戳和当前批次。管理员可用 `vsm sub --json` 读取 `direct` 及可选的 `argo` 订阅链接。这些链接含私有凭据。用 `--token-name 名称` 选择指定设备，用 `--qr-format clash|sing-box|shadowrocket` 选择终端二维码格式。
+`vsm status --json` 返回字节数、重置时间戳和当前批次。管理员可用 `vsm sub --json` 读取 `direct` 及可选的 `argo` 订阅链接。这些链接含私有凭据。用 `--token-name 名称` 选择指定设备，用 `--qr-format clash|sing-box|shadowrocket` 选择终端二维码格式。Argo Shadowrocket 二维码可用 `vsm sub --argo --qr-format shadowrocket` 输出。
 
 `vsm token list --json` 只输出脱敏列表。`vsm token add 名称` 新增凭据，`vsm token rotate` 轮换默认凭据，`vsm token revoke 名称` 吊销指定凭据。`vsm keys rotate --yes` 轮换节点密钥并应用，客户端随后需要刷新订阅。
 
-`vsm config show` 输出当前配置 JSON，`--defaults` 读取新装模板。`vsm config prepare` 生成并校验候选配置。提交其 `.config` 字段给 `vsm config write` 可保存所预览的端口和设置。覆盖已有主配置需要显式指定 `--replace`，随后运行 `vsm apply`。
+`vsm config show` 输出当前配置 JSON，`--defaults` 读取新装模板。`vsm config prepare` 生成并校验候选配置，可用 `--port anytls_tcp=24443` 指定单个节点端口。将 `.config` 字段交给 `vsm config apply` 可直接校验并应用，失败时恢复原配置。`vsm config write` 仅保存，覆盖已有主配置需要显式指定 `--replace`。
 
 ```bash
 vsm config prepare --domain sub.example.com --public-ip 203.0.113.20 \

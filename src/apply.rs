@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use crate::config::{Config, VAR_DIR};
+use crate::config::{CONFIG_REL, Config, VAR_DIR};
 use crate::render::{self, ClientBundle, CompiledDeployment};
 use crate::secrets::{Secrets, random_hex};
 use crate::store::{
@@ -82,16 +82,28 @@ pub fn check_kernel_config(binary: &Path, is_xray: bool, json_doc: &str) -> Resu
 }
 
 pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
-    apply_with_keys(root, false)
+    apply_with_keys(root, false, None)
 }
 
 pub fn rotate_node_keys(root: &Path) -> Result<ApplyReport, ApplyError> {
-    apply_with_keys(root, true)
+    apply_with_keys(root, true, None)
 }
 
-fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyError> {
+pub fn apply_candidate(root: &Path, config: Config) -> Result<ApplyReport, ApplyError> {
+    config.validate()?;
+    apply_with_keys(root, false, Some(config))
+}
+
+fn apply_with_keys(
+    root: &Path,
+    rotate_keys: bool,
+    candidate: Option<Config>,
+) -> Result<ApplyReport, ApplyError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
-    let config = Config::load(root)?;
+    let (config, previous_config) = match candidate {
+        Some(config) => (config, Some(backup(root, CONFIG_REL, 0o640)?)),
+        None => (Config::load(root)?, None),
+    };
     let xray_bin = find_bin(root, "usr/local/bin/xray");
     let sb_bin = find_bin(root, "usr/local/bin/sing-box");
 
@@ -137,7 +149,22 @@ fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyE
         backup(root, SERVE_AUTH_REL, 0o640)?,
         backup(root, CURRENT_REL, 0o640)?,
     ];
+    let previously_active = if previous_config.is_some() && root == Path::new("/") {
+        [
+            "vps-sub-meter.service",
+            "vps-sub-meter-xray.service",
+            "vps-sub-meter-singbox.service",
+        ]
+        .into_iter()
+        .filter(|unit| is_active(unit))
+        .collect::<Vec<_>>()
+    } else {
+        Vec::new()
+    };
     let publish = || {
+        if previous_config.is_some() {
+            config.save(root)?;
+        }
         if secrets != previous {
             secrets.save(root)?;
         }
@@ -155,6 +182,17 @@ fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyE
         Ok(result) => result,
         Err(error) => {
             let error = restore_files(&backups, error);
+            let error = if let Some(previous) = previous_config {
+                let error = restore_files(&[previous], error);
+                for unit in previously_active {
+                    if unit == "vps-sub-meter.service" || !is_active(unit) {
+                        let _ = systemctl(&["restart", unit]);
+                    }
+                }
+                error
+            } else {
+                error
+            };
             if store::current_generation(root)
                 .is_ok_and(|generation| generation.is_none_or(|meta| meta.id != gen_id))
             {
@@ -168,6 +206,7 @@ fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyE
     if root == Path::new("/") {
         fix_live_permissions(&gen_dir);
         sync_live_firewall(&config);
+        refresh_live_argo(&config);
     }
 
     Ok(ApplyReport {
@@ -322,6 +361,20 @@ fn commit_server_and_services(
         backups[0].bytes.as_deref() != compiled.xray_server.as_deref().map(str::as_bytes);
     let sb_changed =
         backups[1].bytes.as_deref() != compiled.singbox_server.as_deref().map(str::as_bytes);
+    let xray_releases_https_port = !config.is_ip_mode()
+        && !config.xray_fronts_443()
+        && backups[0]
+            .bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
+            .is_some_and(|doc| {
+                doc["inbounds"].as_array().is_some_and(|inbounds| {
+                    inbounds.iter().any(|inbound| {
+                        inbound["tag"] == "sni-demux-443"
+                            && inbound["port"] == config.server.https_port
+                    })
+                })
+            });
 
     let write_configs = || -> Result<(), ApplyError> {
         if let Some(doc) = &compiled.xray_server {
@@ -357,6 +410,9 @@ fn commit_server_and_services(
     fix_live_permissions(&root.join(VAR_DIR).join("generations").join(&meta.id));
     let apply_result = (|| -> Result<(bool, bool), ApplyError> {
         systemctl(&["daemon-reload"])?;
+        if xray_releases_https_port && is_active("vps-sub-meter-xray.service") {
+            systemctl(&["stop", "vps-sub-meter-xray.service"])?;
+        }
         systemctl(&["enable", "vps-sub-meter.service"])?;
         if !is_active("vps-sub-meter.service") {
             systemctl(&["start", "vps-sub-meter.service"])?;
@@ -574,6 +630,19 @@ fn sync_live_firewall(config: &Config) {
     let specs = collect_firewall_ports(config);
     if !specs.is_empty() {
         let _ = Command::new(helper).arg("sync-ufw").args(&specs).status();
+    }
+}
+
+fn refresh_live_argo(config: &Config) {
+    let helper = Path::new("/usr/local/lib/vps-sub-meter/argo.sh");
+    if config.argo.enabled
+        && helper.is_file()
+        && !Command::new(helper)
+            .arg("refresh")
+            .status()
+            .is_ok_and(|status| status.success())
+    {
+        eprintln!("Argo 回源规则更新失败，可运行 ly 并选择 7 检查隧道");
     }
 }
 

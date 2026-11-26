@@ -20,7 +20,7 @@ reset_time = "00:00"
 reset_tz = "America/Los_Angeles"
 display_tz = "Asia/Shanghai"
 
-# 节点端口用于向导中的固定端口方案。新装时默认另行随机分配。
+# 新装向导可使用以下模板端口，也可选择随机或手动指定。
 [nodes.vless_reality_pqc]
 enabled = true
 name = "vless-reality-pqc"

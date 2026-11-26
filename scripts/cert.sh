@@ -145,6 +145,28 @@ run_acme_issue() {
 }
 
 case "$CMD" in
+  status)
+    cert_root=/
+    if [[ ${1:-} == --root ]]; then cert_root=${2:?missing root}; shift 2; fi
+    domain=${1:?usage: cert.sh status [--root dir] <domain>}
+    if [[ ! $domain =~ ^[[:alnum:]][[:alnum:].-]*$ || $domain == *..* ]]; then
+      echo '无效证书名称' >&2
+      exit 2
+    fi
+    cert=${cert_root%/}$CERT_BASE/$domain/fullchain.pem
+    if [[ ! -s $cert ]]; then
+      printf '未找到当前证书。\n'
+      exit 0
+    fi
+    openssl x509 -in "$cert" -noout -subject -issuer -startdate -enddate
+    if ! openssl x509 -in "$cert" -noout -checkend 0 >/dev/null; then
+      printf '状态：已过期\n'
+    elif ! openssl x509 -in "$cert" -noout -checkend 2592000 >/dev/null; then
+      printf '状态：30 天内到期\n'
+    else
+      printf '状态：有效\n'
+    fi
+    ;;
   issue)
     domain=${1:?usage: cert.sh issue <domain> [email]}
     email=${2:-}
@@ -206,7 +228,7 @@ case "$CMD" in
     fi
     ;;
   *)
-    echo "用法: $0 {issue|reload|sync|renew|self-signed} ..." >&2
+    echo "用法: $0 {status|issue|reload|sync|renew|self-signed} ..." >&2
     exit 2
     ;;
 esac
