@@ -234,6 +234,11 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
         return print_json(&json!({"direct": subscription_links(&base), "argo": argo}));
     }
 
+    if config.is_ip_mode() {
+        eprintln!(
+            "提示: 当前未配置域名，订阅使用明文 HTTP，存在泄露风险；请运行 ly 选择「6. 配置 / 切换域名 (HTTPS)」绑定域名。"
+        );
+    }
     println!("看板:         {base}/index");
     println!("Clash/Mihomo: {base}/clash.yaml");
     println!("sing-box:     {base}/sing-box.json");

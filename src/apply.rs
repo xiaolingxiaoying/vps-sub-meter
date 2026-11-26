@@ -528,7 +528,11 @@ pub(crate) fn collect_firewall_ports(config: &Config) -> Vec<String> {
             specs.push(spec);
         }
     };
-    if !config.domain.is_empty() {
+    if config.is_ip_mode() {
+        if config.server.http_fallback_port > 0 {
+            push(format!("{}/tcp", config.server.http_fallback_port));
+        }
+    } else {
         if config.server.acme_port > 0 {
             push(format!("{}/tcp", config.server.acme_port));
         }
@@ -683,6 +687,28 @@ mod tests {
             ports,
             vec![
                 "80/tcp",
+                "443/tcp",
+                "2053/tcp",
+                "2083/tcp",
+                "34443/udp",
+                "30000:35000/udp",
+                "2096/udp",
+            ]
+        );
+    }
+
+    #[test]
+    fn collects_http_fallback_port_in_ip_mode() {
+        let cfg = Config {
+            domain: String::new(),
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        let ports = collect_firewall_ports(&cfg);
+        assert_eq!(
+            ports,
+            vec![
+                "2080/tcp",
                 "443/tcp",
                 "2053/tcp",
                 "2083/tcp",

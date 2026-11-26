@@ -70,7 +70,7 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 
 可通过交互菜单或独立卸载脚本清理（默认保留 `/etc/letsencrypt/live/*` 与 `/root/.acme.sh` 证书，并在彻底卸载前自动备份配置与流量账本至 `/root/vsm-uninstall-backup-*.tar.gz`）：
 
-- 交互菜单：运行 `ly` → 选择 `8. 卸载 vps-sub-meter`（菜单同时内置内核更新与 Argo 隧道管理）
+- 交互菜单：运行 `ly` → 选择 `9. 卸载 vps-sub-meter`（菜单同时内置内核更新、`6. 配置 / 切换域名 (HTTPS)` 与 Argo 隧道管理）
 - 本地卸载：
   ```bash
   sudo bash /usr/local/lib/vps-sub-meter/uninstall.sh

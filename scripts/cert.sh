@@ -8,6 +8,7 @@ CERT_BASE="/var/lib/vps-sub-meter/certificates"
 WEBROOT="/var/lib/vps-sub-meter/acme-webroot"
 ACME_SH_HOME="${ACME_SH_HOME:-/root/.acme.sh}"
 ACME_SH="${ACME_SH_HOME}/acme.sh"
+HOOK_PATH="/etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook"
 
 CMD="${1:-}"
 shift || true
@@ -85,6 +86,25 @@ install_acme_cert() {
   fix_perms_and_reload "$domain"
 }
 
+install_certbot_deploy_hook() {
+  local domain=${1:?missing domain}
+  [[ -d /etc/letsencrypt/renewal ]] || return 0
+  mkdir -p "$(dirname "$HOOK_PATH")"
+  cat >"$HOOK_PATH" <<EOF
+#!/bin/sh
+set -eu
+/usr/local/lib/vps-sub-meter/cert.sh sync "$domain"
+EOF
+  chmod 0755 "$HOOK_PATH"
+}
+
+has_valid_letsencrypt_cert() {
+  local domain=${1:?missing domain}
+  local live="/etc/letsencrypt/live/${domain}"
+  [[ -r "${live}/fullchain.pem" && -r "${live}/privkey.pem" ]] || return 1
+  openssl x509 -checkend 1296000 -noout -in "${live}/fullchain.pem" >/dev/null 2>&1
+}
+
 sync_legacy_letsencrypt() {
   local domain=${1:?missing domain}
   local live="/etc/letsencrypt/live/${domain}"
@@ -101,6 +121,7 @@ sync_legacy_letsencrypt() {
     || cat "${live}/privkey.pem" > "${dest}/.privkey.pem.tmp"
   mv -f "${dest}/.fullchain.pem.tmp" "${dest}/fullchain.pem"
   mv -f "${dest}/.privkey.pem.tmp" "${dest}/privkey.pem"
+  install_certbot_deploy_hook "$domain"
   fix_perms_and_reload "$domain"
 }
 
@@ -127,7 +148,12 @@ case "$CMD" in
   issue)
     domain=${1:?usage: cert.sh issue <domain> [email]}
     email=${2:-}
-    run_acme_issue "$domain" "$email"
+    if has_valid_letsencrypt_cert "$domain"; then
+      echo "检测到现有有效的 Let's Encrypt 证书，直接同步并复用。"
+      sync_legacy_letsencrypt "$domain"
+    else
+      run_acme_issue "$domain" "$email"
+    fi
     ;;
   reload)
     fix_perms_and_reload "${1:?usage: cert.sh reload <domain>}"

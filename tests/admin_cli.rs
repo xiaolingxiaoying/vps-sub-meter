@@ -375,6 +375,81 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
 
 #[cfg(unix)]
 #[test]
+fn bash_menu_domain_config_switches_ip_http_to_https() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let script_path = "usr/local/lib/vps-sub-meter/ly.sh";
+    sandbox.write(script_path, include_str!("../scripts/ly.sh"));
+    let executable = sandbox.root().join("usr/local/bin/vps-sub-meter");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink(env!("CARGO_BIN_EXE_vps-sub-meter"), executable).unwrap();
+
+    let mut cfg = sandbox.json(&["config", "show", "--defaults"]);
+    cfg["domain"] = json!("");
+    cfg["public_ip"] = json!("203.0.113.20");
+    cfg["nodes"]["vless_reality_pqc"]["enabled"] = json!(false);
+    cfg["nodes"]["vless_xhttp_pqc"]["enabled"] = json!(false);
+    sandbox.ok(&["config", "write"], Some(&cfg));
+    sandbox.ok(&["apply"], None);
+
+    let before_sub = sandbox.json(&["sub", "--json"]);
+    assert!(
+        before_sub["direct"]["clash"]
+            .as_str()
+            .unwrap()
+            .starts_with("http://203.0.113.20:2080/sub/")
+    );
+    assert_eq!(sandbox.json(&["status", "--json"])["https_enabled"], false);
+
+    let run_menu = |input: &str| -> Output {
+        let mut process = Command::new("/bin/bash")
+            .arg(sandbox.root().join(script_path))
+            .arg("--root")
+            .arg(sandbox.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        process.wait_with_output().unwrap()
+    };
+
+    // Pure IP must be rejected when binding domain for HTTPS
+    let rejected = run_menu("6\n1\n203.0.113.20\n0\n");
+    assert!(rejected.status.success());
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("不能为纯 IP"));
+    assert_eq!(sandbox.json(&["config", "show"])["domain"], "");
+
+    // Valid domain switches subscription from HTTP fallback to HTTPS while preserving ports
+    let switched = run_menu("6\n1\nsub.example.com\n\n1\n0\n");
+    assert!(
+        switched.status.success(),
+        "{}",
+        String::from_utf8_lossy(&switched.stderr)
+    );
+    let after_cfg = sandbox.json(&["config", "show"]);
+    assert_eq!(after_cfg["domain"], "sub.example.com");
+    assert_eq!(after_cfg["nodes"], cfg["nodes"]);
+
+    let after_sub = sandbox.json(&["sub", "--json"]);
+    assert!(
+        after_sub["direct"]["clash"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://sub.example.com/sub/")
+    );
+    assert_eq!(sandbox.json(&["status", "--json"])["https_enabled"], true);
+}
+
+#[cfg(unix)]
+#[test]
 fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
     let seed_sandbox = |sandbox: &Sandbox| {
         for rel in [

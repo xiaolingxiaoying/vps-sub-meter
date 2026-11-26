@@ -39,6 +39,7 @@ confirm() {
 
 initialize() {
   local current host domain ip interface quota reset_day ports candidate email='' mode sni
+  local acme_port https_port
   local detected default_ip replace=() show=() default_ports=2
   if [[ -e $config_path || -L $config_path ]]; then
     replace=(--replace)
@@ -60,7 +61,7 @@ initialize() {
     fi
   fi
   host=$(jq -r '.domain' <<<"$current") || return 1
-  ask '订阅域名或公网 IP' "${host:-$default_ip}" || return 1
+  ask '订阅域名（推荐，启用 HTTPS；填公网 IP 则退回明文 HTTP）' "${host:-$default_ip}" || return 1
   host=$answer
   if [[ $host == *:* || $host =~ ^([0-9]+\.){3}[0-9]+$ ]]; then
     domain=''
@@ -93,6 +94,11 @@ initialize() {
   fi
   jq -r '"部署模式：\(.mode)  网卡：\(.config.interface)  月额度：\(.config.traffic.monthly_gb) GiB  重置日：\(.config.traffic.reset_day)",
     (.config.nodes[] | "  \(.name): \(.port)")' <<<"$candidate" || return 1
+  if [[ $mode == ip ]]; then
+    printf '警告：未配置域名，订阅将使用不安全的明文 HTTP 端口，代理 TLS 节点使用自签证书。建议输入已解析到本机的域名以启用 HTTPS。\n' >&2
+  else
+    printf '订阅协议：HTTPS (https://%s/sub/...)\n' "$sni"
+  fi
   confirm '确认保存配置并部署' 1 || return 1
 
   if [[ $root == / ]]; then
@@ -101,6 +107,9 @@ initialize() {
     if [[ $mode == ip ]]; then
       "$script_dir/cert.sh" self-signed "$sni" || return 1
     else
+      acme_port=$(jq -r '.config.server.acme_port' <<<"$candidate") || return 1
+      https_port=$(jq -r '.config.server.https_port' <<<"$candidate") || return 1
+      "$script_dir/net.sh" sync-ufw "${acme_port}/tcp" "${https_port}/tcp" || true
       "$script_dir/cert.sh" issue "$sni" "$email" || return 1
     fi
   fi
@@ -231,6 +240,62 @@ manage_argo() {
   esac
 }
 
+manage_domain() {
+  if [[ ! -e $config_path ]]; then
+    printf '尚未初始化配置，请先选择 1 初始化。\n' >&2
+    return 1
+  fi
+  local current cur_domain acme_port https_port new_domain email='' candidate mode sni
+  current=$(vsm config show) || return 1
+  cur_domain=$(jq -r '.domain' <<<"$current") || return 1
+  acme_port=$(jq -r '.server.acme_port' <<<"$current") || return 1
+  https_port=$(jq -r '.server.https_port' <<<"$current") || return 1
+
+  if [[ -z $cur_domain ]]; then
+    printf '当前状态: 未配置域名（明文 HTTP 模式，存在泄露风险）\n' >&2
+  else
+    printf '当前域名: %s（HTTPS 加密模式）\n' "$cur_domain" >&2
+  fi
+
+  ask '域名与 HTTPS 操作 (1 绑定/更换域名并启用 HTTPS / 2 同步或续期当前证书 / 0 返回)' 1 || return 0
+  case $answer in
+    1)
+      ask '输入已解析到本机的域名（用于启用 HTTPS）' "$cur_domain" || return 0
+      new_domain=$answer
+      if [[ -z $new_domain || $new_domain == *:* || $new_domain =~ ^([0-9]+\.){3}[0-9]+$ ]]; then
+        printf '请输入有效域名（不能为纯 IP），以签发 TLS 证书并启用 HTTPS。\n' >&2
+        return 1
+      fi
+      ask 'ACME 邮箱（回车跳过）' '' || return 0
+      email=$answer
+      candidate=$(vsm config prepare --domain="$new_domain" --ports=keep) || return 1
+      mode=$(jq -r '.mode' <<<"$candidate") || return 1
+      sni=$(jq -r '.tls_sni' <<<"$candidate") || return 1
+      acme_port=$(jq -r '.config.server.acme_port' <<<"$candidate") || return 1
+      https_port=$(jq -r '.config.server.https_port' <<<"$candidate") || return 1
+      printf '订阅模式：%s  订阅域名：%s  (https://%s/sub/...)\n' "$mode" "$sni" "$sni" >&2
+      confirm '确认保存域名配置、签发/同步 TLS 证书并启用 HTTPS' 1 || return 0
+      if [[ $root == / ]]; then
+        "$script_dir/net.sh" sync-ufw "${acme_port}/tcp" "${https_port}/tcp" || true
+        "$script_dir/cert.sh" issue "$sni" "$email" || return 1
+      fi
+      jq -c '.config' <<<"$candidate" | vsm config write --replace || return 1
+      vsm apply
+      ;;
+    2)
+      if [[ -z $cur_domain ]]; then
+        printf '尚未配置域名，请先选择 1 绑定域名。\n' >&2
+        return 1
+      fi
+      if [[ $root == / ]]; then
+        "$script_dir/net.sh" sync-ufw "${acme_port}/tcp" "${https_port}/tcp" || true
+        "$script_dir/cert.sh" renew "$cur_domain"
+      fi
+      ;;
+    *) printf '无效选择。\n' >&2; return 1 ;;
+  esac
+}
+
 main() {
   if ! command -v jq >/dev/null 2>&1; then
     printf '找不到 jq，请安装后再使用 ly。\n' >&2
@@ -241,8 +306,8 @@ main() {
     printf '\nvps-sub-meter · 管理菜单\n'
     if [[ -e $config_path ]]; then vsm status; fi
     printf '%s\n' '1. 初始化 / 重新配置' '2. 查看订阅与二维码' '3. 管理订阅凭据' \
-      '4. 轮换节点密钥' '5. 更新内核 (Xray / sing-box)' '6. 管理 Argo 隧道' \
-      '7. 应用配置' '8. 卸载 vps-sub-meter' '0. 退出'
+      '4. 轮换节点密钥' '5. 更新内核 (Xray / sing-box)' '6. 配置 / 切换域名 (HTTPS)' \
+      '7. 管理 Argo 隧道' '8. 应用配置' '9. 卸载 vps-sub-meter' '0. 退出'
     ask '选择操作' || exit 0
     case $answer in
       1) initialize ;;
@@ -250,9 +315,10 @@ main() {
       3) tokens ;;
       4) if confirm '确认轮换全部节点密钥，客户端需刷新订阅' 2; then vsm keys rotate --yes; fi ;;
       5) update_cores ;;
-      6) manage_argo ;;
-      7) vsm apply ;;
-      8) uninstall_vsm ;;
+      6) manage_domain ;;
+      7) manage_argo ;;
+      8) vsm apply ;;
+      9) uninstall_vsm ;;
       *) printf '无效选择。\n' >&2 ;;
     esac
   done

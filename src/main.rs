@@ -120,6 +120,7 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
                 return admin::print_json(&json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "address": cfg.primary_host(),
+                    "https_enabled": !cfg.is_ip_mode(),
                     "interface": snap.interface,
                     "traffic": {
                         "upload_bytes": snap.upload_bytes,
@@ -133,14 +134,29 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
                     "argo_enabled": cfg.argo.enabled,
                 }));
             }
+            let sub_proto = if cfg.is_ip_mode() {
+                format!(
+                    "HTTP (明文 :{}，未配置域名，建议运行 ly 选择 6 绑定域名启用 HTTPS)",
+                    cfg.server.http_fallback_port
+                )
+            } else if cfg.server.https_port == 443 {
+                format!("HTTPS (https://{})", cfg.domain.trim())
+            } else {
+                format!(
+                    "HTTPS (https://{}:{})",
+                    cfg.domain.trim(),
+                    cfg.server.https_port
+                )
+            };
             println!(
-                "vps-sub-meter v{}\n域名/地址: {}\n网卡: {}\n上传: {}\n下载: {}\n总计: {} / {}\n下次重置: {} ({})",
+                "vps-sub-meter v{}\n域名/地址: {}\n订阅协议: {}\n网卡: {}\n上传: {}\n下载: {}\n总计: {} / {}\n下次重置: {} ({})",
                 env!("CARGO_PKG_VERSION"),
                 if cfg.is_ip_mode() {
                     &cfg.public_ip
                 } else {
                     &cfg.domain
                 },
+                sub_proto,
                 snap.interface,
                 traffic::format_iec(snap.upload_bytes),
                 traffic::format_iec(snap.download_bytes),
