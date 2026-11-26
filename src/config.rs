@@ -5,7 +5,7 @@
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::{Path, PathBuf};
 
 use crate::fs_util;
@@ -194,7 +194,7 @@ impl Config {
     pub fn save(&self, root: &Path) -> Result<(), ConfigError> {
         self.validate()?;
         let text = self.to_commented_toml();
-        fs_util::write_atomic(&Self::path(root), text.as_bytes(), 0o640)?;
+        fs_util::write_atomic_preserving_owner(&Self::path(root), text.as_bytes(), 0o640)?;
         Ok(())
     }
 
@@ -555,6 +555,62 @@ impl Config {
              # 密钥、UUID、密码与订阅 Token 单独存放在 /etc/vps-sub-meter/secrets.json (0600)。\n\n{raw}"
         )
     }
+}
+
+pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 10_000;
+
+    let mut reserved = BTreeSet::from([
+        cfg.server.acme_port,
+        cfg.server.https_port,
+        cfg.server.loopback_https_port,
+        cfg.server.http_fallback_port,
+        cfg.nodes.vless_reality_pqc.loopback_port,
+    ]);
+    reserved.extend(cfg.server.extra_https_port);
+    if cfg.argo.enabled {
+        reserved.insert(cfg.argo.loopback_sub_port);
+        reserved.extend(cfg.argo.ws_inbounds.iter().map(|ws| ws.port));
+    }
+    let hop_range = cfg
+        .parse_hop_range()
+        .map_err(|e| e.to_string())?
+        .map(|(start, end)| start..=end);
+
+    for (port, udp) in [
+        (&mut cfg.nodes.vless_reality_pqc.port, false),
+        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
+        (&mut cfg.nodes.anytls_tcp.port, false),
+        (&mut cfg.nodes.hysteria2_hop.port, true),
+        (&mut cfg.nodes.tuic_bbr.port, true),
+    ] {
+        let mut bytes = [0; 4];
+        getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
+        let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
+        let selected = (0..COUNT)
+            .map(|offset| FIRST + (start + offset) % COUNT)
+            .find(|candidate| {
+                if reserved.contains(candidate)
+                    || hop_range
+                        .as_ref()
+                        .is_some_and(|range| range.contains(candidate))
+                {
+                    return false;
+                }
+                let addr = (Ipv4Addr::UNSPECIFIED, *candidate);
+                !probe_local_ports
+                    || if udp {
+                        UdpSocket::bind(addr).is_ok()
+                    } else {
+                        TcpListener::bind(addr).is_ok()
+                    }
+            })
+            .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
+        *port = selected;
+        reserved.insert(selected);
+    }
+    Ok(())
 }
 
 fn read_defaults(path: &Path) -> Result<toml::Table, ConfigError> {

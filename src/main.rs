@@ -1,12 +1,13 @@
 //! `vps-sub-meter` (`vsm` / `ly`) CLI entrypoint.
 
+mod admin;
+
 use clap::{Parser, Subcommand};
+use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use vps_sub_meter::{
-    apply, config::Config, menu, prompt::ConsoleIo, qr, release, secrets::Secrets, serve, traffic,
-};
+use vps_sub_meter::{apply, config::Config, menu, prompt::ConsoleIo, release, serve, traffic};
 
 #[derive(Parser)]
 #[command(
@@ -30,11 +31,26 @@ enum Commands {
     /// 校验配置与模板、生成新订阅批次并平滑重启变动的服务
     Apply,
     /// 查看当前运行状态、节点摘要与实时流量
-    Status,
-    /// 打印订阅链接 (加 --qr 输出终端二维码)
-    Sub {
+    Status {
         #[arg(long)]
-        qr: bool,
+        json: bool,
+    },
+    /// 打印订阅链接 (加 --qr 输出终端二维码)
+    Sub(admin::SubArgs),
+    /// 查看、预览与保存部署配置
+    Config {
+        #[command(subcommand)]
+        cmd: admin::ConfigCmd,
+    },
+    /// 管理订阅凭据
+    Token {
+        #[command(subcommand)]
+        cmd: admin::TokenCmd,
+    },
+    /// 管理代理节点密钥
+    Keys {
+        #[command(subcommand)]
+        cmd: KeysCmd,
     },
     /// 流量账期操作
     Traffic {
@@ -45,6 +61,15 @@ enum Commands {
     Release {
         #[command(subcommand)]
         cmd: ReleaseCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeysCmd {
+    /// 轮换节点密钥并应用配置
+    Rotate {
+        #[arg(long)]
+        yes: bool,
     },
 }
 
@@ -115,9 +140,27 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
             );
             Ok(())
         }
-        Commands::Status => {
+        Commands::Status { json } => {
             let cfg = Config::load(root).map_err(|e| e.to_string())?;
             let snap = traffic::snapshot(root, &cfg).map_err(|e| e.to_string())?;
+            if json {
+                let generation = apply::current_generation(root).map_err(|e| e.to_string())?;
+                return admin::print_json(&json!({
+                    "version": env!("CARGO_PKG_VERSION"),
+                    "address": cfg.primary_host(),
+                    "interface": snap.interface,
+                    "traffic": {
+                        "upload_bytes": snap.upload_bytes,
+                        "download_bytes": snap.download_bytes,
+                        "total_used_bytes": snap.total_used(),
+                        "monthly_limit_bytes": snap.monthly_limit_bytes,
+                        "next_reset_ts": snap.next_reset_ts,
+                        "display_tz": cfg.traffic.display_tz,
+                    },
+                    "generation": generation,
+                    "argo_enabled": cfg.argo.enabled,
+                }));
+            }
             println!(
                 "vps-sub-meter v{}\n域名/地址: {}\n网卡: {}\n上传: {}\n下载: {}\n总计: {} / {}\n下次重置: {} ({})",
                 env!("CARGO_PKG_VERSION"),
@@ -148,22 +191,17 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
             }
             Ok(())
         }
-        Commands::Sub { qr: show_qr } => {
-            let cfg = Config::load(root).map_err(|e| e.to_string())?;
-            let sec = Secrets::load_or_default(root).map_err(|e| e.to_string())?;
-            let tok = sec
-                .primary_token()
-                .ok_or_else(|| "尚未生成订阅凭据".to_owned())?;
-            let base = cfg.subscription_base_url(tok);
-            println!("看板:         {base}/index");
-            println!("Clash/Mihomo: {base}/clash.yaml");
-            println!("sing-box:     {base}/sing-box.json");
-            println!("Shadowrocket: {base}/shadowrocket.txt");
-            println!("URI:          {base}/uri.txt");
-            if show_qr {
-                let ansi = qr::render_ansi(&format!("{base}/clash.yaml"))?;
-                print!("{ansi}");
+        Commands::Sub(args) => admin::sub(root, args),
+        Commands::Config { cmd } => admin::config(root, cmd),
+        Commands::Token { cmd } => admin::token(root, cmd),
+        Commands::Keys {
+            cmd: KeysCmd::Rotate { yes },
+        } => {
+            if !yes {
+                return Err("确认轮换全部节点密钥时需要 --yes".into());
             }
+            let report = apply::rotate_node_keys(root).map_err(|e| e.to_string())?;
+            println!("节点密钥已轮换并发布批次 {}", report.generation_id);
             Ok(())
         }
         Commands::Traffic { cmd } => {

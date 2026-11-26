@@ -130,19 +130,29 @@ pub fn check_kernel_config(binary: &Path, is_xray: bool, json_doc: &str) -> Resu
 }
 
 pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
-    let lock_file = fs_util::open_lock(&root.join(VAR_DIR))?;
-    fs2::FileExt::lock_exclusive(&lock_file)?;
+    apply_with_keys(root, false)
+}
 
+pub fn rotate_node_keys(root: &Path) -> Result<ApplyReport, ApplyError> {
+    apply_with_keys(root, true)
+}
+
+fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyError> {
+    let _lock = fs_util::lock_exclusive(&root.join(VAR_DIR))?;
     let config = Config::load(root)?;
     let xray_bin = find_bin(root, "usr/local/bin/xray");
     let sb_bin = find_bin(root, "usr/local/bin/sing-box");
 
-    let mut secrets = Secrets::load_or_default(root)?;
-    let secrets_before = secrets.clone();
+    let previous = Secrets::load_or_default(root)?;
+    let mut secrets = if rotate_keys {
+        Secrets {
+            tokens: previous.tokens.clone(),
+            ..Secrets::default()
+        }
+    } else {
+        previous.clone()
+    };
     secrets.ensure_populated(&config, xray_bin.as_deref())?;
-    if secrets != secrets_before {
-        secrets.save(root)?;
-    }
 
     let compiled = compiler::compile_all(root, &config, &secrets)?;
 
@@ -198,26 +208,6 @@ pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
         files.push("sing-box.json".to_owned());
     }
 
-    // Write derived auth file for the non-root subscription daemon (only token SHA-256 hashes + Argo WS client fields).
-    let serve_auth = ServeAuth {
-        token_sha256: secrets
-            .tokens
-            .iter()
-            .map(|t| {
-                Sha256::digest(t.token.as_bytes())
-                    .iter()
-                    .map(|b| format!("{b:02x}"))
-                    .collect()
-            })
-            .collect(),
-        argo_ws: secrets.argo_ws.clone(),
-    };
-    fs_util::write_atomic(
-        &root.join(SERVE_AUTH_REL),
-        &serde_json::to_vec_pretty(&serve_auth).unwrap(),
-        0o640,
-    )?;
-
     let meta = GenerationMeta {
         id: gen_id.clone(),
         files,
@@ -225,8 +215,29 @@ pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
         singbox_nodes: compiled.clients.singbox_node_names.clone(),
     };
 
-    let (xray_restarted, singbox_restarted) =
-        commit_server_and_services(root, &config, &compiled, &meta)?;
+    let backups = [
+        backup(root, crate::secrets::SECRETS_REL, 0o600)?,
+        backup(root, SERVE_AUTH_REL, 0o640)?,
+        backup(root, CURRENT_REL, 0o640)?,
+    ];
+    let publish = || {
+        if secrets != previous {
+            secrets.save(root)?;
+        }
+        let auth = ServeAuth {
+            token_sha256: token_hashes(&secrets.tokens),
+            argo_ws: secrets.argo_ws,
+        };
+        write_auth(root, &auth)?;
+        commit_server_and_services(root, &config, &compiled, &meta)
+    };
+    let (xray_restarted, singbox_restarted) = match publish() {
+        Ok(result) => result,
+        Err(error) => {
+            let _ = fs::remove_dir_all(&gen_dir);
+            return Err(restore_files(&backups, error));
+        }
+    };
 
     prune_old_generations(root, &gen_id);
     if root == Path::new("/") {
@@ -243,6 +254,85 @@ pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
     })
 }
 
+pub fn update_tokens(
+    root: &Path,
+    update: impl FnOnce(&mut Vec<crate::secrets::SubscriptionToken>) -> Result<(), String>,
+) -> Result<(), ApplyError> {
+    let _lock = fs_util::lock_exclusive(&root.join(VAR_DIR))?;
+    let mut secrets = Secrets::load_or_default(root)?;
+    let mut auth: ServeAuth =
+        serde_json::from_slice(&fs_util::read_no_follow(&root.join(SERVE_AUTH_REL))?)
+            .map_err(|e| ApplyError::System(format!("serve-auth.json 损坏: {e}")))?;
+    update(&mut secrets.tokens).map_err(ApplyError::System)?;
+    auth.token_sha256 = token_hashes(&secrets.tokens);
+
+    let previous = backup(root, crate::secrets::SECRETS_REL, 0o600)?;
+    secrets.save(root)?;
+    write_auth(root, &auth).map_err(|error| restore_files(&[previous], error))
+}
+
+fn token_hashes(tokens: &[crate::secrets::SubscriptionToken]) -> Vec<String> {
+    tokens
+        .iter()
+        .map(|token| format!("{:x}", Sha256::digest(token.token.as_bytes())))
+        .collect()
+}
+
+fn write_auth(root: &Path, auth: &ServeAuth) -> Result<(), ApplyError> {
+    fs_util::write_atomic_preserving_owner(
+        &root.join(SERVE_AUTH_REL),
+        &serde_json::to_vec_pretty(auth).unwrap(),
+        0o640,
+    )?;
+    Ok(())
+}
+
+struct FileBackup {
+    path: PathBuf,
+    bytes: Option<Vec<u8>>,
+    mode: u32,
+}
+
+fn backup(root: &Path, relative: &str, mode: u32) -> std::io::Result<FileBackup> {
+    let path = root.join(relative);
+    let bytes = match fs_util::read_no_follow(&path) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error),
+    };
+    Ok(FileBackup { path, bytes, mode })
+}
+
+fn restore_files(backups: &[FileBackup], error: ApplyError) -> ApplyError {
+    let failures: Vec<_> = backups
+        .iter()
+        .filter_map(|backup| {
+            let result = match &backup.bytes {
+                Some(bytes)
+                    if fs_util::read_no_follow(&backup.path).as_ref().ok() == Some(bytes) =>
+                {
+                    Ok(())
+                }
+                Some(bytes) => {
+                    fs_util::write_atomic_preserving_owner(&backup.path, bytes, backup.mode)
+                }
+                None => match fs::remove_file(&backup.path) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    result => result,
+                },
+            };
+            result
+                .err()
+                .map(|error| format!("{}: {error}", backup.path.display()))
+        })
+        .collect();
+    if failures.is_empty() {
+        error
+    } else {
+        ApplyError::System(format!("{error}，回滚失败: {}", failures.join("；")))
+    }
+}
+
 fn find_bin(root: &Path, rel: &str) -> Option<PathBuf> {
     let p = root.join(rel);
     p.is_file().then_some(p)
@@ -254,36 +344,56 @@ fn commit_server_and_services(
     compiled: &CompiledDeployment,
     meta: &GenerationMeta,
 ) -> Result<(bool, bool), ApplyError> {
-    let prev_xray = fs_util::read_to_string_no_follow(&root.join(XRAY_CONFIG_REL)).ok();
-    let prev_sb = fs_util::read_to_string_no_follow(&root.join(SINGBOX_CONFIG_REL)).ok();
+    let backups = [
+        backup(root, XRAY_CONFIG_REL, 0o640)?,
+        backup(root, SINGBOX_CONFIG_REL, 0o640)?,
+        backup(root, "etc/systemd/system/vps-sub-meter.service", 0o644)?,
+        backup(root, "etc/systemd/system/vps-sub-meter-xray.service", 0o644)?,
+        backup(
+            root,
+            "etc/systemd/system/vps-sub-meter-singbox.service",
+            0o644,
+        )?,
+    ];
+    let xray_changed =
+        backups[0].bytes.as_deref() != compiled.xray_server.as_deref().map(str::as_bytes);
+    let sb_changed =
+        backups[1].bytes.as_deref() != compiled.singbox_server.as_deref().map(str::as_bytes);
 
-    let xray_changed = prev_xray.as_deref() != compiled.xray_server.as_deref();
-    let sb_changed = prev_sb.as_deref() != compiled.singbox_server.as_deref();
-
-    if let Some(doc) = &compiled.xray_server {
-        fs_util::ensure_dir_mode(&root.join("etc/vps-sub-meter/xray"), 0o750)?;
-        fs_util::write_atomic(&root.join(XRAY_CONFIG_REL), doc.as_bytes(), 0o640)?;
-    }
-    if let Some(doc) = &compiled.singbox_server {
-        fs_util::ensure_dir_mode(&root.join("etc/vps-sub-meter/sing-box"), 0o750)?;
-        fs_util::write_atomic(&root.join(SINGBOX_CONFIG_REL), doc.as_bytes(), 0o640)?;
-    }
-
-    write_systemd_units(root, config)?;
-    fs_util::write_atomic(
-        &root.join(CURRENT_REL),
-        &serde_json::to_vec_pretty(meta).unwrap(),
-        0o640,
-    )?;
+    let write_configs = || -> Result<(), ApplyError> {
+        if let Some(doc) = &compiled.xray_server {
+            fs_util::ensure_dir_mode(&root.join("etc/vps-sub-meter/xray"), 0o750)?;
+            fs_util::write_atomic_preserving_owner(
+                &root.join(XRAY_CONFIG_REL),
+                doc.as_bytes(),
+                0o640,
+            )?;
+        }
+        if let Some(doc) = &compiled.singbox_server {
+            fs_util::ensure_dir_mode(&root.join("etc/vps-sub-meter/sing-box"), 0o750)?;
+            fs_util::write_atomic_preserving_owner(
+                &root.join(SINGBOX_CONFIG_REL),
+                doc.as_bytes(),
+                0o640,
+            )?;
+        }
+        write_systemd_units(root, config)?;
+        fs_util::write_atomic_preserving_owner(
+            &root.join(CURRENT_REL),
+            &serde_json::to_vec_pretty(meta).unwrap(),
+            0o640,
+        )?;
+        Ok(())
+    };
+    write_configs().map_err(|error| restore_files(&backups, error))?;
 
     if root != Path::new("/") {
         return Ok((xray_changed, sb_changed));
     }
 
     fix_live_permissions();
-    systemctl(&["daemon-reload"])?;
-
     let apply_result = (|| -> Result<(bool, bool), ApplyError> {
+        systemctl(&["daemon-reload"])?;
         systemctl(&["enable", "vps-sub-meter.service"])?;
         if !is_active("vps-sub-meter.service") {
             systemctl(&["start", "vps-sub-meter.service"])?;
@@ -330,20 +440,19 @@ fn commit_server_and_services(
         Ok((xr_restarted, sb_restarted))
     })();
 
-    if let Err(err) = apply_result {
-        // Automatic rollback of previous server configs
-        if let Some(old) = prev_xray {
-            let _ = fs_util::write_atomic(&root.join(XRAY_CONFIG_REL), old.as_bytes(), 0o640);
-            let _ = systemctl(&["restart", "vps-sub-meter-xray.service"]);
+    apply_result.map_err(|error| {
+        let error = restore_files(&backups, error);
+        let _ = systemctl(&["daemon-reload"]);
+        for (backup, unit) in [
+            (&backups[0], "vps-sub-meter-xray.service"),
+            (&backups[1], "vps-sub-meter-singbox.service"),
+        ] {
+            if backup.bytes.is_some() {
+                let _ = systemctl(&["restart", unit]);
+            }
         }
-        if let Some(old) = prev_sb {
-            let _ = fs_util::write_atomic(&root.join(SINGBOX_CONFIG_REL), old.as_bytes(), 0o640);
-            let _ = systemctl(&["restart", "vps-sub-meter-singbox.service"]);
-        }
-        return Err(err);
-    }
-
-    Ok(apply_result.unwrap())
+        error
+    })
 }
 
 pub fn write_systemd_units(root: &Path, config: &Config) -> Result<(), ApplyError> {

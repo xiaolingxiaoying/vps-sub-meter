@@ -2,14 +2,17 @@
 //! Every input, selection, and confirmation accepts `0` to immediately cancel
 //! and return without mutating files.
 
+#[cfg(test)]
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::IpAddr;
 use std::path::Path;
 use std::process::Command;
 
 use crate::apply;
 use crate::compiler;
-use crate::config::{Config, ConfigError, is_valid_host, is_valid_hostname, is_valid_interface};
+use crate::config::{
+    Config, ConfigError, is_valid_host, is_valid_hostname, is_valid_interface, randomize_node_ports,
+};
 use crate::prompt::{PromptError, PromptIo, PromptResult, ask_menu_choice, ask_parsed, ask_text};
 use crate::qr;
 use crate::secrets::{Secrets, SubscriptionToken, random_urlsafe};
@@ -339,62 +342,6 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
             }
         }
         Err(e) => io.report(&format!("应用失败（已保留原有运行状态）: {e}")),
-    }
-    Ok(())
-}
-
-fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
-    const FIRST: u16 = 20_000;
-    const COUNT: u16 = 10_000;
-
-    let mut reserved = BTreeSet::from([
-        cfg.server.acme_port,
-        cfg.server.https_port,
-        cfg.server.loopback_https_port,
-        cfg.server.http_fallback_port,
-        cfg.nodes.vless_reality_pqc.loopback_port,
-    ]);
-    reserved.extend(cfg.server.extra_https_port);
-    if cfg.argo.enabled {
-        reserved.insert(cfg.argo.loopback_sub_port);
-        reserved.extend(cfg.argo.ws_inbounds.iter().map(|ws| ws.port));
-    }
-    let hop_range = cfg
-        .parse_hop_range()
-        .map_err(|e| e.to_string())?
-        .map(|(start, end)| start..=end);
-
-    for (port, udp) in [
-        (&mut cfg.nodes.vless_reality_pqc.port, false),
-        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
-        (&mut cfg.nodes.anytls_tcp.port, false),
-        (&mut cfg.nodes.hysteria2_hop.port, true),
-        (&mut cfg.nodes.tuic_bbr.port, true),
-    ] {
-        let mut bytes = [0; 4];
-        getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
-        let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
-        let selected = (0..COUNT)
-            .map(|offset| FIRST + (start + offset) % COUNT)
-            .find(|candidate| {
-                if reserved.contains(candidate)
-                    || hop_range
-                        .as_ref()
-                        .is_some_and(|range| range.contains(candidate))
-                {
-                    return false;
-                }
-                let addr = (Ipv4Addr::UNSPECIFIED, *candidate);
-                !probe_local_ports
-                    || if udp {
-                        UdpSocket::bind(addr).is_ok()
-                    } else {
-                        TcpListener::bind(addr).is_ok()
-                    }
-            })
-            .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
-        *port = selected;
-        reserved.insert(selected);
     }
     Ok(())
 }

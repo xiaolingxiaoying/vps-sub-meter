@@ -29,31 +29,64 @@ pub fn read_to_string_no_follow(path: &Path) -> io::Result<String> {
 }
 
 pub fn write_atomic(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_inner(path, contents, mode, false)
+}
+
+pub fn write_atomic_preserving_owner(path: &Path, contents: &[u8], mode: u32) -> io::Result<()> {
+    write_atomic_inner(path, contents, mode, true)
+}
+
+fn write_atomic_inner(
+    path: &Path,
+    contents: &[u8],
+    mode: u32,
+    preserve_owner: bool,
+) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "路径缺少父目录"))?;
     fs::create_dir_all(parent)?;
-    if let Ok(meta) = fs::symlink_metadata(path)
-        && meta.file_type().is_symlink()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "拒绝写入符号链接目标",
-        ));
-    }
+    let previous = match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "拒绝写入符号链接目标",
+            ));
+        }
+        Ok(meta) => Some(meta),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => None,
+        Err(err) => return Err(err),
+    };
     let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
     tmp.write_all(contents)?;
     tmp.flush()?;
-    tmp.as_file().sync_all()?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(mode))?;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if preserve_owner && let Some(previous) = previous {
+            let current = tmp.as_file().metadata()?;
+            if (previous.uid(), previous.gid()) != (current.uid(), current.gid()) {
+                std::os::unix::fs::fchown(
+                    tmp.as_file(),
+                    Some(previous.uid()),
+                    Some(previous.gid()),
+                )?;
+            }
+        }
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
-    let _ = mode;
+    let _ = (mode, previous, preserve_owner);
+    tmp.as_file().sync_all()?;
     tmp.persist(path).map_err(|e| e.error)?;
     Ok(())
+}
+
+pub fn lock_exclusive(dir: &Path) -> io::Result<File> {
+    let file = open_lock(dir)?;
+    fs2::FileExt::lock_exclusive(&file)?;
+    Ok(file)
 }
 
 pub fn ensure_dir_mode(path: &Path, mode: u32) -> io::Result<()> {
