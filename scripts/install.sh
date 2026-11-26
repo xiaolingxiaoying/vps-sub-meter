@@ -87,7 +87,7 @@ install_from_dir() {
     fi
   done
 
-  for t in mihomo.yaml sing-box.json; do
+  for t in default-config.toml mihomo.yaml sing-box.json; do
     if [[ -f "$src/templates/$t" ]]; then
       if [[ "$FORCE_TEMPLATES" -eq 1 || ! -f "/etc/vps-sub-meter/templates/$t" ]]; then
         install -m 0640 -o root -g vps-sub-meter "$src/templates/$t" "/etc/vps-sub-meter/templates/$t"

@@ -317,7 +317,7 @@ def render_config_toml(
     reset_time: str,
     reset_tz: str,
     display_tz: str,
-    decoy_sni: str,
+    decoy_sni: str | None,
     node_names: list[str],
     reality_loopback: int,
     xhttp_port: int,
@@ -335,6 +335,7 @@ def render_config_toml(
         else ""
     )
     hop_line = f'hop_range = "{toml_escape(hy2_range)}"\n' if hy2_range else ""
+    decoy_line = f'decoy_sni = "{toml_escape(decoy_sni)}"\n' if decoy_sni else ""
     base = (
         f'profile_name = "{toml_escape(profile_name)}"\n'
         f'domain = "{toml_escape(domain)}"\n'
@@ -359,7 +360,7 @@ def render_config_toml(
         f'name = "{toml_escape(node_names[0])}"\n'
         f"port = 443\n"
         f"loopback_port = {reality_loopback}\n"
-        f'decoy_sni = "{toml_escape(decoy_sni)}"\n\n'
+        f"{decoy_line}\n"
         f"[nodes.vless_xhttp_pqc]\n"
         f"enabled = true\n"
         f'name = "{toml_escape(node_names[1])}"\n'
@@ -449,7 +450,7 @@ def migrate_sbctl(root: Path, check_only: bool) -> dict:
     decoy = str(raw.get("reality_decoy_sni", "")).strip()
     # This legacy target fails the REALITY handshake with ML-DSA-65 enabled.
     if not valid_hostname(decoy) or decoy.rstrip(".").lower() == "gateway.icloud.com":
-        decoy = "aws.amazon.com"
+        decoy = None
 
     # Tokens: keep active credentials ONLY (strictly exclude revoked entries).
     now_ts = int(time.time())
@@ -872,7 +873,7 @@ def migrate_sub_srv_v1(root: Path, check_only: bool) -> dict:
         reset_time=reset_time,
         reset_tz=reset_tz,
         display_tz="Asia/Shanghai",
-        decoy_sni="aws.amazon.com",
+        decoy_sni=None,
         node_names=[
             "vless-reality-pqc",
             "vless-xhttp-pqc",

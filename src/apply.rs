@@ -587,7 +587,7 @@ mod tests {
         let cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         cfg.save(dir.path()).unwrap();
 
@@ -623,7 +623,7 @@ mod tests {
         let cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         let ports = collect_firewall_ports(&cfg);
         assert_eq!(

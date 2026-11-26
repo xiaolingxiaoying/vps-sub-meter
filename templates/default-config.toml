@@ -1,0 +1,73 @@
+# 新装向导的初始值，也是旧版精简配置缺少必填字段时的补全来源。
+# 实际部署配置保存在 /etc/vps-sub-meter/config.toml。
+profile_name = "VPS 5Proto-PQC"
+domain = ""
+public_ip = ""
+interface = "eth0"
+ipv4_only = true
+latency_probe_url = "https://www.gstatic.com/generate_204"
+
+[server]
+acme_port = 80
+https_port = 443
+loopback_https_port = 8444
+http_fallback_port = 2080
+
+[traffic]
+monthly_gb = 0.0
+reset_day = 1
+reset_time = "00:00"
+reset_tz = "America/Los_Angeles"
+display_tz = "Asia/Shanghai"
+
+# 节点端口用于向导中的固定端口方案。新装时默认另行随机分配。
+[nodes.vless_reality_pqc]
+enabled = true
+name = "vless-reality-pqc"
+port = 443
+loopback_port = 1443
+decoy_sni = "www.icloud.com"
+
+[nodes.vless_xhttp_pqc]
+enabled = true
+name = "vless-xhttp-pqc"
+port = 2053
+
+[nodes.anytls_tcp]
+enabled = true
+name = "anytls-tcp"
+port = 2083
+
+[nodes.hysteria2_hop]
+enabled = true
+name = "hysteria2-hop"
+port = 34443
+hop_range = "30000-35000"
+hop_interval_sec = 30
+obfs_salamander = true
+up_mbps = 50
+down_mbps = 150
+server_up_mbps = 100
+server_down_mbps = 200
+
+[nodes.tuic_bbr]
+enabled = true
+name = "tuic-bbr"
+port = 2096
+
+[argo]
+enabled = false
+profile_name = "Argo TCP"
+tunnel_domain = ""
+sub_domain = ""
+loopback_sub_port = 18081
+preferred_ips_file = "/etc/vps-sub-meter/argo-ips.txt"
+
+[[argo.ws_inbounds]]
+id = "argo-vless"
+name = "argo-vless-ws"
+protocol = "vless"
+engine = "xray"
+listen = "127.0.0.1"
+port = 23382
+tls = false

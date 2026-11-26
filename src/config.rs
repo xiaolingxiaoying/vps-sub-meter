@@ -14,8 +14,7 @@ pub const ETC_DIR: &str = "etc/vps-sub-meter";
 pub const VAR_DIR: &str = "var/lib/vps-sub-meter";
 pub const LIB_DIR: &str = "usr/local/lib/vps-sub-meter";
 pub const CONFIG_REL: &str = "etc/vps-sub-meter/config.toml";
-pub const DEFAULT_PROFILE_NAME: &str = "VPS 5Proto-PQC";
-pub const DEFAULT_LATENCY_URL: &str = "https://www.gstatic.com/generate_204";
+pub const DEFAULT_CONFIG_REL: &str = "etc/vps-sub-meter/templates/default-config.toml";
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -25,6 +24,8 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("配置解析失败: {0}")]
     Parse(String),
+    #[error("无法加载默认配置 {0}: {1}")]
+    Defaults(PathBuf, String),
     #[error("配置校验失败: {0}")]
     Invalid(String),
 }
@@ -44,7 +45,6 @@ pub enum WsProtocol {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Config {
     pub profile_name: String,
     pub domain: String,
@@ -59,7 +59,6 @@ pub struct Config {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ServerConfig {
     pub acme_port: u16,
     pub https_port: u16,
@@ -69,7 +68,6 @@ pub struct ServerConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TrafficConfig {
     pub monthly_gb: f64,
     pub reset_day: u8,
@@ -78,8 +76,7 @@ pub struct TrafficConfig {
     pub display_tz: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NodesConfig {
     pub vless_reality_pqc: VlessRealityPqcConfig,
     pub vless_xhttp_pqc: VlessXhttpPqcConfig,
@@ -89,7 +86,6 @@ pub struct NodesConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct VlessRealityPqcConfig {
     pub enabled: bool,
     pub name: String,
@@ -100,7 +96,6 @@ pub struct VlessRealityPqcConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct VlessXhttpPqcConfig {
     pub enabled: bool,
     pub name: String,
@@ -108,7 +103,6 @@ pub struct VlessXhttpPqcConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct AnytlsTcpConfig {
     pub enabled: bool,
     pub name: String,
@@ -116,7 +110,6 @@ pub struct AnytlsTcpConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct Hysteria2HopConfig {
     pub enabled: bool,
     pub name: String,
@@ -131,7 +124,6 @@ pub struct Hysteria2HopConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct TuicBbrConfig {
     pub enabled: bool,
     pub name: String,
@@ -139,7 +131,6 @@ pub struct TuicBbrConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(default)]
 pub struct ArgoConfig {
     pub enabled: bool,
     pub profile_name: String,
@@ -161,132 +152,16 @@ pub struct ArgoWsInbound {
     pub tls: bool,
 }
 
-impl Default for ServerConfig {
-    fn default() -> Self {
-        Self {
-            acme_port: 80,
-            https_port: 443,
-            loopback_https_port: 8444,
-            extra_https_port: None,
-            http_fallback_port: 2080,
-        }
-    }
-}
-
-impl Default for TrafficConfig {
-    fn default() -> Self {
-        Self {
-            monthly_gb: 0.0,
-            reset_day: 1,
-            reset_time: "00:00".into(),
-            reset_tz: "America/Los_Angeles".into(),
-            display_tz: "Asia/Shanghai".into(),
-        }
-    }
-}
-
-impl Default for VlessRealityPqcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: "vless-reality-pqc".into(),
-            port: 443,
-            loopback_port: 1443,
-            decoy_sni: "aws.amazon.com".into(),
-            connect_host: None,
-        }
-    }
-}
-
-impl Default for VlessXhttpPqcConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: "vless-xhttp-pqc".into(),
-            port: 2053,
-        }
-    }
-}
-
-impl Default for AnytlsTcpConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: "anytls-tcp".into(),
-            port: 2083,
-        }
-    }
-}
-
-impl Default for Hysteria2HopConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: "hysteria2-hop".into(),
-            port: 34443,
-            hop_range: Some("30000-35000".into()),
-            hop_interval_sec: 30,
-            obfs_salamander: true,
-            up_mbps: 50,
-            down_mbps: 150,
-            server_up_mbps: 100,
-            server_down_mbps: 200,
-        }
-    }
-}
-
-impl Default for TuicBbrConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            name: "tuic-bbr".into(),
-            port: 2096,
-        }
-    }
-}
-
-impl Default for ArgoConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            profile_name: "Argo TCP".into(),
-            tunnel_domain: String::new(),
-            sub_domain: String::new(),
-            loopback_sub_port: 18081,
-            preferred_ips_file: "/etc/vps-sub-meter/argo-ips.txt".into(),
-            ws_inbounds: vec![ArgoWsInbound {
-                id: "argo-vless".into(),
-                name: "argo-vless-ws".into(),
-                protocol: WsProtocol::Vless,
-                engine: EngineKind::Xray,
-                listen: "127.0.0.1".into(),
-                port: 23382,
-                tls: false,
-            }],
-        }
-    }
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            profile_name: DEFAULT_PROFILE_NAME.into(),
-            domain: String::new(),
-            public_ip: String::new(),
-            interface: "eth0".into(),
-            ipv4_only: true,
-            latency_probe_url: DEFAULT_LATENCY_URL.into(),
-            server: Default::default(),
-            traffic: Default::default(),
-            nodes: Default::default(),
-            argo: Default::default(),
-        }
-    }
-}
-
 impl Config {
     pub fn path(root: &Path) -> PathBuf {
         root.join(CONFIG_REL)
+    }
+
+    pub fn load_defaults(root: &Path) -> Result<Self, ConfigError> {
+        let path = root.join(DEFAULT_CONFIG_REL);
+        read_defaults(&path)?
+            .try_into()
+            .map_err(|e: toml::de::Error| ConfigError::Defaults(path, e.to_string()))
     }
 
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
@@ -298,7 +173,20 @@ impl Config {
             }
             Err(e) => return Err(e.into()),
         };
-        let cfg: Self = toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+        let cfg: Self = match toml::from_str(&text) {
+            Ok(cfg) => cfg,
+            Err(main_error) => {
+                let overrides: toml::Table =
+                    toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string()))?;
+                let path = root.join(DEFAULT_CONFIG_REL);
+                let mut defaults = read_defaults(&path)
+                    .map_err(|e| ConfigError::Parse(format!("{main_error}\n{e}")))?;
+                overlay_config(&mut defaults, overrides);
+                defaults
+                    .try_into()
+                    .map_err(|e: toml::de::Error| ConfigError::Parse(e.to_string()))?
+            }
+        };
         cfg.validate()?;
         Ok(cfg)
     }
@@ -669,6 +557,31 @@ impl Config {
     }
 }
 
+fn read_defaults(path: &Path) -> Result<toml::Table, ConfigError> {
+    let text = fs_util::read_to_string_no_follow(path)
+        .map_err(|e| ConfigError::Defaults(path.to_path_buf(), e.to_string()))?;
+    toml::from_str(&text).map_err(|e| ConfigError::Defaults(path.to_path_buf(), e.to_string()))
+}
+
+fn overlay_config(defaults: &mut toml::Table, overrides: toml::Table) {
+    for (key, value) in overrides {
+        match (defaults.get_mut(&key), value) {
+            (Some(toml::Value::Table(base)), toml::Value::Table(overlay)) => {
+                overlay_config(base, overlay);
+            }
+            (_, value) => {
+                defaults.insert(key, value);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_defaults() -> Config {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/default-config.toml");
+    read_defaults(&path).unwrap().try_into().unwrap()
+}
+
 pub fn check_node_port(port: u16) -> Result<(), ConfigError> {
     if port == 443 || port >= 1024 {
         Ok(())
@@ -756,7 +669,7 @@ mod tests {
         let cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         cfg.save(dir.path()).unwrap();
         let loaded = Config::load(dir.path()).unwrap();
@@ -767,11 +680,40 @@ mod tests {
     }
 
     #[test]
+    fn sparse_main_config_uses_external_defaults_and_preserves_explicit_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let defaults_path = root.join(DEFAULT_CONFIG_REL);
+        std::fs::create_dir_all(defaults_path.parent().unwrap()).unwrap();
+        let mut defaults = test_defaults();
+        defaults.nodes.vless_reality_pqc.decoy_sni = "decoy.example.com".into();
+        defaults.traffic.reset_day = 18;
+        std::fs::write(&defaults_path, defaults.to_commented_toml()).unwrap();
+        std::fs::write(
+            Config::path(root),
+            "domain = \"sub.example.com\"\n[traffic]\nreset_day = 12\n[argo]\nws_inbounds = []\n",
+        )
+        .unwrap();
+
+        let loaded = Config::load(root).unwrap();
+        assert_eq!(
+            loaded.nodes.vless_reality_pqc.decoy_sni,
+            "decoy.example.com"
+        );
+        assert_eq!(loaded.traffic.reset_day, 12);
+        assert!(loaded.argo.ws_inbounds.is_empty());
+
+        loaded.save(root).unwrap();
+        std::fs::write(defaults_path, "invalid toml").unwrap();
+        assert_eq!(Config::load(root).unwrap(), loaded);
+    }
+
+    #[test]
     fn detects_hy2_hop_port_overlap_with_tuic() {
         let mut cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         cfg.nodes.tuic_bbr.port = 31000;
         assert!(cfg.validate().is_err());
@@ -782,7 +724,7 @@ mod tests {
         let cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         assert!(cfg.validate().is_ok());
     }

@@ -1261,7 +1261,7 @@ mod tests {
         let mut cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         cfg.argo.enabled = true;
         cfg.argo.tunnel_domain = "argo.example.com".into();

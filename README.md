@@ -8,11 +8,15 @@
 
 | 序号 | 节点名称 | 内核 | 默认端口 | 协议栈特性 |
 | --- | --- | --- | --- | --- |
-| 1 | `vless-reality-pqc` | Xray `26.11.9` | `443/tcp`（SNI 分流至回环 `1443`） | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
-| 2 | `vless-xhttp-pqc` | Xray `26.11.9` | `2053/tcp` | VLESS + XHTTP (`mode: auto`) + TLS 1.3 (`h2`) + VLESS Encryption (`ML-KEM-768`) |
-| 3 | `anytls-tcp` | sing-box `1.14+` | `2083/tcp` | AnyTLS + TLS 1.3 + 8 段 `padding_scheme` |
-| 4 | `hysteria2-hop` | sing-box `1.14+` | `34443/udp`（跳跃 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
-| 5 | `tuic-bbr` | sing-box `1.14+` | `2096/udp` | TUIC v5 + BBR + 0-RTT + Native UDP |
+| 1 | `vless-reality-pqc` | Xray `26.11.9` | 随机 TCP | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
+| 2 | `vless-xhttp-pqc` | Xray `26.11.9` | 随机 TCP | VLESS + XHTTP (`mode: auto`) + TLS 1.3 (`h2`) + VLESS Encryption (`ML-KEM-768`) |
+| 3 | `anytls-tcp` | sing-box `1.14+` | 随机 TCP | AnyTLS + TLS 1.3 + 8 段 `padding_scheme` |
+| 4 | `hysteria2-hop` | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
+| 5 | `tuic-bbr` | sing-box `1.14+` | 随机 UDP | TUIC v5 + BBR + 0-RTT + Native UDP |
+
+全新安装时，端口方案直接回车会在 `20000–29999` 内给五个节点各分配一个不同的可用端口，确认后写入 `/etc/vps-sub-meter/config.toml`。后续应用和升级会沿用已保存的端口，重新运行向导时默认也会保留现有端口。域名模式的订阅 HTTPS 默认仍用 `443/tcp`。全新安装也可手动选择固定端口方案，在域名模式下由 Xray 与订阅 HTTPS 共用 `443/tcp`。
+
+REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
 
 另可选原生集成 **Cloudflare Argo 隧道优选订阅**（直接读取 `/etc/vps-sub-meter/argo-ips.txt` 动态展开优选 IP，无需额外 Python 服务）。
 
@@ -45,7 +49,8 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 ## 目录布局
 
 - 主程序与快捷命令：`/usr/local/bin/vps-sub-meter`（软链接 `vsm`、`ly`）
-- 配置文件：`/etc/vps-sub-meter/config.toml`（修改后运行 `vsm apply` 校验并平滑生效）
+- 主配置：`/etc/vps-sub-meter/config.toml`（修改后运行 `vsm apply` 校验并生效）。主配置完整时可独立读取。旧配置缺少必填字段时，用默认模板补齐，主配置中已填写的值优先。
+- 默认配置模板：仓库的 `templates/default-config.toml` 安装到 `/etc/vps-sub-meter/templates/default-config.toml`。新装向导从这里读取默认值，确认后保存到主配置。升级默认保留已安装模板。
 - 密钥仓库：`/etc/vps-sub-meter/secrets.json`（`0600 root:root`，绝不进入订阅目录）
 - 外置客户端模板：`/etc/vps-sub-meter/templates/{mihomo.yaml, sing-box.json}`
 - 运维脚本库：`/usr/local/lib/vps-sub-meter/{cores.sh, cert.sh, net.sh, argo.sh, upgrade.sh, migrate_legacy.py, migrate-sbctl.sh}`

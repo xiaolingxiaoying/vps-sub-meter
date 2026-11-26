@@ -2,13 +2,14 @@
 //! Every input, selection, and confirmation accepts `0` to immediately cancel
 //! and return without mutating files.
 
-use std::net::IpAddr;
+use std::collections::BTreeSet;
+use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
 use std::path::Path;
 use std::process::Command;
 
 use crate::apply;
 use crate::compiler;
-use crate::config::{Config, is_valid_host, is_valid_hostname, is_valid_interface};
+use crate::config::{Config, ConfigError, is_valid_host, is_valid_hostname, is_valid_interface};
 use crate::prompt::{PromptError, PromptIo, PromptResult, ask_menu_choice, ask_parsed, ask_text};
 use crate::qr;
 use crate::secrets::{Secrets, SubscriptionToken, random_urlsafe};
@@ -151,27 +152,38 @@ fn svc_mark(unit: &str) -> &'static str {
 }
 
 fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()> {
-    let existing = Config::load(root).ok();
-    let default_iface = detect_default_interface(root);
-    let default_ip = detect_public_ip().unwrap_or_else(|| "127.0.0.1".into());
+    let (mut cfg, fresh) = match Config::load(root) {
+        Ok(cfg) => (cfg, false),
+        Err(ConfigError::Missing(_)) => match Config::load_defaults(root) {
+            Ok(cfg) => (cfg, true),
+            Err(e) => {
+                io.report(&e.to_string());
+                return Ok(());
+            }
+        },
+        Err(e) => {
+            io.report(&format!("读取现有配置失败: {e}"));
+            return Ok(());
+        }
+    };
+    let default_ip = if cfg.public_ip.is_empty() {
+        detect_public_ip().unwrap_or_else(|| "127.0.0.1".into())
+    } else {
+        cfg.public_ip.clone()
+    };
 
     io.report("\n=== 4 步快速安装 / 初始化向导 (任何步骤输入 0 立即返回) ===");
 
     // Step 1: Domain or IP
-    let def_host = existing
-        .as_ref()
-        .map(|c| {
-            if c.domain.is_empty() {
-                c.public_ip.clone()
-            } else {
-                c.domain.clone()
-            }
-        })
-        .unwrap_or_else(|| default_ip.clone());
+    let def_host = if cfg.domain.is_empty() {
+        &default_ip
+    } else {
+        &cfg.domain
+    };
     let host = ask_parsed(
         io,
         "第 1/4 步 - 订阅域名（无域名可直接回车使用探测公网 IP 走自签模式）",
-        Some(&def_host),
+        Some(def_host),
         |s| {
             if is_valid_host(s) {
                 Ok(s.to_owned())
@@ -187,13 +199,7 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
         let ip = ask_parsed(
             io,
             "公网 IPv4 地址（用于 VLESS Reality 直连免 DNS 解析）",
-            Some(
-                existing
-                    .as_ref()
-                    .map(|c| c.public_ip.as_str())
-                    .filter(|s| !s.is_empty())
-                    .unwrap_or(&default_ip),
-            ),
+            Some(&default_ip),
             |s| {
                 s.parse::<IpAddr>()
                     .map(|_| s.to_owned())
@@ -204,10 +210,7 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
     };
 
     // Step 2: Traffic limit & reset day
-    let def_gb = existing
-        .as_ref()
-        .map(|c| c.traffic.monthly_gb.to_string())
-        .unwrap_or_else(|| "0".into());
+    let def_gb = cfg.traffic.monthly_gb.to_string();
     let monthly_gb = ask_parsed(
         io,
         "第 2/4 步 - 每月流量限额 GiB（0 为不限）",
@@ -223,10 +226,7 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
             Ok(v)
         },
     )?;
-    let def_day = existing
-        .as_ref()
-        .map(|c| c.traffic.reset_day.to_string())
-        .unwrap_or_else(|| "1".into());
+    let def_day = cfg.traffic.reset_day.to_string();
     let reset_day = ask_parsed(io, "每月流量重置日 (1-31)", Some(&def_day), |s| {
         let d: u8 = s.parse().map_err(|_| "请输入 1-31 的整数".to_owned())?;
         if !(1..=31).contains(&d) {
@@ -237,25 +237,30 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
 
     // Step 3: Port profile
     io.report("第 3/4 步 - 节点端口方案:");
-    io.report("  1. 推荐标准端口 (443 Reality / 2053 XHTTP / 2083 AnyTLS / 34443[30000-35000] Hy2 / 2096 TUIC)");
-    io.report("  2. 随机高端口方案 (避让常用端口)");
-    let port_mode = ask_menu_choice(io, "选择端口方案 [1]", 2)?;
-    if port_mode == 0 {
-        return Err(PromptError::Cancelled);
-    }
+    let default_mode = if fresh {
+        io.report("  1. 使用默认配置文件中的端口");
+        "2"
+    } else {
+        io.report("  1. 保留现有端口");
+        "1"
+    };
+    io.report("  2. 为五个主力节点分配随机高端口 (20000-29999)");
+    let randomize = ask_parsed(io, "选择端口方案", Some(default_mode), |s| match s {
+        "1" => Ok(false),
+        "2" => Ok(true),
+        _ => Err("请输入 1 或 2".into()),
+    })?;
 
-    let mut cfg = existing.unwrap_or_default();
     cfg.domain = domain.clone();
     cfg.public_ip = public_ip;
-    cfg.interface = default_iface;
+    if fresh && let Some(iface) = detect_default_interface(root) {
+        cfg.interface = iface;
+    }
     cfg.traffic.monthly_gb = monthly_gb;
     cfg.traffic.reset_day = reset_day;
-    if port_mode == 2 {
-        cfg.nodes.vless_reality_pqc.port = 24443;
-        cfg.nodes.vless_xhttp_pqc.port = 22053;
-        cfg.nodes.anytls_tcp.port = 22083;
-        cfg.nodes.hysteria2_hop.port = 34443;
-        cfg.nodes.tuic_bbr.port = 22096;
+    if randomize && let Err(e) = randomize_node_ports(&mut cfg, root == Path::new("/")) {
+        io.report(&format!("分配节点端口失败: {e}"));
+        return Ok(());
     }
 
     // Step 4: Summary & confirm
@@ -264,8 +269,10 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
         "  模式: {} | 网卡: {} | 月流量: {} GiB (每月 {} 日重置)",
         if cfg.is_ip_mode() {
             "IP 自签 HTTP"
+        } else if cfg.xray_fronts_443() {
+            "域名 HTTPS + REALITY 共用端口"
         } else {
-            "域名 HTTPS + 443 共用"
+            "域名 HTTPS + 独立节点端口"
         },
         cfg.interface,
         cfg.traffic.monthly_gb,
@@ -332,6 +339,62 @@ fn action_install_wizard(root: &Path, io: &mut impl PromptIo) -> PromptResult<()
             }
         }
         Err(e) => io.report(&format!("应用失败（已保留原有运行状态）: {e}")),
+    }
+    Ok(())
+}
+
+fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 10_000;
+
+    let mut reserved = BTreeSet::from([
+        cfg.server.acme_port,
+        cfg.server.https_port,
+        cfg.server.loopback_https_port,
+        cfg.server.http_fallback_port,
+        cfg.nodes.vless_reality_pqc.loopback_port,
+    ]);
+    reserved.extend(cfg.server.extra_https_port);
+    if cfg.argo.enabled {
+        reserved.insert(cfg.argo.loopback_sub_port);
+        reserved.extend(cfg.argo.ws_inbounds.iter().map(|ws| ws.port));
+    }
+    let hop_range = cfg
+        .parse_hop_range()
+        .map_err(|e| e.to_string())?
+        .map(|(start, end)| start..=end);
+
+    for (port, udp) in [
+        (&mut cfg.nodes.vless_reality_pqc.port, false),
+        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
+        (&mut cfg.nodes.anytls_tcp.port, false),
+        (&mut cfg.nodes.hysteria2_hop.port, true),
+        (&mut cfg.nodes.tuic_bbr.port, true),
+    ] {
+        let mut bytes = [0; 4];
+        getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
+        let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
+        let selected = (0..COUNT)
+            .map(|offset| FIRST + (start + offset) % COUNT)
+            .find(|candidate| {
+                if reserved.contains(candidate)
+                    || hop_range
+                        .as_ref()
+                        .is_some_and(|range| range.contains(candidate))
+                {
+                    return false;
+                }
+                let addr = (Ipv4Addr::UNSPECIFIED, *candidate);
+                !probe_local_ports
+                    || if udp {
+                        UdpSocket::bind(addr).is_ok()
+                    } else {
+                        TcpListener::bind(addr).is_ok()
+                    }
+            })
+            .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
+        *port = selected;
+        reserved.insert(selected);
     }
     Ok(())
 }
@@ -479,8 +542,8 @@ fn action_nodes_menu(root: &Path, io: &mut impl PromptIo) -> PromptResult<()> {
                 .hysteria2_hop
                 .hop_range
                 .as_deref()
-                .unwrap_or("30000-35000");
-            let r = ask_text(io, "跳跃端口范围 (格式 30000-35000)", Some(def_range), true)?;
+                .unwrap_or_default();
+            let r = ask_text(io, "跳跃端口范围 (格式 起始-结束)", Some(def_range), true)?;
             cfg.nodes.hysteria2_hop.hop_range = (!r.is_empty()).then_some(r);
         }
         5 => {
@@ -837,7 +900,7 @@ fn parse_port(s: &str) -> Result<u16, String> {
     Ok(p)
 }
 
-fn detect_default_interface(root: &Path) -> String {
+fn detect_default_interface(root: &Path) -> Option<String> {
     if root == Path::new("/")
         && let Ok(out) = Command::new("sh")
             .args(["-c", "ip -4 route show default | awk '{print $5; exit}'"])
@@ -845,10 +908,10 @@ fn detect_default_interface(root: &Path) -> String {
     {
         let iface = String::from_utf8_lossy(&out.stdout).trim().to_owned();
         if is_valid_interface(&iface) {
-            return iface;
+            return Some(iface);
         }
     }
-    "eth0".into()
+    None
 }
 
 fn detect_public_ip() -> Option<String> {
@@ -884,8 +947,41 @@ mod tests {
     use crate::prompt::BufferedIo;
 
     #[test]
+    fn random_node_ports_are_distinct_and_avoid_configured_listeners() {
+        let mut cfg = Config {
+            domain: "sub.example.com".into(),
+            ..crate::config::test_defaults()
+        };
+        cfg.server.extra_https_port = Some(20_001);
+        cfg.nodes.hysteria2_hop.hop_range = Some("20002-29990".into());
+        randomize_node_ports(&mut cfg, false).unwrap();
+
+        let ports = BTreeSet::from([
+            cfg.nodes.vless_reality_pqc.port,
+            cfg.nodes.vless_xhttp_pqc.port,
+            cfg.nodes.anytls_tcp.port,
+            cfg.nodes.hysteria2_hop.port,
+            cfg.nodes.tuic_bbr.port,
+        ]);
+        assert_eq!(ports.len(), 5);
+        assert!(
+            ports
+                .iter()
+                .all(|p| *p == 20_000 || (29_991..=29_999).contains(p))
+        );
+        cfg.validate().unwrap();
+    }
+
+    #[test]
     fn install_wizard_returns_cleanly_on_zero_at_any_step() {
         let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(crate::config::DEFAULT_CONFIG_REL);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::copy(
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/default-config.toml"),
+            path,
+        )
+        .unwrap();
         // Cancel at step 2 ("0\n") after entering domain at step 1: nothing written!
         let mut io = BufferedIo::new(
             std::io::Cursor::new("sub.example.com\n1.2.3.4\n0\n"),

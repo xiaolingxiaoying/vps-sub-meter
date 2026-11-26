@@ -419,7 +419,7 @@ Authentication: ML-KEM-768, Post-Quantum
 
     #[test]
     fn token_comparison_matches_valid_and_rejects_others() {
-        let cfg = Config::default();
+        let cfg = crate::config::test_defaults();
         let s = Secrets::generate_for_test(&cfg);
         assert!(s.matches_token("test_token_0123456789abcdef0123456789"));
         assert!(!s.matches_token("wrong_token"));

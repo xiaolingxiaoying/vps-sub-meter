@@ -1,6 +1,11 @@
 use std::fs;
 use vps_sub_meter::{
-    apply, compiler, config::Config, menu, prompt::BufferedIo, secrets::Secrets, traffic,
+    apply, compiler,
+    config::{Config, DEFAULT_CONFIG_REL},
+    menu,
+    prompt::BufferedIo,
+    secrets::Secrets,
+    traffic,
 };
 
 #[test]
@@ -17,23 +22,34 @@ fn full_sandbox_lifecycle_apply_config_edit_and_menu_zero_cancel() {
     fs::create_dir_all(&proc_dir).unwrap();
     fs::write(proc_dir.join("boot_id"), "sandbox-boot-1").unwrap();
 
-    // 1. Save domain config + test secrets + apply
-    let mut cfg = Config {
+    // 1. Initialize through the wizard using customized deployed defaults.
+    let defaults = root.join(DEFAULT_CONFIG_REL);
+    fs::create_dir_all(defaults.parent().unwrap()).unwrap();
+    fs::copy(
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("templates/default-config.toml"),
+        &defaults,
+    )
+    .unwrap();
+    let mut initial = Config {
         domain: "sub.example.com".into(),
         public_ip: "203.0.113.20".into(),
-        ..Default::default()
+        ..Config::load_defaults(root).unwrap()
     };
-    cfg.traffic.monthly_gb = 500.0;
-    cfg.traffic.reset_day = 11;
-    cfg.traffic.reset_time = "01:32".into();
-    cfg.save(root).unwrap();
-
-    let sec = Secrets::generate_for_test(&cfg);
+    initial.traffic.monthly_gb = 500.0;
+    initial.traffic.reset_day = 11;
+    initial.traffic.reset_time = "01:32".into();
+    initial.nodes.vless_reality_pqc.decoy_sni = "decoy.example.com".into();
+    fs::write(&defaults, initial.to_commented_toml()).unwrap();
+    let sec = Secrets::generate_for_test(&initial);
     sec.save(root).unwrap();
 
-    let rep = apply::apply_all(root).unwrap();
-    assert_eq!(rep.direct_nodes, 5);
-    assert_eq!(rep.singbox_nodes, 3);
+    let mut io = BufferedIo::new(std::io::Cursor::new("1\n\n\n\n\n1\n\n\n0\n"), Vec::new());
+    menu::run(root, &mut io);
+    let cfg = Config::load(root).unwrap();
+    assert_eq!(cfg, initial);
+    let generation = apply::current_generation(root).unwrap().unwrap();
+    assert_eq!(generation.direct_nodes.len(), 5);
+    assert_eq!(generation.singbox_nodes.len(), 3);
 
     // 2. Verify traffic checkpoint + userinfo direction
     let snap = traffic::set_used(root, &cfg, 1000, 3000).unwrap();

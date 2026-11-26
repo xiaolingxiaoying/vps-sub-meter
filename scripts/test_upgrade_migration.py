@@ -145,7 +145,7 @@ password = "tuic_pw_example"
             self.assertIn('public_ip = "203.0.113.10"', cfg_text)
             self.assertIn("ipv4_only = true", cfg_text)
             self.assertIn("reset_day = 15", cfg_text)
-            self.assertIn('decoy_sni = "aws.amazon.com"', cfg_text)
+            self.assertNotIn("decoy_sni =", cfg_text)
             self.assertIn('reset_time = "04:05"', cfg_text)
 
             sec = json.loads((root / "etc/vps-sub-meter/secrets.json").read_text(encoding="utf-8"))

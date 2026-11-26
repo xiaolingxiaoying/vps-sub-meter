@@ -359,7 +359,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut cfg = Config {
             domain: "sub.example.com".into(),
-            ..Default::default()
+            ..crate::config::test_defaults()
         };
         cfg.traffic.monthly_gb = 500.0;
         cfg.traffic.reset_day = 11;
@@ -388,7 +388,7 @@ mod tests {
 
     #[test]
     fn anchored_los_angeles_reset_rolls_over_and_converts_to_shanghai() {
-        let mut cfg = Config::default();
+        let mut cfg = crate::config::test_defaults();
         cfg.traffic.reset_day = 11;
         cfg.traffic.reset_time = "01:32".into();
         cfg.traffic.reset_tz = "America/Los_Angeles".into();
