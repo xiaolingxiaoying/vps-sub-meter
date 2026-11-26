@@ -1,6 +1,6 @@
-//! Hardened HTTP/HTTPS subscription & ACME server with per-IP concurrency
+//! Hardened read-only HTTP/HTTPS subscription & ACME server with per-IP concurrency
 //! isolation, token-bucket rate limiting, zero-downtime certificate hot-reload,
-//! dark Chinese overview dashboard (`/index`), and native Argo loopback mode.
+//! dark Chinese overview dashboard (`/index`), and precompiled Argo loopback mode.
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
@@ -10,7 +10,6 @@ use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use hyper_util::rt::TokioIo;
 use rustls_pemfile::{certs, private_key};
-use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::BufReader;
@@ -22,13 +21,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 use tokio_rustls::TlsAcceptor;
 
-use crate::apply::{self, SERVE_AUTH_REL, ServeAuth};
-use crate::compiler::{self, pct};
-use crate::config::Config;
-use crate::fs_util;
+use crate::config::{Config, pct};
 use crate::qr;
-use crate::secrets::Secrets;
+use crate::store::{self, GenerationMeta, SERVE_AUTH_REL, ServeAuth};
 use crate::traffic::{self, TrafficSnapshot};
+
+const INDEX_HTML_TEMPLATE: &str = include_str!("../templates/index.html");
 
 const MAX_HEADER_BYTES: usize = 16 * 1024;
 const HEADER_TIMEOUT: Duration = Duration::from_secs(5);
@@ -46,11 +44,57 @@ enum ListenerKind {
     ArgoLoopback,
 }
 
+type FileStamp = (SystemTime, u64);
+
+struct FileCache<T> {
+    entry: Mutex<Option<(FileStamp, Arc<T>)>>,
+}
+
+impl<T> FileCache<T> {
+    fn new() -> Self {
+        Self {
+            entry: Mutex::new(None),
+        }
+    }
+
+    fn get_or_load<E>(&self, path: &Path, load: impl FnOnce() -> Result<T, E>) -> Option<Arc<T>> {
+        let meta = fs::symlink_metadata(path).ok()?;
+        let modified = meta.modified().ok()?;
+        let stamp = (modified, meta.len());
+        {
+            let guard = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((cached_stamp, cached)) = guard.as_ref()
+                && *cached_stamp == stamp
+            {
+                return Some(Arc::clone(cached));
+            }
+        }
+        let fresh = Arc::new(load().ok()?);
+        let mut guard = self.entry.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some((stamp, Arc::clone(&fresh)));
+        Some(fresh)
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     root: PathBuf,
     kind: ListenerKind,
     budget: Arc<Mutex<IpBudget>>,
+    config_cache: Arc<FileCache<Config>>,
+    auth_cache: Arc<FileCache<ServeAuth>>,
+}
+
+impl AppState {
+    fn new(root: PathBuf, kind: ListenerKind, budget: Arc<Mutex<IpBudget>>) -> Self {
+        Self {
+            root,
+            kind,
+            budget,
+            config_cache: Arc::new(FileCache::new()),
+            auth_cache: Arc::new(FileCache::new()),
+        }
+    }
 }
 
 struct ConnectionLimits {
@@ -153,6 +197,20 @@ impl IpBudget {
     }
 }
 
+#[derive(Clone)]
+enum LoopMode {
+    Acme {
+        root: PathBuf,
+    },
+    Http {
+        state: AppState,
+    },
+    Https {
+        state: AppState,
+        tls_rx: watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
+    },
+}
+
 pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::load(&root)?;
     let _ = traffic::checkpoint(&root, &config);
@@ -177,23 +235,26 @@ pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error +
         let addr: SocketAddr = ([0, 0, 0, 0], config.server.http_fallback_port).into();
         let listener = TcpListener::bind(addr).await?;
         eprintln!("vps-sub-meter listening HTTP fallback on {addr}");
-        let state = AppState {
-            root: root.clone(),
-            kind: ListenerKind::FallbackHttp,
-            budget: Arc::clone(&budget),
-        };
-        handles.push(tokio::spawn(async move {
-            serve_http_loop(listener, state, true).await;
-        }));
+        let state = AppState::new(
+            root.clone(),
+            ListenerKind::FallbackHttp,
+            Arc::clone(&budget),
+        );
+        handles.push(tokio::spawn(accept_loop(
+            listener,
+            LoopMode::Http { state },
+            true,
+        )));
     } else {
         // ACME HTTP-01 listener
         let acme_addr: SocketAddr = ([0, 0, 0, 0], config.server.acme_port).into();
         let acme_listener = TcpListener::bind(acme_addr).await?;
-        let acme_root = root.clone();
         eprintln!("vps-sub-meter listening ACME HTTP on {acme_addr}");
-        handles.push(tokio::spawn(async move {
-            serve_acme_loop(acme_listener, acme_root).await;
-        }));
+        handles.push(tokio::spawn(accept_loop(
+            acme_listener,
+            LoopMode::Acme { root: root.clone() },
+            true,
+        )));
 
         // TLS reloader
         let (tls_tx, tls_rx) = watch::channel(None);
@@ -211,31 +272,32 @@ pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error +
         };
         let primary_listener = TcpListener::bind(primary_addr).await?;
         eprintln!("vps-sub-meter listening HTTPS on {primary_addr}");
-        let primary_state = AppState {
-            root: root.clone(),
-            kind: ListenerKind::DirectHttps,
-            budget: Arc::clone(&budget),
-        };
-        let rx1 = tls_rx.clone();
-        let per_peer = !config.xray_fronts_443();
-        handles.push(tokio::spawn(async move {
-            serve_https_loop(primary_listener, primary_state, rx1, per_peer).await;
-        }));
+        let primary_state =
+            AppState::new(root.clone(), ListenerKind::DirectHttps, Arc::clone(&budget));
+        handles.push(tokio::spawn(accept_loop(
+            primary_listener,
+            LoopMode::Https {
+                state: primary_state,
+                tls_rx: tls_rx.clone(),
+            },
+            !config.xray_fronts_443(),
+        )));
 
         // Optional extra HTTPS port (e.g. 8443 compatibility during migration)
         if let Some(extra) = config.server.extra_https_port {
             let extra_addr: SocketAddr = ([0, 0, 0, 0], extra).into();
             let extra_listener = TcpListener::bind(extra_addr).await?;
             eprintln!("vps-sub-meter listening extra HTTPS on {extra_addr}");
-            let extra_state = AppState {
-                root: root.clone(),
-                kind: ListenerKind::DirectHttps,
-                budget: Arc::clone(&budget),
-            };
-            let rx2 = tls_rx.clone();
-            handles.push(tokio::spawn(async move {
-                serve_https_loop(extra_listener, extra_state, rx2, true).await;
-            }));
+            let extra_state =
+                AppState::new(root.clone(), ListenerKind::DirectHttps, Arc::clone(&budget));
+            handles.push(tokio::spawn(accept_loop(
+                extra_listener,
+                LoopMode::Https {
+                    state: extra_state,
+                    tls_rx,
+                },
+                true,
+            )));
         }
     }
 
@@ -244,20 +306,93 @@ pub async fn run_server(root: PathBuf) -> Result<(), Box<dyn std::error::Error +
         let argo_addr: SocketAddr = ([127, 0, 0, 1], config.argo.loopback_sub_port).into();
         let argo_listener = TcpListener::bind(argo_addr).await?;
         eprintln!("vps-sub-meter listening Argo loopback HTTP on {argo_addr}");
-        let argo_state = AppState {
-            root: root.clone(),
-            kind: ListenerKind::ArgoLoopback,
-            budget: Arc::clone(&budget),
-        };
-        handles.push(tokio::spawn(async move {
-            serve_http_loop(argo_listener, argo_state, false).await;
-        }));
+        let argo_state = AppState::new(root, ListenerKind::ArgoLoopback, budget);
+        handles.push(tokio::spawn(accept_loop(
+            argo_listener,
+            LoopMode::Http { state: argo_state },
+            false,
+        )));
     }
 
     for h in handles {
         let _ = h.await;
     }
     Ok(())
+}
+
+async fn accept_loop(listener: TcpListener, mode: LoopMode, per_peer: bool) {
+    let limits = ConnectionLimits::new(per_peer);
+    loop {
+        let Ok((stream, _)) = listener.accept().await else {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            continue;
+        };
+        let peer = stream.peer_addr().ok().map(|a| a.ip());
+        let Some(permit) = limits.try_acquire(peer) else {
+            drop(stream);
+            continue;
+        };
+        let m = mode.clone();
+        tokio::spawn(async move {
+            let _p = permit;
+            match m {
+                LoopMode::Acme { root } => {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let resp = with_len(handle_acme(&req, &root));
+                        async { Ok::<_, std::convert::Infallible>(resp) }
+                    });
+                    let _ = tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        http1_builder().serve_connection(TokioIo::new(stream), svc),
+                    )
+                    .await;
+                }
+                LoopMode::Http { state } => {
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let resp = with_len(route_request(
+                            req.method(),
+                            req.uri().path(),
+                            req.uri().query(),
+                            &state,
+                            peer,
+                        ));
+                        async { Ok::<_, std::convert::Infallible>(resp) }
+                    });
+                    let _ = tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        http1_builder().serve_connection(TokioIo::new(stream), svc),
+                    )
+                    .await;
+                }
+                LoopMode::Https { state, tls_rx } => {
+                    let Some(tls_cfg) = tls_rx.borrow().clone() else {
+                        return;
+                    };
+                    let acceptor = TlsAcceptor::from(tls_cfg);
+                    let Ok(Ok(tls_stream)) =
+                        tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
+                    else {
+                        return;
+                    };
+                    let svc = service_fn(move |req: Request<Incoming>| {
+                        let resp = with_len(route_request(
+                            req.method(),
+                            req.uri().path(),
+                            req.uri().query(),
+                            &state,
+                            peer,
+                        ));
+                        async { Ok::<_, std::convert::Infallible>(resp) }
+                    });
+                    let _ = tokio::time::timeout(
+                        CONNECTION_TIMEOUT,
+                        http1_builder().serve_connection(TokioIo::new(Box::pin(tls_stream)), svc),
+                    )
+                    .await;
+                }
+            }
+        });
+    }
 }
 
 async fn watch_tls_material(
@@ -314,105 +449,6 @@ fn http1_builder() -> hyper::server::conn::http1::Builder {
     b
 }
 
-async fn serve_acme_loop(listener: TcpListener, root: PathBuf) {
-    let limits = ConnectionLimits::new(true);
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        };
-        let peer = stream.peer_addr().ok().map(|a| a.ip());
-        let Some(permit) = limits.try_acquire(peer) else {
-            drop(stream);
-            continue;
-        };
-        let r = root.clone();
-        tokio::spawn(async move {
-            let _p = permit;
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let resp = with_len(handle_acme(req, &r));
-                async { Ok::<_, std::convert::Infallible>(resp) }
-            });
-            let _ = tokio::time::timeout(
-                CONNECTION_TIMEOUT,
-                http1_builder().serve_connection(TokioIo::new(stream), svc),
-            )
-            .await;
-        });
-    }
-}
-
-async fn serve_http_loop(listener: TcpListener, state: AppState, per_peer: bool) {
-    let limits = ConnectionLimits::new(per_peer);
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        };
-        let peer = stream.peer_addr().ok().map(|a| a.ip());
-        let Some(permit) = limits.try_acquire(peer) else {
-            drop(stream);
-            continue;
-        };
-        let st = state.clone();
-        tokio::spawn(async move {
-            let _p = permit;
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let resp = with_len(handle_subscription_request(req, &st, peer));
-                async { Ok::<_, std::convert::Infallible>(resp) }
-            });
-            let _ = tokio::time::timeout(
-                CONNECTION_TIMEOUT,
-                http1_builder().serve_connection(TokioIo::new(stream), svc),
-            )
-            .await;
-        });
-    }
-}
-
-async fn serve_https_loop(
-    listener: TcpListener,
-    state: AppState,
-    tls_rx: watch::Receiver<Option<Arc<rustls::ServerConfig>>>,
-    per_peer: bool,
-) {
-    let limits = ConnectionLimits::new(per_peer);
-    loop {
-        let Ok((stream, _)) = listener.accept().await else {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            continue;
-        };
-        let peer = stream.peer_addr().ok().map(|a| a.ip());
-        let Some(permit) = limits.try_acquire(peer) else {
-            drop(stream);
-            continue;
-        };
-        let Some(tls_cfg) = tls_rx.borrow().clone() else {
-            drop(stream);
-            continue;
-        };
-        let st = state.clone();
-        tokio::spawn(async move {
-            let _p = permit;
-            let acceptor = TlsAcceptor::from(tls_cfg);
-            let Ok(Ok(tls_stream)) =
-                tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await
-            else {
-                return;
-            };
-            let svc = service_fn(move |req: Request<Incoming>| {
-                let resp = with_len(handle_subscription_request(req, &st, peer));
-                async { Ok::<_, std::convert::Infallible>(resp) }
-            });
-            let _ = tokio::time::timeout(
-                CONNECTION_TIMEOUT,
-                http1_builder().serve_connection(TokioIo::new(Box::pin(tls_stream)), svc),
-            )
-            .await;
-        });
-    }
-}
-
 fn with_len(mut resp: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
     use hyper::body::Body;
     let len = resp.body().size_hint().exact().unwrap_or(0);
@@ -421,7 +457,7 @@ fn with_len(mut resp: Response<Full<Bytes>>) -> Response<Full<Bytes>> {
     resp
 }
 
-fn handle_acme(req: Request<Incoming>, root: &Path) -> Response<Full<Bytes>> {
+fn handle_acme(req: &Request<Incoming>, root: &Path) -> Response<Full<Bytes>> {
     if !matches!(*req.method(), Method::GET | Method::HEAD) {
         return plain_status(StatusCode::METHOD_NOT_ALLOWED, b"Method Not Allowed\n");
     }
@@ -440,7 +476,7 @@ fn handle_acme(req: Request<Incoming>, root: &Path) -> Response<Full<Bytes>> {
     let path = root
         .join("var/lib/vps-sub-meter/acme-webroot/.well-known/acme-challenge")
         .join(token);
-    match fs_util::read_no_follow(&path) {
+    match store::read_no_follow(&path) {
         Ok(bytes) => Response::builder()
             .status(StatusCode::OK)
             .header("Content-Type", "text/plain; charset=utf-8")
@@ -450,20 +486,6 @@ fn handle_acme(req: Request<Incoming>, root: &Path) -> Response<Full<Bytes>> {
             .unwrap(),
         Err(_) => plain_status(StatusCode::NOT_FOUND, b"Not Found\n"),
     }
-}
-
-fn handle_subscription_request(
-    req: Request<Incoming>,
-    state: &AppState,
-    peer: Option<IpAddr>,
-) -> Response<Full<Bytes>> {
-    route_request(
-        req.method(),
-        req.uri().path(),
-        req.uri().query(),
-        state,
-        peer,
-    )
 }
 
 fn route_request(
@@ -505,93 +527,67 @@ fn route_request(
     let token = parts[1];
     let tail = parts[2..].join("/");
 
-    let Ok(config) = Config::load(&state.root) else {
+    let Some(config) = state
+        .config_cache
+        .get_or_load(&Config::path(&state.root), || Config::load(&state.root))
+    else {
         return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable\n");
     };
-    let Ok(auth_bytes) = fs_util::read_no_follow(&state.root.join(SERVE_AUTH_REL)) else {
-        return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable\n");
-    };
-    let Ok(auth) = serde_json::from_slice::<ServeAuth>(&auth_bytes) else {
+    let Some(auth) = state
+        .auth_cache
+        .get_or_load(&state.root.join(SERVE_AUTH_REL), || {
+            store::read_serve_auth(&state.root)
+        })
+    else {
         return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Service Unavailable\n");
     };
 
-    if !constant_time_hash_match(&auth.token_sha256, token) {
+    if !store::constant_time_hash_match(&auth.token_sha256, token) {
         return plain_status(StatusCode::NOT_FOUND, b"Not Found\n");
+    }
+
+    let Ok(Some(gen_meta)) = store::current_generation(&state.root) else {
+        return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Not Ready\n");
+    };
+
+    let is_argo = state.kind == ListenerKind::ArgoLoopback;
+    if is_argo && (!config.argo.enabled || gen_meta.argo_files.is_empty()) {
+        return plain_status(StatusCode::NOT_FOUND, b"Argo Not Enabled\n");
     }
 
     let snap = traffic::snapshot(&state.root, &config).ok();
     let userinfo = snap.as_ref().map(|s| s.userinfo_header());
+    let (base_url, profile_title) = if is_argo {
+        (
+            format!("https://{}/sub/{token}", config.argo.sub_domain.trim()),
+            config.argo.profile_name.as_str(),
+        )
+    } else {
+        (
+            config.subscription_base_url(token),
+            config.profile_name.as_str(),
+        )
+    };
 
-    match state.kind {
-        ListenerKind::ArgoLoopback => {
-            let secrets = Secrets {
-                argo_ws: auth.argo_ws,
-                ..Default::default()
-            };
-            let Ok(bundle) = compiler::compile_argo_suite(&state.root, &config, &secrets) else {
-                return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Argo Error\n");
-            };
-            let base = format!("https://{}/sub/{token}", config.argo.sub_domain.trim());
-            serve_bundle_route(
-                &tail,
-                &config,
-                &bundle,
-                &base,
-                &config.argo.profile_name,
-                snap.as_ref(),
-                userinfo.as_deref(),
-                true,
-            )
-        }
-        ListenerKind::DirectHttps | ListenerKind::FallbackHttp => {
-            let Ok(Some(gen_meta)) = apply::current_generation(&state.root) else {
-                return plain_status(StatusCode::SERVICE_UNAVAILABLE, b"Not Ready\n");
-            };
-            let clash_yaml = apply::read_generation_file(&state.root, &gen_meta.id, "clash.yaml")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let sing_box_json =
-                apply::read_generation_file(&state.root, &gen_meta.id, "sing-box.json")
-                    .ok()
-                    .flatten();
-            let shadowrocket_txt =
-                apply::read_generation_file(&state.root, &gen_meta.id, "shadowrocket.txt")
-                    .ok()
-                    .flatten()
-                    .unwrap_or_default();
-            let uri_txt = apply::read_generation_file(&state.root, &gen_meta.id, "uri.txt")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-            let bundle = compiler::ClientBundle {
-                clash_yaml,
-                sing_box_json,
-                shadowrocket_txt,
-                uri_txt,
-                direct_node_names: gen_meta.direct_nodes,
-                singbox_node_names: gen_meta.singbox_nodes,
-            };
-            let base = config.subscription_base_url(token);
-            serve_bundle_route(
-                &tail,
-                &config,
-                &bundle,
-                &base,
-                &config.profile_name,
-                snap.as_ref(),
-                userinfo.as_deref(),
-                false,
-            )
-        }
-    }
+    serve_route(
+        &state.root,
+        &tail,
+        &config,
+        &gen_meta,
+        &base_url,
+        profile_title,
+        snap.as_ref(),
+        userinfo.as_deref(),
+        is_argo,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
-fn serve_bundle_route(
+fn serve_route(
+    root: &Path,
     tail: &str,
     config: &Config,
-    bundle: &compiler::ClientBundle,
+    gen_meta: &GenerationMeta,
     base_url: &str,
     profile_title: &str,
     snap: Option<&TrafficSnapshot>,
@@ -601,52 +597,77 @@ fn serve_bundle_route(
     let title_b64 = format!("base64:{}", STANDARD.encode(profile_title.as_bytes()));
     let index_url = format!("{base_url}/index");
 
+    let has_singbox = if is_argo {
+        gen_meta.argo_files.iter().any(|f| f == "sing-box.json")
+    } else {
+        !gen_meta.singbox_nodes.is_empty()
+    };
+
     match tail {
-        "clash.yaml" => build_sub_resp(
-            StatusCode::OK,
+        "clash.yaml" => serve_artifact(
+            root,
+            &gen_meta.id,
+            is_argo,
+            "clash.yaml",
             "text/yaml; charset=utf-8",
-            bundle.clash_yaml.as_bytes(),
             Some("vsm-clash.yaml"),
             Some(&title_b64),
             Some(&index_url),
             userinfo,
-            is_argo,
         ),
-        "sing-box.json" | "sing-box-full.json" => match &bundle.sing_box_json {
-            Some(json_str) => build_sub_resp(
-                StatusCode::OK,
+        "sing-box.json" => {
+            if !has_singbox {
+                return plain_status(StatusCode::NOT_FOUND, b"No compatible sing-box nodes\n");
+            }
+            serve_artifact(
+                root,
+                &gen_meta.id,
+                is_argo,
+                "sing-box.json",
                 "application/json; charset=utf-8",
-                json_str.as_bytes(),
                 Some("sing-box.json"),
                 Some(&title_b64),
                 Some(&index_url),
                 userinfo,
-                is_argo,
-            ),
-            None => plain_status(StatusCode::NOT_FOUND, b"No compatible sing-box nodes\n"),
-        },
-        "shadowrocket.txt" => build_sub_resp(
-            StatusCode::OK,
+            )
+        }
+        "shadowrocket.txt" => serve_artifact(
+            root,
+            &gen_meta.id,
+            is_argo,
+            "shadowrocket.txt",
             "text/plain; charset=utf-8",
-            bundle.shadowrocket_txt.as_bytes(),
             Some("shadowrocket.txt"),
             Some(&title_b64),
             Some(&index_url),
             userinfo,
-            is_argo,
         ),
-        "uri.txt" | "uri" => build_sub_resp(
-            StatusCode::OK,
+        "uri.txt" => serve_artifact(
+            root,
+            &gen_meta.id,
+            is_argo,
+            "uri.txt",
             "text/plain; charset=utf-8",
-            bundle.uri_txt.as_bytes(),
             None,
             None,
             None,
             userinfo,
-            is_argo,
         ),
-        "" | "index" | "qr" => {
-            let html = build_index_html(config, bundle, base_url, profile_title, snap, is_argo);
+        "" | "index" => {
+            let uri_txt = store::read_generation_file(root, &gen_meta.id, is_argo, "uri.txt")
+                .ok()
+                .flatten()
+                .unwrap_or_default();
+            let html = build_index_html(
+                config,
+                gen_meta,
+                &uri_txt,
+                base_url,
+                profile_title,
+                snap,
+                has_singbox,
+                is_argo,
+            );
             build_sub_resp(
                 StatusCode::OK,
                 "text/html; charset=utf-8",
@@ -658,11 +679,9 @@ fn serve_bundle_route(
                 is_argo,
             )
         }
-        "qr/clash.svg" | "qr/clash.yaml" => {
-            render_qr_response(&format!("{base_url}/clash.yaml"), is_argo)
-        }
-        "qr/sing-box.svg" | "qr/sing-box.json" => {
-            if bundle.sing_box_json.is_none() {
+        "qr/clash.svg" => render_qr_response(&format!("{base_url}/clash.yaml"), is_argo),
+        "qr/sing-box.svg" => {
+            if !has_singbox {
                 return plain_status(StatusCode::NOT_FOUND, b"Not Found\n");
             }
             let payload = format!(
@@ -672,7 +691,7 @@ fn serve_bundle_route(
             );
             render_qr_response(&payload, is_argo)
         }
-        "qr/shadowrocket.svg" | "qr/shadowrocket.txt" => {
+        "qr/shadowrocket.svg" => {
             render_qr_response(&format!("{base_url}/shadowrocket.txt"), is_argo)
         }
         "qr/shadowrocket-sub.svg" => {
@@ -683,7 +702,34 @@ fn serve_bundle_route(
             );
             render_qr_response(&sr_sub, is_argo)
         }
-        "qr/uri.svg" | "qr/uri.txt" => render_qr_response(&format!("{base_url}/uri.txt"), is_argo),
+        "qr/uri.svg" => render_qr_response(&format!("{base_url}/uri.txt"), is_argo),
+        _ => plain_status(StatusCode::NOT_FOUND, b"Not Found\n"),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn serve_artifact(
+    root: &Path,
+    gen_id: &str,
+    is_argo: bool,
+    file: &str,
+    content_type: &str,
+    filename: Option<&str>,
+    profile_title: Option<&str>,
+    web_url: Option<&str>,
+    userinfo: Option<&str>,
+) -> Response<Full<Bytes>> {
+    match store::read_generation_file(root, gen_id, is_argo, file) {
+        Ok(Some(text)) => build_sub_resp(
+            StatusCode::OK,
+            content_type,
+            text.as_bytes(),
+            filename,
+            profile_title,
+            web_url,
+            userinfo,
+            is_argo,
+        ),
         _ => plain_status(StatusCode::NOT_FOUND, b"Not Found\n"),
     }
 }
@@ -757,37 +803,15 @@ fn plain_status(status: StatusCode, body: &'static [u8]) -> Response<Full<Bytes>
         .unwrap()
 }
 
-fn constant_time_hash_match(hashes: &[String], candidate_token: &str) -> bool {
-    if candidate_token.is_empty() || candidate_token.len() > 128 {
-        return false;
-    }
-    let cand_hex: String = Sha256::digest(candidate_token.as_bytes())
-        .iter()
-        .map(|b| format!("{b:02x}"))
-        .collect();
-    let cand_bytes = cand_hex.as_bytes();
-    let mut matched = 0u8;
-    for expected in hashes {
-        if expected.len() != cand_bytes.len() {
-            continue;
-        }
-        let mut diff = 0u8;
-        for (a, b) in expected.as_bytes().iter().zip(cand_bytes.iter()) {
-            diff |= a ^ b;
-        }
-        if diff == 0 {
-            matched = 1;
-        }
-    }
-    matched == 1
-}
-
+#[allow(clippy::too_many_arguments)]
 fn build_index_html(
     config: &Config,
-    bundle: &compiler::ClientBundle,
+    gen_meta: &GenerationMeta,
+    uri_txt: &str,
     base_url: &str,
     title: &str,
     snap: Option<&TrafficSnapshot>,
+    has_singbox: bool,
     is_argo: bool,
 ) -> String {
     let esc = |s: &str| {
@@ -865,18 +889,25 @@ fn build_index_html(
         &clash_url,
         &clash_url,
     );
-    if bundle.sing_box_json.is_some() {
+    let node_names = if is_argo {
+        &gen_meta.argo_nodes
+    } else {
+        &gen_meta.direct_nodes
+    };
+    if has_singbox {
         let sb_url = format!("{base_url}/sing-box.json");
         let sb_qr = format!(
             "sing-box://import-remote-profile?url={}#{}",
             pct(&sb_url),
             pct(title)
         );
+        let sb_count = if is_argo {
+            node_names.len()
+        } else {
+            gen_meta.singbox_nodes.len()
+        };
         push_card(
-            &format!(
-                "sing-box 1.14+ 订阅 ({} 节点)",
-                bundle.singbox_node_names.len()
-            ),
+            &format!("sing-box 1.14+ 订阅 ({sb_count} 节点)"),
             if is_argo {
                 "Cloudflare Argo 优选节点（严格 TCP）。"
             } else {
@@ -900,119 +931,65 @@ fn build_index_html(
     );
     push_card("明文 URI 列表", "每行一条分享链接。", &uri_url, &uri_url);
 
-    let nodes_summary = esc(&bundle.direct_node_names.join(" · "));
-    let uri_escaped = esc(bundle.uri_txt.trim());
+    let nodes_summary = esc(&node_names.join(" · "));
+    let uri_escaped = esc(uri_txt.trim());
 
-    format!(
-        r#"<!doctype html>
-<html lang="zh-CN">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<meta name="referrer" content="no-referrer">
-<title>{title}</title>
-<style>
-  body {{ font-family: system-ui, -apple-system, sans-serif; margin: 0; padding: 20px; background: #0f172a; color: #e2e8f0; }}
-  .wrap {{ max-width: 1020px; margin: 0 auto; }}
-  h1 {{ font-size: 1.4rem; margin: 0 0 8px; }}
-  .sub {{ color: #94a3b8; font-size: 0.9rem; margin-bottom: 16px; }}
-  .stats {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; margin-bottom: 16px; display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; align-items: center; }}
-  .stat-label {{ font-size: 0.85rem; color: #94a3b8; margin-bottom: 4px; }}
-  .stat-value {{ font-size: 1.3rem; font-weight: 700; color: #f8fafc; }}
-  .stat-value span {{ font-size: 0.95rem; font-weight: 500; color: #94a3b8; }}
-  .stat-meta {{ font-size: 0.82rem; color: #94a3b8; margin-top: 6px; }}
-  .bar {{ height: 8px; background: #0f172a; border-radius: 999px; overflow: hidden; margin-top: 8px; }}
-  .bar-fill {{ height: 100%; background: linear-gradient(90deg, #38bdf8, #3b82f6); width: {pct_val}%; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; }}
-  .card {{ background: #1e293b; border: 1px solid #334155; border-radius: 12px; padding: 16px; display: flex; flex-direction: column; gap: 10px; }}
-  .card h2 {{ font-size: 1.02rem; margin: 0; color: #f8fafc; }}
-  .desc {{ font-size: 0.84rem; color: #94a3b8; margin: 0; line-height: 1.4; }}
-  .qr {{ background: #fff; border-radius: 8px; padding: 10px; align-self: center; }}
-  .qr svg {{ display: block; width: 180px; height: 180px; }}
-  .url-box {{ background: #0f172a; border: 1px solid #334155; border-radius: 6px; padding: 8px; overflow-x: auto; }}
-  code {{ font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.78rem; word-break: break-all; color: #38bdf8; }}
-  button {{ cursor: pointer; background: #2563eb; color: #fff; border: none; border-radius: 6px; padding: 8px 12px; font-size: 0.9rem; }}
-  button:hover {{ background: #1d4ed8; }}
-</style>
-</head>
-<body>
-<div class="wrap">
-  <h1>{title}</h1>
-  <p class="sub">{nodes_summary}</p>
-  <div class="stats">
-    <div>
-      <div class="stat-label">本期流量</div>
-      <div class="stat-value">{used_str} <span>/ {total_str}</span></div>
-      <div class="bar"><div class="bar-fill"></div></div>
-      <div class="stat-meta">已用 {pct_val}% · 上传 {up_str} · 下载 {down_str}</div>
-    </div>
-    <div>
-      <div class="stat-label">下次重置</div>
-      <div class="stat-value">{reset_str}</div>
-      <div class="stat-meta">共 {node_count} 个节点</div>
-    </div>
-  </div>
-  <div class="grid">{cards}</div>
-  <div class="card" style="margin-top:16px">
-    <h2>节点分享链接原文</h2>
-    <div class="url-box"><code style="white-space:pre-wrap">{uri_escaped}</code></div>
-    <button type="button" onclick="copyText(this)" data-val="{uri_escaped}">复制全部节点链接</button>
-  </div>
-</div>
-<script>
-function copyText(btn) {{
-  const val = btn.getAttribute("data-val");
-  navigator.clipboard.writeText(val).then(() => {{
-    const old = btn.textContent;
-    btn.textContent = "已复制";
-    setTimeout(() => btn.textContent = old, 1500);
-  }});
-}}
-</script>
-</body>
-</html>"#,
-        title = esc(title),
-        node_count = bundle.direct_node_names.len(),
-    )
+    INDEX_HTML_TEMPLATE
+        .replace("{{TITLE}}", &esc(title))
+        .replace("{{NODES_SUMMARY}}", &nodes_summary)
+        .replace("{{USED}}", &used_str)
+        .replace("{{TOTAL}}", &total_str)
+        .replace("{{PCT}}", &pct_val)
+        .replace("{{UPLOAD}}", &up_str)
+        .replace("{{DOWNLOAD}}", &down_str)
+        .replace("{{RESET}}", &reset_str)
+        .replace("{{NODE_COUNT}}", &node_names.len().to_string())
+        .replace("{{CARDS}}", &cards)
+        .replace("{{URI_ESCAPED}}", &uri_escaped)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::apply;
     use hyper::body::Body;
 
     #[test]
-    fn rejects_invalid_tokens_and_query_params_and_serves_valid_routes() {
+    fn rejects_invalid_tokens_and_query_params_and_serves_valid_and_argo_routes() {
         let dir = tempfile::tempdir().unwrap();
-        let cfg = Config {
+        let mut cfg = Config {
             domain: "sub.example.com".into(),
             public_ip: "203.0.113.10".into(),
             ..crate::config::test_defaults()
         };
+        cfg.argo.enabled = true;
+        cfg.argo.tunnel_domain = "tunnel.example.com".into();
+        cfg.argo.sub_domain = "argo.example.com".into();
         cfg.save(dir.path()).unwrap();
         let sec = crate::test_secrets::fixture(&cfg);
         sec.save(dir.path()).unwrap();
         apply::apply_all(dir.path()).unwrap();
 
-        let state = AppState {
-            root: dir.path().to_path_buf(),
-            kind: ListenerKind::DirectHttps,
-            budget: Arc::new(Mutex::new(IpBudget::new())),
-        };
+        let budget = Arc::new(Mutex::new(IpBudget::new()));
+        let direct_state = AppState::new(
+            dir.path().to_path_buf(),
+            ListenerKind::DirectHttps,
+            Arc::clone(&budget),
+        );
+        let argo_state =
+            AppState::new(dir.path().to_path_buf(), ListenerKind::ArgoLoopback, budget);
         let token = sec.primary_token().unwrap();
 
-        let auth: ServeAuth =
-            serde_json::from_slice(&fs::read(dir.path().join(SERVE_AUTH_REL)).unwrap()).unwrap();
-        assert!(constant_time_hash_match(&auth.token_sha256, token));
-        assert!(!constant_time_hash_match(&auth.token_sha256, "bad"));
+        let auth = store::read_serve_auth(dir.path()).unwrap();
+        assert!(store::constant_time_hash_match(&auth.token_sha256, token));
+        assert!(!store::constant_time_hash_match(&auth.token_sha256, "bad"));
 
         // Valid GET & HEAD
         let ok = route_request(
             &Method::GET,
             &format!("/sub/{token}/clash.yaml"),
             None,
-            &state,
+            &direct_state,
             None,
         );
         assert_eq!(ok.status(), StatusCode::OK);
@@ -1027,23 +1004,71 @@ mod tests {
             &Method::HEAD,
             &format!("/sub/{token}/sing-box.json"),
             None,
-            &state,
+            &direct_state,
             None,
         );
         assert_eq!(head.status(), StatusCode::OK);
+
+        // Index & QR SVG
+        let idx = route_request(
+            &Method::GET,
+            &format!("/sub/{token}/index"),
+            None,
+            &direct_state,
+            None,
+        );
+        assert_eq!(idx.status(), StatusCode::OK);
+        let qr_svg = route_request(
+            &Method::GET,
+            &format!("/sub/{token}/qr/clash.svg"),
+            None,
+            &direct_state,
+            None,
+        );
+        assert_eq!(qr_svg.status(), StatusCode::OK);
+
+        // Precompiled Argo serving
+        let argo_ok = route_request(
+            &Method::GET,
+            &format!("/sub/{token}/clash.yaml"),
+            None,
+            &argo_state,
+            None,
+        );
+        assert_eq!(argo_ok.status(), StatusCode::OK);
+        assert_eq!(
+            argo_ok.headers().get("CDN-Cache-Control").unwrap(),
+            "no-store"
+        );
+
+        // Legacy alias removed
+        let legacy = route_request(
+            &Method::GET,
+            &format!("/sub/{token}/sing-box-full.json"),
+            None,
+            &direct_state,
+            None,
+        );
+        assert_eq!(legacy.status(), StatusCode::NOT_FOUND);
 
         // Query string rejected with 404
         let q = route_request(
             &Method::GET,
             &format!("/sub/{token}/clash.yaml"),
             Some("format=clash"),
-            &state,
+            &direct_state,
             None,
         );
         assert_eq!(q.status(), StatusCode::NOT_FOUND);
 
         // Wrong token rejected with 404
-        let bad_tok = route_request(&Method::GET, "/sub/wrong/clash.yaml", None, &state, None);
+        let bad_tok = route_request(
+            &Method::GET,
+            "/sub/wrong/clash.yaml",
+            None,
+            &direct_state,
+            None,
+        );
         assert_eq!(bad_tok.status(), StatusCode::NOT_FOUND);
 
         // POST rejected with 405
@@ -1051,7 +1076,7 @@ mod tests {
             &Method::POST,
             &format!("/sub/{token}/clash.yaml"),
             None,
-            &state,
+            &direct_state,
             None,
         );
         assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);

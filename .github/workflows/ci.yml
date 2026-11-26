@@ -33,7 +33,7 @@ jobs:
             sudo apt-get update -qq
             sudo apt-get install -y jq
           fi
-      - run: cargo test --all-targets --features test-signing
+      - run: cargo test --all-targets
 
   build-linux-amd64:
     runs-on: ubuntu-22.04

@@ -70,9 +70,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: stable
-      - env:
-          VSM_RELEASE_PUBLIC_KEY_HEX: ${{ vars.VSM_RELEASE_PUBLIC_KEY_HEX || vars.SBCTL_RELEASE_PUBLIC_KEY_HEX }}
-        run: cargo build --release --locked --no-default-features
+      - run: cargo build --release --locked --no-default-features
       - run: |
           mkdir -p dist
           install -m 0755 target/release/vps-sub-meter "dist/vps-sub-meter-linux-${{ matrix.arch }}"
@@ -104,13 +102,12 @@ jobs:
           PUBLISH: ${{ github.event_name == 'push' || inputs.publish }}
         run: |
           set -euo pipefail
-          chmod 0755 dist/vps-sub-meter-linux-amd64
-          export VSM_SIGNER="$PWD/dist/vps-sub-meter-linux-amd64"
           umask 077
           seed_file=$(mktemp)
           trap 'rm -f "$seed_file"' EXIT
           printf '%s' "$SIGNING_SEED" > "$seed_file"
           export VSM_SIGNING_KEY="$seed_file"
+          export VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX"
 
           tar -czf dist/vps-sub-meter-bundle.tar.gz templates scripts
           for arch in amd64 arm64; do

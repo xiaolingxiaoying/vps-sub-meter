@@ -50,7 +50,7 @@ ensure_accounts_and_dirs() {
     usermod -aG vsm-cert "$u"
   done
 
-  mkdir -p /etc/vps-sub-meter/templates /etc/vps-sub-meter/overrides \
+  mkdir -p /etc/vps-sub-meter/templates \
            /etc/vps-sub-meter/xray /etc/vps-sub-meter/sing-box \
            /var/lib/vps-sub-meter/acme-webroot/.well-known/acme-challenge \
            /var/lib/vps-sub-meter/certificates \
@@ -59,8 +59,8 @@ ensure_accounts_and_dirs() {
 
   chown root:root /etc/vps-sub-meter
   chmod 0755 /etc/vps-sub-meter
-  chown root:vps-sub-meter /etc/vps-sub-meter/templates /etc/vps-sub-meter/overrides
-  chmod 0750 /etc/vps-sub-meter/templates /etc/vps-sub-meter/overrides
+  chown root:vps-sub-meter /etc/vps-sub-meter/templates
+  chmod 0750 /etc/vps-sub-meter/templates
   chown root:xray /etc/vps-sub-meter/xray
   chmod 0750 /etc/vps-sub-meter/xray
   chown root:sing-box /etc/vps-sub-meter/sing-box

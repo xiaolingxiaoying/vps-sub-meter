@@ -5,10 +5,10 @@
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::net::{IpAddr, Ipv4Addr, TcpListener, UdpSocket};
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use crate::fs_util;
+use crate::store;
 
 pub const ETC_DIR: &str = "etc/vps-sub-meter";
 pub const VAR_DIR: &str = "var/lib/vps-sub-meter";
@@ -166,7 +166,7 @@ impl Config {
 
     pub fn load(root: &Path) -> Result<Self, ConfigError> {
         let path = Self::path(root);
-        let text = match fs_util::read_to_string_no_follow(&path) {
+        let text = match store::read_to_string_no_follow(&path) {
             Ok(t) => t,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(ConfigError::Missing(path));
@@ -194,7 +194,7 @@ impl Config {
     pub fn save(&self, root: &Path) -> Result<(), ConfigError> {
         self.validate()?;
         let text = self.to_commented_toml();
-        fs_util::write_atomic_preserving_owner(&Self::path(root), text.as_bytes(), 0o640)?;
+        store::write_atomic_preserving_owner(&Self::path(root), text.as_bytes(), 0o640)?;
         Ok(())
     }
 
@@ -323,6 +323,17 @@ impl Config {
     }
 
     pub fn validate(&self) -> Result<(), ConfigError> {
+        self.validate_base()?;
+        self.validate_traffic()?;
+
+        let mut tcp_ports = BTreeSet::new();
+        let mut udp_ports = BTreeSet::new();
+        self.validate_server_ports(&mut tcp_ports)?;
+        self.validate_nodes(&mut tcp_ports, &mut udp_ports)?;
+        self.validate_argo(&mut tcp_ports)
+    }
+
+    fn validate_base(&self) -> Result<(), ConfigError> {
         if self.profile_name.trim().is_empty() || self.profile_name.chars().any(char::is_control) {
             return Err(ConfigError::Invalid("profile_name 无效".into()));
         }
@@ -340,9 +351,10 @@ impl Config {
         if !is_valid_interface(self.interface.trim()) {
             return Err(ConfigError::Invalid("interface 网卡名无效".into()));
         }
-        validate_url_http(&self.latency_probe_url)?;
+        validate_url_http(&self.latency_probe_url)
+    }
 
-        // Traffic validation
+    fn validate_traffic(&self) -> Result<(), ConfigError> {
         if !self.traffic.monthly_gb.is_finite() || self.traffic.monthly_gb < 0.0 {
             return Err(ConfigError::Invalid("traffic.monthly_gb 不能为负数".into()));
         }
@@ -358,8 +370,43 @@ impl Config {
             .display_tz
             .parse::<Tz>()
             .map_err(|_| ConfigError::Invalid("traffic.display_tz 不是有效 IANA 时区".into()))?;
+        Ok(())
+    }
 
-        // At least 1 node enabled
+    fn validate_server_ports(&self, tcp_ports: &mut BTreeSet<u16>) -> Result<(), ConfigError> {
+        if self.is_ip_mode() {
+            check_node_port(self.server.http_fallback_port)?;
+            tcp_ports.insert(self.server.http_fallback_port);
+            return Ok(());
+        }
+        if self.server.acme_port == 0 || self.server.https_port == 0 {
+            return Err(ConfigError::Invalid(
+                "acme_port / https_port 不能为 0".into(),
+            ));
+        }
+        tcp_ports.insert(self.server.acme_port);
+        if !self.xray_fronts_443() {
+            tcp_ports.insert(self.server.https_port);
+        } else {
+            check_high_port(self.server.loopback_https_port)?;
+            tcp_ports.insert(self.server.loopback_https_port);
+        }
+        if let Some(extra) = self.server.extra_https_port {
+            check_node_port(extra)?;
+            if !tcp_ports.insert(extra) {
+                return Err(ConfigError::Invalid(
+                    "extra_https_port 与其他 TCP 端口冲突".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_nodes(
+        &self,
+        tcp_ports: &mut BTreeSet<u16>,
+        udp_ports: &mut BTreeSet<u16>,
+    ) -> Result<(), ConfigError> {
         let enabled_count = [
             self.nodes.vless_reality_pqc.enabled,
             self.nodes.vless_xhttp_pqc.enabled,
@@ -374,37 +421,7 @@ impl Config {
             return Err(ConfigError::Invalid("至少需要启用一个主力代理节点".into()));
         }
 
-        // Validate ports across TCP & UDP namespaces
-        let mut tcp_ports = BTreeSet::new();
-        let mut udp_ports = BTreeSet::new();
         let mut node_names = BTreeSet::new();
-
-        if self.is_ip_mode() {
-            check_node_port(self.server.http_fallback_port)?;
-            tcp_ports.insert(self.server.http_fallback_port);
-        } else {
-            if self.server.acme_port == 0 || self.server.https_port == 0 {
-                return Err(ConfigError::Invalid(
-                    "acme_port / https_port 不能为 0".into(),
-                ));
-            }
-            tcp_ports.insert(self.server.acme_port);
-            if !self.xray_fronts_443() {
-                tcp_ports.insert(self.server.https_port);
-            } else {
-                check_high_port(self.server.loopback_https_port)?;
-                tcp_ports.insert(self.server.loopback_https_port);
-            }
-            if let Some(extra) = self.server.extra_https_port {
-                check_node_port(extra)?;
-                if !tcp_ports.insert(extra) {
-                    return Err(ConfigError::Invalid(
-                        "extra_https_port 与其他 TCP 端口冲突".into(),
-                    ));
-                }
-            }
-        }
-
         let mut push_name = |name: &str| -> Result<(), ConfigError> {
             let trimmed = name.trim();
             if trimmed.is_empty()
@@ -418,12 +435,13 @@ impl Config {
         };
 
         if self.nodes.vless_reality_pqc.enabled {
-            push_name(&self.nodes.vless_reality_pqc.name)?;
-            check_node_port(self.nodes.vless_reality_pqc.port)?;
-            if !is_valid_hostname(self.nodes.vless_reality_pqc.decoy_sni.trim()) {
+            let n = &self.nodes.vless_reality_pqc;
+            push_name(&n.name)?;
+            check_node_port(n.port)?;
+            if !is_valid_hostname(n.decoy_sni.trim()) {
                 return Err(ConfigError::Invalid("Reality decoy_sni 无效".into()));
             }
-            if let Some(host) = &self.nodes.vless_reality_pqc.connect_host
+            if let Some(host) = &n.connect_host
                 && !host.trim().is_empty()
                 && !is_valid_host(host.trim())
             {
@@ -432,40 +450,46 @@ impl Config {
                 ));
             }
             if self.xray_fronts_443() {
-                check_high_port(self.nodes.vless_reality_pqc.loopback_port)?;
-                if !tcp_ports.insert(self.nodes.vless_reality_pqc.port)
-                    || !tcp_ports.insert(self.nodes.vless_reality_pqc.loopback_port)
-                {
+                check_high_port(n.loopback_port)?;
+                if !tcp_ports.insert(n.port) || !tcp_ports.insert(n.loopback_port) {
                     return Err(ConfigError::Invalid("Reality 443/loopback 端口冲突".into()));
                 }
-            } else if !tcp_ports.insert(self.nodes.vless_reality_pqc.port) {
+            } else if !tcp_ports.insert(n.port) {
                 return Err(ConfigError::Invalid("vless_reality_pqc 端口冲突".into()));
             }
         }
 
-        if self.nodes.vless_xhttp_pqc.enabled {
-            push_name(&self.nodes.vless_xhttp_pqc.name)?;
-            check_node_port(self.nodes.vless_xhttp_pqc.port)?;
-            if !tcp_ports.insert(self.nodes.vless_xhttp_pqc.port) {
-                return Err(ConfigError::Invalid("vless_xhttp_pqc 端口冲突".into()));
-            }
-        }
-
-        if self.nodes.anytls_tcp.enabled {
-            push_name(&self.nodes.anytls_tcp.name)?;
-            check_node_port(self.nodes.anytls_tcp.port)?;
-            if !tcp_ports.insert(self.nodes.anytls_tcp.port) {
-                return Err(ConfigError::Invalid("anytls_tcp 端口冲突".into()));
+        for (enabled, name, port, label) in [
+            (
+                self.nodes.vless_xhttp_pqc.enabled,
+                &self.nodes.vless_xhttp_pqc.name,
+                self.nodes.vless_xhttp_pqc.port,
+                "vless_xhttp_pqc",
+            ),
+            (
+                self.nodes.anytls_tcp.enabled,
+                &self.nodes.anytls_tcp.name,
+                self.nodes.anytls_tcp.port,
+                "anytls_tcp",
+            ),
+        ] {
+            if enabled {
+                push_name(name)?;
+                check_node_port(port)?;
+                if !tcp_ports.insert(port) {
+                    return Err(ConfigError::Invalid(format!("{label} 端口冲突")));
+                }
             }
         }
 
         if self.nodes.hysteria2_hop.enabled {
-            push_name(&self.nodes.hysteria2_hop.name)?;
-            check_node_port(self.nodes.hysteria2_hop.port)?;
-            if !udp_ports.insert(self.nodes.hysteria2_hop.port) {
+            let n = &self.nodes.hysteria2_hop;
+            push_name(&n.name)?;
+            check_node_port(n.port)?;
+            if !udp_ports.insert(n.port) {
                 return Err(ConfigError::Invalid("hysteria2_hop UDP 端口冲突".into()));
             }
-            if !(5..=3600).contains(&self.nodes.hysteria2_hop.hop_interval_sec) {
+            if !(5..=3600).contains(&n.hop_interval_sec) {
                 return Err(ConfigError::Invalid(
                     "hop_interval_sec 须在 5..=3600".into(),
                 ));
@@ -473,7 +497,7 @@ impl Config {
             if let Some((start, end)) = self.parse_hop_range()?
                 && udp_ports
                     .iter()
-                    .filter(|p| **p != self.nodes.hysteria2_hop.port)
+                    .filter(|p| **p != n.port)
                     .chain(tcp_ports.iter())
                     .any(|p| (start..=end).contains(p))
             {
@@ -484,13 +508,14 @@ impl Config {
         }
 
         if self.nodes.tuic_bbr.enabled {
-            push_name(&self.nodes.tuic_bbr.name)?;
-            check_node_port(self.nodes.tuic_bbr.port)?;
-            if !udp_ports.insert(self.nodes.tuic_bbr.port) {
+            let n = &self.nodes.tuic_bbr;
+            push_name(&n.name)?;
+            check_node_port(n.port)?;
+            if !udp_ports.insert(n.port) {
                 return Err(ConfigError::Invalid("tuic_bbr UDP 端口冲突".into()));
             }
             if let Some((start, end)) = self.parse_hop_range()?
-                && (start..=end).contains(&self.nodes.tuic_bbr.port)
+                && (start..=end).contains(&n.port)
             {
                 return Err(ConfigError::Invalid(
                     "tuic_bbr 端口落入 Hy2 跳跃范围".into(),
@@ -498,52 +523,56 @@ impl Config {
             }
         }
 
-        if self.argo.enabled {
-            if !is_valid_hostname(self.argo.tunnel_domain.trim())
-                || !is_valid_hostname(self.argo.sub_domain.trim())
+        Ok(())
+    }
+
+    fn validate_argo(&self, tcp_ports: &mut BTreeSet<u16>) -> Result<(), ConfigError> {
+        if !self.argo.enabled {
+            return Ok(());
+        }
+        if !is_valid_hostname(self.argo.tunnel_domain.trim())
+            || !is_valid_hostname(self.argo.sub_domain.trim())
+        {
+            return Err(ConfigError::Invalid(
+                "启用 Argo 时 tunnel_domain 与 sub_domain 必须为有效域名".into(),
+            ));
+        }
+        check_high_port(self.argo.loopback_sub_port)?;
+        if !tcp_ports.insert(self.argo.loopback_sub_port) {
+            return Err(ConfigError::Invalid(
+                "argo.loopback_sub_port 端口冲突".into(),
+            ));
+        }
+        if self.argo.ws_inbounds.is_empty() {
+            return Err(ConfigError::Invalid(
+                "启用 Argo 时至少需要一条 ws_inbounds".into(),
+            ));
+        }
+        let mut ws_ids = BTreeSet::new();
+        for ws in &self.argo.ws_inbounds {
+            if ws.id.trim().is_empty()
+                || !ws
+                    .id
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+                || !ws_ids.insert(ws.id.clone())
             {
-                return Err(ConfigError::Invalid(
-                    "启用 Argo 时 tunnel_domain 与 sub_domain 必须为有效域名".into(),
-                ));
+                return Err(ConfigError::Invalid(format!(
+                    "Argo WS id 无效或重复: {}",
+                    ws.id
+                )));
             }
-            check_high_port(self.argo.loopback_sub_port)?;
-            if !tcp_ports.insert(self.argo.loopback_sub_port) {
-                return Err(ConfigError::Invalid(
-                    "argo.loopback_sub_port 端口冲突".into(),
-                ));
+            check_high_port(ws.port)?;
+            if ws.listen.parse::<IpAddr>().is_err() {
+                return Err(ConfigError::Invalid("Argo WS listen 地址无效".into()));
             }
-            if self.argo.ws_inbounds.is_empty() {
-                return Err(ConfigError::Invalid(
-                    "启用 Argo 时至少需要一条 ws_inbounds".into(),
-                ));
-            }
-            let mut ws_ids = BTreeSet::new();
-            for ws in &self.argo.ws_inbounds {
-                if ws.id.trim().is_empty()
-                    || !ws
-                        .id
-                        .bytes()
-                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
-                    || !ws_ids.insert(ws.id.clone())
-                {
-                    return Err(ConfigError::Invalid(format!(
-                        "Argo WS id 无效或重复: {}",
-                        ws.id
-                    )));
-                }
-                check_high_port(ws.port)?;
-                if ws.listen.parse::<IpAddr>().is_err() {
-                    return Err(ConfigError::Invalid("Argo WS listen 地址无效".into()));
-                }
-                if !tcp_ports.insert(ws.port) {
-                    return Err(ConfigError::Invalid(format!(
-                        "Argo WS 端口 {} 冲突",
-                        ws.port
-                    )));
-                }
+            if !tcp_ports.insert(ws.port) {
+                return Err(ConfigError::Invalid(format!(
+                    "Argo WS 端口 {} 冲突",
+                    ws.port
+                )));
             }
         }
-
         Ok(())
     }
 
@@ -557,64 +586,8 @@ impl Config {
     }
 }
 
-pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
-    const FIRST: u16 = 20_000;
-    const COUNT: u16 = 10_000;
-
-    let mut reserved = BTreeSet::from([
-        cfg.server.acme_port,
-        cfg.server.https_port,
-        cfg.server.loopback_https_port,
-        cfg.server.http_fallback_port,
-        cfg.nodes.vless_reality_pqc.loopback_port,
-    ]);
-    reserved.extend(cfg.server.extra_https_port);
-    if cfg.argo.enabled {
-        reserved.insert(cfg.argo.loopback_sub_port);
-        reserved.extend(cfg.argo.ws_inbounds.iter().map(|ws| ws.port));
-    }
-    let hop_range = cfg
-        .parse_hop_range()
-        .map_err(|e| e.to_string())?
-        .map(|(start, end)| start..=end);
-
-    for (port, udp) in [
-        (&mut cfg.nodes.vless_reality_pqc.port, false),
-        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
-        (&mut cfg.nodes.anytls_tcp.port, false),
-        (&mut cfg.nodes.hysteria2_hop.port, true),
-        (&mut cfg.nodes.tuic_bbr.port, true),
-    ] {
-        let mut bytes = [0; 4];
-        getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
-        let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
-        let selected = (0..COUNT)
-            .map(|offset| FIRST + (start + offset) % COUNT)
-            .find(|candidate| {
-                if reserved.contains(candidate)
-                    || hop_range
-                        .as_ref()
-                        .is_some_and(|range| range.contains(candidate))
-                {
-                    return false;
-                }
-                let addr = (Ipv4Addr::UNSPECIFIED, *candidate);
-                !probe_local_ports
-                    || if udp {
-                        UdpSocket::bind(addr).is_ok()
-                    } else {
-                        TcpListener::bind(addr).is_ok()
-                    }
-            })
-            .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
-        *port = selected;
-        reserved.insert(selected);
-    }
-    Ok(())
-}
-
 fn read_defaults(path: &Path) -> Result<toml::Table, ConfigError> {
-    let text = fs_util::read_to_string_no_follow(path)
+    let text = store::read_to_string_no_follow(path)
         .map_err(|e| ConfigError::Defaults(path.to_path_buf(), e.to_string()))?;
     toml::from_str(&text).map_err(|e| ConfigError::Defaults(path.to_path_buf(), e.to_string()))
 }
@@ -702,17 +675,17 @@ pub fn format_url_host(host: &str) -> String {
     }
 }
 
-pub fn is_public_ipv4(ip: std::net::Ipv4Addr) -> bool {
-    !ip.is_private()
-        && !ip.is_loopback()
-        && !ip.is_link_local()
-        && !ip.is_broadcast()
-        && !ip.is_documentation()
-        && !ip.is_multicast()
-        && !ip.is_unspecified()
-        && ip.octets()[0] != 0
-        && !(ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
-        && ip.octets()[0] < 240
+pub fn pct(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char);
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -783,31 +756,5 @@ mod tests {
             ..crate::config::test_defaults()
         };
         assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn random_node_ports_are_distinct_and_avoid_configured_listeners() {
-        let mut cfg = Config {
-            domain: "sub.example.com".into(),
-            ..test_defaults()
-        };
-        cfg.server.extra_https_port = Some(20_001);
-        cfg.nodes.hysteria2_hop.hop_range = Some("20002-29990".into());
-        randomize_node_ports(&mut cfg, false).unwrap();
-
-        let ports = BTreeSet::from([
-            cfg.nodes.vless_reality_pqc.port,
-            cfg.nodes.vless_xhttp_pqc.port,
-            cfg.nodes.anytls_tcp.port,
-            cfg.nodes.hysteria2_hop.port,
-            cfg.nodes.tuic_bbr.port,
-        ]);
-        assert_eq!(ports.len(), 5);
-        assert!(
-            ports
-                .iter()
-                .all(|p| *p == 20_000 || (29_991..=29_999).contains(p))
-        );
-        cfg.validate().unwrap();
     }
 }

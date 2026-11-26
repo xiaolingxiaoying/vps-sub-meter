@@ -9,7 +9,7 @@ use std::process::Command;
 use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 use crate::config::Config;
-use crate::fs_util;
+use crate::store;
 
 pub const SECRETS_REL: &str = "etc/vps-sub-meter/secrets.json";
 
@@ -97,7 +97,7 @@ impl Secrets {
     }
 
     pub fn load_or_default(root: &Path) -> Result<Self, SecretsError> {
-        match fs_util::read_no_follow(&Self::path(root)) {
+        match store::read_no_follow(&Self::path(root)) {
             Ok(bytes) => {
                 serde_json::from_slice(&bytes).map_err(|e| SecretsError::Parse(e.to_string()))
             }
@@ -109,7 +109,7 @@ impl Secrets {
     pub fn save(&self, root: &Path) -> Result<(), SecretsError> {
         let bytes =
             serde_json::to_vec_pretty(self).map_err(|e| SecretsError::Parse(e.to_string()))?;
-        fs_util::write_atomic(&Self::path(root), &bytes, 0o600)?;
+        store::write_atomic(&Self::path(root), &bytes, 0o600)?;
         Ok(())
     }
 

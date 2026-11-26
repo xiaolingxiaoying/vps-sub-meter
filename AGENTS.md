@@ -10,7 +10,7 @@ See `CONTEXT.md` at the repository root.
 
 - Format check: `cargo fmt --all -- --check`
 - Lint: `cargo clippy --all-targets --all-features -- -D warnings`
-- Unit & integration tests: `cargo test --all-targets --features test-signing`
+- Unit & integration tests: `cargo test --all-targets`
 - Shell syntax check: `bash -n scripts/*.sh`
 
 ## 使用中文回答我

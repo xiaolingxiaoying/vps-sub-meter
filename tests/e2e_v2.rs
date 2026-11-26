@@ -3,9 +3,9 @@ mod test_secrets;
 
 use std::fs;
 use vps_sub_meter::{
-    apply, compiler,
+    apply,
     config::{Config, DEFAULT_CONFIG_REL},
-    traffic,
+    render, store, traffic,
 };
 
 #[test]
@@ -47,7 +47,7 @@ fn full_sandbox_lifecycle_and_external_client_template() {
     apply::apply_all(root).unwrap();
     let cfg = Config::load(root).unwrap();
     assert_eq!(cfg, initial);
-    let generation = apply::current_generation(root).unwrap().unwrap();
+    let generation = store::current_generation(root).unwrap().unwrap();
     assert_eq!(generation.direct_nodes.len(), 5);
     assert_eq!(generation.singbox_nodes.len(), 3);
 
@@ -64,6 +64,6 @@ fn full_sandbox_lifecycle_and_external_client_template() {
         "external-controller: '127.0.0.1:9099'",
     );
     fs::write(tpl_dir.join("mihomo.yaml"), custom_mihomo).unwrap();
-    let bundle = compiler::compile_direct_clients(root, &cfg, &sec).unwrap();
+    let bundle = render::client::compile_direct_clients(root, &cfg, &sec).unwrap();
     assert!(bundle.clash_yaml.contains("127.0.0.1:9099"));
 }

@@ -18,7 +18,7 @@
 
 REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
 
-另可选原生集成 **Cloudflare Argo 隧道优选订阅**（直接读取 `/etc/vps-sub-meter/argo-ips.txt` 动态展开优选 IP，无需额外 Python 服务）。
+另可选原生集成 **Cloudflare Argo 隧道优选订阅**（在 `vsm apply` 时读取 `/etc/vps-sub-meter/argo-ips.txt` 预编译并展开优选 IP，更新优选 IP 后执行一次 `vsm apply` 即可生效）。
 
 ## 快速安装与全版本平滑升级
 

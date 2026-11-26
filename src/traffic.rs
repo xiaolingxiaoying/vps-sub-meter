@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
 use crate::config::{Config, VAR_DIR};
-use crate::fs_util;
+use crate::store;
 
 pub const TRAFFIC_REL: &str = "var/lib/vps-sub-meter/traffic-state.json";
 
@@ -77,8 +77,8 @@ pub fn state_path(root: &Path) -> PathBuf {
 
 pub fn read_iface_counters(root: &Path, iface: &str) -> Result<(u64, u64), TrafficError> {
     let base = root.join("sys/class/net").join(iface).join("statistics");
-    let rx_s = fs_util::read_to_string_no_follow(&base.join("rx_bytes"))?;
-    let tx_s = fs_util::read_to_string_no_follow(&base.join("tx_bytes"))?;
+    let rx_s = store::read_to_string_no_follow(&base.join("rx_bytes"))?;
+    let tx_s = store::read_to_string_no_follow(&base.join("tx_bytes"))?;
     let rx = rx_s
         .trim()
         .parse::<u64>()
@@ -91,7 +91,7 @@ pub fn read_iface_counters(root: &Path, iface: &str) -> Result<(u64, u64), Traff
 }
 
 pub fn read_boot_id(root: &Path) -> String {
-    fs_util::read_to_string_no_follow(&root.join("proc/sys/kernel/random/boot_id"))
+    store::read_to_string_no_follow(&root.join("proc/sys/kernel/random/boot_id"))
         .map(|s| s.trim().to_owned())
         .unwrap_or_else(|_| "unknown".into())
 }
@@ -163,7 +163,7 @@ fn resolve_local_datetime(
 }
 
 pub fn load_state(root: &Path) -> Result<Option<TrafficState>, TrafficError> {
-    match fs_util::read_no_follow(&state_path(root)) {
+    match store::read_no_follow(&state_path(root)) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
             .map_err(|e| TrafficError::Parse(e.to_string())),
@@ -174,7 +174,7 @@ pub fn load_state(root: &Path) -> Result<Option<TrafficState>, TrafficError> {
 
 pub fn save_state(root: &Path, state: &TrafficState) -> Result<(), TrafficError> {
     let bytes = serde_json::to_vec_pretty(state).map_err(|e| TrafficError::Parse(e.to_string()))?;
-    fs_util::write_atomic(&state_path(root), &bytes, 0o640)?;
+    store::write_atomic(&state_path(root), &bytes, 0o640)?;
     Ok(())
 }
 
@@ -234,8 +234,7 @@ pub fn checkpoint_at(
     config: &Config,
     now: DateTime<Utc>,
 ) -> Result<TrafficSnapshot, TrafficError> {
-    let _lock = fs_util::open_lock(&root.join(VAR_DIR))?;
-    fs2::FileExt::lock_exclusive(&_lock)?;
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
     let (rx, tx) = read_iface_counters(root, &config.interface)?;
     let boot_id = read_boot_id(root);
     let next_reset = next_reset_after(config, now)?;
@@ -292,8 +291,7 @@ pub fn set_used(
     upload_bytes: u64,
     download_bytes: u64,
 ) -> Result<TrafficSnapshot, TrafficError> {
-    let _lock = fs_util::open_lock(&root.join(VAR_DIR))?;
-    fs2::FileExt::lock_exclusive(&_lock)?;
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
     let (rx, tx) = read_iface_counters(root, &config.interface)?;
     let boot_id = read_boot_id(root);
     let next_reset = next_reset_after(config, Utc::now())?;

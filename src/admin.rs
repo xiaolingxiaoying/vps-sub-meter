@@ -1,14 +1,17 @@
+use std::collections::BTreeSet;
 use std::io::{self, Write};
+use std::net::{Ipv4Addr, TcpListener, UdpSocket};
 use std::path::Path;
 
 use clap::{Args, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::json;
 use vps_sub_meter::{
-    apply, compiler,
-    config::{Config, ConfigError, VAR_DIR, randomize_node_ports},
-    fs_util, qr,
+    apply,
+    config::{Config, ConfigError, VAR_DIR, pct},
+    qr,
     secrets::{Secrets, SubscriptionToken, random_urlsafe},
+    store,
 };
 
 #[derive(Subcommand)]
@@ -129,7 +132,7 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
             let config: Config = serde_json::from_reader(io::stdin().lock())
                 .map_err(|e| format!("配置 JSON 无效: {e}"))?;
             config.validate().map_err(|e| e.to_string())?;
-            let _lock = fs_util::lock_exclusive(&root.join(VAR_DIR)).map_err(|e| e.to_string())?;
+            let _lock = store::lock_exclusive(&root.join(VAR_DIR)).map_err(|e| e.to_string())?;
             if !replace {
                 match Config::path(root).symlink_metadata() {
                     Ok(_) => return Err("主配置已存在，覆盖时需要 --replace".into()),
@@ -140,6 +143,62 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
             config.save(root).map_err(|e| e.to_string())
         }
     }
+}
+
+pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
+    const FIRST: u16 = 20_000;
+    const COUNT: u16 = 10_000;
+
+    let mut reserved = BTreeSet::from([
+        cfg.server.acme_port,
+        cfg.server.https_port,
+        cfg.server.loopback_https_port,
+        cfg.server.http_fallback_port,
+        cfg.nodes.vless_reality_pqc.loopback_port,
+    ]);
+    reserved.extend(cfg.server.extra_https_port);
+    if cfg.argo.enabled {
+        reserved.insert(cfg.argo.loopback_sub_port);
+        reserved.extend(cfg.argo.ws_inbounds.iter().map(|ws| ws.port));
+    }
+    let hop_range = cfg
+        .parse_hop_range()
+        .map_err(|e| e.to_string())?
+        .map(|(start, end)| start..=end);
+
+    for (port, udp) in [
+        (&mut cfg.nodes.vless_reality_pqc.port, false),
+        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
+        (&mut cfg.nodes.anytls_tcp.port, false),
+        (&mut cfg.nodes.hysteria2_hop.port, true),
+        (&mut cfg.nodes.tuic_bbr.port, true),
+    ] {
+        let mut bytes = [0; 4];
+        getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
+        let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
+        let selected = (0..COUNT)
+            .map(|offset| FIRST + (start + offset) % COUNT)
+            .find(|candidate| {
+                if reserved.contains(candidate)
+                    || hop_range
+                        .as_ref()
+                        .is_some_and(|range| range.contains(candidate))
+                {
+                    return false;
+                }
+                let addr = (Ipv4Addr::UNSPECIFIED, *candidate);
+                !probe_local_ports
+                    || if udp {
+                        UdpSocket::bind(addr).is_ok()
+                    } else {
+                        TcpListener::bind(addr).is_ok()
+                    }
+            })
+            .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
+        *port = selected;
+        reserved.insert(selected);
+    }
+    Ok(())
 }
 
 pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
@@ -170,8 +229,8 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
             QrFormat::Clash => format!("{base}/clash.yaml"),
             QrFormat::SingBox => format!(
                 "sing-box://import-remote-profile?url={}#{}",
-                compiler::pct(&format!("{base}/sing-box.json")),
-                compiler::pct(&config.profile_name)
+                pct(&format!("{base}/sing-box.json")),
+                pct(&config.profile_name)
             ),
             QrFormat::Shadowrocket => format!("{base}/shadowrocket.txt"),
         };
@@ -285,4 +344,30 @@ pub fn print_json(value: &impl Serialize) -> Result<(), String> {
     let mut stdout = io::stdout().lock();
     serde_json::to_writer(&mut stdout, value).map_err(|e| e.to_string())?;
     writeln!(stdout).map_err(|e| e.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn random_node_ports_are_distinct_and_avoid_configured_listeners() {
+        let mut cfg: Config =
+            toml::from_str(include_str!("../templates/default-config.toml")).unwrap();
+        cfg.domain = "sub.example.com".into();
+        cfg.server.extra_https_port = Some(20_001);
+        cfg.nodes.hysteria2_hop.hop_range = Some("20002-29990".into());
+        randomize_node_ports(&mut cfg, false).unwrap();
+
+        let ports = BTreeSet::from([
+            cfg.nodes.vless_reality_pqc.port,
+            cfg.nodes.vless_xhttp_pqc.port,
+            cfg.nodes.anytls_tcp.port,
+            cfg.nodes.hysteria2_hop.port,
+            cfg.nodes.tuic_bbr.port,
+        ]);
+        assert_eq!(ports.len(), 5);
+        assert!(ports.iter().all(|p| (20_000..=29_999).contains(p)));
+        assert!(!ports.contains(&20_001));
+    }
 }

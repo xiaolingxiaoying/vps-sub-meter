@@ -8,8 +8,8 @@ use tempfile::TempDir;
 #[cfg(unix)]
 use vps_sub_meter::secrets::SECRETS_REL;
 use vps_sub_meter::{
-    apply::{CURRENT_REL, SERVE_AUTH_REL},
     config::{CONFIG_REL, DEFAULT_CONFIG_REL},
+    store::{CURRENT_REL, SERVE_AUTH_REL},
 };
 
 struct Sandbox(TempDir);
@@ -183,7 +183,6 @@ fn subscriptions_and_tokens_use_published_auth() {
         assert!(sandbox.ok(args, None).contains("\u{1b}["));
     }
 
-    let pending_auth: Value = serde_json::from_slice(&sandbox.file(SERVE_AUTH_REL)).unwrap();
     sandbox.ok(&["token", "add", "phone"], None);
     assert!(
         !sandbox
@@ -203,7 +202,16 @@ fn subscriptions_and_tokens_use_published_auth() {
         auth["token_sha256"][1],
         format!("{:x}", Sha256::digest(token))
     );
-    assert_eq!(auth["argo_ws"], pending_auth["argo_ws"]);
+    assert!(auth.get("argo_ws").is_none());
+    let gen_id = status["generation"]["id"].as_str().unwrap();
+    assert!(
+        sandbox
+            .root()
+            .join("var/lib/vps-sub-meter/generations")
+            .join(gen_id)
+            .join("argo/clash.yaml")
+            .is_file()
+    );
     assert_eq!(sandbox.file(CURRENT_REL), generation);
     sandbox.ok(&["token", "revoke", "phone"], None);
     assert!(
@@ -292,6 +300,25 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     defaults["nodes"]["vless_xhttp_pqc"]["enabled"] = toml::Value::Boolean(false);
     sandbox.write(DEFAULT_CONFIG_REL, &toml::to_string(&defaults).unwrap());
 
+    let run_menu = |input: &str| -> Output {
+        let mut process = Command::new("/bin/bash")
+            .arg(sandbox.root().join(script_path))
+            .arg("--root")
+            .arg(sandbox.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        process.wait_with_output().unwrap()
+    };
+
     let inputs = [
         "1\n",
         "sub.example.com\n",
@@ -305,7 +332,7 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     let mut prefix = String::new();
     for input in inputs {
         for attempt in [prefix.clone(), format!("{prefix}0\n0\n")] {
-            let output = sandbox.cli_with_input(&["menu"], Some(&attempt));
+            let output = run_menu(&attempt);
             assert!(
                 output.status.success(),
                 "{}",
@@ -318,7 +345,7 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
         prefix.push_str(input);
     }
 
-    let output = sandbox.cli_with_input(&["menu"], Some(&format!("{prefix}0\n")));
+    let output = run_menu(&format!("{prefix}0\n"));
     assert!(output.status.success());
     assert!(output.stderr.is_empty() || !String::from_utf8_lossy(&output.stderr).contains("错误:"));
     let screen = String::from_utf8(output.stdout).unwrap();
@@ -331,7 +358,7 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     }
     assert!(sandbox.root().join(CURRENT_REL).exists());
 
-    let output = sandbox.cli_with_input(&[], Some("1\n\n\n\n\n\n\n\n0\n"));
+    let output = run_menu("1\n\n\n\n\n\n\n\n0\n");
     assert!(output.status.success());
     assert_eq!(sandbox.json(&["config", "show"]), config);
 }

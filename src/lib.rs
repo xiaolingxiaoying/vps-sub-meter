@@ -1,12 +1,10 @@
 pub mod apply;
-pub mod compiler;
 pub mod config;
-pub mod fs_util;
-pub mod merge;
 pub mod qr;
-pub mod release;
+pub mod render;
 pub mod secrets;
 pub mod serve;
+pub mod store;
 pub mod traffic;
 
 #[cfg(test)]

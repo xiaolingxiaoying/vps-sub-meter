@@ -1,4 +1,4 @@
-//! `vps-sub-meter` (`vsm` / `ly`) CLI entrypoint.
+//! `vps-sub-meter` (`vsm`) CLI entrypoint.
 
 mod admin;
 
@@ -7,7 +7,7 @@ use serde_json::json;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
-use vps_sub_meter::{apply, config::Config, release, serve, traffic};
+use vps_sub_meter::{apply, config::Config, serve, store, traffic};
 
 #[derive(Parser)]
 #[command(
@@ -19,13 +19,11 @@ struct Cli {
     #[arg(long, default_value = "/")]
     root: PathBuf,
     #[command(subcommand)]
-    command: Option<Commands>,
+    command: Commands,
 }
 
 #[derive(Subcommand)]
 enum Commands {
-    /// 打开交互管理菜单 (等价于直接运行 `ly` 或 `vsm`)
-    Menu,
     /// 启动 HTTPS / ACME / Argo 订阅守护进程
     Serve,
     /// 校验配置与模板、生成新订阅批次并平滑重启变动的服务
@@ -57,11 +55,6 @@ enum Commands {
         #[command(subcommand)]
         cmd: TrafficCmd,
     },
-    /// 发布清单签名与校验
-    Release {
-        #[command(subcommand)]
-        cmd: ReleaseCmd,
-    },
 }
 
 #[derive(Subcommand)]
@@ -81,22 +74,6 @@ enum TrafficCmd {
     Set { upload_gib: f64, download_gib: f64 },
 }
 
-#[derive(Subcommand)]
-enum ReleaseCmd {
-    Sign {
-        #[arg(long)]
-        manifest: PathBuf,
-        #[arg(long)]
-        private_key: PathBuf,
-        #[arg(long)]
-        output: PathBuf,
-    },
-    Verify {
-        #[arg(long)]
-        manifest: PathBuf,
-    },
-}
-
 fn main() -> ExitCode {
     #[cfg(unix)]
     unsafe {
@@ -113,9 +90,8 @@ fn main() -> ExitCode {
     }
 }
 
-fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
-    match command.unwrap_or(Commands::Menu) {
-        Commands::Menu => launch_menu(root),
+fn run(root: &Path, command: Commands) -> Result<(), String> {
+    match command {
         Commands::Serve => {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -140,7 +116,7 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
             let cfg = Config::load(root).map_err(|e| e.to_string())?;
             let snap = traffic::snapshot(root, &cfg).map_err(|e| e.to_string())?;
             if json {
-                let generation = apply::current_generation(root).map_err(|e| e.to_string())?;
+                let generation = store::current_generation(root).map_err(|e| e.to_string())?;
                 return admin::print_json(&json!({
                     "version": env!("CARGO_PKG_VERSION"),
                     "address": cfg.primary_host(),
@@ -177,7 +153,7 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
                 traffic::format_time_in_tz(snap.next_reset_ts, &cfg.traffic.display_tz),
                 cfg.traffic.display_tz
             );
-            if let Ok(Some(gen_meta)) = apply::current_generation(root) {
+            if let Ok(Some(gen_meta)) = store::current_generation(root) {
                 println!(
                     "当前订阅批次: {} ({} 个节点: {})",
                     gen_meta.id,
@@ -238,42 +214,6 @@ fn run(root: &Path, command: Option<Commands>) -> Result<(), String> {
                 }
             }
             Ok(())
-        }
-        Commands::Release { cmd } => match cmd {
-            ReleaseCmd::Sign {
-                manifest,
-                private_key,
-                output,
-            } => release::sign_manifest_file(&manifest, &private_key, &output)
-                .map_err(|e| e.to_string()),
-            ReleaseCmd::Verify { manifest } => {
-                let m = release::verify_manifest_file(&manifest).map_err(|e| e.to_string())?;
-                println!("清单签名有效: vps-sub-meter {}", m.vps_sub_meter.version);
-                Ok(())
-            }
-        },
-    }
-}
-
-fn launch_menu(root: &Path) -> Result<(), String> {
-    let script = root.join("usr/local/lib/vps-sub-meter/ly.sh");
-    if !script.is_file() {
-        return Err(format!("找不到 {}，请重新安装菜单脚本", script.display()));
-    }
-    let mut command = std::process::Command::new("/bin/bash");
-    command.arg(script).arg("--root").arg(root);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        Err(command.exec().to_string())
-    }
-    #[cfg(not(unix))]
-    {
-        let status = command.status().map_err(|e| e.to_string())?;
-        if status.success() {
-            Ok(())
-        } else {
-            Err(format!("ly 退出: {status}"))
         }
     }
 }
