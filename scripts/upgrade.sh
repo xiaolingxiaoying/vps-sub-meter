@@ -114,7 +114,7 @@ fi
 
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  ca-certificates curl jq openssl python3 tar unzip certbot nftables >/dev/null
+  ca-certificates curl jq openssl socat tar unzip nftables >/dev/null
 
 WORK_DIR=$(mktemp -d)
 trap 'rm -rf -- "$WORK_DIR"' EXIT
@@ -206,6 +206,9 @@ bash /usr/local/lib/vps-sub-meter/net.sh tune-sysctl || true
 
 # 4. Run non-destructive configuration & traffic state migration for legacy versions
 if [[ "$EXISTING_GEN" != "v2" ]]; then
+  if ! command -v python3 >/dev/null 2>&1; then
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends python3 >/dev/null
+  fi
   python3 /usr/local/lib/vps-sub-meter/migrate_legacy.py --root /
   /usr/local/bin/vsm status >/dev/null
 fi

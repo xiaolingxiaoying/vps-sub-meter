@@ -8,13 +8,13 @@
 
 | 序号 | 节点名称 | 内核 | 默认端口 | 协议栈特性 |
 | --- | --- | --- | --- | --- |
-| 1 | `vless-reality-pqc` | Xray `26.11.9` | 随机 TCP | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
+| 1 | `vless-reality-pqc` | Xray `26.11.9` | 优先 `443/tcp`（被占则随机） | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
 | 2 | `vless-xhttp-pqc` | Xray `26.11.9` | 随机 TCP | VLESS + XHTTP (`mode: auto`) + TLS 1.3 (`h2`) + VLESS Encryption (`ML-KEM-768`) |
 | 3 | `anytls-tcp` | sing-box `1.14+` | 随机 TCP | AnyTLS + TLS 1.3 + 8 段 `padding_scheme` |
 | 4 | `hysteria2-hop` | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
 | 5 | `tuic-bbr` | sing-box `1.14+` | 随机 UDP | TUIC v5 + BBR + 0-RTT + Native UDP |
 
-全新安装时，端口方案直接回车会在 `20000–29999` 内给五个节点各分配一个不同的可用端口，确认后写入 `/etc/vps-sub-meter/config.toml`。后续应用和升级会沿用已保存的端口，重新运行向导时默认也会保留现有端口。域名模式的订阅 HTTPS 默认仍用 `443/tcp`。全新安装也可手动选择固定端口方案，在域名模式下由 Xray 与订阅 HTTPS 共用 `443/tcp`。
+全新安装时，端口方案默认采用「`vless-reality-pqc` 优先使用 `443/tcp`（域名模式下与订阅 HTTPS 通过 SNI 复用 `443/tcp`，若本机 `443` 已被占用则自动回退到随机高位端口），其余 4 个节点在 `20000–29999` 内随机分配」，确认后写入 `/etc/vps-sub-meter/config.toml`。后续应用和升级会沿用已保存的端口，重新运行向导时默认也会保留现有端口。证书管理采用纯 Shell `acme.sh`，新装部署无需 Python 依赖。
 
 REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
 
@@ -53,7 +53,7 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 - 默认配置模板：仓库的 `templates/default-config.toml` 安装到 `/etc/vps-sub-meter/templates/default-config.toml`。新装向导从这里读取默认值，确认后保存到主配置。升级默认保留已安装模板。
 - 密钥仓库：`/etc/vps-sub-meter/secrets.json`（`0600 root:root`，绝不进入订阅目录）
 - 外置客户端模板：`/etc/vps-sub-meter/templates/{mihomo.yaml, sing-box.json}`
-- 运维脚本库：`/usr/local/lib/vps-sub-meter/{cores.sh, cert.sh, net.sh, argo.sh, upgrade.sh, migrate_legacy.py, migrate-sbctl.sh}`
+- 运维脚本库：`/usr/local/lib/vps-sub-meter/{cores.sh, cert.sh, net.sh, argo.sh, upgrade.sh, uninstall.sh, migrate_legacy.py, migrate-sbctl.sh}`
 - 订阅批次与流量账本：`/var/lib/vps-sub-meter/{current.json, serve-auth.json, traffic-state.json, generations/, certificates/}`
 
 ## 精简订阅端点
@@ -65,6 +65,22 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 - `/sub/<token>/shadowrocket.txt` — Shadowrocket Base64 订阅
 - `/sub/<token>/uri.txt` — 明文分享 URI
 - `/sub/<token>/index` — 暗色中文流量看板与内联 SVG 二维码页
+
+## 卸载
+
+可通过交互菜单或独立卸载脚本清理（默认保留 `/etc/letsencrypt/live/*` 与 `/root/.acme.sh` 证书，并在彻底卸载前自动备份配置与流量账本至 `/root/vsm-uninstall-backup-*.tar.gz`）：
+
+- 交互菜单：运行 `ly` → 选择 `8. 卸载 vps-sub-meter`（菜单同时内置内核更新与 Argo 隧道管理）
+- 本地卸载：
+  ```bash
+  sudo bash /usr/local/lib/vps-sub-meter/uninstall.sh
+  ```
+- 在线卸载：
+  ```bash
+  curl -fsSL https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/download/uninstall.sh | sudo bash
+  ```
+
+常用参数：`--keep-config`（保留配置与流量账本）、`--keep-cores`（保留 Xray/sing-box/cloudflared 内核）、`--no-backup`（跳过自动备份）、`-y / --yes`（跳过确认）。
 
 ## 常用命令
 

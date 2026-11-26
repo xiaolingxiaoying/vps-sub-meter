@@ -38,7 +38,7 @@ esac
 
 apt-get update -qq
 DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-  ca-certificates curl jq openssl tar unzip certbot nftables >/dev/null
+  ca-certificates curl jq openssl socat tar unzip nftables >/dev/null
 
 ensure_accounts_and_dirs() {
   getent group vsm-cert >/dev/null || groupadd --system vsm-cert
@@ -88,7 +88,7 @@ install_from_dir() {
   ln -sf /usr/local/bin/vps-sub-meter /usr/local/bin/vsm
   ln -sfn /usr/local/lib/vps-sub-meter/ly.sh /usr/local/bin/ly
 
-  for s in cores.sh cert.sh net.sh argo.sh migrate-sbctl.sh migrate_legacy.py upgrade.sh; do
+  for s in cores.sh cert.sh net.sh argo.sh migrate-sbctl.sh migrate_legacy.py upgrade.sh uninstall.sh; do
     if [[ -f "$src/scripts/$s" ]]; then
       install -m 0755 "$src/scripts/$s" "/usr/local/lib/vps-sub-meter/$s"
     fi

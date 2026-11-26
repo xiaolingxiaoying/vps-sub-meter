@@ -148,23 +148,114 @@ tokens() {
   esac
 }
 
-if ! command -v jq >/dev/null 2>&1; then
-  printf '找不到 jq，请安装后再使用 ly。\n' >&2
-  exit 2
-fi
-
-while true; do
-  printf '\nvps-sub-meter · 管理菜单\n'
-  if [[ -e $config_path ]]; then vsm status; fi
-  printf '%s\n' '1. 初始化 / 重新配置' '2. 查看订阅与二维码' '3. 管理订阅凭据' \
-    '4. 轮换节点密钥' '5. 应用配置' '0. 退出'
-  ask '选择操作' || exit 0
+uninstall_vsm() {
+  local flags=() rc=0
+  if [[ ! -f $script_dir/uninstall.sh ]]; then
+    printf '找不到卸载脚本: %s\n' "$script_dir/uninstall.sh" >&2
+    return 1
+  fi
+  ask '卸载模式 (1 彻底卸载 / 2 保留配置与流量账本 / 0 返回)' 0 || return 0
   case $answer in
-    1) initialize ;;
-    2) subscriptions ;;
-    3) tokens ;;
-    4) if confirm '确认轮换全部节点密钥，客户端需刷新订阅' 2; then vsm keys rotate --yes; fi ;;
-    5) vsm apply ;;
-    *) printf '无效选择。\n' >&2 ;;
+    1) flags=() ;;
+    2) flags=(--keep-config) ;;
+    *) printf '无效选择。\n' >&2; return 1 ;;
   esac
-done
+  bash "$script_dir/uninstall.sh" --root "$root" "${flags[@]}" || rc=$?
+  case $rc in
+    0) exit 0 ;;
+    10) return 0 ;;
+    *) return "$rc" ;;
+  esac
+}
+
+update_cores() {
+  if [[ ! -f $script_dir/cores.sh ]]; then
+    printf '找不到内核更新脚本: %s\n' "$script_dir/cores.sh" >&2
+    return 1
+  fi
+  confirm '确认更新 Xray 与 sing-box 内核到脚本指定版本' 1 || return 0
+  if [[ $root == / ]]; then
+    bash "$script_dir/cores.sh" update || return 1
+  fi
+  if [[ -e $config_path ]]; then
+    vsm apply
+  fi
+}
+
+manage_argo() {
+  if [[ ! -e $config_path ]]; then
+    printf '尚未初始化配置，请先选择 1 初始化。\n' >&2
+    return 1
+  fi
+  local current enabled td_cur sd_cur token td sd updated
+  current=$(vsm config show) || return 1
+  enabled=$(jq -r '.argo.enabled' <<<"$current") || return 1
+  td_cur=$(jq -r '.argo.tunnel_domain' <<<"$current") || return 1
+  sd_cur=$(jq -r '.argo.sub_domain' <<<"$current") || return 1
+  printf '当前 Argo 状态: %s' "$([[ $enabled == true ]] && printf '已启用' || printf '未启用')" >&2
+  if [[ -n $td_cur ]]; then
+    printf ' (tunnel=%s, sub=%s)' "$td_cur" "${sd_cur:-$td_cur}" >&2
+  fi
+  printf '\n' >&2
+
+  ask 'Argo 隧道操作 (1 配置并启用固定隧道 / 2 停用 Argo 隧道 / 0 返回)' 0 || return 0
+  case $answer in
+    1)
+      ask 'Cloudflare Tunnel Token' '' || return 0
+      token=$answer
+      [[ -n $token ]] || { printf 'Tunnel Token 不能为空。\n' >&2; return 1; }
+      ask 'Argo 隧道节点域名 (tunnel_domain)' "$td_cur" || return 0
+      td=$answer
+      [[ -n $td ]] || { printf 'tunnel_domain 不能为空。\n' >&2; return 1; }
+      ask 'Argo 订阅域名 (sub_domain)' "${sd_cur:-$td}" || return 0
+      sd=${answer:-$td}
+      confirm '确认写入 Argo 配置并生效' 1 || return 0
+      updated=$(jq -c --arg td "$td" --arg sd "$sd" \
+        '.argo.enabled = true | .argo.tunnel_domain = $td | .argo.sub_domain = $sd' <<<"$current") || return 1
+      vsm config write --replace <<<"$updated" || return 1
+      if [[ $root == / && -f $script_dir/argo.sh ]]; then
+        bash "$script_dir/argo.sh" setup "$token" || return 1
+      fi
+      vsm apply
+      ;;
+    2)
+      confirm '确认停用 Argo 隧道并重新应用配置' 2 || return 0
+      updated=$(jq -c '.argo.enabled = false' <<<"$current") || return 1
+      vsm config write --replace <<<"$updated" || return 1
+      if [[ $root == / && -f $script_dir/argo.sh ]]; then
+        bash "$script_dir/argo.sh" disable || true
+      fi
+      vsm apply
+      ;;
+    *) printf '无效选择。\n' >&2; return 1 ;;
+  esac
+}
+
+main() {
+  if ! command -v jq >/dev/null 2>&1; then
+    printf '找不到 jq，请安装后再使用 ly。\n' >&2
+    exit 2
+  fi
+
+  while true; do
+    printf '\nvps-sub-meter · 管理菜单\n'
+    if [[ -e $config_path ]]; then vsm status; fi
+    printf '%s\n' '1. 初始化 / 重新配置' '2. 查看订阅与二维码' '3. 管理订阅凭据' \
+      '4. 轮换节点密钥' '5. 更新内核 (Xray / sing-box)' '6. 管理 Argo 隧道' \
+      '7. 应用配置' '8. 卸载 vps-sub-meter' '0. 退出'
+    ask '选择操作' || exit 0
+    case $answer in
+      1) initialize ;;
+      2) subscriptions ;;
+      3) tokens ;;
+      4) if confirm '确认轮换全部节点密钥，客户端需刷新订阅' 2; then vsm keys rotate --yes; fi ;;
+      5) update_cores ;;
+      6) manage_argo ;;
+      7) vsm apply ;;
+      8) uninstall_vsm ;;
+      *) printf '无效选择。\n' >&2 ;;
+    esac
+  done
+}
+
+main

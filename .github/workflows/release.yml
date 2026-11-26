@@ -118,7 +118,8 @@ jobs:
 
           VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/install.sh dist/install.sh
           VSM_RELEASE_PUBLIC_KEY_HEX="$PUBLIC_KEY_HEX" python3 scripts/prepare-installer.py --template scripts/upgrade.sh dist/upgrade.sh
-          ( cd dist && sha256sum vps-sub-meter-linux-* vps-sub-meter-bundle.tar.gz manifest-*.json install.sh upgrade.sh > SHA256SUMS )
+          install -m 0755 scripts/uninstall.sh dist/uninstall.sh
+          ( cd dist && sha256sum vps-sub-meter-linux-* vps-sub-meter-bundle.tar.gz manifest-*.json install.sh upgrade.sh uninstall.sh > SHA256SUMS )
 
           retry() {
             for n in 1 2 3 4 5; do

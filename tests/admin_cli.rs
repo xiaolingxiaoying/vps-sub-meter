@@ -109,10 +109,16 @@ fn config_preview_and_write_share_validated_ports() {
     assert_eq!(fixed["config"]["nodes"], defaults["nodes"]);
     assert_eq!(fixed["mode"], "https-shared");
     let preview = sandbox.prepare(&["--monthly-gib", "0", "--reset-day", "11"]);
+    assert_eq!(preview["mode"], "https-shared");
+    assert_eq!(preview["config"]["nodes"]["vless_reality_pqc"]["port"], 443);
     let mut ports = std::collections::BTreeSet::new();
-    for node in preview["config"]["nodes"].as_object().unwrap().values() {
+    for (key, node) in preview["config"]["nodes"].as_object().unwrap() {
         let port = node["port"].as_u64().unwrap();
-        assert!((20000..=29999).contains(&port));
+        if key == "vless_reality_pqc" {
+            assert_eq!(port, 443);
+        } else {
+            assert!((20000..=29999).contains(&port), "{key}: {port}");
+        }
         assert!(ports.insert(port));
     }
     assert_eq!(preview["tls_sni"], "sub.example.com");
@@ -354,11 +360,180 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
         let name = node["name"].as_str().unwrap();
         let port = node["port"].as_u64().unwrap();
         assert!(screen.contains(&format!("{name}: {port}")));
-        assert!((20000..=29999).contains(&port));
+        if name == "vless-reality-pqc" {
+            assert_eq!(port, 443);
+        } else {
+            assert!((20000..=29999).contains(&port), "{name}: {port}");
+        }
     }
     assert!(sandbox.root().join(CURRENT_REL).exists());
 
     let output = run_menu("1\n\n\n\n\n\n\n\n0\n");
     assert!(output.status.success());
     assert_eq!(sandbox.json(&["config", "show"]), config);
+}
+
+#[cfg(unix)]
+#[test]
+fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
+    let seed_sandbox = |sandbox: &Sandbox| {
+        for rel in [
+            "etc/vps-sub-meter/config.toml",
+            "etc/vps-sub-meter/secrets.json",
+            "var/lib/vps-sub-meter/traffic-state.json",
+            "var/lib/vps-sub-meter/current.json",
+            "var/lib/vps-sub-meter/serve-auth.json",
+            "var/lib/vps-sub-meter/generations/g1/clash.yaml",
+            "var/lib/vps-sub-meter/certificates/sub.example.com/fullchain.pem",
+            "etc/systemd/system/vps-sub-meter.service",
+            "etc/systemd/system/vps-sub-meter-xray.service",
+            "etc/systemd/system/vps-sub-meter-singbox.service",
+            "etc/systemd/system/vps-sub-meter-argo.service",
+            "etc/sysctl.d/99-vps-sub-meter.conf",
+            "etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook",
+            "etc/letsencrypt/live/sub.example.com/fullchain.pem",
+            "etc/cloudflared/vps-sub-meter-argo.token",
+            "usr/local/bin/vps-sub-meter",
+            "usr/local/bin/vsm",
+            "usr/local/bin/ly",
+            "usr/local/bin/xray",
+            "usr/local/bin/sing-box",
+            "usr/local/bin/cloudflared",
+            "usr/local/share/xray/geoip.dat",
+            "usr/local/lib/vps-sub-meter/ly.sh",
+            "usr/local/lib/vps-sub-meter/uninstall.sh",
+        ] {
+            sandbox.write(rel, "fixture");
+        }
+    };
+
+    let run_uninstall = |sandbox: &Sandbox, args: &[&str], stdin_data: Option<&str>| -> Output {
+        let script = sandbox
+            .root()
+            .join("usr/local/lib/vps-sub-meter/uninstall.sh");
+        let mut process = Command::new("/bin/bash")
+            .arg(script)
+            .arg("--root")
+            .arg(sandbox.root())
+            .args(args)
+            .stdin(if stdin_data.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        if let Some(data) = stdin_data {
+            process
+                .stdin
+                .take()
+                .unwrap()
+                .write_all(data.as_bytes())
+                .unwrap();
+        }
+        process.wait_with_output().unwrap()
+    };
+
+    // 1. 取消卸载 (输入 0 返回 10，保留所有文件)
+    let sandbox = Sandbox::new();
+    seed_sandbox(&sandbox);
+    let cancelled = run_uninstall(&sandbox, &[], Some("0\n"));
+    assert_eq!(cancelled.status.code(), Some(10));
+    assert!(sandbox.root().join("usr/local/bin/vps-sub-meter").exists());
+    assert!(
+        sandbox
+            .root()
+            .join("etc/vps-sub-meter/config.toml")
+            .exists()
+    );
+
+    // 2. --keep-config --keep-cores --yes 保留配置、账本和代理内核
+    let keep = run_uninstall(&sandbox, &["--keep-config", "--keep-cores", "--yes"], None);
+    assert!(
+        keep.status.success(),
+        "{}",
+        String::from_utf8_lossy(&keep.stderr)
+    );
+    assert!(
+        sandbox
+            .root()
+            .join("etc/vps-sub-meter/config.toml")
+            .exists()
+    );
+    assert!(
+        sandbox
+            .root()
+            .join("var/lib/vps-sub-meter/traffic-state.json")
+            .exists()
+    );
+    assert!(sandbox.root().join("usr/local/bin/xray").exists());
+    assert!(
+        sandbox
+            .root()
+            .join("etc/letsencrypt/live/sub.example.com/fullchain.pem")
+            .exists()
+    );
+    for removed in [
+        "usr/local/bin/vps-sub-meter",
+        "usr/local/bin/vsm",
+        "usr/local/bin/ly",
+        "usr/local/lib/vps-sub-meter",
+        "etc/systemd/system/vps-sub-meter.service",
+        "etc/sysctl.d/99-vps-sub-meter.conf",
+        "etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook",
+        "etc/cloudflared/vps-sub-meter-argo.token",
+        "var/lib/vps-sub-meter/generations",
+        "var/lib/vps-sub-meter/current.json",
+    ] {
+        assert!(!sandbox.root().join(removed).exists(), "{removed}");
+    }
+
+    // 3. 默认彻底卸载：自动备份后清理配置、账本与内核，但仍保留 Let's Encrypt 证书
+    let full_sandbox = Sandbox::new();
+    seed_sandbox(&full_sandbox);
+    let full = run_uninstall(&full_sandbox, &["--yes"], None);
+    assert!(
+        full.status.success(),
+        "{}",
+        String::from_utf8_lossy(&full.stderr)
+    );
+    assert!(!full_sandbox.root().join("etc/vps-sub-meter").exists());
+    assert!(!full_sandbox.root().join("var/lib/vps-sub-meter").exists());
+    assert!(!full_sandbox.root().join("usr/local/bin/xray").exists());
+    assert!(!full_sandbox.root().join("usr/local/bin/sing-box").exists());
+    assert!(
+        !full_sandbox
+            .root()
+            .join("usr/local/bin/cloudflared")
+            .exists()
+    );
+    assert!(!full_sandbox.root().join("usr/local/share/xray").exists());
+    assert!(
+        full_sandbox
+            .root()
+            .join("etc/letsencrypt/live/sub.example.com/fullchain.pem")
+            .exists()
+    );
+    let backups: Vec<_> = fs::read_dir(full_sandbox.root().join("root"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("vsm-uninstall-backup-") && n.ends_with(".tar.gz"))
+        })
+        .collect();
+    assert_eq!(backups.len(), 1);
+    let tar_list = Command::new("tar")
+        .arg("-tzf")
+        .arg(&backups[0])
+        .output()
+        .unwrap();
+    assert!(tar_list.status.success());
+    let listing = String::from_utf8_lossy(&tar_list.stdout);
+    assert!(listing.contains("etc/vps-sub-meter/config.toml"));
+    assert!(listing.contains("var/lib/vps-sub-meter/traffic-state.json"));
 }

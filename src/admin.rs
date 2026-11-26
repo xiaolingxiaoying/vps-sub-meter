@@ -151,7 +151,6 @@ pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result
 
     let mut reserved = BTreeSet::from([
         cfg.server.acme_port,
-        cfg.server.https_port,
         cfg.server.loopback_https_port,
         cfg.server.http_fallback_port,
         cfg.nodes.vless_reality_pqc.loopback_port,
@@ -166,13 +165,7 @@ pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result
         .map_err(|e| e.to_string())?
         .map(|(start, end)| start..=end);
 
-    for (port, udp) in [
-        (&mut cfg.nodes.vless_reality_pqc.port, false),
-        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
-        (&mut cfg.nodes.anytls_tcp.port, false),
-        (&mut cfg.nodes.hysteria2_hop.port, true),
-        (&mut cfg.nodes.tuic_bbr.port, true),
-    ] {
+    let pick_random = |reserved: &mut BTreeSet<u16>, udp: bool| -> Result<u16, String> {
         let mut bytes = [0; 4];
         getrandom::fill(&mut bytes).map_err(|_| "系统随机数不可用".to_owned())?;
         let start = (u32::from_ne_bytes(bytes) % u32::from(COUNT)) as u16;
@@ -195,8 +188,30 @@ pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result
                     }
             })
             .ok_or_else(|| "20000-29999 内没有足够的可用端口".to_owned())?;
-        *port = selected;
         reserved.insert(selected);
+        Ok(selected)
+    };
+
+    // VLESS + REALITY 优先使用 443（域名模式下与订阅 HTTPS 通过 SNI 复用）；若 443 不可用则回退随机端口
+    let can_use_443 = !reserved.contains(&443)
+        && !hop_range.as_ref().is_some_and(|range| range.contains(&443))
+        && (!probe_local_ports || TcpListener::bind((Ipv4Addr::UNSPECIFIED, 443)).is_ok());
+    if can_use_443 {
+        cfg.nodes.vless_reality_pqc.port = 443;
+        reserved.insert(443);
+    } else {
+        reserved.insert(cfg.server.https_port);
+        cfg.nodes.vless_reality_pqc.port = pick_random(&mut reserved, false)?;
+    }
+    reserved.insert(cfg.server.https_port);
+
+    for (port, udp) in [
+        (&mut cfg.nodes.vless_xhttp_pqc.port, false),
+        (&mut cfg.nodes.anytls_tcp.port, false),
+        (&mut cfg.nodes.hysteria2_hop.port, true),
+        (&mut cfg.nodes.tuic_bbr.port, true),
+    ] {
+        *port = pick_random(&mut reserved, udp)?;
     }
     Ok(())
 }
@@ -359,15 +374,21 @@ mod tests {
         cfg.nodes.hysteria2_hop.hop_range = Some("20002-29990".into());
         randomize_node_ports(&mut cfg, false).unwrap();
 
-        let ports = BTreeSet::from([
-            cfg.nodes.vless_reality_pqc.port,
+        assert_eq!(cfg.nodes.vless_reality_pqc.port, 443);
+        let others = BTreeSet::from([
             cfg.nodes.vless_xhttp_pqc.port,
             cfg.nodes.anytls_tcp.port,
             cfg.nodes.hysteria2_hop.port,
             cfg.nodes.tuic_bbr.port,
         ]);
-        assert_eq!(ports.len(), 5);
-        assert!(ports.iter().all(|p| (20_000..=29_999).contains(p)));
-        assert!(!ports.contains(&20_001));
+        assert_eq!(others.len(), 4);
+        assert!(others.iter().all(|p| (20_000..=29_999).contains(p)));
+        assert!(!others.contains(&20_001));
+        assert!(others.iter().all(|p| !(20_002..=29_990).contains(p)));
+
+        // 当 443 已被其他配置占用时，REALITY 自动回退到 20000-29999 随机端口
+        cfg.server.extra_https_port = Some(443);
+        randomize_node_ports(&mut cfg, false).unwrap();
+        assert!((20_000..=29_999).contains(&cfg.nodes.vless_reality_pqc.port));
     }
 }
