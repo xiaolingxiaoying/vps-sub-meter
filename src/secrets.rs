@@ -3,7 +3,6 @@
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -118,26 +117,6 @@ impl Secrets {
         self.tokens.first().map(|t| t.token.as_str())
     }
 
-    /// Constant-time token verification against all registered tokens.
-    pub fn matches_token(&self, candidate: &str) -> bool {
-        if candidate.is_empty() || candidate.len() > 128 {
-            return false;
-        }
-        let cand_digest = Sha256::digest(candidate.as_bytes());
-        let mut matched = 0u8;
-        for entry in &self.tokens {
-            let expected = Sha256::digest(entry.token.as_bytes());
-            let mut diff = 0u8;
-            for (a, b) in cand_digest.iter().zip(expected.iter()) {
-                diff |= a ^ b;
-            }
-            if diff == 0 {
-                matched = 1;
-            }
-        }
-        matched == 1
-    }
-
     /// Populate any missing secrets. Calls official `xray` CLI for ML-DSA-65
     /// and ML-KEM-768 pairs when `xray_bin` is provided.
     pub fn ensure_populated(
@@ -234,51 +213,6 @@ impl Secrets {
             }
         }
         Ok(())
-    }
-
-    pub fn generate_for_test(config: &Config) -> Self {
-        let mut s = Self::default();
-        s.tokens.push(SubscriptionToken {
-            name: "default".into(),
-            token: "test_token_0123456789abcdef0123456789".into(),
-            created_at: 1_700_000_000,
-        });
-        let (priv_k, pub_k) = generate_x25519().unwrap();
-        s.vless_reality_pqc = VlessRealitySecrets {
-            uuid: random_uuid().unwrap(),
-            x25519_private_key: priv_k,
-            x25519_public_key: pub_k,
-            short_id: "0123456789abcdef".into(),
-            mldsa65_seed: "TEST_MLDSA65_SEED_43_CHARS_PLACEHOLDER_1234".into(),
-            mldsa65_verify: "TEST_MLDSA65_VERIFY_PLACEHOLDER".into(),
-            vless_decryption: "mlkem768x25519plus.native.600s.TEST_DEC_KEY".into(),
-            vless_encryption: "mlkem768x25519plus.native.0rtt.TEST_ENC_KEY".into(),
-        };
-        s.vless_xhttp_pqc = VlessXhttpSecrets {
-            uuid: random_uuid().unwrap(),
-            path: "/test-xhttp-path".into(),
-            vless_decryption: "mlkem768x25519plus.native.600s.TEST_XHTTP_DEC".into(),
-            vless_encryption: "mlkem768x25519plus.native.0rtt.TEST_XHTTP_ENC".into(),
-        };
-        s.anytls_tcp.password = "anytls_test_pass".into();
-        s.hysteria2_hop = Hysteria2Secrets {
-            password: "hy2_test_pass".into(),
-            obfs_password: "hy2_obfs_pass".into(),
-        };
-        s.tuic_bbr = TuicSecrets {
-            uuid: random_uuid().unwrap(),
-            password: "tuic_test_pass".into(),
-        };
-        for ws in &config.argo.ws_inbounds {
-            s.argo_ws.insert(
-                ws.id.clone(),
-                ArgoWsSecret {
-                    uuid: random_uuid().unwrap(),
-                    path: format!("/ws-{}", ws.id),
-                },
-            );
-        }
-        s
     }
 }
 
@@ -415,15 +349,6 @@ Authentication: ML-KEM-768, Post-Quantum
         let (dec, enc) = parse_vlessenc_mlkem_output(vlessenc).unwrap();
         assert_eq!(dec, "mlkem768x25519plus.native.600s.PQ_DEC_KEY");
         assert_eq!(enc, "mlkem768x25519plus.native.0rtt.PQ_ENC_KEY");
-    }
-
-    #[test]
-    fn token_comparison_matches_valid_and_rejects_others() {
-        let cfg = crate::config::test_defaults();
-        let s = Secrets::generate_for_test(&cfg);
-        assert!(s.matches_token("test_token_0123456789abcdef0123456789"));
-        assert!(!s.matches_token("wrong_token"));
-        assert!(!s.matches_token(""));
     }
 
     #[test]

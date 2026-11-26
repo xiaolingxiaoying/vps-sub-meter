@@ -991,7 +991,7 @@ mod tests {
             ..crate::config::test_defaults()
         };
         cfg.save(dir.path()).unwrap();
-        let sec = Secrets::generate_for_test(&cfg);
+        let sec = crate::test_secrets::fixture(&cfg);
         sec.save(dir.path()).unwrap();
         apply::apply_all(dir.path()).unwrap();
 

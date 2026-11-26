@@ -784,4 +784,30 @@ mod tests {
         };
         assert!(cfg.validate().is_ok());
     }
+
+    #[test]
+    fn random_node_ports_are_distinct_and_avoid_configured_listeners() {
+        let mut cfg = Config {
+            domain: "sub.example.com".into(),
+            ..test_defaults()
+        };
+        cfg.server.extra_https_port = Some(20_001);
+        cfg.nodes.hysteria2_hop.hop_range = Some("20002-29990".into());
+        randomize_node_ports(&mut cfg, false).unwrap();
+
+        let ports = BTreeSet::from([
+            cfg.nodes.vless_reality_pqc.port,
+            cfg.nodes.vless_xhttp_pqc.port,
+            cfg.nodes.anytls_tcp.port,
+            cfg.nodes.hysteria2_hop.port,
+            cfg.nodes.tuic_bbr.port,
+        ]);
+        assert_eq!(ports.len(), 5);
+        assert!(
+            ports
+                .iter()
+                .all(|p| *p == 20_000 || (29_991..=29_999).contains(p))
+        );
+        cfg.validate().unwrap();
+    }
 }

@@ -1282,7 +1282,7 @@ mod tests {
     fn compiles_dual_core_servers_with_ssrf_guard_and_sni_demux() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = sample_config();
-        let sec = Secrets::generate_for_test(&cfg);
+        let sec = crate::test_secrets::fixture(&cfg);
         let compiled = compile_all(dir.path(), &cfg, &sec).unwrap();
 
         let xray: Value = serde_json::from_str(compiled.xray_server.as_deref().unwrap()).unwrap();
@@ -1311,7 +1311,7 @@ mod tests {
     fn compiles_four_clean_subscriptions_with_fakeip_guard_and_singbox_filtering() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = sample_config();
-        let sec = Secrets::generate_for_test(&cfg);
+        let sec = crate::test_secrets::fixture(&cfg);
         let compiled = compile_all(dir.path(), &cfg, &sec).unwrap();
 
         let clash: serde_yaml::Value = serde_yaml::from_str(&compiled.clients.clash_yaml).unwrap();
@@ -1335,7 +1335,7 @@ mod tests {
     fn argo_preferred_ips_expand_dynamically_with_udp_reject() {
         let dir = tempfile::tempdir().unwrap();
         let cfg = sample_config();
-        let sec = Secrets::generate_for_test(&cfg);
+        let sec = crate::test_secrets::fixture(&cfg);
         std::fs::create_dir_all(dir.path().join("etc/vps-sub-meter")).unwrap();
         std::fs::write(
             dir.path().join("etc/vps-sub-meter/argo-ips.txt"),

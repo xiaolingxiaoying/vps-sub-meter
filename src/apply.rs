@@ -234,8 +234,13 @@ fn apply_with_keys(root: &Path, rotate_keys: bool) -> Result<ApplyReport, ApplyE
     let (xray_restarted, singbox_restarted) = match publish() {
         Ok(result) => result,
         Err(error) => {
-            let _ = fs::remove_dir_all(&gen_dir);
-            return Err(restore_files(&backups, error));
+            let error = restore_files(&backups, error);
+            if current_generation(root)
+                .is_ok_and(|generation| generation.is_none_or(|meta| meta.id != gen_id))
+            {
+                let _ = fs::remove_dir_all(&gen_dir);
+            }
+            return Err(error);
         }
     };
 
@@ -700,7 +705,7 @@ mod tests {
         };
         cfg.save(dir.path()).unwrap();
 
-        let sec = Secrets::generate_for_test(&cfg);
+        let sec = crate::test_secrets::fixture(&cfg);
         sec.save(dir.path()).unwrap();
 
         let report = apply_all(dir.path()).unwrap();

@@ -250,6 +250,24 @@ fn node_rotation_requires_confirmation_and_keeps_deployment_on_failed_preflight(
     assert_eq!(sandbox.file(SERVE_AUTH_REL), auth);
 
     sandbox.write("usr/local/bin/sing-box", "#!/bin/sh\nexit 0\n");
+    let unit = sandbox
+        .root()
+        .join("etc/systemd/system/vps-sub-meter.service");
+    let hidden_unit = unit.with_extension("saved");
+    fs::rename(&unit, &hidden_unit).unwrap();
+    fs::create_dir(&unit).unwrap();
+    assert!(
+        !sandbox
+            .cli(&["keys", "rotate", "--yes"], None)
+            .status
+            .success()
+    );
+    assert_eq!(sandbox.file(SECRETS_REL), secrets);
+    assert_eq!(sandbox.file(CURRENT_REL), generation);
+    assert_eq!(sandbox.file(SERVE_AUTH_REL), auth);
+    fs::remove_dir(&unit).unwrap();
+    fs::rename(hidden_unit, unit).unwrap();
+
     let links = sandbox.json(&["sub", "--json"]);
     sandbox.ok(&["keys", "rotate", "--yes"], None);
     assert_eq!(sandbox.json(&["sub", "--json"]), links);

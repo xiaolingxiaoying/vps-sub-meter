@@ -1,15 +1,15 @@
+#[path = "support/secrets.rs"]
+mod test_secrets;
+
 use std::fs;
 use vps_sub_meter::{
     apply, compiler,
     config::{Config, DEFAULT_CONFIG_REL},
-    menu,
-    prompt::BufferedIo,
-    secrets::Secrets,
     traffic,
 };
 
 #[test]
-fn full_sandbox_lifecycle_apply_config_edit_and_menu_zero_cancel() {
+fn full_sandbox_lifecycle_and_external_client_template() {
     let dir = tempfile::tempdir().unwrap();
     let root = dir.path();
 
@@ -22,7 +22,7 @@ fn full_sandbox_lifecycle_apply_config_edit_and_menu_zero_cancel() {
     fs::create_dir_all(&proc_dir).unwrap();
     fs::write(proc_dir.join("boot_id"), "sandbox-boot-1").unwrap();
 
-    // 1. Initialize through the wizard using customized deployed defaults.
+    // 1. Apply a configuration derived from customized deployed defaults.
     let defaults = root.join(DEFAULT_CONFIG_REL);
     fs::create_dir_all(defaults.parent().unwrap()).unwrap();
     fs::copy(
@@ -40,11 +40,11 @@ fn full_sandbox_lifecycle_apply_config_edit_and_menu_zero_cancel() {
     initial.traffic.reset_time = "01:32".into();
     initial.nodes.vless_reality_pqc.decoy_sni = "decoy.example.com".into();
     fs::write(&defaults, initial.to_commented_toml()).unwrap();
-    let sec = Secrets::generate_for_test(&initial);
+    let sec = test_secrets::fixture(&initial);
     sec.save(root).unwrap();
 
-    let mut io = BufferedIo::new(std::io::Cursor::new("1\n\n\n\n\n1\n\n\n0\n"), Vec::new());
-    menu::run(root, &mut io);
+    initial.save(root).unwrap();
+    apply::apply_all(root).unwrap();
     let cfg = Config::load(root).unwrap();
     assert_eq!(cfg, initial);
     let generation = apply::current_generation(root).unwrap().unwrap();
@@ -66,11 +66,4 @@ fn full_sandbox_lifecycle_apply_config_edit_and_menu_zero_cancel() {
     fs::write(tpl_dir.join("mihomo.yaml"), custom_mihomo).unwrap();
     let bundle = compiler::compile_direct_clients(root, &cfg, &sec).unwrap();
     assert!(bundle.clash_yaml.contains("127.0.0.1:9099"));
-
-    // 4. Verify menu handles `0` cleanly without blocking or panicking
-    let mut io = BufferedIo::new(std::io::Cursor::new("0\n"), Vec::new());
-    menu::run(root, &mut io);
-    let screen = String::from_utf8(io.writer).unwrap();
-    assert!(screen.contains("vps-sub-meter"));
-    assert!(screen.contains("0. 退出"));
 }

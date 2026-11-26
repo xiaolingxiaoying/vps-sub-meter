@@ -43,8 +43,9 @@ DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
 ensure_accounts_and_dirs() {
   getent group vsm-cert >/dev/null || groupadd --system vsm-cert
   for u in vps-sub-meter xray sing-box; do
+    getent group "$u" >/dev/null || groupadd --system "$u"
     if ! id -u "$u" >/dev/null 2>&1; then
-      useradd --system --no-create-home --shell /usr/sbin/nologin "$u"
+      useradd --system --gid "$u" --no-create-home --shell /usr/sbin/nologin "$u"
     fi
     usermod -aG vsm-cert "$u"
   done
