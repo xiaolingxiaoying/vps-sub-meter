@@ -66,7 +66,7 @@ ensure_accounts_and_dirs() {
   chmod 0750 /etc/vps-sub-meter/sing-box
 
   chown root:vps-sub-meter /var/lib/vps-sub-meter /var/lib/vps-sub-meter/generations
-  chmod 1775 /var/lib/vps-sub-meter
+  chmod 0775 /var/lib/vps-sub-meter
   chmod 0750 /var/lib/vps-sub-meter/generations
   chown -R vps-sub-meter:vps-sub-meter /var/lib/vps-sub-meter/acme-webroot
   chmod 0755 /var/lib/vps-sub-meter/acme-webroot /var/lib/vps-sub-meter/acme-webroot/.well-known

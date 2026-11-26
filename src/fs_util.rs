@@ -72,17 +72,29 @@ pub fn open_lock(dir: &Path) -> io::Result<File> {
     fs::create_dir_all(dir)?;
     let lock_path = dir.join(".operation.lock");
     let mut opts = OpenOptions::new();
-    opts.create(true).read(true).write(true);
+    opts.read(true).write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         opts.custom_flags(libc::O_NOFOLLOW);
-        let file = opts.open(&lock_path)?;
-        fs::set_permissions(&lock_path, fs::Permissions::from_mode(0o600))?;
+        // Linux protected_regular rejects O_CREAT for another user's existing
+        // lock in the sticky state directory, even when root opens it.
+        let file = match opts.open(&lock_path) {
+            Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                match opts.clone().create_new(true).mode(0o600).open(&lock_path) {
+                    Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+                        opts.open(&lock_path)?
+                    }
+                    result => result?,
+                }
+            }
+            result => result?,
+        };
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
         Ok(file)
     }
     #[cfg(not(unix))]
     {
-        opts.open(&lock_path)
+        opts.create(true).open(&lock_path)
     }
 }

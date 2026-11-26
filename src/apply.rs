@@ -466,7 +466,7 @@ fn fix_live_permissions() {
         "chown -R root:vps-sub-meter /etc/vps-sub-meter/templates /etc/vps-sub-meter/overrides /var/lib/vps-sub-meter/generations 2>/dev/null || true",
         "chmod 0750 /etc/vps-sub-meter/templates /etc/vps-sub-meter/overrides /var/lib/vps-sub-meter/generations 2>/dev/null || true",
         "chown root:vps-sub-meter /var/lib/vps-sub-meter /var/lib/vps-sub-meter/current.json /var/lib/vps-sub-meter/serve-auth.json 2>/dev/null || true",
-        "chmod 1775 /var/lib/vps-sub-meter 2>/dev/null || true",
+        "chmod 0775 /var/lib/vps-sub-meter 2>/dev/null || true",
         "chown vps-sub-meter:vps-sub-meter /var/lib/vps-sub-meter/traffic-state.json /var/lib/vps-sub-meter/.operation.lock 2>/dev/null || true",
         "chown -R root:xray /etc/vps-sub-meter/xray 2>/dev/null || true",
         "chown -R root:sing-box /etc/vps-sub-meter/sing-box 2>/dev/null || true",

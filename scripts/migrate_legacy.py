@@ -447,7 +447,8 @@ def migrate_sbctl(root: Path, check_only: bool) -> dict:
         http_fallback = 2080
 
     decoy = str(raw.get("reality_decoy_sni", "")).strip()
-    if not valid_hostname(decoy):
+    # This legacy target fails the REALITY handshake with ML-DSA-65 enabled.
+    if not valid_hostname(decoy) or decoy.rstrip(".").lower() == "gateway.icloud.com":
         decoy = "aws.amazon.com"
 
     # Tokens: keep active credentials ONLY (strictly exclude revoked entries).
