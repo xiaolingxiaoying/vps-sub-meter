@@ -43,8 +43,17 @@ EOF
   cleanup-hy2)
     nft delete table inet "$TABLE" 2>/dev/null || true
     ;;
+  sync-ufw)
+    command -v ufw >/dev/null 2>&1 || exit 0
+    ufw status 2>/dev/null | grep -qi '^Status: active' || exit 0
+    for spec in "$@"; do
+      if [[ "$spec" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]]; then
+        ufw allow "$spec" comment "vps-sub-meter" >/dev/null 2>&1 || true
+      fi
+    done
+    ;;
   *)
-    echo "用法: $0 {tune-sysctl|apply-hy2|cleanup-hy2}" >&2
+    echo "用法: $0 {tune-sysctl|apply-hy2|cleanup-hy2|sync-ufw}" >&2
     exit 2
     ;;
 esac

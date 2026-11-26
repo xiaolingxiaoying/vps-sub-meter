@@ -231,6 +231,7 @@ pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
     prune_old_generations(root, &gen_id);
     if root == Path::new("/") {
         fix_live_permissions();
+        sync_live_firewall(&config);
     }
 
     Ok(ApplyReport {
@@ -477,6 +478,59 @@ fn fix_live_permissions() {
     }
 }
 
+/// Collects TCP/UDP port and range specs required by enabled services for firewall sync.
+pub(crate) fn collect_firewall_ports(config: &Config) -> Vec<String> {
+    let mut specs = Vec::new();
+    let mut push = |spec: String| {
+        if !specs.contains(&spec) {
+            specs.push(spec);
+        }
+    };
+    if !config.domain.is_empty() {
+        if config.server.acme_port > 0 {
+            push(format!("{}/tcp", config.server.acme_port));
+        }
+        if config.server.https_port > 0 {
+            push(format!("{}/tcp", config.server.https_port));
+        }
+    }
+    if let Some(extra) = config.server.extra_https_port
+        && extra > 0
+    {
+        push(format!("{extra}/tcp"));
+    }
+    if config.nodes.vless_reality_pqc.enabled {
+        push(format!("{}/tcp", config.nodes.vless_reality_pqc.port));
+    }
+    if config.nodes.vless_xhttp_pqc.enabled {
+        push(format!("{}/tcp", config.nodes.vless_xhttp_pqc.port));
+    }
+    if config.nodes.anytls_tcp.enabled {
+        push(format!("{}/tcp", config.nodes.anytls_tcp.port));
+    }
+    if config.nodes.hysteria2_hop.enabled {
+        push(format!("{}/udp", config.nodes.hysteria2_hop.port));
+        if let Ok(Some((start, end))) = config.parse_hop_range() {
+            push(format!("{start}:{end}/udp"));
+        }
+    }
+    if config.nodes.tuic_bbr.enabled {
+        push(format!("{}/udp", config.nodes.tuic_bbr.port));
+    }
+    specs
+}
+
+fn sync_live_firewall(config: &Config) {
+    let helper = Path::new("/usr/local/lib/vps-sub-meter/net.sh");
+    if !helper.is_file() {
+        return;
+    }
+    let specs = collect_firewall_ports(config);
+    if !specs.is_empty() {
+        let _ = Command::new(helper).arg("sync-ufw").args(&specs).status();
+    }
+}
+
 fn systemctl(args: &[&str]) -> Result<(), ApplyError> {
     let status = Command::new("systemctl").args(args).status()?;
     if status.success() {
@@ -562,5 +616,27 @@ mod tests {
         )
         .unwrap();
         assert!(sb_unit.contains("net.sh apply-hy2 eth0 30000-35000 34443"));
+    }
+
+    #[test]
+    fn collects_firewall_ports_for_enabled_nodes_and_acme() {
+        let cfg = Config {
+            domain: "sub.example.com".into(),
+            public_ip: "203.0.113.10".into(),
+            ..Default::default()
+        };
+        let ports = collect_firewall_ports(&cfg);
+        assert_eq!(
+            ports,
+            vec![
+                "80/tcp",
+                "443/tcp",
+                "2053/tcp",
+                "2083/tcp",
+                "34443/udp",
+                "30000:35000/udp",
+                "2096/udp",
+            ]
+        );
     }
 }
