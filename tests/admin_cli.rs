@@ -401,10 +401,13 @@ fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
             "usr/local/bin/cloudflared",
             "usr/local/share/xray/geoip.dat",
             "usr/local/lib/vps-sub-meter/ly.sh",
-            "usr/local/lib/vps-sub-meter/uninstall.sh",
         ] {
             sandbox.write(rel, "fixture");
         }
+        sandbox.write(
+            "usr/local/lib/vps-sub-meter/uninstall.sh",
+            include_str!("../scripts/uninstall.sh"),
+        );
     };
 
     let run_uninstall = |sandbox: &Sandbox, args: &[&str], stdin_data: Option<&str>| -> Output {
