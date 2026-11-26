@@ -1,7 +1,9 @@
 //! 4-format client subscription compilation (direct & Cloudflare Argo preferred-IP).
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use rustls::server::ParsedCertificate;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
@@ -9,7 +11,7 @@ use crate::config::{Config, WsProtocol, format_url_host, pct};
 use crate::secrets::Secrets;
 use crate::store;
 
-use super::{ClientBundle, CompileError};
+use super::{ClientBundle, CompileError, cert_paths};
 
 const BUNDLED_MIHOMO_TEMPLATE: &str = include_str!("../../templates/mihomo.yaml");
 const BUNDLED_SINGBOX_TEMPLATE: &str = include_str!("../../templates/sing-box.json");
@@ -78,12 +80,44 @@ pub fn load_argo_preferred_ips(root: &Path, config: &Config) -> Vec<String> {
     out
 }
 
+struct TlsFingerprints {
+    certificate: String,
+    public_key: String,
+}
+
+fn ip_mode_tls_fingerprints(root: &Path, config: &Config) -> Result<TlsFingerprints, CompileError> {
+    let path = cert_paths(root, config).fullchain;
+    let cert_error = |reason| CompileError::TlsCertificate {
+        path: path.clone(),
+        reason,
+    };
+    let pem = store::read_no_follow(Path::new(&path)).map_err(|err| cert_error(err.to_string()))?;
+    let leaf = rustls_pemfile::certs(&mut pem.as_slice())
+        .next()
+        .transpose()
+        .map_err(|err| cert_error(err.to_string()))?
+        .ok_or_else(|| cert_error("证书文件缺少 PEM 叶证书".into()))?;
+    let cert = ParsedCertificate::try_from(&leaf).map_err(|err| cert_error(err.to_string()))?;
+    Ok(TlsFingerprints {
+        certificate: format!("{:x}", Sha256::digest(leaf.as_ref())),
+        public_key: STANDARD.encode(Sha256::digest(cert.subject_public_key_info().as_ref())),
+    })
+}
+
 pub fn compile_direct_clients(
     root: &Path,
     config: &Config,
     secrets: &Secrets,
 ) -> Result<ClientBundle, CompileError> {
-    let insecure = config.is_ip_mode();
+    let ip_mode = config.is_ip_mode();
+    let nodes = &config.nodes;
+    let tls_enabled = nodes.vless_xhttp_pqc.enabled
+        || nodes.anytls_tcp.enabled
+        || nodes.hysteria2_hop.enabled
+        || nodes.tuic_bbr.enabled;
+    let fingerprints = (ip_mode && tls_enabled)
+        .then(|| ip_mode_tls_fingerprints(root, config))
+        .transpose()?;
     let host = config.primary_host();
     let sni = config.tls_sni();
 
@@ -160,7 +194,7 @@ pub fn compile_direct_clients(
             "servername": sni,
             "alpn": ["h2"],
             "client-fingerprint": "chrome",
-            "skip-cert-verify": insecure,
+            "skip-cert-verify": false,
             "encryption": s.vless_encryption,
             "xhttp-opts": {
                 "path": s.path,
@@ -168,11 +202,9 @@ pub fn compile_direct_clients(
                 "mode": "auto"
             }
         }));
-        let extra_insecure = if insecure {
-            "&allowInsecure=1&insecure=1"
-        } else {
-            ""
-        };
+        let certificate_pin = fingerprints
+            .as_ref()
+            .map_or_else(String::new, |pins| format!("&pcs={}", pins.certificate));
         uris.push(format!(
             "vless://{}@{}:{}?encryption={}&security=tls&sni={}&alpn=h2&fp=chrome&type=xhttp&host={}&path={}&mode=auto{}#{}",
             s.uuid,
@@ -182,7 +214,7 @@ pub fn compile_direct_clients(
             pct(sni),
             pct(sni),
             pct(&s.path),
-            extra_insecure,
+            certificate_pin,
             pct(&n.name)
         ));
     }
@@ -201,7 +233,7 @@ pub fn compile_direct_clients(
             "password": s.password,
             "sni": sni,
             "client-fingerprint": "chrome",
-            "skip-cert-verify": insecure,
+            "skip-cert-verify": false,
             "udp": true,
             "idle-session-check-interval": 30,
             "idle-session-timeout": 30,
@@ -218,8 +250,7 @@ pub fn compile_direct_clients(
             "min_idle_session": 5,
             "tls": {
                 "enabled": true,
-                "server_name": sni,
-                "insecure": insecure
+                "server_name": sni
             }
         }));
         uris.push(format!(
@@ -227,7 +258,7 @@ pub fn compile_direct_clients(
             pct(&s.password),
             format_url_host(host),
             n.port,
-            u8::from(insecure),
+            u8::from(ip_mode),
             pct(sni),
             pct(&n.name)
         ));
@@ -250,7 +281,7 @@ pub fn compile_direct_clients(
             "down": format!("{} Mbps", n.down_mbps),
             "sni": sni,
             "alpn": ["h3"],
-            "skip-cert-verify": insecure
+            "skip-cert-verify": false
         });
         if let Some((start, end)) = hop {
             clash_hy["ports"] = json!(format!("{start}-{end}"));
@@ -272,8 +303,7 @@ pub fn compile_direct_clients(
             "tls": {
                 "enabled": true,
                 "server_name": sni,
-                "alpn": ["h3"],
-                "insecure": insecure
+                "alpn": ["h3"]
             }
         });
         if let Some((start, end)) = hop {
@@ -299,7 +329,10 @@ pub fn compile_direct_clients(
             query.push(format!("obfs-password={}", pct(&s.obfs_password)));
         }
         query.push(format!("sni={}", pct(sni)));
-        query.push(format!("insecure={}", u8::from(insecure)));
+        query.push(format!("insecure={}", u8::from(ip_mode)));
+        if let Some(pins) = &fingerprints {
+            query.push(format!("pinSHA256={}", pins.certificate));
+        }
         uris.push(format!(
             "hysteria2://{}@{}:{}/?{}#{}",
             pct(&s.password),
@@ -328,7 +361,7 @@ pub fn compile_direct_clients(
             "udp-relay-mode": "native",
             "reduce-rtt": true,
             "heartbeat-interval": 10000,
-            "skip-cert-verify": insecure,
+            "skip-cert-verify": false,
             "disable-sni": false
         }));
         singbox_outbounds.push(json!({
@@ -345,8 +378,7 @@ pub fn compile_direct_clients(
             "tls": {
                 "enabled": true,
                 "server_name": sni,
-                "alpn": ["h3"],
-                "insecure": insecure
+                "alpn": ["h3"]
             }
         }));
         uris.push(format!(
@@ -355,10 +387,21 @@ pub fn compile_direct_clients(
             pct(&s.password),
             format_url_host(host),
             n.port,
-            u8::from(insecure),
+            u8::from(ip_mode),
             pct(sni),
             pct(&n.name)
         ));
+    }
+
+    if let Some(pins) = &fingerprints {
+        for proxy in &mut clash_proxies {
+            if proxy.get("skip-cert-verify").is_some() {
+                proxy["fingerprint"] = json!(pins.certificate);
+            }
+        }
+        for outbound in &mut singbox_outbounds {
+            outbound["tls"]["certificate_public_key_sha256"] = json!([pins.public_key]);
+        }
     }
 
     let clash_yaml =
@@ -746,6 +789,10 @@ mod tests {
 
         let clash: serde_yaml::Value = serde_yaml::from_str(&compiled.clients.clash_yaml).unwrap();
         assert_eq!(clash["proxies"].as_sequence().unwrap().len(), 5);
+        for proxy in &clash["proxies"].as_sequence().unwrap()[1..] {
+            assert_eq!(proxy["skip-cert-verify"].as_bool(), Some(false));
+            assert!(proxy.get("fingerprint").is_none());
+        }
         assert_eq!(
             clash["rules"].as_sequence().unwrap()[0].as_str(),
             Some("IP-CIDR,198.18.0.0/15,REJECT,no-resolve")
@@ -760,6 +807,84 @@ mod tests {
         assert_eq!(compiled.clients.singbox_node_names.len(), 3);
         assert_eq!(compiled.clients.uri_txt.lines().count(), 5);
         assert!(compiled.argo_clients.is_some());
+    }
+
+    #[test]
+    fn ip_mode_pins_tls_certificates_in_supported_formats() {
+        const CERT_PIN: &str = "b7c112a61fb4bdd8a62f57570e18a947404370395e4649a71f404c14063f626d";
+        const PUBLIC_KEY_PIN: &str = "VDceoxJtdji1+mV50mQWwyLhpqWo7Rs+yNajUzp1I/Y=";
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        let sec = crate::test_secrets::fixture(&cfg);
+        let path = PathBuf::from(cert_paths(dir.path(), &cfg).fullchain);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            include_bytes!("../../tests/support/ip-mode-cert.txt"),
+        )
+        .unwrap();
+
+        let bundle = compile_direct_clients(dir.path(), &cfg, &sec).unwrap();
+        let clash: serde_yaml::Value = serde_yaml::from_str(&bundle.clash_yaml).unwrap();
+        let proxies = clash["proxies"].as_sequence().unwrap();
+        assert_eq!(proxies.len(), 5);
+        assert!(proxies[0].get("fingerprint").is_none());
+        for proxy in &proxies[1..] {
+            assert_eq!(proxy["skip-cert-verify"].as_bool(), Some(false));
+            assert_eq!(proxy["fingerprint"].as_str(), Some(CERT_PIN));
+        }
+
+        let sb: Value = serde_json::from_str(bundle.sing_box_json.as_deref().unwrap()).unwrap();
+        let tls = sb["outbounds"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|outbound| outbound.get("tls"))
+            .collect::<Vec<_>>();
+        assert_eq!(tls.len(), 3);
+        for config in tls {
+            assert_ne!(config["insecure"], true);
+            assert_eq!(
+                config["certificate_public_key_sha256"],
+                json!([PUBLIC_KEY_PIN])
+            );
+        }
+
+        assert!(bundle.uri_txt.contains(&format!("&pcs={CERT_PIN}#")));
+        assert!(bundle.uri_txt.contains(&format!("&pinSHA256={CERT_PIN}#")));
+        assert!(!bundle.uri_txt.contains("allowInsecure"));
+    }
+
+    #[test]
+    fn ip_mode_requires_a_certificate_only_when_a_tls_node_is_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        let sec = crate::test_secrets::fixture(&cfg);
+        let compile = |cfg: &Config| compile_direct_clients(dir.path(), cfg, &sec);
+        assert!(matches!(
+            compile(&cfg),
+            Err(CompileError::TlsCertificate { .. })
+        ));
+
+        let path = PathBuf::from(cert_paths(dir.path(), &cfg).fullchain);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, "invalid PEM").unwrap();
+        assert!(matches!(
+            compile(&cfg),
+            Err(CompileError::TlsCertificate { .. })
+        ));
+
+        cfg.nodes.vless_xhttp_pqc.enabled = false;
+        cfg.nodes.anytls_tcp.enabled = false;
+        cfg.nodes.hysteria2_hop.enabled = false;
+        cfg.nodes.tuic_bbr.enabled = false;
+        assert_eq!(compile(&cfg).unwrap().uri_txt.lines().count(), 1);
     }
 
     #[test]

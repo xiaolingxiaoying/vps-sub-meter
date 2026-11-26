@@ -126,7 +126,7 @@ initialize() {
   jq -r '"部署模式：\(.mode)  网卡：\(.config.interface)  月额度：\(.config.traffic.monthly_gb) GiB  重置日：\(.config.traffic.reset_day)",
     (.config.nodes[] | "  \(.name): \(.port)")' <<<"$candidate" || return 1
   if [[ $mode == ip ]]; then
-    printf '警告：未配置域名，订阅将使用不安全的明文 HTTP 端口，代理 TLS 节点使用自签证书。建议输入已解析到本机的域名以启用 HTTPS。\n' >&2
+    printf '警告：未配置域名，订阅使用明文 HTTP。请通过可信渠道导入带证书指纹的客户端配置，或绑定域名启用 HTTPS。\n' >&2
   else
     printf '订阅协议：HTTPS (https://%s/sub/...)\n' "$sni"
   fi
@@ -401,6 +401,7 @@ manage_certificate() {
         confirm '确认检查并补齐自签证书' 2 || return 0
         if [[ $root == / ]]; then
           bash "$script_dir/cert.sh" self-signed "$sni" || return 1
+          vsm apply || return 1
           bash "$script_dir/cert.sh" reload "$sni"
         fi
       fi

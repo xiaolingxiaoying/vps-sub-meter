@@ -16,6 +16,8 @@ pub enum CompileError {
     Io(#[from] std::io::Error),
     #[error("模板格式错误: {0}")]
     Format(String),
+    #[error("无法为 IP 模式固定 TLS 证书 {path}: {reason}")]
+    TlsCertificate { path: String, reason: String },
 }
 
 #[derive(Clone, Debug)]

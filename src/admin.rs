@@ -305,7 +305,7 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
     };
     if !args.argo && config.is_ip_mode() {
         eprintln!(
-            "提示: 当前未配置域名，订阅使用明文 HTTP，存在泄露风险；请运行 ly 选择「6. 配置 / 切换域名 (HTTPS)」绑定域名。"
+            "提示: 直连订阅使用明文 HTTP。请通过可信渠道导入客户端配置，或在 ly 选择「6. 配置 / 切换域名 (HTTPS)」绑定域名。"
         );
     }
     println!("看板:         {base}/index");

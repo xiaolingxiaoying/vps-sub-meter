@@ -513,6 +513,10 @@ fn bash_menu_domain_config_switches_ip_http_to_https() {
     cfg["public_ip"] = json!("203.0.113.20");
     cfg["nodes"]["vless_reality_pqc"]["enabled"] = json!(false);
     cfg["nodes"]["vless_xhttp_pqc"]["enabled"] = json!(false);
+    sandbox.write(
+        "var/lib/vps-sub-meter/certificates/www.bing.com/fullchain.pem",
+        include_str!("support/ip-mode-cert.txt"),
+    );
     sandbox.ok(&["config", "write"], Some(&cfg));
     sandbox.ok(&["apply"], None);
 

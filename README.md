@@ -14,6 +14,8 @@
 | 4 | `hysteria2-hop` | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
 | 5 | `tuic-bbr` | sing-box `1.14+` | 随机 UDP | TUIC v5 + BBR + 0-RTT + Native UDP |
 
+日常直连优先选 `vless-reality-pqc`。UDP 通畅且线路延迟较高或有丢包时，可以对比 `hysteria2-hop` 的下载吞吐。需要接入 HTTPS 反代或 CDN 时，优先考虑 `vless-xhttp-pqc`。`anytls-tcp` 可作 TCP 备用，常转发游戏或语音 UDP 时可对比 `tuic-bbr` 的延迟和抖动。
+
 新装向导可使用模板默认端口、随机端口，或逐个手动输入端口。随机方案让 `vless-reality-pqc` 优先使用可用的 `443/tcp`，其余节点使用 `20000–29999`。域名模式下 REALITY 可与订阅 HTTPS 通过 SNI 复用 `443/tcp`。已有部署可通过 `ly` 的 `11. 节点端口设置` 修改单个节点、套用模板或重新随机分配。证书管理采用纯 Shell `acme.sh`，新装部署无需 Python 依赖。
 
 REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
@@ -94,7 +96,11 @@ vsm traffic checkpoint # 立即刷新流量账本到磁盘
 
 运行 `ly`，选择 `10. 流量账期与校准`，可修改月流量上限、每月重置日、时间和时区，也可校准已用上传和下载或立即保存流量账本。修改重置日程时保留本期已用流量。
 
-`ly` 的 `12. 证书管理` 显示当前证书的签发者和有效期，也可续期、同步或申请域名证书。IP 模式可补齐自签证书。
+`ly` 的 `12. 证书管理` 显示当前证书的签发者和有效期，也可续期、同步或申请域名证书。IP 模式可补齐自签证书并重新发布订阅。
+
+域名模式使用常规 TLS 证书验证。IP 模式在 Mihomo 配置中固定服务器证书的 SHA-256 指纹，在 sing-box 配置中固定证书公钥的 SHA-256 指纹。XHTTP 分享链接使用 `pcs`，Hysteria2 链接使用 `pinSHA256`，需要客户端支持对应字段。IP 模式的 AnyTLS、TUIC 分享链接仍使用兼容参数跳过证书验证。对证书验证有要求时，优先使用 Mihomo 或 sing-box 的完整配置。
+
+IP 模式的直连订阅通过 HTTP 发布，其中包含连接凭据和指纹。请通过 SSH 等可信渠道获取配置并导入，或绑定域名启用 HTTPS。手动更换 IP 模式证书后，运行 `vsm apply` 重新生成配置，再用 `cert.sh reload www.bing.com` 让内核加载证书，并通过可信渠道刷新客户端。
 
 节点和 Argo 在 `config.toml` 中编辑，保存后执行 `vsm apply`。Argo 隧道部署用 `argo.sh setup`。组件更新用 `cores.sh update`，证书续期用 `cert.sh renew`，内核参数调优用 `net.sh tune-sysctl`。这些脚本安装在 `/usr/local/lib/vps-sub-meter/`。
 
