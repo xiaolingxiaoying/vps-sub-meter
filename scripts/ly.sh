@@ -26,10 +26,12 @@ fi
 alt_screen_active=false
 winch_resized=0
 version_bg_pid=''
+RAW_TERM_COLS=80
+RAW_TERM_LINES=24
 TERM_COLS=80
 TERM_LINES=24
-LAST_DRAW_COLS=0
-LAST_DRAW_LINES=0
+LAST_RAW_COLS=0
+LAST_RAW_LINES=0
 VERSION_CACHE_TTL=1800
 
 # ── 缓存的面板展示数据（窗口缩放重绘时复用，避免闪烁与重复查询） ──
@@ -105,7 +107,7 @@ clear_screen() {
   fi
 }
 
-refresh_term_size() {
+query_raw_term_size() {
   local size rows='' cols=''
   if "$interactive"; then
     if size=$(stty size </dev/tty 2>/dev/null) && [[ $size =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
@@ -117,10 +119,27 @@ refresh_term_size() {
       cols=$(tput cols 2>/dev/null || true)
     fi
   fi
-  rows=${rows:-${LINES:-24}}
-  cols=${cols:-${COLUMNS:-80}}
-  [[ $rows =~ ^[0-9]+$ ]] || rows=24
-  [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  if [[ $rows =~ ^[0-9]+$ && $cols =~ ^[0-9]+$ ]] && ((rows > 0 && cols > 0)); then
+    RAW_TERM_LINES=$rows
+    RAW_TERM_COLS=$cols
+    return 0
+  fi
+  return 1
+}
+
+refresh_term_size() {
+  local rows='' cols=''
+  if query_raw_term_size; then
+    rows=$RAW_TERM_LINES
+    cols=$RAW_TERM_COLS
+  else
+    rows=${LINES:-24}
+    cols=${COLUMNS:-80}
+    [[ $rows =~ ^[0-9]+$ ]] && ((rows > 0)) || rows=24
+    [[ $cols =~ ^[0-9]+$ ]] && ((cols > 0)) || cols=80
+    RAW_TERM_LINES=$rows
+    RAW_TERM_COLS=$cols
+  fi
   ((rows < 16)) && rows=16
   ((cols < 48)) && cols=48
   TERM_LINES=$rows
@@ -387,7 +406,7 @@ invalidate_version_cache() {
 
 fetch_github_latest_tag() {
   local repo=$1 eff tag=''
-  eff=$(curl -fsSLI --disable --noproxy '*' --connect-timeout 3 --max-time 6 \
+  eff=$(curl -fsSLI --disable --noproxy '*' --connect-timeout 2 --max-time 3 \
     -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
   if [[ $eff == */releases/tag/* ]]; then
     tag=${eff##*/releases/tag/}
@@ -395,7 +414,7 @@ fetch_github_latest_tag() {
     tag=${tag%%#*}
   fi
   if [[ -z $tag ]]; then
-    tag=$(curl -fsSL --disable --noproxy '*' --connect-timeout 3 --max-time 6 \
+    tag=$(curl -fsSL --disable --noproxy '*' --connect-timeout 2 --max-time 3 \
       -H 'Accept: application/vnd.github+json' \
       "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
       | jq -r '.tag_name // empty' 2>/dev/null || true)
@@ -405,16 +424,26 @@ fetch_github_latest_tag() {
 }
 
 refresh_version_cache_worker() {
-  local file dir tmp vsm_v='' xray_v='' sb_v='' ip4='' now
+  local file dir tmp vsm_v='' xray_v='' sb_v='' ip4='' now work
   file=$(version_cache_path)
   dir=$(dirname "$file")
   mkdir -p "$dir" 2>/dev/null || return 0
-  vsm_v=$(fetch_github_latest_tag 'xiaolingxiaoying/vps-sub-meter' || true)
-  xray_v=$(fetch_github_latest_tag 'XTLS/Xray-core' || true)
-  sb_v=$(fetch_github_latest_tag 'SagerNet/sing-box' || true)
-  ip4=$(curl -4 --disable --noproxy '*' --fail --silent --connect-timeout 2 --max-time 4 \
-    https://api.ipify.org 2>/dev/null || true)
-  [[ $ip4 =~ ^([0-9]+\.){3}[0-9]+$ ]] || ip4=''
+  work=$(mktemp -d 2>/dev/null || return 0)
+  (fetch_github_latest_tag 'xiaolingxiaoying/vps-sub-meter' >"$work/vsm" 2>/dev/null || true) &
+  (fetch_github_latest_tag 'XTLS/Xray-core' >"$work/xray" 2>/dev/null || true) &
+  (fetch_github_latest_tag 'SagerNet/sing-box' >"$work/sb" 2>/dev/null || true) &
+  (
+    local ip=''
+    ip=$(curl -4 --disable --noproxy '*' --fail --silent --connect-timeout 2 --max-time 3 \
+      https://api.ipify.org 2>/dev/null || true)
+    [[ $ip =~ ^([0-9]+\.){3}[0-9]+$ ]] && printf '%s' "$ip" >"$work/ip4"
+  ) &
+  wait
+  vsm_v=$(cat "$work/vsm" 2>/dev/null || true)
+  xray_v=$(cat "$work/xray" 2>/dev/null || true)
+  sb_v=$(cat "$work/sb" 2>/dev/null || true)
+  ip4=$(cat "$work/ip4" 2>/dev/null || true)
+  rm -rf "$work" 2>/dev/null || true
   now=$(date +%s 2>/dev/null || printf '0')
   (
     umask 077
@@ -576,6 +605,7 @@ svc_active_label() {
 }
 
 collect_core_and_versions() {
+  local force_ver=${1:-0}
   local vsm_ver='' xray_ver='' sb_ver=''
   if [[ -n $DASH_STATUS_JSON ]]; then
     vsm_ver=$(jq -r '.version // empty' <<<"$DASH_STATUS_JSON" 2>/dev/null || true)
@@ -609,7 +639,12 @@ collect_core_and_versions() {
   SVC_ARGO_STATE=$(svc_active_label 'vps-sub-meter-argo.service')
 
   if [[ $root == / ]] && "$interactive"; then
-    if ! read_version_cache; then
+    local cache_file
+    cache_file=$(version_cache_path)
+    if ((force_ver)) || [[ ! -r $cache_file ]]; then
+      refresh_version_cache_worker
+      read_version_cache >/dev/null 2>&1 || true
+    elif ! read_version_cache; then
       start_version_check_async
     fi
   fi
@@ -773,7 +808,7 @@ collect_dashboard_data() {
   if ((force_ver)); then
     invalidate_version_cache
   fi
-  collect_core_and_versions
+  collect_core_and_versions "$force_ver"
   build_panel_ssh_command
 }
 
@@ -818,15 +853,10 @@ section_half_bar() {
   printf ' %s%s%s' "$(paint 2 '── ')" "$(paint '1;36' "$title")" "$(paint 2 " $(repeat_char '─' "$fill")")"
 }
 
-render_main_menu() {
-  local w title_right='' compact=0
-  refresh_term_size
-  LAST_DRAW_COLS=$TERM_COLS
-  LAST_DRAW_LINES=$TERM_LINES
-  ((TERM_LINES < 30)) && compact=1
+render_main_menu_body() {
+  local w compact=${1:-0} title_right=''
 
   if "$interactive"; then
-    clear_screen
     w=$(panel_width)
     if ((HAS_VSM_UPDATE)); then
       title_right=$(paint '1;33' "★ 发现新版 v${LATEST_VSM_VER}")
@@ -996,16 +1026,30 @@ render_main_menu() {
   fi
 }
 
-# 返回码: 0=已选中编号($answer), 1=退出(0或EOF), 2=窗口变化/缓存更新需重绘, 3=手动刷新(r)
+render_main_menu() {
+  local compact=0 frame=''
+  refresh_term_size
+  LAST_RAW_COLS=$RAW_TERM_COLS
+  LAST_RAW_LINES=$RAW_TERM_LINES
+  ((TERM_LINES < 30)) && compact=1
+
+  if "$interactive"; then
+    frame=$(render_main_menu_body "$compact")
+    printf '\033[H\033[2J\033[3J%s\n' "$frame"
+  else
+    render_main_menu_body "$compact"
+  fi
+}
+
+# 返回码: 0=已选中编号($answer), 1=退出(0或EOF), 2=窗口尺寸真实变化需重绘, 3=手动刷新(r)
 read_main_choice() {
-  local rc cur_size cur_mtime cache_path
-  cache_path=$(version_cache_path)
+  local rc settle prev_r prev_c
   while true; do
     paint '1;33' '请输入编号（0–13，r 刷新）' >&2
     printf ': ' >&2
     while true; do
       winch_resized=0
-      IFS= read -r -t 0.4 answer
+      IFS= read -r -t 0.5 answer
       rc=$?
       if ((rc == 0)); then
         answer=${answer#"${answer%%[![:space:]]*}"}
@@ -1022,21 +1066,23 @@ read_main_choice() {
       elif ((rc == 1)); then
         return 1
       else
-        if ((winch_resized)); then
+        if query_raw_term_size && ((RAW_TERM_LINES != LAST_RAW_LINES || RAW_TERM_COLS != LAST_RAW_COLS)); then
+          settle=0
+          prev_r=$RAW_TERM_LINES
+          prev_c=$RAW_TERM_COLS
+          while ((settle < 3)); do
+            sleep 0.12
+            if query_raw_term_size && ((RAW_TERM_LINES == prev_r && RAW_TERM_COLS == prev_c)); then
+              break
+            fi
+            prev_r=$RAW_TERM_LINES
+            prev_c=$RAW_TERM_COLS
+            ((settle += 1))
+          done
+          winch_resized=0
           return 2
         fi
-        cur_size=$(stty size </dev/tty 2>/dev/null || true)
-        if [[ $cur_size =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
-          if [[ ${BASH_REMATCH[1]} != "$LAST_DRAW_LINES" || ${BASH_REMATCH[2]} != "$LAST_DRAW_COLS" ]]; then
-            return 2
-          fi
-        fi
-        cur_mtime=$(cache_file_mtime "$cache_path" 2>/dev/null || printf '')
-        if [[ -n $cur_mtime && $cur_mtime != "$CACHE_MTIME_SEEN" ]]; then
-          read_version_cache >/dev/null 2>&1 || true
-          evaluate_update_flags
-          return 2
-        fi
+        winch_resized=0
       fi
     done
   done
