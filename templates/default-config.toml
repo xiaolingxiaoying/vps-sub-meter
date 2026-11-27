@@ -62,6 +62,8 @@ tunnel_domain = ""
 sub_domain = ""
 loopback_sub_port = 18081
 preferred_ips_file = "/etc/vps-sub-meter/argo-ips.txt"
+# 省略时读取 preferred_ips_file，设为 [] 时仅使用隧道域名。
+# preferred_ips = ["104.16.0.1", "104.17.0.1"]
 
 [[argo.ws_inbounds]]
 id = "argo-vless"

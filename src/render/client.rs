@@ -7,7 +7,8 @@ use sha2::{Digest, Sha256};
 use std::net::Ipv4Addr;
 use std::path::{Path, PathBuf};
 
-use crate::config::{Config, WsProtocol, format_url_host, pct};
+pub use crate::config::is_public_ipv4;
+use crate::config::{Config, MAX_ARGO_PREFERRED_IPS, WsProtocol, format_url_host, pct};
 use crate::secrets::Secrets;
 use crate::store;
 
@@ -36,20 +37,10 @@ pub fn load_singbox_template(root: &Path) -> Result<Value, CompileError> {
     serde_json::from_str(&text).map_err(|e| CompileError::Format(format!("sing-box.json: {e}")))
 }
 
-pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
-    !ip.is_private()
-        && !ip.is_loopback()
-        && !ip.is_link_local()
-        && !ip.is_broadcast()
-        && !ip.is_documentation()
-        && !ip.is_multicast()
-        && !ip.is_unspecified()
-        && ip.octets()[0] != 0
-        && !(ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
-        && ip.octets()[0] < 240
-}
-
 pub fn load_argo_preferred_ips(root: &Path, config: &Config) -> Vec<String> {
+    if let Some(ips) = &config.argo.preferred_ips {
+        return ips.iter().map(ToString::to_string).collect();
+    }
     let raw = config.argo.preferred_ips_file.trim();
     let path = if root == Path::new("/") {
         PathBuf::from(raw)
@@ -72,7 +63,7 @@ pub fn load_argo_preferred_ips(root: &Path, config: &Config) -> Vec<String> {
             && !out.contains(&ip.to_string())
         {
             out.push(ip.to_string());
-            if out.len() >= 32 {
+            if out.len() >= MAX_ARGO_PREFERRED_IPS {
                 break;
             }
         }
@@ -580,6 +571,20 @@ fn finalize_bundle(
     })
 }
 
+fn dedup_argo_domains<'a>(tunnel: &'a str, sub: &'a str) -> Vec<&'a str> {
+    let mut domains = Vec::with_capacity(2);
+    for domain in [sub.trim(), tunnel.trim()] {
+        if !domain.is_empty()
+            && !domains
+                .iter()
+                .any(|existing: &&str| existing.eq_ignore_ascii_case(domain))
+        {
+            domains.push(domain);
+        }
+    }
+    domains
+}
+
 fn render_clash_from_template(
     root: &Path,
     config: &Config,
@@ -660,8 +665,9 @@ fn render_clash_from_template(
 
     if let Some((tunnel, sub)) = argo_domains {
         push_rule("NETWORK,udp,REJECT");
-        push_rule(&format!("DOMAIN,{sub},DIRECT"));
-        push_rule(&format!("DOMAIN,{tunnel},DIRECT"));
+        for domain in dedup_argo_domains(tunnel, sub) {
+            push_rule(&format!("DOMAIN,{domain},DIRECT"));
+        }
     }
     push_rule("IP-CIDR,198.18.0.0/15,REJECT,no-resolve");
     for item in existing_rules {
@@ -680,10 +686,13 @@ fn render_clash_from_template(
             .get_mut("nameserver-policy")
             .and_then(|v| v.as_mapping_mut())
     {
-        policy.insert(
-            serde_yaml::Value::String(format!("{sub},{tunnel}")),
-            serde_yaml::to_value(vec!["https://1.12.12.12/dns-query"]).unwrap(),
-        );
+        let domains = dedup_argo_domains(tunnel, sub);
+        if !domains.is_empty() {
+            policy.insert(
+                serde_yaml::Value::String(domains.join(",")),
+                serde_yaml::to_value(vec!["https://1.12.12.12/dns-query"]).unwrap(),
+            );
+        }
     }
 
     serde_yaml::to_string(&doc).map_err(|e| CompileError::Format(e.to_string()))
@@ -734,11 +743,12 @@ fn render_singbox_from_template(
     doc["outbounds"] = Value::Array(outbounds);
 
     if let Some((tunnel, sub)) = argo_domains {
-        let mut prefix_rules = vec![
-            json!({ "protocol": "dns", "action": "hijack-dns" }),
-            json!({ "domain": [sub, tunnel], "outbound": "DIRECT" }),
-            json!({ "network": "udp", "action": "reject" }),
-        ];
+        let domains = dedup_argo_domains(tunnel, sub);
+        let mut prefix_rules = vec![json!({ "protocol": "dns", "action": "hijack-dns" })];
+        if !domains.is_empty() {
+            prefix_rules.push(json!({ "domain": domains, "outbound": "DIRECT" }));
+        }
+        prefix_rules.push(json!({ "network": "udp", "action": "reject" }));
         if let Some(rules) = doc["route"]["rules"].as_array() {
             for r in rules {
                 if r.get("protocol").and_then(Value::as_str) == Some("dns") {
@@ -907,5 +917,31 @@ mod tests {
             clash["rules"].as_sequence().unwrap()[0].as_str(),
             Some("NETWORK,udp,REJECT")
         );
+    }
+
+    #[test]
+    fn argo_same_sub_and_tunnel_domain_deduplicates_dns_policy_and_singbox_rules() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = sample_config();
+        cfg.argo.tunnel_domain = "argo.example.com".into();
+        cfg.argo.sub_domain = "argo.example.com".into();
+        let sec = crate::test_secrets::fixture(&cfg);
+
+        let argo = compile_argo_clients(dir.path(), &cfg, &sec).unwrap();
+        let clash: serde_yaml::Value = serde_yaml::from_str(&argo.clash_yaml).unwrap();
+        let policy = clash["dns"]["nameserver-policy"].as_mapping().unwrap();
+        assert!(policy.contains_key(serde_yaml::Value::String("argo.example.com".into())));
+        assert!(!policy.contains_key(serde_yaml::Value::String(
+            "argo.example.com,argo.example.com".into()
+        )));
+
+        let sb: Value = serde_json::from_str(argo.sing_box_json.as_deref().unwrap()).unwrap();
+        let direct_rule = sb["route"]["rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r.get("outbound").and_then(Value::as_str) == Some("DIRECT"))
+            .unwrap();
+        assert_eq!(direct_rule["domain"], json!(["argo.example.com"]));
     }
 }

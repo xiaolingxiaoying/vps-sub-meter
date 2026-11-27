@@ -23,6 +23,8 @@ pub struct GenerationMeta {
     pub argo_nodes: Vec<String>,
     #[serde(default)]
     pub argo_files: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -273,6 +275,14 @@ pub fn hash_token(token: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+
+pub fn config_revision(root: &Path) -> io::Result<String> {
+    match read_no_follow(&root.join(crate::config::CONFIG_REL)) {
+        Ok(bytes) => Ok(format!("{:x}", Sha256::digest(bytes))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(String::new()),
+        Err(error) => Err(error),
+    }
 }
 
 pub fn constant_time_hash_match(hashes: &[String], candidate_token: &str) -> bool {

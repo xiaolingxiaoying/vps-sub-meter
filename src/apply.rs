@@ -5,6 +5,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use sha2::{Digest, Sha256};
+
 use crate::config::{CONFIG_REL, Config, VAR_DIR};
 use crate::render::{self, ClientBundle, CompiledDeployment};
 use crate::secrets::{Secrets, random_hex};
@@ -31,6 +33,8 @@ pub enum ApplyError {
     KernelCheck(&'static str, String),
     #[error("执行系统操作失败: {0}")]
     System(String),
+    #[error("主配置在编辑期间已修改，请刷新面板后重试")]
+    StaleConfig,
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +44,7 @@ pub struct ApplyReport {
     pub singbox_nodes: usize,
     pub xray_restarted: bool,
     pub singbox_restarted: bool,
+    pub argo_warning: Option<String>,
 }
 
 pub fn check_kernel_config(binary: &Path, is_xray: bool, json_doc: &str) -> Result<(), ApplyError> {
@@ -81,25 +86,145 @@ pub fn check_kernel_config(binary: &Path, is_xray: bool, json_doc: &str) -> Resu
     }
 }
 
+fn file_sha256_opt(path: &Path) -> Option<String> {
+    let bytes = store::read_no_follow(path).ok()?;
+    Some(format!("{:x}", Sha256::digest(bytes)))
+}
+
+/// Canonical SHA-256 fingerprint of all deployment-affecting configuration
+/// (everything except live-reloaded `traffic` schedule/quota settings, plus the
+/// resolved Argo preferred IP list when Argo is enabled, external custom client
+/// templates, and the IP-mode leaf TLS certificate when present).
+pub fn deployment_fingerprint(root: &Path, config: &Config) -> String {
+    #[derive(serde::Serialize)]
+    struct FingerprintInput<'a> {
+        profile_name: &'a str,
+        domain: &'a str,
+        public_ip: &'a str,
+        interface: &'a str,
+        ipv4_only: bool,
+        latency_probe_url: &'a str,
+        server: &'a crate::config::ServerConfig,
+        nodes: &'a crate::config::NodesConfig,
+        argo: &'a crate::config::ArgoConfig,
+        argo_preferred_ips: Option<Vec<String>>,
+        mihomo_template_sha256: Option<String>,
+        singbox_template_sha256: Option<String>,
+        ip_mode_cert_sha256: Option<String>,
+    }
+    let ip_mode_cert_sha256 = config
+        .is_ip_mode()
+        .then(|| {
+            file_sha256_opt(
+                &root
+                    .join(VAR_DIR)
+                    .join("certificates")
+                    .join(config.tls_sni())
+                    .join("fullchain.pem"),
+            )
+        })
+        .flatten();
+    let input = FingerprintInput {
+        profile_name: &config.profile_name,
+        domain: &config.domain,
+        public_ip: &config.public_ip,
+        interface: &config.interface,
+        ipv4_only: config.ipv4_only,
+        latency_probe_url: &config.latency_probe_url,
+        server: &config.server,
+        nodes: &config.nodes,
+        argo: &config.argo,
+        argo_preferred_ips: config
+            .argo
+            .enabled
+            .then(|| render::client::load_argo_preferred_ips(root, config)),
+        mihomo_template_sha256: file_sha256_opt(
+            &root.join("etc/vps-sub-meter/templates/mihomo.yaml"),
+        ),
+        singbox_template_sha256: file_sha256_opt(
+            &root.join("etc/vps-sub-meter/templates/sing-box.json"),
+        ),
+        ip_mode_cert_sha256,
+    };
+    let bytes = serde_json::to_vec(&input).expect("deployment fingerprint serializes");
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Returns true when the current `config` has deployment changes that have not
+/// yet been compiled and published into `generation`.
+pub fn has_pending_changes(
+    root: &Path,
+    config: &Config,
+    generation: Option<&GenerationMeta>,
+) -> bool {
+    let Some(meta) = generation else {
+        return true;
+    };
+    if let Some(published) = meta.config_fingerprint.as_deref() {
+        return published != deployment_fingerprint(root, config);
+    }
+    let expected_direct: Vec<&str> = [
+        (
+            config.nodes.vless_reality_pqc.enabled,
+            config.nodes.vless_reality_pqc.name.as_str(),
+        ),
+        (
+            config.nodes.vless_xhttp_pqc.enabled,
+            config.nodes.vless_xhttp_pqc.name.as_str(),
+        ),
+        (
+            config.nodes.anytls_tcp.enabled,
+            config.nodes.anytls_tcp.name.as_str(),
+        ),
+        (
+            config.nodes.hysteria2_hop.enabled,
+            config.nodes.hysteria2_hop.name.as_str(),
+        ),
+        (
+            config.nodes.tuic_bbr.enabled,
+            config.nodes.tuic_bbr.name.as_str(),
+        ),
+    ]
+    .into_iter()
+    .filter_map(|(enabled, name)| enabled.then_some(name))
+    .collect();
+    let published_direct: Vec<&str> = meta.direct_nodes.iter().map(String::as_str).collect();
+    expected_direct != published_direct || config.argo.enabled != !meta.argo_files.is_empty()
+}
+
 pub fn apply_all(root: &Path) -> Result<ApplyReport, ApplyError> {
-    apply_with_keys(root, false, None)
+    apply_with_keys(root, false, None, None)
 }
 
 pub fn rotate_node_keys(root: &Path) -> Result<ApplyReport, ApplyError> {
-    apply_with_keys(root, true, None)
+    apply_with_keys(root, true, None, None)
 }
 
 pub fn apply_candidate(root: &Path, config: Config) -> Result<ApplyReport, ApplyError> {
+    apply_candidate_at_revision(root, config, None)
+}
+
+pub fn apply_candidate_at_revision(
+    root: &Path,
+    config: Config,
+    revision: Option<&str>,
+) -> Result<ApplyReport, ApplyError> {
     config.validate()?;
-    apply_with_keys(root, false, Some(config))
+    apply_with_keys(root, false, Some(config), revision)
 }
 
 fn apply_with_keys(
     root: &Path,
     rotate_keys: bool,
     candidate: Option<Config>,
+    revision: Option<&str>,
 ) -> Result<ApplyReport, ApplyError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    if let Some(revision) = revision
+        && store::config_revision(root)? != revision
+    {
+        return Err(ApplyError::StaleConfig);
+    }
     let (config, previous_config) = match candidate {
         Some(config) => (config, Some(backup(root, CONFIG_REL, 0o640)?)),
         None => (Config::load(root)?, None),
@@ -142,6 +267,7 @@ fn apply_with_keys(
         singbox_nodes: compiled.clients.singbox_node_names.clone(),
         argo_nodes,
         argo_files,
+        config_fingerprint: Some(deployment_fingerprint(root, &config)),
     };
 
     let backups = [
@@ -203,11 +329,13 @@ fn apply_with_keys(
     };
 
     prune_old_generations(root, &gen_id);
-    if root == Path::new("/") {
+    let argo_warning = if root == Path::new("/") {
         fix_live_permissions(&gen_dir);
         sync_live_firewall(&config);
-        refresh_live_argo(&config);
-    }
+        refresh_live_argo(&config)
+    } else {
+        None
+    };
 
     Ok(ApplyReport {
         generation_id: gen_id,
@@ -215,6 +343,7 @@ fn apply_with_keys(
         singbox_nodes: compiled.clients.singbox_node_names.len(),
         xray_restarted,
         singbox_restarted,
+        argo_warning,
     })
 }
 
@@ -633,7 +762,7 @@ fn sync_live_firewall(config: &Config) {
     }
 }
 
-fn refresh_live_argo(config: &Config) {
+fn refresh_live_argo(config: &Config) -> Option<String> {
     let helper = Path::new("/usr/local/lib/vps-sub-meter/argo.sh");
     if config.argo.enabled
         && helper.is_file()
@@ -642,8 +771,11 @@ fn refresh_live_argo(config: &Config) {
             .status()
             .is_ok_and(|status| status.success())
     {
-        eprintln!("Argo 回源规则更新失败，可运行 ly 并选择 7 检查隧道");
+        let warning = "Argo 回源规则更新失败，请检查隧道配置与 Cloudflared 服务".to_owned();
+        eprintln!("{warning}");
+        return Some(warning);
     }
+    None
 }
 
 fn systemctl(args: &[&str]) -> Result<(), ApplyError> {
@@ -786,5 +918,110 @@ mod tests {
                 "2096/udp",
             ]
         );
+    }
+
+    #[test]
+    fn pending_changes_detects_deployment_edits_but_ignores_live_traffic_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            domain: "sub.example.com".into(),
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        cfg.argo.enabled = true;
+        cfg.argo.tunnel_domain = "argo.example.com".into();
+        cfg.argo.sub_domain = "argo.example.com".into();
+        cfg.save(dir.path()).unwrap();
+        crate::test_secrets::fixture(&cfg).save(dir.path()).unwrap();
+
+        assert!(has_pending_changes(dir.path(), &cfg, None));
+        apply_all(dir.path()).unwrap();
+        let meta = store::current_generation(dir.path()).unwrap().unwrap();
+        assert!(meta.config_fingerprint.is_some());
+        assert!(!has_pending_changes(dir.path(), &cfg, Some(&meta)));
+
+        // Traffic schedule/quota updates take effect live without `vsm apply`.
+        let mut traffic_only = cfg.clone();
+        traffic_only.traffic.monthly_gb = 123.0;
+        traffic_only.traffic.reset_day = 15;
+        assert!(!has_pending_changes(dir.path(), &traffic_only, Some(&meta)));
+
+        // Port, domain, protocol param, preferred IP, or preferred_ips_file edits require apply.
+        let mut port_changed = cfg.clone();
+        port_changed.nodes.anytls_tcp.port = 24443;
+        assert!(has_pending_changes(dir.path(), &port_changed, Some(&meta)));
+
+        let mut domain_changed = cfg.clone();
+        domain_changed.domain = "new.example.com".into();
+        assert!(has_pending_changes(
+            dir.path(),
+            &domain_changed,
+            Some(&meta)
+        ));
+
+        let mut proto_changed = cfg.clone();
+        proto_changed.nodes.hysteria2_hop.obfs_salamander =
+            !proto_changed.nodes.hysteria2_hop.obfs_salamander;
+        assert!(has_pending_changes(dir.path(), &proto_changed, Some(&meta)));
+
+        let mut ip_changed = cfg.clone();
+        ip_changed.argo.preferred_ips = Some(vec!["104.16.0.1".parse().unwrap()]);
+        assert!(has_pending_changes(dir.path(), &ip_changed, Some(&meta)));
+
+        // Editing the referenced argo-ips.txt file also flags pending changes.
+        let ips_file = dir.path().join("etc/vps-sub-meter/argo-ips.txt");
+        fs::create_dir_all(ips_file.parent().unwrap()).unwrap();
+        fs::write(&ips_file, "104.16.0.1\n").unwrap();
+        assert!(has_pending_changes(dir.path(), &cfg, Some(&meta)));
+        fs::remove_file(&ips_file).unwrap();
+        assert!(!has_pending_changes(dir.path(), &cfg, Some(&meta)));
+
+        // Editing external custom client templates also flags pending changes.
+        let custom_mihomo = dir.path().join("etc/vps-sub-meter/templates/mihomo.yaml");
+        fs::create_dir_all(custom_mihomo.parent().unwrap()).unwrap();
+        fs::write(&custom_mihomo, "mixed-port: 7890\n").unwrap();
+        assert!(has_pending_changes(dir.path(), &cfg, Some(&meta)));
+        fs::remove_file(&custom_mihomo).unwrap();
+        assert!(!has_pending_changes(dir.path(), &cfg, Some(&meta)));
+
+        let custom_sb = dir.path().join("etc/vps-sub-meter/templates/sing-box.json");
+        fs::write(&custom_sb, "{}\n").unwrap();
+        assert!(has_pending_changes(dir.path(), &cfg, Some(&meta)));
+        fs::remove_file(&custom_sb).unwrap();
+        assert!(!has_pending_changes(dir.path(), &cfg, Some(&meta)));
+
+        // IP-mode certificate updates change the pinned fingerprint and flag pending changes.
+        let mut ip_cfg = Config {
+            domain: String::new(),
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        ip_cfg.nodes.vless_xhttp_pqc.enabled = false;
+        ip_cfg.nodes.anytls_tcp.enabled = false;
+        ip_cfg.nodes.hysteria2_hop.enabled = false;
+        ip_cfg.nodes.tuic_bbr.enabled = false;
+        let ip_dir = tempfile::tempdir().unwrap();
+        let ip_cert = ip_dir
+            .path()
+            .join("var/lib/vps-sub-meter/certificates/www.bing.com/fullchain.pem");
+        fs::create_dir_all(ip_cert.parent().unwrap()).unwrap();
+        fs::write(&ip_cert, "cert-v1").unwrap();
+        ip_cfg.save(ip_dir.path()).unwrap();
+        crate::test_secrets::fixture(&ip_cfg)
+            .save(ip_dir.path())
+            .unwrap();
+        apply_all(ip_dir.path()).unwrap();
+        let ip_meta = store::current_generation(ip_dir.path()).unwrap().unwrap();
+        assert!(!has_pending_changes(ip_dir.path(), &ip_cfg, Some(&ip_meta)));
+        fs::write(&ip_cert, "cert-v2").unwrap();
+        assert!(has_pending_changes(ip_dir.path(), &ip_cfg, Some(&ip_meta)));
+
+        // Legacy current.json without config_fingerprint falls back to node/argo comparison.
+        let mut legacy = meta;
+        legacy.config_fingerprint = None;
+        assert!(!has_pending_changes(dir.path(), &cfg, Some(&legacy)));
+        let mut argo_off = cfg.clone();
+        argo_off.argo.enabled = false;
+        assert!(has_pending_changes(dir.path(), &argo_off, Some(&legacy)));
     }
 }

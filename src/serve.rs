@@ -819,25 +819,44 @@ fn build_index_html(
             .replace('"', "&quot;")
             .replace('\'', "&#39;")
     };
-    let (used_str, total_str, up_str, down_str, pct_val, reset_str) = match snap {
+    let (used_str, total_str, pct_val, bar_class, bar_attr, quota_meta, reset_str) = match snap {
         Some(s) => {
             let used = s.total_used();
-            let pct_f = if s.monthly_limit_bytes > 0 {
-                (used as f64 * 100.0 / s.monthly_limit_bytes as f64).min(100.0)
+            let up_str = traffic::format_iec(s.upload_bytes);
+            let down_str = traffic::format_iec(s.download_bytes);
+            let (total_lbl, bar_pct, bar_cls, bar, meta) = if s.monthly_limit_bytes > 0 {
+                let raw_pct = used as f64 * 100.0 / s.monthly_limit_bytes as f64;
+                let bar_pct = format!("{:.2}", raw_pct.min(100.0));
+                let text_pct = format!("{raw_pct:.2}");
+                let over = used > s.monthly_limit_bytes;
+                let meta = if over {
+                    format!("已用 {text_pct}%（已超额） · 上传 {up_str} · 下载 {down_str}")
+                } else {
+                    format!("已用 {text_pct}% · 上传 {up_str} · 下载 {down_str}")
+                };
+                (
+                    traffic::format_iec(s.monthly_limit_bytes),
+                    bar_pct,
+                    if over { "bar-fill over" } else { "bar-fill" },
+                    "",
+                    meta,
+                )
             } else {
-                0.0
-            };
-            let total_lbl = if s.monthly_limit_bytes > 0 {
-                traffic::format_iec(s.monthly_limit_bytes)
-            } else {
-                "不限".into()
+                (
+                    "不限".into(),
+                    "0.00".into(),
+                    "bar-fill",
+                    " hidden",
+                    format!("不限额度 · 上传 {up_str} · 下载 {down_str}"),
+                )
             };
             (
                 traffic::format_iec(used),
                 total_lbl,
-                traffic::format_iec(s.upload_bytes),
-                traffic::format_iec(s.download_bytes),
-                format!("{pct_f:.2}"),
+                bar_pct,
+                bar_cls,
+                bar,
+                meta,
                 format!(
                     "{} ({})",
                     traffic::format_time_in_tz(s.next_reset_ts, &config.traffic.display_tz),
@@ -848,14 +867,20 @@ fn build_index_html(
         None => (
             "暂不可用".into(),
             "-".into(),
-            "-".into(),
-            "-".into(),
             "0.00".into(),
+            "bar-fill",
+            " hidden",
+            "流量统计暂不可用".into(),
             "-".into(),
         ),
     };
 
     let clash_url = format!("{base_url}/clash.yaml");
+    let clash_import_url = format!(
+        "clash://install-config?url={}&name={}",
+        pct(&clash_url),
+        pct(title)
+    );
     let sr_url = format!("{base_url}/shadowrocket.txt");
     let sr_sub_url = format!(
         "sub://{}#{}",
@@ -865,27 +890,44 @@ fn build_index_html(
     let uri_url = format!("{base_url}/uri.txt");
 
     let mut cards = String::new();
-    let mut push_card = |card_title: &str, desc: &str, link: &str, qr_payload: &str| {
+    let mut push_card = |card_title: &str,
+                         desc: &str,
+                         link: &str,
+                         qr_payload: &str,
+                         import_href: Option<&str>| {
         let svg = qr::render_svg(qr_payload).unwrap_or_default();
+        let import_btn = import_href
+            .map(|href| {
+                format!(
+                    r#"<a class="btn-link btn-secondary" href="{href}">一键导入</a>"#,
+                    href = esc(href)
+                )
+            })
+            .unwrap_or_default();
         cards.push_str(&format!(
-            r#"<div class="card">
+                r#"<div class="card">
   <h2>{t}</h2>
   <p class="desc">{d}</p>
   <div class="qr">{svg}</div>
   <div class="url-box"><code>{l}</code></div>
-  <button type="button" onclick="copyText(this)" data-val="{l}">复制链接</button>
+  <div class="card-actions"><button type="button" onclick="copyText(this)" data-val="{l}">复制链接</button>{import_btn}</div>
 </div>"#,
-            t = esc(card_title),
-            d = esc(desc),
-            l = esc(link)
-        ));
+                t = esc(card_title),
+                d = esc(desc),
+                l = esc(link)
+            ));
     };
 
     push_card(
         "Clash Party / Mihomo 订阅",
-        "支持全部节点及 TCP优选/自动选择组。",
+        if is_argo {
+            "支持全部 Argo 优选节点及 Argo优选 自动测速组（严格 TCP）。"
+        } else {
+            "支持全部节点及 TCP优选/自动选择组。"
+        },
         &clash_url,
         &clash_url,
+        Some(&clash_import_url),
     );
     let node_names = if is_argo {
         &gen_meta.argo_nodes
@@ -913,37 +955,93 @@ fn build_index_html(
             },
             &sb_url,
             &sb_qr,
+            Some(&sb_qr),
         );
     }
     push_card(
         "Shadowrocket 扫码订阅 (推荐)",
-        "使用 Shadowrocket 首页左上角扫码直接添加。",
+        "使用 Shadowrocket 首页左上角扫码，或在手机浏览器直接一键导入。",
         &sr_sub_url,
         &sr_sub_url,
+        Some(&sr_sub_url),
     );
     push_card(
         "Shadowrocket / 通用 Base64",
         "粘贴至 Shadowrocket 或 v2rayN 订阅地址。",
         &sr_url,
         &sr_url,
+        None,
     );
-    push_card("明文 URI 列表", "每行一条分享链接。", &uri_url, &uri_url);
+    push_card(
+        "明文 URI 列表",
+        "每行一条分享链接。",
+        &uri_url,
+        &uri_url,
+        None,
+    );
 
-    let nodes_summary = esc(&node_names.join(" · "));
+    const COMPACT_NODE_THRESHOLD: usize = 6;
+    let nodes_section = if node_names.len() <= COMPACT_NODE_THRESHOLD {
+        format!(r#"<p class="sub">{}</p>"#, esc(&node_names.join(" · ")))
+    } else {
+        let preview = esc(&node_names[..4].join(" · "));
+        let chips: String = node_names
+            .iter()
+            .map(|name| format!(r#"<span class="node-chip">{}</span>"#, esc(name)))
+            .collect();
+        format!(
+            r#"<p class="sub">{preview} 等共 {} 个节点</p>
+  <details class="nodes-details"><summary>展开查看全部 {} 个节点</summary><div class="node-list">{chips}</div></details>"#,
+            node_names.len(),
+            node_names.len()
+        )
+    };
+    let uri_open_attr = if node_names.len() <= COMPACT_NODE_THRESHOLD {
+        " open"
+    } else {
+        ""
+    };
+    let title_escaped = esc(title);
+    let quota_meta_escaped = esc(&quota_meta);
+    let node_count_str = node_names.len().to_string();
     let uri_escaped = esc(uri_txt.trim());
 
-    INDEX_HTML_TEMPLATE
-        .replace("{{TITLE}}", &esc(title))
-        .replace("{{NODES_SUMMARY}}", &nodes_summary)
-        .replace("{{USED}}", &used_str)
-        .replace("{{TOTAL}}", &total_str)
-        .replace("{{PCT}}", &pct_val)
-        .replace("{{UPLOAD}}", &up_str)
-        .replace("{{DOWNLOAD}}", &down_str)
-        .replace("{{RESET}}", &reset_str)
-        .replace("{{NODE_COUNT}}", &node_names.len().to_string())
-        .replace("{{CARDS}}", &cards)
-        .replace("{{URI_ESCAPED}}", &uri_escaped)
+    render_template_once(
+        INDEX_HTML_TEMPLATE,
+        &[
+            ("{{TITLE}}", &title_escaped),
+            ("{{NODES_SECTION}}", &nodes_section),
+            ("{{USED}}", &used_str),
+            ("{{TOTAL}}", &total_str),
+            ("{{PCT}}", &pct_val),
+            ("{{BAR_CLASS}}", bar_class),
+            ("{{BAR_ATTR}}", bar_attr),
+            ("{{QUOTA_META}}", &quota_meta_escaped),
+            ("{{RESET}}", &reset_str),
+            ("{{NODE_COUNT}}", &node_count_str),
+            ("{{CARDS}}", &cards),
+            ("{{URI_OPEN_ATTR}}", uri_open_attr),
+            ("{{URI_ESCAPED}}", &uri_escaped),
+        ],
+    )
+}
+
+fn render_template_once(template: &str, replacements: &[(&str, &str)]) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut rest = template;
+    while let Some(pos) = rest.find("{{") {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos..];
+        if let Some((key, val)) = replacements.iter().find(|(k, _)| after.starts_with(k)) {
+            out.push_str(val);
+            rest = &after[key.len()..];
+        } else {
+            out.push_str("{{");
+            rest = &after[2..];
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[cfg(test)]
@@ -1078,5 +1176,130 @@ mod tests {
             None,
         );
         assert_eq!(post.status(), StatusCode::METHOD_NOT_ALLOWED);
+    }
+
+    #[test]
+    fn dashboard_html_handles_unlimited_quota_and_http_copy_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = Config {
+            domain: "sub.example.com".into(),
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        cfg.traffic.monthly_gb = 0.0;
+        let gen_meta = GenerationMeta {
+            id: "abcd1234".into(),
+            files: vec!["clash.yaml".into()],
+            direct_nodes: vec!["vless-reality-pqc".into()],
+            singbox_nodes: vec![],
+            argo_nodes: vec![],
+            argo_files: vec![],
+            config_fingerprint: None,
+        };
+        let snap = TrafficSnapshot {
+            interface: "eth0".into(),
+            upload_bytes: 1024 * 1024,
+            download_bytes: 2 * 1024 * 1024,
+            monthly_limit_bytes: 0,
+            next_reset_ts: 1_796_981_520,
+        };
+        let html_unlimited = build_index_html(
+            &cfg,
+            &gen_meta,
+            "vless://example",
+            "https://sub.example.com/sub/tok",
+            &cfg.profile_name,
+            Some(&snap),
+            false,
+            false,
+        );
+        assert!(html_unlimited.contains("不限额度"));
+        assert!(html_unlimited.contains(r#"class="bar" hidden"#));
+        assert!(html_unlimited.contains("fallbackCopy"));
+        assert!(!html_unlimited.contains("已用 0.00%"));
+
+        let snap_limited = TrafficSnapshot {
+            monthly_limit_bytes: 10 * 1024 * 1024,
+            ..snap
+        };
+        let html_limited = build_index_html(
+            &cfg,
+            &gen_meta,
+            "vless://example",
+            "https://sub.example.com/sub/tok",
+            &cfg.profile_name,
+            Some(&snap_limited),
+            false,
+            false,
+        );
+        assert!(html_limited.contains("已用 30.00%"));
+        assert!(!html_limited.contains(r#"class="bar" hidden"#));
+        let _ = dir;
+    }
+
+    #[test]
+    fn dashboard_html_handles_over_quota_argo_copy_and_compact_many_nodes() {
+        let cfg = Config {
+            domain: "sub.example.com".into(),
+            public_ip: "203.0.113.10".into(),
+            ..crate::config::test_defaults()
+        };
+        let argo_nodes: Vec<String> = (1..=10)
+            .map(|i| format!("argo-ws [CF-{i:02} 104.16.0.{i}]"))
+            .collect();
+        let gen_meta = GenerationMeta {
+            id: "abcd1234".into(),
+            files: vec!["clash.yaml".into()],
+            direct_nodes: vec!["vless-reality-pqc".into()],
+            singbox_nodes: vec![],
+            argo_nodes,
+            argo_files: vec!["clash.yaml".into(), "sing-box.json".into()],
+            config_fingerprint: None,
+        };
+        let snap_over = TrafficSnapshot {
+            interface: "eth0".into(),
+            upload_bytes: 5 * 1024 * 1024,
+            download_bytes: 10 * 1024 * 1024,
+            monthly_limit_bytes: 10 * 1024 * 1024,
+            next_reset_ts: 1_796_981_520,
+        };
+        let html = build_index_html(
+            &cfg,
+            &gen_meta,
+            "vless://a\nvless://b\n",
+            "https://argo.example.com/sub/tok",
+            "Argo 订阅",
+            Some(&snap_over),
+            true,
+            true,
+        );
+        // Argo Clash card accurately describes Argo优选 instead of TCP优选/自动选择组.
+        assert!(html.contains("Argo优选"));
+        assert!(!html.contains("TCP优选/自动选择组"));
+        // Over-quota text shows real >100% value while CSS bar width stays capped at 100.00%.
+        assert!(html.contains("已用 150.00%（已超额）"));
+        assert!(html.contains("width: 100.00%;"));
+        assert!(html.contains(r#"class="bar-fill over""#));
+        // Many nodes collapse both header node list and raw URI details by default.
+        assert!(html.contains("等共 10 个节点"));
+        assert!(html.contains(r#"class="nodes-details""#));
+        assert!(html.contains(r#"<details class="uri-details">"#));
+        // One-click import deep links are rendered for Clash, sing-box, and Shadowrocket.
+        assert!(html.contains("clash://install-config?url="));
+        assert!(html.contains("sing-box://import-remote-profile?url="));
+        assert!(html.contains("href=\"sub://"));
+
+        // Literal placeholder-like text in title or node names must not be re-expanded.
+        let literal_html = build_index_html(
+            &cfg,
+            &gen_meta,
+            "vless://secret-line\n",
+            "https://argo.example.com/sub/tok",
+            "Title {{USED}} {{URI_ESCAPED}}",
+            Some(&snap_over),
+            true,
+            true,
+        );
+        assert!(literal_html.contains("<h1>Title {{USED}} {{URI_ESCAPED}}</h1>"));
     }
 }

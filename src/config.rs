@@ -5,7 +5,7 @@
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 
 use crate::store;
@@ -15,6 +15,7 @@ pub const VAR_DIR: &str = "var/lib/vps-sub-meter";
 pub const LIB_DIR: &str = "usr/local/lib/vps-sub-meter";
 pub const CONFIG_REL: &str = "etc/vps-sub-meter/config.toml";
 pub const DEFAULT_CONFIG_REL: &str = "etc/vps-sub-meter/templates/default-config.toml";
+pub(crate) const MAX_ARGO_PREFERRED_IPS: usize = 32;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -138,6 +139,7 @@ pub struct ArgoConfig {
     pub sub_domain: String,
     pub loopback_sub_port: u16,
     pub preferred_ips_file: String,
+    pub preferred_ips: Option<Vec<Ipv4Addr>>,
     pub ws_inbounds: Vec<ArgoWsInbound>,
 }
 
@@ -531,6 +533,24 @@ impl Config {
     }
 
     fn validate_argo(&self, tcp_ports: &mut BTreeSet<u16>) -> Result<(), ConfigError> {
+        if let Some(ips) = &self.argo.preferred_ips {
+            if ips.len() > MAX_ARGO_PREFERRED_IPS {
+                return Err(ConfigError::Invalid(format!(
+                    "Argo 优选 IP 最多可配置 {MAX_ARGO_PREFERRED_IPS} 个"
+                )));
+            }
+            let mut seen = BTreeSet::new();
+            for &ip in ips {
+                if !is_public_ipv4(ip) {
+                    return Err(ConfigError::Invalid(format!(
+                        "Argo 优选 IP 必须是公网 IPv4 地址: {ip}"
+                    )));
+                }
+                if !seen.insert(ip) {
+                    return Err(ConfigError::Invalid(format!("Argo 优选 IP 重复: {ip}")));
+                }
+            }
+        }
         if !self.argo.enabled {
             return Ok(());
         }
@@ -650,6 +670,19 @@ pub fn is_valid_hostname(s: &str) -> bool {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-')
         })
+}
+
+pub fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_private()
+        && !ip.is_loopback()
+        && !ip.is_link_local()
+        && !ip.is_broadcast()
+        && !ip.is_documentation()
+        && !ip.is_multicast()
+        && !ip.is_unspecified()
+        && ip.octets()[0] != 0
+        && !(ip.octets()[0] == 100 && (64..128).contains(&ip.octets()[1]))
+        && ip.octets()[0] < 240
 }
 
 pub fn is_valid_host(s: &str) -> bool {

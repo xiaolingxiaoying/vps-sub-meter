@@ -20,7 +20,9 @@
 
 REALITY 新装默认 SNI 是 `www.icloud.com`，来自 `/etc/vps-sub-meter/templates/default-config.toml` 的 `[nodes.vless_reality_pqc]` → `decoy_sni`，编辑模板即可调整新装默认值。已有部署应在主配置 `/etc/vps-sub-meter/config.toml` 里编辑同一字段，运行 `vsm apply` 后刷新客户端订阅。
 
-另可选原生集成 **Cloudflare Argo 隧道优选订阅**。`ly` 的 `2. 查看订阅与二维码` 可以先选直连或 Argo，再选客户端格式。`7. 管理 Argo 隧道` 可检查本机与公网订阅。节点和订阅域名的 DNS 需指向该隧道，域名相同时本机生成的回源规则按 URL 路径分流。若在 Cloudflare 控制台配置了回源规则，也应将 `/sub/…` 指向订阅监听端口，并将节点 WebSocket 路径指向对应 WS 入站。更新 `/etc/vps-sub-meter/argo-ips.txt` 后运行 `vsm apply` 可重新生成优选订阅。
+另可选原生集成 **Cloudflare Argo 隧道优选订阅**。`ly` 的 `2. 查看订阅与二维码` 可以先选直连或 Argo，再选客户端格式。`7. 管理 Argo 隧道` 可检查本机与公网订阅。节点和订阅域名的 DNS 需指向该隧道，域名相同时本机生成的回源规则按 URL 路径分流。若在 Cloudflare 控制台配置了回源规则，也应将 `/sub/…` 指向订阅监听端口，并将节点 WebSocket 路径指向对应 WS 入站。
+
+在 `ly` → `7. 管理 Argo 隧道` → `1. 配置并启用` 或 `5. 更新优选 IP` 中，可输入最多 32 个公网 IPv4 地址，用逗号或空格分隔。回车保留当前设置，输入 `清空` 仅使用隧道域名，输入 `文件` 则从 `preferred_ips_file` 读取（默认 `/etc/vps-sub-meter/argo-ips.txt`）。确认后会重新生成订阅。也可以直接编辑 `config.toml` 中 `[argo]` 下的 `preferred_ips`，或在文件模式下更新 IP 文件，再运行 `vsm apply`。
 
 ## 快速安装与全版本平滑升级
 
@@ -89,6 +91,7 @@ curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/
 ```sh
 ly                     # 初始化、查订阅、管理 Token、轮换节点密钥或应用配置
 vsm status             # 查看订阅批次与实时流量
+vsm panel              # 按需打开仅供 SSH 转发访问的网页管理面板
 vsm sub --qr           # 输出订阅链接与终端二维码
 vsm apply              # 校验外部配置/模板，检查官方内核后平滑生效
 vsm traffic checkpoint # 立即刷新流量账本到磁盘
@@ -103,6 +106,27 @@ vsm traffic checkpoint # 立即刷新流量账本到磁盘
 IP 模式的直连订阅通过 HTTP 发布，其中包含连接凭据和指纹。请通过 SSH 等可信渠道获取配置并导入，或绑定域名启用 HTTPS。手动更换 IP 模式证书后，运行 `vsm apply` 重新生成配置，再用 `cert.sh reload www.bing.com` 让内核加载证书，并通过可信渠道刷新客户端。
 
 节点和 Argo 在 `config.toml` 中编辑，保存后执行 `vsm apply`。Argo 隧道部署用 `argo.sh setup`。组件更新用 `cores.sh update`，证书续期用 `cert.sh renew`，内核参数调优用 `net.sh tune-sysctl`。这些脚本安装在 `/usr/local/lib/vps-sub-meter/`。
+
+## 网页管理面板
+
+在你自己的电脑上运行以下命令，把 `admin@vps.example.com` 换成实际的 SSH 用户和主机：
+
+```bash
+ssh -t -o ExitOnForwardFailure=yes -L 127.0.0.1:8787:127.0.0.1:8787 admin@vps.example.com 'sudo /usr/local/bin/vps-sub-meter panel'
+```
+
+在浏览器打开 `http://127.0.0.1:8787/`，输入 SSH 终端显示的会话密钥。密钥仅在此次面板进程运行期间有效。保持 SSH 连接，等待运维操作完成后按 Ctrl+C 关闭面板。端口被占用时，给面板加 `--port 其他端口`，并同步修改 SSH 转发两端的端口和浏览器地址。
+
+面板内置于 `vps-sub-meter` 二进制，只监听 VPS 的 `127.0.0.1`，无需额外安装 Web 服务、开公网端口或启动常驻进程。它复用项目已有的配置、密钥、流量账本及 Bash 运维脚本。
+
+- **概览、部署配置、节点端口** 展示流量和已发布批次，支持初始化、完整配置 JSON、模板或随机端口，以及预览、仅保存或应用配置。
+- **流量、订阅与设备凭据** 支持账期设置、流量校准和保存、各设备的直连和 Argo 订阅链接及二维码、凭据新增和吊销、默认凭据与节点密钥轮换。
+- **域名与 HTTPS、Argo、证书** 支持域名绑定、证书状态和签发、同步或续期，以及 Argo 启停、优选 IP、回源刷新和连接检查。
+- **系统维护** 支持重新应用配置、更新代理内核、网络参数调优、升级检查、安装官方发行包，以及保留配置或彻底卸载。
+
+手动修改本期用量时，在「流量账期」的「流量校准」中填写上传和下载，点击「保存已用流量」并确认。「账本维护」中的「记录当前统计」用于立即记录服务器当前统计的用量。
+
+重置时区和显示时区可以分别选择美西（洛杉矶）、美东（纽约）等常用时区，也可以填写自定义 IANA 时区名称。
 
 ## 脚本接口
 

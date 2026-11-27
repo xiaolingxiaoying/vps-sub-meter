@@ -25,6 +25,8 @@ pub enum TrafficError {
     Parse(String),
     #[error("无效的时间或时区配置: {0}")]
     Schedule(String),
+    #[error("主配置在编辑期间已修改，请刷新面板后重试")]
+    StaleConfig,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -186,7 +188,20 @@ pub fn save_state(root: &Path, state: &TrafficState) -> Result<(), TrafficError>
 
 /// Updates traffic settings and reschedules the active cycle without changing its counters.
 pub fn configure(root: &Path, edit: impl FnOnce(&mut TrafficConfig)) -> Result<bool, TrafficError> {
+    configure_at_revision(root, None, edit)
+}
+
+pub fn configure_at_revision(
+    root: &Path,
+    revision: Option<&str>,
+    edit: impl FnOnce(&mut TrafficConfig),
+) -> Result<bool, TrafficError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    if let Some(revision) = revision
+        && store::config_revision(root)? != revision
+    {
+        return Err(TrafficError::StaleConfig);
+    }
     let mut config = Config::load(root)?;
     let previous = config.traffic.clone();
     edit(&mut config.traffic);
@@ -353,7 +368,7 @@ pub fn set_used(
     download_bytes: u64,
 ) -> Result<TrafficSnapshot, TrafficError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
-    set_used_locked(root, config, upload_bytes, download_bytes)
+    set_used_optional_locked(root, config, Some(upload_bytes), Some(download_bytes))
 }
 
 pub fn set_used_current(
@@ -363,33 +378,71 @@ pub fn set_used_current(
 ) -> Result<TrafficSnapshot, TrafficError> {
     let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
     let config = Config::load(root)?;
-    set_used_locked(root, &config, upload_bytes, download_bytes)
+    set_used_optional_locked(root, &config, Some(upload_bytes), Some(download_bytes))
 }
 
-fn set_used_locked(
+/// Manually updates either or both client upload/download counters while preserving
+/// exact byte counts for any omitted (`None`) direction under a single NIC counter read.
+pub fn set_used_optional_current(
+    root: &Path,
+    upload_bytes: Option<u64>,
+    download_bytes: Option<u64>,
+) -> Result<TrafficSnapshot, TrafficError> {
+    let _lock = store::lock_exclusive(&root.join(VAR_DIR))?;
+    let config = Config::load(root)?;
+    set_used_optional_locked(root, &config, upload_bytes, download_bytes)
+}
+
+fn set_used_optional_locked(
     root: &Path,
     config: &Config,
-    upload_bytes: u64,
-    download_bytes: u64,
+    upload_bytes: Option<u64>,
+    download_bytes: Option<u64>,
 ) -> Result<TrafficSnapshot, TrafficError> {
+    let now = Utc::now();
     let (rx, tx) = read_iface_counters(root, &config.interface)?;
     let boot_id = read_boot_id(root);
-    let next_reset = next_reset_after(config, Utc::now())?;
+    let existing = load_state(root)?;
+    let active = existing
+        .as_ref()
+        .filter(|st| st.interface == config.interface && now.timestamp() < st.cycle_next_reset_ts);
+    let (cur_up, cur_down, next_reset) = match active {
+        Some(st) => {
+            let delta_rx = if st.boot_id == boot_id && rx >= st.baseline_rx {
+                rx - st.baseline_rx
+            } else {
+                0
+            };
+            let delta_tx = if st.boot_id == boot_id && tx >= st.baseline_tx {
+                tx - st.baseline_tx
+            } else {
+                0
+            };
+            (
+                st.accumulated_rx.saturating_add(delta_rx),
+                st.accumulated_tx.saturating_add(delta_tx),
+                st.cycle_next_reset_ts,
+            )
+        }
+        None => (0, 0, next_reset_after(config, now)?),
+    };
+    let final_up = upload_bytes.unwrap_or(cur_up);
+    let final_down = download_bytes.unwrap_or(cur_down);
     let state = TrafficState {
         schema: 1,
         interface: config.interface.clone(),
         boot_id,
         baseline_rx: rx,
         baseline_tx: tx,
-        accumulated_rx: upload_bytes,
-        accumulated_tx: download_bytes,
+        accumulated_rx: final_up,
+        accumulated_tx: final_down,
         cycle_next_reset_ts: next_reset,
     };
     save_state(root, &state)?;
     Ok(TrafficSnapshot {
         interface: state.interface,
-        upload_bytes,
-        download_bytes,
+        upload_bytes: final_up,
+        download_bytes: final_down,
         monthly_limit_bytes: config.monthly_limit_bytes(),
         next_reset_ts: next_reset,
     })
@@ -481,5 +534,36 @@ mod tests {
             format_time_in_tz(next, &cfg.traffic.display_tz),
             "2026-12-11 17:32"
         );
+    }
+
+    #[test]
+    fn set_used_optional_preserves_omitted_direction_and_active_reset_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = Config {
+            domain: "sub.example.com".into(),
+            ..crate::config::test_defaults()
+        };
+        cfg.save(dir.path()).unwrap();
+        seed_iface(dir.path(), "eth0", "boot-1", 1000, 5000);
+        let pinned_reset = Utc::now().timestamp() + 86_400 * 10;
+        save_state(
+            dir.path(),
+            &TrafficState {
+                schema: 1,
+                interface: "eth0".into(),
+                boot_id: "boot-1".into(),
+                baseline_rx: 1000,
+                baseline_tx: 5000,
+                accumulated_rx: 42_000,
+                accumulated_tx: 99_000,
+                cycle_next_reset_ts: pinned_reset,
+            },
+        )
+        .unwrap();
+        seed_iface(dir.path(), "eth0", "boot-1", 1777, 5500);
+        let snap = set_used_optional_current(dir.path(), None, Some(123_456)).unwrap();
+        assert_eq!(snap.upload_bytes, 42_777);
+        assert_eq!(snap.download_bytes, 123_456);
+        assert_eq!(snap.next_reset_ts, pinned_reset);
     }
 }

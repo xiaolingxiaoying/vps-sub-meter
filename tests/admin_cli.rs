@@ -424,6 +424,99 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
 
 #[cfg(unix)]
 #[test]
+fn bash_menu_configures_argo_preferred_ips_and_keeps_file_mode_available() {
+    use std::os::unix::fs::symlink;
+    use vps_sub_meter::store::{current_generation, read_generation_file};
+
+    let sandbox = Sandbox::new();
+    let script = sandbox.write(
+        "usr/local/lib/vps-sub-meter/ly.sh",
+        include_str!("../scripts/ly.sh"),
+    );
+    let executable = sandbox.root().join("usr/local/bin/vps-sub-meter");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink(env!("CARGO_BIN_EXE_vps-sub-meter"), executable).unwrap();
+
+    let mut config = sandbox.prepare(&["--ports", "keep"])["config"].clone();
+    config["nodes"]["vless_reality_pqc"]["enabled"] = json!(false);
+    config["nodes"]["vless_xhttp_pqc"]["enabled"] = json!(false);
+    config["argo"]["ws_inbounds"][0]["engine"] = json!("sing-box");
+    config["argo"]["preferred_ips_file"] = json!("/etc/vps-sub-meter/custom-ips.txt");
+    let ip_file = "etc/vps-sub-meter/custom-ips.txt";
+    let file_content = "# existing list\n104.18.0.1\n";
+    sandbox.write(ip_file, file_content);
+    sandbox.ok(&["config", "write"], Some(&config));
+
+    let run_menu = |input: &str| {
+        let mut process = Command::new("/bin/bash")
+            .arg(&script)
+            .arg("--root")
+            .arg(sandbox.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(input.as_bytes())
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(output.status.success());
+        String::from_utf8(output.stderr).unwrap()
+    };
+    let assert_servers = |expected: &[&str]| {
+        let meta = current_generation(sandbox.root()).unwrap().unwrap();
+        let clash = read_generation_file(sandbox.root(), &meta.id, true, "clash.yaml")
+            .unwrap()
+            .unwrap();
+        let clash: serde_yaml::Value = serde_yaml::from_str(&clash).unwrap();
+        let servers: Vec<_> = clash["proxies"]
+            .as_sequence()
+            .unwrap()
+            .iter()
+            .map(|proxy| proxy["server"].as_str().unwrap())
+            .collect();
+        assert_eq!(servers, expected);
+    };
+
+    let setup = "7\n1\ntest-token\ntunnel.example.com\nargo.example.com\n104.17.0.1，104.16.0.1\n";
+    run_menu(&format!("{setup}0\n0\n"));
+    assert_eq!(sandbox.json(&["config", "show"]), config);
+    assert!(!sandbox.root().join(CURRENT_REL).exists());
+
+    run_menu(&format!("{setup}1\n0\n"));
+    let configured = sandbox.json(&["config", "show"]);
+    assert_eq!(
+        configured["argo"]["preferred_ips"],
+        json!(["104.17.0.1", "104.16.0.1"])
+    );
+    assert_servers(&["104.17.0.1", "104.16.0.1", "tunnel.example.com"]);
+
+    let generation = sandbox.file(CURRENT_REL);
+    run_menu("7\n5\n\n0\n");
+    let invalid = run_menu("7\n5\n127.0.0.1\n1\n0\n");
+    assert!(invalid.contains("Argo 优选 IP 必须是公网 IPv4 地址"));
+    assert_eq!(sandbox.json(&["config", "show"]), configured);
+    assert_eq!(sandbox.file(CURRENT_REL), generation);
+
+    run_menu("7\n5\n清空\n1\n0\n");
+    assert_eq!(
+        sandbox.json(&["config", "show"])["argo"]["preferred_ips"],
+        json!([])
+    );
+    assert_servers(&["tunnel.example.com"]);
+
+    run_menu("7\n5\n文件\n1\n0\n");
+    assert!(sandbox.json(&["config", "show"])["argo"]["preferred_ips"].is_null());
+    assert_servers(&["104.18.0.1", "tunnel.example.com"]);
+    assert_eq!(sandbox.file(ip_file), file_content.as_bytes());
+}
+
+#[cfg(unix)]
+#[test]
 fn bash_menu_updates_traffic_schedule_without_losing_usage() {
     use std::os::unix::fs::symlink;
     use vps_sub_meter::traffic::TRAFFIC_REL;
@@ -747,4 +840,130 @@ fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
     let listing = String::from_utf8_lossy(&tar_list.stdout);
     assert!(listing.contains("etc/vps-sub-meter/config.toml"));
     assert!(listing.contains("var/lib/vps-sub-meter/traffic-state.json"));
+}
+
+#[test]
+fn status_reports_pending_changes_and_sub_omits_unavailable_singbox() {
+    let sandbox = Sandbox::new();
+    let mut config = sandbox.prepare(&["--ports", "keep"])["config"].clone();
+    // Disable Xray PQC nodes so sandbox apply doesn't need xray keygen binary, keeping sing-box nodes first.
+    config["nodes"]["vless_reality_pqc"]["enabled"] = json!(false);
+    config["nodes"]["vless_xhttp_pqc"]["enabled"] = json!(false);
+    sandbox.ok(&["config", "write"], Some(&config));
+
+    // Before first apply, status reports pending changes.
+    assert_eq!(sandbox.json(&["status", "--json"])["pending_changes"], true);
+    assert!(sandbox.ok(&["status"], None).contains("尚未发布订阅批次"));
+
+    sandbox.ok(&["apply"], None);
+    assert_eq!(
+        sandbox.json(&["status", "--json"])["pending_changes"],
+        false
+    );
+    assert!(!sandbox.ok(&["status"], None).contains("配置状态:"));
+
+    // Live traffic config changes must NOT mark deployment config as pending.
+    sandbox.ok(&["traffic", "configure", "--monthly-gib", "333"], None);
+    assert_eq!(
+        sandbox.json(&["status", "--json"])["pending_changes"],
+        false
+    );
+
+    // Changing a node port without applying MUST flag pending_changes in JSON & text status.
+    let mut updated = sandbox.json(&["config", "show"]);
+    updated["nodes"]["anytls_tcp"]["port"] = json!(24443);
+    sandbox.ok(&["config", "write", "--replace"], Some(&updated));
+    assert_eq!(sandbox.json(&["status", "--json"])["pending_changes"], true);
+    assert!(
+        sandbox
+            .ok(&["status"], None)
+            .contains("检测到主配置与当前已发布批次不一致")
+    );
+
+    sandbox.ok(&["apply"], None);
+    assert_eq!(
+        sandbox.json(&["status", "--json"])["pending_changes"],
+        false
+    );
+
+    // When no sing-box compatible nodes are enabled, `vsm sub` must omit sing-box.json
+    // and reject `--qr-format sing-box`.
+    let mut xray_only: vps_sub_meter::config::Config =
+        serde_json::from_value(sandbox.json(&["config", "show"])).unwrap();
+    xray_only.nodes.vless_reality_pqc.enabled = true;
+    xray_only.nodes.anytls_tcp.enabled = false;
+    xray_only.nodes.hysteria2_hop.enabled = false;
+    xray_only.nodes.tuic_bbr.enabled = false;
+    let sec = vps_sub_meter::secrets::Secrets {
+        vless_reality_pqc: vps_sub_meter::secrets::VlessRealitySecrets {
+            uuid: "11111111-2222-3333-4444-555555555555".into(),
+            x25519_private_key: "priv".into(),
+            x25519_public_key: "pub".into(),
+            short_id: "01234567".into(),
+            mldsa65_seed: "seed".into(),
+            mldsa65_verify: "verify".into(),
+            vless_decryption: "none".into(),
+            vless_encryption: "none".into(),
+        },
+        ..vps_sub_meter::secrets::Secrets::load_or_default(sandbox.root()).unwrap()
+    };
+    sec.save(sandbox.root()).unwrap();
+    sandbox.ok(
+        &["config", "write", "--replace"],
+        Some(&serde_json::to_value(&xray_only).unwrap()),
+    );
+    sandbox.ok(&["apply"], None);
+
+    let sub_text = sandbox.ok(&["sub"], None);
+    assert!(sub_text.contains("/clash.yaml"));
+    assert!(!sub_text.contains("/sing-box.json"));
+    let sub_json = sandbox.json(&["sub", "--json"]);
+    assert!(sub_json["direct"].get("sing_box").is_none());
+    let qr_err = sandbox.cli(&["sub", "--qr-format", "sing-box"], None);
+    assert!(!qr_err.status.success());
+    assert!(String::from_utf8_lossy(&qr_err.stderr).contains("sing-box"));
+}
+
+#[cfg(unix)]
+#[test]
+fn bash_menu_requires_initialized_for_keys_rotate_and_apply() {
+    use std::os::unix::fs::symlink;
+
+    let sandbox = Sandbox::new();
+    let script = sandbox.write(
+        "usr/local/lib/vps-sub-meter/ly.sh",
+        include_str!("../scripts/ly.sh"),
+    );
+    let executable = sandbox.root().join("usr/local/bin/vps-sub-meter");
+    fs::create_dir_all(executable.parent().unwrap()).unwrap();
+    symlink(env!("CARGO_BIN_EXE_vps-sub-meter"), executable).unwrap();
+
+    for choice in ["4\n0\n", "8\n0\n"] {
+        let mut process = Command::new("/bin/bash")
+            .arg(&script)
+            .arg("--root")
+            .arg(sandbox.root())
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        process
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(choice.as_bytes())
+            .unwrap();
+        let output = process.wait_with_output().unwrap();
+        assert!(output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("尚未初始化配置"),
+            "choice={choice:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("确认轮换全部节点密钥"),
+            "choice={choice:?} should fail before confirm: {stderr}"
+        );
+    }
 }

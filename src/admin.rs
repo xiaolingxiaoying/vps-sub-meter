@@ -12,7 +12,34 @@ use vps_sub_meter::{
     qr,
     secrets::{Secrets, SubscriptionToken, random_urlsafe},
     store,
+    traffic::TrafficSnapshot,
 };
+
+pub fn status_json(
+    root: &Path,
+    cfg: &Config,
+    snap: &TrafficSnapshot,
+) -> Result<serde_json::Value, String> {
+    let generation = store::current_generation(root).map_err(|e| e.to_string())?;
+    let pending_changes = apply::has_pending_changes(root, cfg, generation.as_ref());
+    Ok(json!({
+        "version": env!("CARGO_PKG_VERSION"),
+        "address": cfg.primary_host(),
+        "https_enabled": !cfg.is_ip_mode(),
+        "interface": snap.interface,
+        "traffic": {
+            "upload_bytes": snap.upload_bytes,
+            "download_bytes": snap.download_bytes,
+            "total_used_bytes": snap.total_used(),
+            "monthly_limit_bytes": snap.monthly_limit_bytes,
+            "next_reset_ts": snap.next_reset_ts,
+            "display_tz": cfg.traffic.display_tz,
+        },
+        "generation": generation,
+        "argo_enabled": cfg.argo.enabled,
+        "pending_changes": pending_changes,
+    }))
+}
 
 #[derive(Subcommand)]
 pub enum ConfigCmd {
@@ -158,12 +185,7 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
                     Ports::Keep
                 }) {
                 Ports::Keep => {}
-                Ports::Defaults => {
-                    let mut defaults = Config::load_defaults(root).map_err(|e| e.to_string())?;
-                    for &node in NodeName::value_variants() {
-                        *node.port(&mut config) = *node.port(&mut defaults);
-                    }
-                }
+                Ports::Defaults => set_default_node_ports(root, &mut config)?,
                 Ports::Random => randomize_node_ports(&mut config, root == Path::new("/"))?,
             }
             for (node, port) in args.node_ports {
@@ -203,6 +225,14 @@ pub fn config(root: &Path, command: ConfigCmd) -> Result<(), String> {
 
 fn read_candidate_config() -> Result<Config, String> {
     serde_json::from_reader(io::stdin().lock()).map_err(|e| format!("配置 JSON 无效: {e}"))
+}
+
+pub fn set_default_node_ports(root: &Path, config: &mut Config) -> Result<(), String> {
+    let mut defaults = Config::load_defaults(root).map_err(|e| e.to_string())?;
+    for &node in NodeName::value_variants() {
+        *node.port(config) = *node.port(&mut defaults);
+    }
+    Ok(())
 }
 
 pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result<(), String> {
@@ -279,29 +309,45 @@ pub fn randomize_node_ports(cfg: &mut Config, probe_local_ports: bool) -> Result
 pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
     let config = Config::load(root).map_err(|e| e.to_string())?;
     let secrets = Secrets::load_or_default(root).map_err(|e| e.to_string())?;
+    let generation = store::current_generation(root).ok().flatten();
+    let direct_has_singbox = generation.as_ref().map_or_else(
+        || {
+            config.nodes.anytls_tcp.enabled
+                || config.nodes.hysteria2_hop.enabled
+                || config.nodes.tuic_bbr.enabled
+        },
+        |meta| !meta.singbox_nodes.is_empty(),
+    );
+    let argo_has_singbox = generation.as_ref().map_or_else(
+        || config.argo.enabled && !config.argo.ws_inbounds.is_empty(),
+        |meta| meta.argo_files.iter().any(|f| f == "sing-box.json"),
+    );
     let token = match args.token_name {
         Some(name) => &secrets.tokens[token_index(&secrets.tokens, &name)?].token,
         None => secrets.primary_token().ok_or("尚未生成订阅凭据")?,
     };
     let direct_base = config.subscription_base_url(token);
     if args.json {
-        let argo = config
-            .argo
-            .enabled
-            .then(|| subscription_links(&config.argo_subscription_base_url(token)));
-        return print_json(&json!({"direct": subscription_links(&direct_base), "argo": argo}));
+        let argo = config.argo.enabled.then(|| {
+            subscription_links(&config.argo_subscription_base_url(token), argo_has_singbox)
+        });
+        return print_json(&json!({
+            "direct": subscription_links(&direct_base, direct_has_singbox),
+            "argo": argo,
+        }));
     }
 
-    let (base, profile_name) = if args.argo {
+    let (base, profile_name, has_singbox) = if args.argo {
         if !config.argo.enabled {
             return Err("Argo 隧道订阅尚未启用".into());
         }
         (
             config.argo_subscription_base_url(token),
             &config.argo.profile_name,
+            argo_has_singbox,
         )
     } else {
-        (direct_base, &config.profile_name)
+        (direct_base, &config.profile_name, direct_has_singbox)
     };
     if !args.argo && config.is_ip_mode() {
         eprintln!(
@@ -310,17 +356,24 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
     }
     println!("看板:         {base}/index");
     println!("Clash/Mihomo: {base}/clash.yaml");
-    println!("sing-box:     {base}/sing-box.json");
+    if has_singbox {
+        println!("sing-box:     {base}/sing-box.json");
+    }
     println!("Shadowrocket: {base}/shadowrocket.txt");
     println!("URI:          {base}/uri.txt");
     if let Some(format) = args.qr_format.or(args.qr.then_some(QrFormat::Clash)) {
         let payload = match format {
             QrFormat::Clash => format!("{base}/clash.yaml"),
-            QrFormat::SingBox => format!(
-                "sing-box://import-remote-profile?url={}#{}",
-                pct(&format!("{base}/sing-box.json")),
-                pct(profile_name)
-            ),
+            QrFormat::SingBox => {
+                if !has_singbox {
+                    return Err("当前未启用 sing-box 兼容节点，无 sing-box 订阅链接".into());
+                }
+                format!(
+                    "sing-box://import-remote-profile?url={}#{}",
+                    pct(&format!("{base}/sing-box.json")),
+                    pct(profile_name)
+                )
+            }
             QrFormat::Shadowrocket => format!("{base}/shadowrocket.txt"),
         };
         print!("{}", qr::render_ansi(&payload)?);
@@ -328,14 +381,19 @@ pub fn sub(root: &Path, args: SubArgs) -> Result<(), String> {
     Ok(())
 }
 
-fn subscription_links(base: &str) -> serde_json::Value {
-    json!({
-        "index": format!("{base}/index"),
-        "clash": format!("{base}/clash.yaml"),
-        "sing_box": format!("{base}/sing-box.json"),
-        "shadowrocket": format!("{base}/shadowrocket.txt"),
-        "uri": format!("{base}/uri.txt"),
-    })
+fn subscription_links(base: &str, has_singbox: bool) -> serde_json::Value {
+    let mut links = serde_json::Map::new();
+    links.insert("index".into(), json!(format!("{base}/index")));
+    links.insert("clash".into(), json!(format!("{base}/clash.yaml")));
+    if has_singbox {
+        links.insert("sing_box".into(), json!(format!("{base}/sing-box.json")));
+    }
+    links.insert(
+        "shadowrocket".into(),
+        json!(format!("{base}/shadowrocket.txt")),
+    );
+    links.insert("uri".into(), json!(format!("{base}/uri.txt")));
+    serde_json::Value::Object(links)
 }
 
 pub fn token(root: &Path, command: TokenCmd) -> Result<(), String> {

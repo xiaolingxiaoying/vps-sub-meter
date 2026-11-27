@@ -1,0 +1,48 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light">
+  <title>vps-sub-meter 管理面板</title>
+  <link rel="stylesheet" href="/panel.css">
+  <script src="/panel.js" defer></script>
+</head>
+<body>
+  <main id="login" class="login">
+    <form id="login-form" class="login-panel">
+      <div class="brand"><span aria-hidden="true" class="mark"></span>vps-sub-meter</div>
+      <h1>打开管理面板</h1>
+      <p>通过 SSH 转发访问。请输入启动 <code>vsm panel</code> 时显示的会话密钥。</p>
+      <label>会话密钥<input id="key" type="password" autocomplete="off" spellcheck="false" autofocus required></label>
+      <button type="submit" class="primary">进入面板</button>
+      <p id="login-error" role="alert" class="error" hidden></p>
+    </form>
+  </main>
+  <div id="shell" class="shell" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#overview"><span aria-hidden="true" class="mark"></span>vps-sub-meter</a>
+      <nav id="nav" aria-label="管理菜单"></nav>
+    </aside>
+    <header class="topbar">
+      <strong>管理面板</strong>
+      <span class="session"><i aria-hidden="true"></i> SSH 会话</span>
+      <button id="logout" type="button" class="quiet">退出</button>
+    </header>
+    <main class="workspace" id="workspace">
+      <div id="notice" role="status" class="notice" hidden></div>
+      <div id="page"></div>
+    </main>
+  </div>
+  <dialog id="dialog" aria-labelledby="dialog-title">
+    <form id="dialog-form" method="dialog">
+      <h2 id="dialog-title"></h2>
+      <div id="dialog-content"></div>
+      <div class="actions">
+        <button id="dialog-cancel" value="cancel" type="submit" formnovalidate>取消</button>
+        <button id="dialog-confirm" value="ok" type="submit" class="primary">确认</button>
+      </div>
+    </form>
+  </dialog>
+</body>
+</html>

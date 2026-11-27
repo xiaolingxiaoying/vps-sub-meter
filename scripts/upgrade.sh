@@ -21,6 +21,7 @@ usage() {
   --local-dir <dir>   从本地构建目录升级（需包含 vps-sub-meter、scripts/、templates/）
   --from-source       从 GitHub 仓库拉取源码构建并升级（无需等待预编译 Release）
   --branch <name>     配合 --from-source 指定分支（默认 dev）
+  --release-only     仅使用已签名的发行包，不回退为源码构建
   --force-templates   强制用新版覆盖 /etc/vps-sub-meter/templates/*
   -h, --help          显示此帮助
 EOF
@@ -31,6 +32,7 @@ LOCAL_DIR=""
 FROM_SOURCE=0
 SOURCE_BRANCH="dev"
 FORCE_TEMPLATES=0
+RELEASE_ONLY=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -39,10 +41,16 @@ while [[ $# -gt 0 ]]; do
     --from-source) FROM_SOURCE=1; shift ;;
     --branch) SOURCE_BRANCH=${2:?missing branch}; shift 2 ;;
     --force-templates) FORCE_TEMPLATES=1; shift ;;
+    --release-only) RELEASE_ONLY=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *) echo "未知参数: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+if [[ "$RELEASE_ONLY" -eq 1 && ( -n "$LOCAL_DIR" || "$FROM_SOURCE" -eq 1 ) ]]; then
+  echo "--release-only 不能用于本地构建或源码升级。" >&2
+  exit 2
+fi
 
 detect_local_generation() {
   if [[ -f /etc/vps-sub-meter/config.toml && -f /var/lib/vps-sub-meter/current.json ]]; then
@@ -108,6 +116,10 @@ if [[ -z "$LOCAL_DIR" && "$FROM_SOURCE" -eq 0 && "$VSM_PUBLIC_KEY_PEM" == @* ]];
     exit 0
   fi
   rm -rf "$tmp_dl"
+  if [[ "$RELEASE_ONLY" -eq 1 ]]; then
+    echo "找不到已签名的发行包，未执行升级。" >&2
+    exit 2
+  fi
   echo "未检测到已签名的最新 Release upgrade.sh，自动回退为源码构建升级（分支: ${SOURCE_BRANCH}）..."
   FROM_SOURCE=1
 fi
