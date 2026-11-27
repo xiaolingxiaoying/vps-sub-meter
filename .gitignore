@@ -31,6 +31,8 @@ Thumbs.db
 .kilo/
 .zcode/
 .qoder/
+AGENTS.md
+CONTEXT.md
 
 # Local build artefacts
 /vps-sub-meter-linux-*
