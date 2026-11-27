@@ -953,10 +953,63 @@ def run_migration(root: Path, check_only: bool = False) -> dict:
     return res
 
 
+def format_iec_bytes(num_bytes: int) -> str:
+    value = float(max(0, int(num_bytes)))
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024.0 or unit == "TiB":
+            return f"{int(value)} B" if unit == "B" else f"{value:.2f} {unit}"
+        value /= 1024.0
+    return f"{int(num_bytes)} B"
+
+
+def format_check_report(res: dict) -> str:
+    gen = res.get("generation")
+    lines = [
+        "================================================",
+        "  vps-sub-meter 部署检查报告（只读）",
+        "================================================",
+    ]
+    if gen == "v2":
+        lines.extend(
+            [
+                "  部署代际   : vps-sub-meter v2（现行架构）",
+                "  配置文件   : /etc/vps-sub-meter/config.toml",
+                "  检查结论   : 支持就地平滑升级，将保留配置、凭据、证书与流量账本。",
+            ]
+        )
+        return "\n".join(lines)
+
+    gen_label = "sbctl 历史部署（Gen 2）" if gen == "sbctl" else "sub-srv 早期部署（Gen 1）"
+    cfg_path = "/etc/sbctl/config.toml" if gen == "sbctl" else "/etc/sub-srv/config.conf"
+    domain = (res.get("domain") or "").strip()
+    public_ip = (res.get("public_ip") or "").strip()
+    addr_line = f"{domain} (HTTPS)" if domain else (f"{public_ip} (IP / HTTP 模式)" if public_ip else "自动检测")
+    acc_rx = int(res.get("traffic_acc_rx", 0) or 0)
+    acc_tx = int(res.get("traffic_acc_tx", 0) or 0)
+    argo_text = "已启用（将自动迁移隧道与 Token）" if res.get("argo_enabled") else "未启用"
+
+    lines.extend(
+        [
+            f"  部署代际   : {gen_label}",
+            f"  配置文件   : {cfg_path}",
+            f"  订阅地址   : {addr_line}",
+            f"  监控网卡   : {res.get('interface') or 'eth0'}",
+            f"  保留凭据   : {int(res.get('tokens_preserved', 0) or 0)} 个有效订阅凭据",
+            f"  继承流量   : 上传 {format_iec_bytes(acc_rx)} / 下载 {format_iec_bytes(acc_tx)}",
+            f"  Argo 隧道  : {argo_text}",
+        ]
+    )
+    if res.get("extra_https_port"):
+        lines.append(f"  额外端口   : {res['extra_https_port']}")
+    lines.append("  检查结论   : 支持事务化平滑迁移至 vps-sub-meter v2，本次只读检查未改动任何文件。")
+    return "\n".join(lines)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="vps-sub-meter universal legacy migrator")
     ap.add_argument("--root", default="/", help="Target filesystem root")
     ap.add_argument("--check", action="store_true", help="Inspect only without writing")
+    ap.add_argument("--json", action="store_true", help="Emit JSON output")
     args = ap.parse_args()
     root = Path(args.root)
     try:
@@ -964,7 +1017,10 @@ def main() -> int:
     except FileNotFoundError as exc:
         print(str(exc), file=sys.stderr)
         return 3
-    print(json.dumps(res, ensure_ascii=False))
+    if args.check and not args.json:
+        print(format_check_report(res))
+    else:
+        print(json.dumps(res, ensure_ascii=False))
     return 0
 
 

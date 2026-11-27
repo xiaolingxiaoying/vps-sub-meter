@@ -66,17 +66,304 @@ detect_local_generation() {
   fi
 }
 
-if [[ "$CHECK_ONLY" -eq 1 ]]; then
-  if [[ -x /usr/local/lib/vps-sub-meter/migrate_legacy.py ]] && command -v python3 >/dev/null 2>&1; then
-    exec python3 /usr/local/lib/vps-sub-meter/migrate_legacy.py --root / --check
+check_format_iec() {
+  awk -v b="${1:-0}" 'BEGIN {
+    if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
+    else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+    else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+    else if (b >= 1024) printf "%.2f KiB", b/1024;
+    else printf "%.0f B", b;
+  }'
+}
+
+check_svc_state() {
+  local unit=$1 st
+  if ! command -v systemctl >/dev/null 2>&1; then
+    printf '未知'
+    return 0
   fi
-  gen=$(detect_local_generation)
-  case "$gen" in
-    v2)         echo "检测到当前部署: vps-sub-meter v2 (/etc/vps-sub-meter/config.toml) - 支持就地平滑升级。" ;;
-    sbctl)      echo "检测到历史部署: sbctl (/etc/sbctl/config.toml) - 支持事务化迁移至 vps-sub-meter v2。" ;;
-    sub-srv-v1) echo "检测到早期部署: sub-srv (/etc/sub-srv/config.conf) - 支持自动迁移配置、Token 与流量账本至 v2。" ;;
-    *)          echo "未检测到现有部署，请改用 install.sh 进行全新安装。" >&2; exit 3 ;;
+  st=$(systemctl is-active "$unit" 2>/dev/null || true)
+  case "$st" in
+    active) printf '运行中' ;;
+    activating|reloading) printf '启动中' ;;
+    failed) printf '异常' ;;
+    inactive|dead|'') printf '未运行' ;;
+    *) printf '%s' "$st" ;;
   esac
+}
+
+check_toml_val() {
+  local file=$1 key=$2
+  [[ -r "$file" ]] || return 0
+  awk -F'=' -v k="$key" '
+    $1 ~ "^[[:space:]]*" k "[[:space:]]*$" {
+      v=$2
+      sub(/#.*/, "", v)
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+      gsub(/^"|"$|^'\''|'\''$/, "", v)
+      print v
+      exit
+    }' "$file" 2>/dev/null || true
+}
+
+run_upgrade_check() {
+  local use_color=0
+  if [[ -t 1 && ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then
+    use_color=1
+  fi
+  c_paint() {
+    if ((use_color)); then
+      printf '\033[%sm%s\033[0m' "$1" "$2"
+    else
+      printf '%s' "$2"
+    fi
+  }
+
+  local py_out="" py_rc=0 gen="" domain="" public_ip="" interface="" tokens_preserved=""
+  local argo_enabled="" extra_https_port="" acc_rx="" acc_tx=""
+  if [[ -r /usr/local/lib/vps-sub-meter/migrate_legacy.py ]] && command -v python3 >/dev/null 2>&1; then
+    set +e
+    py_out=$(python3 /usr/local/lib/vps-sub-meter/migrate_legacy.py --root / --check --json 2>/dev/null)
+    py_rc=$?
+    if [[ "$py_rc" -ne 0 && "$py_rc" -ne 3 ]]; then
+      py_out=$(python3 /usr/local/lib/vps-sub-meter/migrate_legacy.py --root / --check 2>/dev/null)
+      py_rc=$?
+    fi
+    set -e
+    if [[ "$py_rc" -eq 3 ]]; then
+      echo "未检测到任何历史或现行部署（/etc/vps-sub-meter、/etc/sbctl 或 /etc/sub-srv），请使用 install.sh 进行全新安装。" >&2
+      exit 3
+    fi
+    if [[ "$py_rc" -eq 0 && -n "$py_out" ]]; then
+      local parsed=""
+      if parsed=$(python3 -c '
+import json, sys
+try:
+    d = json.loads(sys.stdin.read())
+except Exception:
+    raise SystemExit(1)
+if not isinstance(d, dict) or not d.get("generation"):
+    raise SystemExit(1)
+def clean(v):
+    if v is None: return ""
+    if isinstance(v, bool): return "true" if v else "false"
+    return str(v).replace("\x1f", " ").replace("\n", " ").replace("\r", "")
+fields = [
+    d.get("generation", ""),
+    d.get("domain", ""),
+    d.get("public_ip", ""),
+    d.get("interface", ""),
+    d.get("tokens_preserved", ""),
+    d.get("argo_enabled", ""),
+    d.get("extra_https_port", ""),
+    d.get("traffic_acc_rx", ""),
+    d.get("traffic_acc_tx", ""),
+]
+print("\x1f".join(clean(x) for x in fields))
+' <<<"$py_out" 2>/dev/null); then
+        IFS=$'\x1f' read -r gen domain public_ip interface tokens_preserved argo_enabled extra_https_port acc_rx acc_tx <<<"$parsed"
+      fi
+    fi
+  fi
+
+  if [[ -z "$gen" ]]; then
+    gen=$(detect_local_generation)
+  fi
+  if [[ "$gen" == "none" ]]; then
+    echo "未检测到任何历史或现行部署（/etc/vps-sub-meter、/etc/sbctl 或 /etc/sub-srv），请使用 install.sh 进行全新安装。" >&2
+    exit 3
+  fi
+
+  local gen_label="" cfg_file="" conclusion=""
+  case "$gen" in
+    v2)
+      gen_label="vps-sub-meter v2（现行架构）"
+      cfg_file="/etc/vps-sub-meter/config.toml"
+      conclusion="检查通过：当前为现行 v2 部署，支持就地平滑升级。"
+      ;;
+    sbctl)
+      gen_label="sbctl 历史部署（Gen 2）"
+      cfg_file="/etc/sbctl/config.toml"
+      conclusion="检查通过：支持从 sbctl 事务化平滑迁移至 vps-sub-meter v2。"
+      ;;
+    sub-srv-v1)
+      gen_label="sub-srv 早期部署（Gen 1）"
+      cfg_file="/etc/sub-srv/config.conf"
+      conclusion="检查通过：支持从 sub-srv 自动迁移配置、凭据与流量账本至 v2。"
+      ;;
+    *)
+      gen_label="$gen"
+      cfg_file="未知"
+      conclusion="检查通过：支持平滑升级。"
+      ;;
+  esac
+
+  local cur_vsm="" latest_vsm="" latest_note="" eff_url=""
+  if [[ -x /usr/local/bin/vps-sub-meter ]]; then
+    cur_vsm=$(/usr/local/bin/vps-sub-meter --version 2>/dev/null | awk '{print $NF; exit}' || true)
+    cur_vsm=${cur_vsm#v}
+  fi
+  if command -v curl >/dev/null 2>&1; then
+    eff_url=$(curl -fsSLI --connect-timeout 3 --max-time 5 -o /dev/null -w '%{url_effective}' \
+      "https://github.com/${REPO_SLUG}/releases/latest" 2>/dev/null || true)
+    if [[ "$eff_url" == */releases/tag/* ]]; then
+      latest_vsm=${eff_url##*/releases/tag/}
+      latest_vsm=${latest_vsm%%\?*}
+      latest_vsm=${latest_vsm#v}
+    fi
+  fi
+  if [[ -n "$latest_vsm" && -n "$cur_vsm" ]]; then
+    if [[ "$latest_vsm" == "$cur_vsm" ]]; then
+      latest_note="$(c_paint 32 "v${latest_vsm}（已是最新 Release）")"
+    elif [[ "$(printf '%s\n%s\n' "$latest_vsm" "$cur_vsm" | sort -V 2>/dev/null | tail -n1)" == "$latest_vsm" ]]; then
+      latest_note="$(c_paint '1;33' "v${latest_vsm}（发现新版本，可升级）")"
+    else
+      latest_note="v${latest_vsm}（当前版本高于最新 Release）"
+    fi
+  elif [[ -n "$latest_vsm" ]]; then
+    latest_note="v${latest_vsm}"
+  else
+    latest_note="$(c_paint 33 '暂未检测到已签名 Release（升级时将自动从 dev 分支源码编译）')"
+  fi
+
+  echo ""
+  c_paint '1;36' "================================================"
+  echo ""
+  c_paint '1;36' "  vps-sub-meter 升级与迁移检查（只读）"
+  echo ""
+  c_paint '1;36' "================================================"
+  echo ""
+  echo ""
+  c_paint '1;36' "[当前部署]"
+  echo ""
+  printf '  部署代际：%s\n' "$gen_label"
+  printf '  配置文件：%s\n' "$cfg_file"
+
+  if [[ "$gen" == "v2" ]]; then
+    local status_json="" sub_addr="" sub_proto="" iface="" traffic_line="" gen_id="" argo_line=""
+    local xray_ver="未安装" sb_ver="未安装" xray_st sb_st vsm_st
+    if [[ -x /usr/local/bin/vps-sub-meter ]]; then
+      status_json=$(/usr/local/bin/vps-sub-meter --root / status --json 2>/dev/null || true)
+    fi
+    if [[ -n "$status_json" ]] && command -v python3 >/dev/null 2>&1; then
+      local s_parsed=""
+      if s_parsed=$(python3 -c '
+import json, sys
+try:
+    s = json.loads(sys.stdin.read())
+except Exception:
+    raise SystemExit(1)
+t = s.get("traffic") or {}
+g = s.get("generation") or {}
+print("\x1f".join(str(x).replace("\x1f", " ") for x in [
+    s.get("address", ""),
+    "true" if s.get("https_enabled") else "false",
+    s.get("interface", ""),
+    t.get("upload_bytes", 0),
+    t.get("download_bytes", 0),
+    t.get("total_used_bytes", 0),
+    t.get("monthly_limit_bytes", 0),
+    g.get("id", ""),
+    len(g.get("direct_nodes") or []),
+    "true" if s.get("argo_enabled") else "false",
+]))
+' <<<"$status_json" 2>/dev/null); then
+        local https_on up_b down_b tot_b lim_b node_cnt argo_on
+        IFS=$'\x1f' read -r sub_addr https_on iface up_b down_b tot_b lim_b gen_id node_cnt argo_on <<<"$s_parsed"
+        if [[ "$https_on" == "true" ]]; then
+          sub_proto="https://${sub_addr} (HTTPS)"
+        else
+          sub_proto="http://${sub_addr} (HTTP 明文)"
+        fi
+        local lim_disp
+        lim_disp=$( [[ "$lim_b" =~ ^[0-9]+$ && "$lim_b" -gt 0 ]] && check_format_iec "$lim_b" || printf '不限' )
+        traffic_line="$(check_format_iec "$tot_b") / ${lim_disp}（上传 $(check_format_iec "$up_b") / 下载 $(check_format_iec "$down_b")）"
+        if [[ "$argo_on" == "true" ]]; then
+          argo_line="已启用 [$(check_svc_state vps-sub-meter-argo.service)]"
+        else
+          argo_line="未启用"
+        fi
+      fi
+    fi
+
+    if [[ -z "$sub_proto" && -r /etc/vps-sub-meter/config.toml ]]; then
+      local cfg_dom cfg_ip cfg_if
+      cfg_dom=$(check_toml_val /etc/vps-sub-meter/config.toml domain)
+      cfg_ip=$(check_toml_val /etc/vps-sub-meter/config.toml public_ip)
+      cfg_if=$(check_toml_val /etc/vps-sub-meter/config.toml interface)
+      iface=${iface:-$cfg_if}
+      if [[ -n "$cfg_dom" ]]; then
+        sub_proto="https://${cfg_dom} (HTTPS)"
+      elif [[ -n "$cfg_ip" ]]; then
+        sub_proto="http://${cfg_ip} (HTTP 明文)"
+      fi
+    fi
+
+    if [[ -x /usr/local/bin/xray ]]; then
+      xray_ver=$(/usr/local/bin/xray version 2>/dev/null | awk 'NR==1{print "v" $2}' || echo "已安装")
+    fi
+    if [[ -x /usr/local/bin/sing-box ]]; then
+      sb_ver=$(/usr/local/bin/sing-box version 2>/dev/null | awk 'NR==1{print "v" $3}' || echo "已安装")
+    fi
+    vsm_st=$(check_svc_state vps-sub-meter.service)
+    xray_st=$(check_svc_state vps-sub-meter-xray.service)
+    sb_st=$(check_svc_state vps-sub-meter-singbox.service)
+
+    printf '  当前版本：%s\n' "${cur_vsm:+v${cur_vsm} [${vsm_st}]}"
+    printf '  最新版本：%s\n' "$latest_note"
+    [[ -n "$sub_proto" ]] && printf '  订阅地址：%s\n' "$sub_proto"
+    [[ -n "$iface" ]] && printf '  监控网卡：%s\n' "$iface"
+    [[ -n "$traffic_line" ]] && printf '  本期流量：%s\n' "$traffic_line"
+    if [[ -n "$gen_id" ]]; then
+      printf '  当前批次：%s (%s 个直连节点)\n' "$gen_id" "${node_cnt:-0}"
+    fi
+    [[ -n "$argo_line" ]] && printf '  Argo 隧道：%s\n' "$argo_line"
+    printf '  代理内核：Xray %s [%s]  |  sing-box %s [%s]\n' "$xray_ver" "$xray_st" "$sb_ver" "$sb_st"
+  else
+    printf '  目标版本：%s\n' "$latest_note"
+    if [[ -n "$domain" ]]; then
+      printf '  订阅域名：%s (HTTPS)\n' "$domain"
+    elif [[ -n "$public_ip" ]]; then
+      printf '  公网地址：%s (IP / HTTP 模式)\n' "$public_ip"
+    fi
+    [[ -n "$interface" ]] && printf '  监控网卡：%s\n' "$interface"
+    [[ -n "$tokens_preserved" ]] && printf '  保留凭据：%s 个有效订阅凭据\n' "$tokens_preserved"
+    if [[ "$acc_rx" =~ ^[0-9]+$ && "$acc_tx" =~ ^[0-9]+$ ]]; then
+      printf '  历史流量：上传 %s / 下载 %s（自动继承）\n' "$(check_format_iec "$acc_rx")" "$(check_format_iec "$acc_tx")"
+    fi
+    if [[ "$argo_enabled" == "true" ]]; then
+      printf '  Argo 隧道：已启用（将自动迁移隧道配置与 Token）\n'
+    elif [[ -n "$argo_enabled" ]]; then
+      printf '  Argo 隧道：未启用\n'
+    fi
+    [[ -n "$extra_https_port" ]] && printf '  额外端口：%s\n' "$extra_https_port"
+  fi
+
+  echo ""
+  c_paint '1;36' "[升级 / 迁移计划]"
+  echo ""
+  echo "  1. 升级前自动备份现有配置与账本至 /root/pre-vsm-upgrade-<UTC>.tar.gz"
+  if [[ "$gen" == "v2" ]]; then
+    echo "  2. 更新主程序、交互菜单 (ly / vsm) 与运维脚本库，默认保留现有配置与模板"
+  else
+    echo "  2. 安装 vps-sub-meter v2 并事务化迁移节点密钥、订阅凭据、证书与流量账本"
+  fi
+  echo "  3. 检查官方 Xray / sing-box 内核版本及 BBR / UDP 系统调优参数"
+  echo "  4. 执行 vsm apply 双内核校验配置并平滑重启服务，随后停用旧版残留单元"
+
+  echo ""
+  c_paint '1;36' "[检查结论]"
+  echo ""
+  echo "  $(c_paint 32 "$conclusion")"
+  echo "  本次仅执行只读检查，未修改任何文件或运行中的服务。"
+  echo ""
+  echo "  执行升级："
+  echo "    curl -fsSL https://raw.githubusercontent.com/${REPO_SLUG}/dev/scripts/upgrade.sh | sudo bash"
+  echo ""
+}
+
+if [[ "$CHECK_ONLY" -eq 1 ]]; then
+  run_upgrade_check
   exit 0
 fi
 

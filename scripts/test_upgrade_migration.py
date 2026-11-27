@@ -1,12 +1,15 @@
 import json
 from pathlib import Path
 import runpy
+import subprocess
+import sys
 import tempfile
 import unittest
 
 MOD_PREPARE = runpy.run_path(str(Path(__file__).with_name("prepare-installer.py")))
 MOD_MIGRATE = runpy.run_path(str(Path(__file__).with_name("migrate_legacy.py")))
 run_migration = MOD_MIGRATE["run_migration"]
+format_check_report = MOD_MIGRATE["format_check_report"]
 
 
 class UpgradeAndMigrationTests(unittest.TestCase):
@@ -168,6 +171,77 @@ password = "tuic_pw_example"
             (root / "etc/vps-sub-meter/config.toml").write_text('domain = "sub.example.com"\n', encoding="utf-8")
             res = run_migration(root, check_only=False)
             self.assertEqual(res, {"generation": "v2", "migrated": False})
+
+    def test_format_check_report_outputs_human_readable_text_for_all_generations(self):
+        v2_report = format_check_report({"generation": "v2", "migrated": False})
+        self.assertIn("vps-sub-meter v2", v2_report)
+        self.assertIn("支持就地平滑升级", v2_report)
+        self.assertNotIn("{", v2_report)
+
+        sbctl_report = format_check_report(
+            {
+                "generation": "sbctl",
+                "domain": "sub.example.com",
+                "public_ip": "203.0.113.10",
+                "interface": "eth0",
+                "tokens_preserved": 2,
+                "argo_enabled": True,
+                "extra_https_port": 8443,
+                "traffic_acc_rx": 2 * 1024**3,
+                "traffic_acc_tx": 5 * 1024**3,
+            }
+        )
+        self.assertIn("sbctl 历史部署", sbctl_report)
+        self.assertIn("sub.example.com (HTTPS)", sbctl_report)
+        self.assertIn("2 个有效订阅凭据", sbctl_report)
+        self.assertIn("2.00 GiB", sbctl_report)
+        self.assertIn("5.00 GiB", sbctl_report)
+        self.assertIn("8443", sbctl_report)
+        self.assertNotIn("{", sbctl_report)
+
+        v1_report = format_check_report(
+            {
+                "generation": "sub-srv-v1",
+                "domain": "",
+                "public_ip": "203.0.113.20",
+                "interface": "ens3",
+                "tokens_preserved": 1,
+                "argo_enabled": False,
+                "extra_https_port": None,
+                "traffic_acc_rx": 512 * 1024**2,
+                "traffic_acc_tx": 1024**3,
+            }
+        )
+        self.assertIn("sub-srv 早期部署", v1_report)
+        self.assertIn("203.0.113.20 (IP / HTTP 模式)", v1_report)
+        self.assertIn("512.00 MiB", v1_report)
+        self.assertNotIn("{", v1_report)
+
+    def test_cli_check_defaults_to_human_readable_and_supports_json_flag(self):
+        script = str(Path(__file__).with_name("migrate_legacy.py"))
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "etc/vps-sub-meter").mkdir(parents=True)
+            (root / "etc/vps-sub-meter/config.toml").write_text('domain = "sub.example.com"\n', encoding="utf-8")
+
+            human = subprocess.run(
+                [sys.executable, script, "--root", str(root), "--check"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertIn("部署检查报告", human.stdout)
+            self.assertNotIn("{", human.stdout)
+
+            raw = subprocess.run(
+                [sys.executable, script, "--root", str(root), "--check", "--json"],
+                check=True,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+            )
+            self.assertEqual(json.loads(raw.stdout), {"generation": "v2", "migrated": False})
 
 
 if __name__ == "__main__":

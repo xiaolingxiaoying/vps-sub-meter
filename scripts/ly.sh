@@ -14,12 +14,59 @@ script_dir=$prefix/usr/local/lib/vps-sub-meter
 
 vsm() { "$prefix/usr/local/bin/vps-sub-meter" --root "$root" "$@"; }
 
+shopt -s checkwinsize 2>/dev/null || true
+
 interactive=false
 color=false
 if [[ -t 0 && -t 1 && -t 2 ]]; then
   interactive=true
   if [[ ${TERM:-dumb} != dumb && -z ${NO_COLOR:-} ]]; then color=true; fi
 fi
+
+alt_screen_active=false
+winch_resized=0
+version_bg_pid=''
+TERM_COLS=80
+TERM_LINES=24
+LAST_DRAW_COLS=0
+LAST_DRAW_LINES=0
+VERSION_CACHE_TTL=1800
+
+# ── 缓存的面板展示数据（窗口缩放重绘时复用，避免闪烁与重复查询） ──
+VPS_INFO_LOADED=0
+VPS_OS='未知'
+VPS_KERNEL='未知'
+VPS_CPU='未知'
+VPS_VIRT='未知'
+VPS_BBR='未知'
+VPS_IPV4='无'
+VPS_IPV6='无'
+VPS_PUB_IPV4_CACHE=''
+
+CUR_VSM_VER=''
+CUR_XRAY_VER='未安装'
+CUR_SB_VER='未安装'
+SVC_VSM_STATE='未知'
+SVC_XRAY_STATE='未知'
+SVC_SB_STATE='未知'
+SVC_ARGO_STATE='未启用'
+
+LATEST_VSM_VER=''
+LATEST_XRAY_VER=''
+LATEST_SB_VER=''
+HAS_VSM_UPDATE=0
+HAS_XRAY_UPDATE=0
+HAS_SB_UPDATE=0
+CACHE_MTIME_SEEN=''
+
+DASH_INITIALIZED=0
+DASH_STATUS_JSON=''
+DASH_CONFIG_JSON=''
+DASH_CERT_SUMMARY='未初始化'
+DASH_REALITY_SNI='—'
+DASH_NODES_LINE1=''
+DASH_NODES_LINE2=''
+DASH_PANEL_SSH_CMD=''
 
 paint() {
   if "$color"; then
@@ -29,18 +76,181 @@ paint() {
   fi
 }
 
-menu_heading() {
-  printf '\n'
-  paint 2 '------------------------------------------------'
-  printf '\n'
-  paint '1;36' "$1"
+enter_alt_screen() {
+  if "$interactive" && [[ ${TERM:-dumb} != dumb ]] && ! "$alt_screen_active"; then
+    printf '\033[?1049h\033[?25h'
+    alt_screen_active=true
+  fi
+}
+
+leave_alt_screen() {
+  if "$alt_screen_active"; then
+    printf '\033[0m\033[?25h\033[?1049l'
+    alt_screen_active=false
+  fi
+}
+
+cleanup() {
+  if [[ -n ${version_bg_pid:-} ]]; then
+    kill "$version_bg_pid" 2>/dev/null || true
+    wait "$version_bg_pid" 2>/dev/null || true
+    version_bg_pid=''
+  fi
+  leave_alt_screen
+}
+
+clear_screen() {
+  if "$interactive" && [[ ${TERM:-dumb} != dumb ]]; then
+    printf '\033[H\033[2J\033[3J'
+  fi
+}
+
+refresh_term_size() {
+  local size rows='' cols=''
+  if "$interactive"; then
+    if size=$(stty size </dev/tty 2>/dev/null) && [[ $size =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+      rows=${BASH_REMATCH[1]}
+      cols=${BASH_REMATCH[2]}
+    fi
+    if [[ -z $cols ]] && command -v tput >/dev/null 2>&1; then
+      rows=$(tput lines 2>/dev/null || true)
+      cols=$(tput cols 2>/dev/null || true)
+    fi
+  fi
+  rows=${rows:-${LINES:-24}}
+  cols=${cols:-${COLUMNS:-80}}
+  [[ $rows =~ ^[0-9]+$ ]] || rows=24
+  [[ $cols =~ ^[0-9]+$ ]] || cols=80
+  ((rows < 16)) && rows=16
+  ((cols < 48)) && cols=48
+  TERM_LINES=$rows
+  TERM_COLS=$cols
+}
+
+panel_width() {
+  local w=$((TERM_COLS - 2))
+  ((w > 116)) && w=116
+  ((w < 46)) && w=46
+  printf '%d' "$w"
+}
+
+vis_width() {
+  local LC_ALL=C
+  local s=$1 clean='' i=0 n byte width=0
+  while [[ $s =~ ^([^$'\033']*)$'\033'\[[0-9\;]*[a-zA-Z](.*)$ ]]; do
+    clean+=${BASH_REMATCH[1]}
+    s=${BASH_REMATCH[2]}
+  done
+  clean+=$s
+  n=${#clean}
+  while ((i < n)); do
+    printf -v byte '%d' "'${clean:i:1}"
+    if ((byte < 128)); then
+      ((width += 1, i += 1))
+    elif ((byte < 224)); then
+      ((width += 1, i += 2))
+    elif ((byte < 240)); then
+      if ((byte == 226 && i + 2 < n)); then
+        ((width += 1))
+      else
+        ((width += 2))
+      fi
+      ((i += 3))
+    else
+      ((width += 2, i += 4))
+    fi
+  done
+  printf '%d' "$width"
+}
+
+repeat_char() {
+  local ch=$1 count=$2 out=''
+  ((count <= 0)) && return 0
+  printf -v out '%*s' "$count" ''
+  printf '%s' "${out// /$ch}"
+}
+
+pad_right() {
+  local text=$1 target=$2 w pad
+  w=$(vis_width "$text")
+  printf '%s' "$text"
+  if ((w < target)); then
+    pad=$((target - w))
+    printf '%*s' "$pad" ''
+  fi
+}
+
+hr_line() {
+  local ch=${1:-─} style=${2:-2} w
+  w=$(panel_width)
+  printf ' '
+  paint "$style" "$(repeat_char "$ch" "$w")"
   printf '\n'
 }
 
+section_bar() {
+  local title=$1 w title_w fill
+  w=$(panel_width)
+  title_w=$(vis_width "$title")
+  fill=$((w - title_w - 4))
+  ((fill < 2)) && fill=2
+  printf ' '
+  paint 2 '── '
+  paint '1;36' "$title"
+  paint 2 " $(repeat_char '─' "$fill")"
+  printf '\n'
+}
+
+print_kv_pair() {
+  local l_key=$1 l_val=$2 r_key=${3-} r_val=${4-}
+  local w col_w left_text right_text lw rw
+  w=$(panel_width)
+  left_text="$(paint 2 "${l_key}:") ${l_val}"
+  if [[ -z $r_key ]]; then
+    printf '  %s\n' "$left_text"
+    return 0
+  fi
+  right_text="$(paint 2 "${r_key}:") ${r_val}"
+  if ((TERM_COLS >= 88)); then
+    col_w=$((w / 2))
+    lw=$(vis_width "$left_text")
+    rw=$(vis_width "$right_text")
+    if ((lw + 2 <= col_w && col_w + rw <= w)); then
+      printf '  %s%s\n' "$(pad_right "$left_text" "$col_w")" "$right_text"
+      return 0
+    fi
+  fi
+  printf '  %s\n' "$left_text"
+  printf '  %s\n' "$right_text"
+}
+
+menu_heading() {
+  if "$interactive"; then
+    clear_screen
+    refresh_term_size
+    hr_line '━' '36'
+    printf '  '
+    paint '1;36' "$1"
+    printf '\n'
+    hr_line '─' '2'
+  else
+    printf '\n'
+    paint 2 '------------------------------------------------'
+    printf '\n'
+    paint '1;36' "$1"
+    printf '\n'
+  fi
+}
+
 menu_section() {
-  printf '\n'
-  paint '1;36' "$1"
-  printf '\n'
+  if "$interactive"; then
+    ((TERM_LINES >= 30)) && printf '\n'
+    section_bar "$1"
+  else
+    printf '\n'
+    paint '1;36' "$1"
+    printf '\n'
+  fi
 }
 
 menu_item() {
@@ -108,7 +318,731 @@ require_initialized() {
   fi
 }
 
-direct_nodes=(vless_reality_pqc vless_xhttp_pqc anytls_tcp hysteria2_hop tuic_bbr)
+# ── 版本比较与远程更新检查 ──
+
+normalize_ver() {
+  local v=${1-}
+  v=${v#v}
+  v=${v#sbctl-v}
+  v=${v%%[[:space:]]*}
+  printf '%s' "$v"
+}
+
+version_gt() {
+  local cand cur top
+  cand=$(normalize_ver "$1")
+  cur=$(normalize_ver "$2")
+  [[ $cand =~ ^[0-9]+(\.[0-9]+)*([-.][0-9A-Za-z.]+)?$ ]] || return 1
+  [[ $cur =~ ^[0-9]+(\.[0-9]+)*([-.][0-9A-Za-z.]+)?$ ]] || return 1
+  [[ $cand != "$cur" ]] || return 1
+  top=$(printf '%s\n%s\n' "$cand" "$cur" | sort -V 2>/dev/null | tail -n1)
+  [[ $top == "$cand" ]]
+}
+
+version_cache_path() {
+  local dir=$prefix/var/lib/vps-sub-meter
+  if [[ $root == / && -d $dir && -w $dir ]]; then
+    printf '%s/.ly-version-cache' "$dir"
+  else
+    printf '%s/.vsm-ly-version-cache' "${XDG_CACHE_HOME:-${HOME:-/tmp}}"
+  fi
+}
+
+cache_file_mtime() {
+  local file=$1
+  [[ -r $file ]] || return 1
+  stat -c %Y "$file" 2>/dev/null || stat -f %m "$file" 2>/dev/null || return 1
+}
+
+read_version_cache() {
+  local file k v
+  file=$(version_cache_path)
+  [[ -r $file ]] || return 1
+  CACHE_MTIME_SEEN=$(cache_file_mtime "$file" 2>/dev/null || printf '')
+  local ts=0 vsm_v='' xray_v='' sb_v='' ip4=''
+  while IFS='=' read -r k v; do
+    case $k in
+      ts) [[ $v =~ ^[0-9]+$ ]] && ts=$v ;;
+      vsm) [[ $v =~ ^[0-9A-Za-z._-]*$ ]] && vsm_v=$v ;;
+      xray) [[ $v =~ ^[0-9A-Za-z._-]*$ ]] && xray_v=$v ;;
+      singbox) [[ $v =~ ^[0-9A-Za-z._-]*$ ]] && sb_v=$v ;;
+      ipv4) [[ $v =~ ^[0-9.]*$ ]] && ip4=$v ;;
+    esac
+  done <"$file"
+  LATEST_VSM_VER=$vsm_v
+  LATEST_XRAY_VER=$xray_v
+  LATEST_SB_VER=$sb_v
+  [[ -n $ip4 ]] && VPS_PUB_IPV4_CACHE=$ip4
+  local now
+  now=$(date +%s 2>/dev/null || printf '0')
+  ((ts > 0 && now - ts < VERSION_CACHE_TTL))
+}
+
+invalidate_version_cache() {
+  local file
+  file=$(version_cache_path)
+  rm -f "$file" 2>/dev/null || true
+  CACHE_MTIME_SEEN=''
+}
+
+fetch_github_latest_tag() {
+  local repo=$1 eff tag=''
+  eff=$(curl -fsSLI --disable --noproxy '*' --connect-timeout 3 --max-time 6 \
+    -o /dev/null -w '%{url_effective}' "https://github.com/${repo}/releases/latest" 2>/dev/null || true)
+  if [[ $eff == */releases/tag/* ]]; then
+    tag=${eff##*/releases/tag/}
+    tag=${tag%%\?*}
+    tag=${tag%%#*}
+  fi
+  if [[ -z $tag ]]; then
+    tag=$(curl -fsSL --disable --noproxy '*' --connect-timeout 3 --max-time 6 \
+      -H 'Accept: application/vnd.github+json' \
+      "https://api.github.com/repos/${repo}/releases/latest" 2>/dev/null \
+      | jq -r '.tag_name // empty' 2>/dev/null || true)
+  fi
+  tag=$(normalize_ver "$tag")
+  [[ $tag =~ ^[0-9]+(\.[0-9]+)+([-.][0-9A-Za-z.]+)?$ ]] && printf '%s' "$tag"
+}
+
+refresh_version_cache_worker() {
+  local file dir tmp vsm_v='' xray_v='' sb_v='' ip4='' now
+  file=$(version_cache_path)
+  dir=$(dirname "$file")
+  mkdir -p "$dir" 2>/dev/null || return 0
+  vsm_v=$(fetch_github_latest_tag 'xiaolingxiaoying/vps-sub-meter' || true)
+  xray_v=$(fetch_github_latest_tag 'XTLS/Xray-core' || true)
+  sb_v=$(fetch_github_latest_tag 'SagerNet/sing-box' || true)
+  ip4=$(curl -4 --disable --noproxy '*' --fail --silent --connect-timeout 2 --max-time 4 \
+    https://api.ipify.org 2>/dev/null || true)
+  [[ $ip4 =~ ^([0-9]+\.){3}[0-9]+$ ]] || ip4=''
+  now=$(date +%s 2>/dev/null || printf '0')
+  (
+    umask 077
+    tmp=$(mktemp "${dir}/.vsm-ver.XXXXXX") || exit 0
+    printf 'ts=%s\nvsm=%s\nxray=%s\nsingbox=%s\nipv4=%s\n' \
+      "$now" "$vsm_v" "$xray_v" "$sb_v" "$ip4" >"$tmp"
+    mv -f "$tmp" "$file"
+  ) 2>/dev/null || true
+}
+
+start_version_check_async() {
+  [[ $root == / ]] || return 0
+  "$interactive" || return 0
+  if [[ -n ${version_bg_pid:-} ]] && kill -0 "$version_bg_pid" 2>/dev/null; then
+    return 0
+  fi
+  refresh_version_cache_worker </dev/null >/dev/null 2>&1 &
+  version_bg_pid=$!
+}
+
+evaluate_update_flags() {
+  HAS_VSM_UPDATE=0
+  HAS_XRAY_UPDATE=0
+  HAS_SB_UPDATE=0
+  if [[ -n $LATEST_VSM_VER && -n $CUR_VSM_VER ]] && version_gt "$LATEST_VSM_VER" "$CUR_VSM_VER"; then
+    HAS_VSM_UPDATE=1
+  fi
+  if [[ -n $LATEST_XRAY_VER && $CUR_XRAY_VER != '未安装' ]] && version_gt "$LATEST_XRAY_VER" "$CUR_XRAY_VER"; then
+    HAS_XRAY_UPDATE=1
+  fi
+  if [[ -n $LATEST_SB_VER && $CUR_SB_VER != '未安装' ]] && version_gt "$LATEST_SB_VER" "$CUR_SB_VER"; then
+    HAS_SB_UPDATE=1
+  fi
+}
+
+# ── VPS 状态、内核状态、节点/证书与 SSH 命令采集 ──
+
+is_private_ipv4() {
+  local ip=$1
+  [[ $ip =~ ^(10\.|127\.|169\.254\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]
+}
+
+collect_vps_info() {
+  if [[ $root != / ]]; then
+    VPS_OS='沙箱环境'
+    VPS_KERNEL='—'
+    VPS_CPU='—'
+    VPS_VIRT='沙箱'
+    VPS_BBR='—'
+    VPS_IPV4='无'
+    VPS_IPV6='无'
+    VPS_INFO_LOADED=1
+    return 0
+  fi
+
+  if ((VPS_INFO_LOADED == 0)); then
+    if [[ -r /etc/os-release ]]; then
+      VPS_OS=$(. /etc/os-release 2>/dev/null && printf '%s' "${PRETTY_NAME:-${NAME:-Linux}}")
+    else
+      VPS_OS=$(uname -s 2>/dev/null || printf 'Linux')
+    fi
+    VPS_KERNEL=$(uname -r 2>/dev/null || printf '未知')
+
+    local cores cpu_model
+    cores=$(nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null || printf '1')
+    cpu_model=$(awk -F: '
+      /^[[:space:]]*(model name|Hardware|Processor|cpu model)[[:space:]]*:/ {
+        v=$2
+        gsub(/^[[:space:]]+|[[:space:]]+$/, "", v)
+        gsub(/[[:space:]]+/, " ", v)
+        if (v != "") { print v; exit }
+      }' /proc/cpuinfo 2>/dev/null || true)
+    if [[ -n $cpu_model ]]; then
+      ((${#cpu_model} > 28)) && cpu_model="${cpu_model:0:25}..."
+      VPS_CPU="${cores}核 · ${cpu_model}"
+    else
+      VPS_CPU="${cores}核"
+    fi
+
+    local virt=''
+    if command -v systemd-detect-virt >/dev/null 2>&1; then
+      virt=$(systemd-detect-virt 2>/dev/null || true)
+    fi
+    case ${virt,,} in
+      none) VPS_VIRT='物理机 / 无' ;;
+      kvm) VPS_VIRT='KVM' ;;
+      qemu) VPS_VIRT='QEMU' ;;
+      vmware) VPS_VIRT='VMware' ;;
+      microsoft|hyperv) VPS_VIRT='Hyper-V' ;;
+      xen) VPS_VIRT='Xen' ;;
+      lxc) VPS_VIRT='LXC' ;;
+      openvz) VPS_VIRT='OpenVZ' ;;
+      docker) VPS_VIRT='Docker' ;;
+      wsl) VPS_VIRT='WSL' ;;
+      '') VPS_VIRT='未知' ;;
+      *) VPS_VIRT=$virt ;;
+    esac
+    VPS_INFO_LOADED=1
+  fi
+
+  local cc qdisc
+  cc=$(tr -d '[:space:]' </proc/sys/net/ipv4/tcp_congestion_control 2>/dev/null || true)
+  qdisc=$(tr -d '[:space:]' </proc/sys/net/core/default_qdisc 2>/dev/null || true)
+  if [[ -n $cc ]]; then
+    VPS_BBR=${qdisc:+"$cc ($qdisc)"}
+    VPS_BBR=${VPS_BBR:-$cc}
+  else
+    VPS_BBR='未知'
+  fi
+
+  local ip4='' addr cfg_ip=''
+  if command -v ip >/dev/null 2>&1; then
+    while read -r addr; do
+      addr=${addr%%/*}
+      [[ -n $addr ]] || continue
+      if ! is_private_ipv4 "$addr"; then
+        ip4=$addr
+        break
+      fi
+    done < <(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}')
+  fi
+  if [[ -z $ip4 && -n $DASH_CONFIG_JSON ]]; then
+    cfg_ip=$(jq -r '.public_ip // empty' <<<"$DASH_CONFIG_JSON" 2>/dev/null || true)
+    [[ $cfg_ip =~ ^([0-9]+\.){3}[0-9]+$ ]] && ! is_private_ipv4 "$cfg_ip" && ip4=$cfg_ip
+  fi
+  if [[ -z $ip4 && -n $VPS_PUB_IPV4_CACHE ]]; then
+    ip4=$VPS_PUB_IPV4_CACHE
+  fi
+  VPS_IPV4=${ip4:-无}
+
+  local ip6=''
+  if command -v ip >/dev/null 2>&1; then
+    while read -r addr; do
+      addr=${addr%%/*}
+      [[ -n $addr ]] || continue
+      case ${addr,,} in
+        fe80:*|fc*|fd*) continue ;;
+        *) ip6=$addr; break ;;
+      esac
+    done < <(ip -6 -o addr show scope global 2>/dev/null | awk '{print $4}')
+  fi
+  VPS_IPV6=${ip6:-无}
+}
+
+svc_active_label() {
+  local unit=$1 state='未知'
+  if [[ $root != / ]] || ! command -v systemctl >/dev/null 2>&1; then
+    printf '—'
+    return 0
+  fi
+  state=$(systemctl is-active "$unit" 2>/dev/null || true)
+  case $state in
+    active) paint 32 '运行中' ;;
+    activating|reloading) paint 33 '启动中' ;;
+    failed) paint 31 '异常' ;;
+    inactive|dead|'') paint 2 '未运行' ;;
+    *) printf '%s' "$state" ;;
+  esac
+}
+
+collect_core_and_versions() {
+  local vsm_ver='' xray_ver='' sb_ver=''
+  if [[ -n $DASH_STATUS_JSON ]]; then
+    vsm_ver=$(jq -r '.version // empty' <<<"$DASH_STATUS_JSON" 2>/dev/null || true)
+  fi
+  if [[ -z $vsm_ver && -x $prefix/usr/local/bin/vps-sub-meter ]]; then
+    vsm_ver=$(vsm --version 2>/dev/null | awk '{print $NF; exit}' || true)
+  fi
+  CUR_VSM_VER=$(normalize_ver "$vsm_ver")
+
+  if [[ $root == / && -x /usr/local/bin/xray ]]; then
+    xray_ver=$(/usr/local/bin/xray version 2>/dev/null | awk 'NR==1{print $2}' || true)
+    CUR_XRAY_VER=$(normalize_ver "${xray_ver:-未知}")
+  elif [[ -x $prefix/usr/local/bin/xray ]]; then
+    CUR_XRAY_VER='已部署'
+  else
+    CUR_XRAY_VER='未安装'
+  fi
+
+  if [[ $root == / && -x /usr/local/bin/sing-box ]]; then
+    sb_ver=$(/usr/local/bin/sing-box version 2>/dev/null | awk 'NR==1{print $3}' || true)
+    CUR_SB_VER=$(normalize_ver "${sb_ver:-未知}")
+  elif [[ -x $prefix/usr/local/bin/sing-box ]]; then
+    CUR_SB_VER='已部署'
+  else
+    CUR_SB_VER='未安装'
+  fi
+
+  SVC_VSM_STATE=$(svc_active_label 'vps-sub-meter.service')
+  SVC_XRAY_STATE=$(svc_active_label 'vps-sub-meter-xray.service')
+  SVC_SB_STATE=$(svc_active_label 'vps-sub-meter-singbox.service')
+  SVC_ARGO_STATE=$(svc_active_label 'vps-sub-meter-argo.service')
+
+  if [[ $root == / ]] && "$interactive"; then
+    if ! read_version_cache; then
+      start_version_check_async
+    fi
+  fi
+  evaluate_update_flags
+}
+
+detect_cert_summary() {
+  local cfg=$1 domain sni cert subject issuer end_line end_str end_ts now_ts days
+  local kind='' days_txt=''
+  domain=$(jq -r '.domain | gsub("^\\s+|\\s+$"; "")' <<<"$cfg" 2>/dev/null || true)
+  if is_ip_host "$domain"; then
+    sni='www.bing.com'
+  else
+    sni=$domain
+  fi
+  cert="$prefix/var/lib/vps-sub-meter/certificates/$sni/fullchain.pem"
+  if [[ ! -s $cert ]]; then
+    DASH_CERT_SUMMARY="$(paint 33 "未签发 ($sni)")"
+    return 0
+  fi
+  subject=$(openssl x509 -in "$cert" -noout -subject 2>/dev/null | sed 's/^subject=[[:space:]]*//' || true)
+  issuer=$(openssl x509 -in "$cert" -noout -issuer 2>/dev/null | sed 's/^issuer=[[:space:]]*//' || true)
+  end_line=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null || true)
+  end_str=${end_line#notAfter=}
+
+  if is_ip_host "$domain" || [[ -n $subject && $subject == "$issuer" ]]; then
+    kind='自签证书'
+  elif [[ $issuer == *"Let's Encrypt"* ]]; then
+    if [[ -d "${prefix}/root/.acme.sh/${sni}_ecc" || -d "${prefix}/root/.acme.sh/${sni}" ]]; then
+      kind="ACME / Let's Encrypt"
+    elif [[ -d "${prefix}/etc/letsencrypt/live/${sni}" ]]; then
+      kind="Certbot / Let's Encrypt"
+    else
+      kind="Let's Encrypt"
+    fi
+  else
+    local ca_name
+    ca_name=$(sed -n 's/.*O[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' <<<"$issuer" | head -n1)
+    if [[ -z $ca_name ]]; then
+      ca_name=$(sed -n 's/.*CN[[:space:]]*=[[:space:]]*\([^,/]*\).*/\1/p' <<<"$issuer" | head -n1)
+    fi
+    kind="CA 证书${ca_name:+ ($ca_name)}"
+  fi
+
+  if [[ -n $end_str ]]; then
+    end_ts=$(date -d "$end_str" +%s 2>/dev/null || printf '')
+    now_ts=$(date +%s 2>/dev/null || printf '')
+    if [[ $end_ts =~ ^[0-9]+$ && $now_ts =~ ^[0-9]+$ ]]; then
+      days=$(( (end_ts - now_ts) / 86400 ))
+      if ((days < 0)); then
+        days_txt=$(paint 31 '已过期')
+      elif ((days <= 30)); then
+        days_txt=$(paint 33 "剩 ${days} 天")
+      else
+        days_txt=$(paint 32 "有效 · 剩 ${days} 天")
+      fi
+    fi
+  fi
+  if [[ -z $days_txt ]]; then
+    if openssl x509 -in "$cert" -noout -checkend 0 >/dev/null 2>&1; then
+      days_txt=$(paint 32 '有效')
+    else
+      days_txt=$(paint 31 '已过期')
+    fi
+  fi
+  DASH_CERT_SUMMARY="${kind} (${sni} · ${days_txt})"
+}
+
+format_node_chip() {
+  local cfg=$1 key=$2 label=$3 enabled port hop extra=''
+  enabled=$(jq -r --arg k "$key" '.nodes[$k].enabled' <<<"$cfg" 2>/dev/null || printf 'false')
+  port=$(jq -r --arg k "$key" '.nodes[$k].port' <<<"$cfg" 2>/dev/null || printf '?')
+  if [[ $key == hysteria2_hop ]]; then
+    hop=$(jq -r '.nodes.hysteria2_hop.hop_range // empty' <<<"$cfg" 2>/dev/null || true)
+    [[ -n $hop ]] && extra=" 跳${hop}"
+  fi
+  if [[ $enabled == true ]]; then
+    printf '%s:%s%s' "$label" "$(paint 36 "$port")" "${extra:+$(paint 2 "($extra)")}"
+  else
+    printf '%s' "$(paint 2 "${label}:${port}(停用)")"
+  fi
+}
+
+collect_node_and_cert_info() {
+  DASH_CONFIG_JSON=''
+  DASH_CERT_SUMMARY='未初始化'
+  DASH_REALITY_SNI='—'
+  DASH_NODES_LINE1=''
+  DASH_NODES_LINE2=''
+
+  ((DASH_INITIALIZED)) || return 0
+  DASH_CONFIG_JSON=$(vsm config show 2>/dev/null || true)
+  [[ -n $DASH_CONFIG_JSON ]] || return 0
+
+  detect_cert_summary "$DASH_CONFIG_JSON"
+
+  local decoy_sni reality_on
+  decoy_sni=$(jq -r '.nodes.vless_reality_pqc.decoy_sni // empty' <<<"$DASH_CONFIG_JSON" 2>/dev/null || true)
+  reality_on=$(jq -r '.nodes.vless_reality_pqc.enabled' <<<"$DASH_CONFIG_JSON" 2>/dev/null || printf 'true')
+  if [[ -n $decoy_sni ]]; then
+    if [[ $reality_on == true ]]; then
+      DASH_REALITY_SNI=$decoy_sni
+    else
+      DASH_REALITY_SNI="${decoy_sni} $(paint 2 '(节点已停用)')"
+    fi
+  else
+    DASH_REALITY_SNI='未设置'
+  fi
+
+  local n1 n2 n3 n4 n5
+  n1=$(format_node_chip "$DASH_CONFIG_JSON" vless_reality_pqc 'REALITY')
+  n2=$(format_node_chip "$DASH_CONFIG_JSON" vless_xhttp_pqc 'XHTTP')
+  n3=$(format_node_chip "$DASH_CONFIG_JSON" anytls_tcp 'AnyTLS')
+  n4=$(format_node_chip "$DASH_CONFIG_JSON" hysteria2_hop 'Hy2')
+  n5=$(format_node_chip "$DASH_CONFIG_JSON" tuic_bbr 'TUIC')
+  DASH_NODES_LINE1="${n1}  ${n2}  ${n3}"
+  DASH_NODES_LINE2="${n4}  ${n5}"
+}
+
+build_panel_ssh_command() {
+  local ssh_user host ssh_port='' port_opt=''
+  ssh_user=${SUDO_USER:-${USER:-$(id -un 2>/dev/null || printf 'root')}}
+  host=''
+  if [[ -n $DASH_CONFIG_JSON ]]; then
+    host=$(jq -r '.domain | gsub("^\\s+|\\s+$"; "")' <<<"$DASH_CONFIG_JSON" 2>/dev/null || true)
+    if [[ -z $host ]]; then
+      host=$(jq -r '.public_ip | gsub("^\\s+|\\s+$"; "")' <<<"$DASH_CONFIG_JSON" 2>/dev/null || true)
+    fi
+  fi
+  if [[ -z $host ]]; then
+    if [[ $VPS_IPV4 != '无' ]]; then
+      host=$VPS_IPV4
+    elif [[ $VPS_IPV6 != '无' ]]; then
+      host="[$VPS_IPV6]"
+    else
+      host='<VPS_IP>'
+    fi
+  elif [[ $host == *:* && $host != \[*\] ]]; then
+    host="[$host]"
+  fi
+  if [[ -n ${SSH_CONNECTION:-} ]]; then
+    ssh_port=$(awk '{print $4}' <<<"$SSH_CONNECTION" 2>/dev/null || true)
+  fi
+  if [[ $ssh_port =~ ^[0-9]+$ && $ssh_port != 22 ]]; then
+    port_opt="-p ${ssh_port} "
+  fi
+  DASH_PANEL_SSH_CMD="ssh -t -o ExitOnForwardFailure=yes ${port_opt}-L 127.0.0.1:8787:127.0.0.1:8787 ${ssh_user}@${host} 'sudo /usr/local/bin/vps-sub-meter panel'"
+}
+
+collect_dashboard_data() {
+  local force_ver=${1:-0}
+  if [[ -e $config_path ]]; then
+    DASH_INITIALIZED=1
+    DASH_STATUS_JSON=$(vsm status --json 2>/dev/null || true)
+  else
+    DASH_INITIALIZED=0
+    DASH_STATUS_JSON=''
+  fi
+  collect_node_and_cert_info
+  collect_vps_info
+  if ((force_ver)); then
+    invalidate_version_cache
+  fi
+  collect_core_and_versions
+  build_panel_ssh_command
+}
+
+format_iec_bytes() {
+  local bytes=${1:-0}
+  awk -v b="$bytes" 'BEGIN {
+    if (b >= 1099511627776) printf "%.2f TiB", b/1099511627776;
+    else if (b >= 1073741824) printf "%.2f GiB", b/1073741824;
+    else if (b >= 1048576) printf "%.2f MiB", b/1048576;
+    else if (b >= 1024) printf "%.2f KiB", b/1024;
+    else printf "%.0f B", b;
+  }'
+}
+
+format_ver_badge() {
+  local cur=$1 svc=$2 has_upd=$3 latest=$4
+  local cur_disp upd_disp=''
+  if [[ $cur == '未安装' || $cur == '已部署' || $cur == '未知' ]]; then
+    cur_disp=$(paint 33 "$cur")
+  else
+    cur_disp="v${cur}"
+  fi
+  if ((has_upd)) && [[ -n $latest ]]; then
+    upd_disp=" $(paint '1;33' "→ 新版 v${latest}")"
+  elif [[ -n $latest && $cur != '未安装' && $cur != '已部署' ]]; then
+    upd_disp=" $(paint 2 '(最新)')"
+  fi
+  printf '[%s] %s%s' "$svc" "$cur_disp" "$upd_disp"
+}
+
+menu_entry_str() {
+  local num=$1 label=$2 col=${3:-32} formatted
+  printf -v formatted '%2s.' "$num"
+  printf '  %s %s' "$(paint "$col" "$formatted")" "$label"
+}
+
+section_half_bar() {
+  local title=$1 width=$2 tw fill
+  tw=$(vis_width "$title")
+  fill=$((width - tw - 6))
+  ((fill < 2)) && fill=2
+  printf ' %s%s%s' "$(paint 2 '── ')" "$(paint '1;36' "$title")" "$(paint 2 " $(repeat_char '─' "$fill")")"
+}
+
+render_main_menu() {
+  local w title_right='' compact=0
+  refresh_term_size
+  LAST_DRAW_COLS=$TERM_COLS
+  LAST_DRAW_LINES=$TERM_LINES
+  ((TERM_LINES < 30)) && compact=1
+
+  if "$interactive"; then
+    clear_screen
+    w=$(panel_width)
+    if ((HAS_VSM_UPDATE)); then
+      title_right=$(paint '1;33' "★ 发现新版 v${LATEST_VSM_VER}")
+    else
+      title_right=$(paint 2 "v${CUR_VSM_VER:-?}")
+    fi
+
+    hr_line '━' '36'
+    local title_left
+    title_left="  $(paint '1;36' 'vps-sub-meter · 管理菜单')"
+    if ((TERM_COLS >= 72)); then
+      local lw rw gap
+      lw=$(vis_width "$title_left")
+      rw=$(vis_width "$title_right")
+      gap=$((w - lw - rw))
+      if ((gap >= 2)); then
+        printf '%s%*s%s\n' "$title_left" "$gap" '' "$title_right"
+      else
+        printf '%s  %s\n' "$title_left" "$title_right"
+      fi
+    else
+      printf '%s  %s\n' "$title_left" "$title_right"
+    fi
+    hr_line '─' '2'
+
+    # ── 1. 节点、证书与订阅 ──
+    if ((DASH_INITIALIZED)) && [[ -n $DASH_CONFIG_JSON ]]; then
+      local host_addr proto_label https_on
+      host_addr=$(jq -r '.address // empty' <<<"$DASH_STATUS_JSON" 2>/dev/null || true)
+      https_on=$(jq -r '.https_enabled // false' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf 'false')
+      if [[ $https_on == true ]]; then
+        proto_label=$(paint 32 "HTTPS (${host_addr})")
+      else
+        proto_label=$(paint 33 "HTTP 明文 (${host_addr})")
+      fi
+      print_kv_pair '订阅地址' "$proto_label" '证书形式' "$DASH_CERT_SUMMARY"
+      print_kv_pair 'REALITY 伪装' "$(paint 36 "$DASH_REALITY_SNI")" '主力端口' "$DASH_NODES_LINE1"
+      print_kv_pair '备用/UDP' "$DASH_NODES_LINE2"
+
+      if [[ -n $DASH_STATUS_JSON ]]; then
+        local up_b down_b tot_b lim_b tz reset_ts reset_str iface gen_id node_cnt argo_on pending
+        up_b=$(jq -r '.traffic.upload_bytes // 0' <<<"$DASH_STATUS_JSON")
+        down_b=$(jq -r '.traffic.download_bytes // 0' <<<"$DASH_STATUS_JSON")
+        tot_b=$(jq -r '.traffic.total_used_bytes // 0' <<<"$DASH_STATUS_JSON")
+        lim_b=$(jq -r '.traffic.monthly_limit_bytes // 0' <<<"$DASH_STATUS_JSON")
+        tz=$(jq -r '.traffic.display_tz // "UTC"' <<<"$DASH_STATUS_JSON")
+        reset_ts=$(jq -r '.traffic.next_reset_ts // 0' <<<"$DASH_STATUS_JSON")
+        iface=$(jq -r '.interface // "eth0"' <<<"$DASH_STATUS_JSON")
+        gen_id=$(jq -r '.generation.id // empty' <<<"$DASH_STATUS_JSON")
+        node_cnt=$(jq -r '.generation.direct_nodes | length // 0' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf '0')
+        argo_on=$(jq -r '.argo_enabled // false' <<<"$DASH_STATUS_JSON")
+        pending=$(jq -r '.pending_changes // false' <<<"$DASH_STATUS_JSON")
+
+        local lim_str traffic_str reset_disp
+        lim_str=$( ((lim_b > 0)) && format_iec_bytes "$lim_b" || printf '不限' )
+        traffic_str="$(format_iec_bytes "$tot_b") / ${lim_str} (↑$(format_iec_bytes "$up_b") ↓$(format_iec_bytes "$down_b"))"
+        reset_disp=$(TZ="$tz" date -d "@${reset_ts}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$reset_ts")
+        print_kv_pair "流量 ($iface)" "$traffic_str" '下次重置' "${reset_disp} (${tz})"
+
+        local batch_str argo_str
+        batch_str=${gen_id:+"${gen_id} (${node_cnt} 节点)"}
+        batch_str=${batch_str:-$(paint 33 '未发布')}
+        if [[ $argo_on == true ]]; then
+          argo_str="已启用 [$SVC_ARGO_STATE]"
+        else
+          argo_str=$(paint 2 '未启用')
+        fi
+        print_kv_pair '当前批次' "$batch_str" 'Argo 隧道' "$argo_str"
+        if [[ $pending == true ]]; then
+          printf '  %s\n' "$(paint '1;33' '配置待应用: 主配置与已发布批次不一致，请选择「8. 应用配置」生效')"
+        fi
+      fi
+    else
+      printf '  %s\n' "$(paint '1;33' '尚未初始化部署，请选择「1. 初始化 / 重新配置」开始部署。')"
+    fi
+
+    # ── 2. 内核版本与服务状态 ──
+    ((compact == 0)) && hr_line '─' '2'
+    local vsm_badge xray_badge sb_badge
+    vsm_badge=$(format_ver_badge "${CUR_VSM_VER:-?}" "$SVC_VSM_STATE" "$HAS_VSM_UPDATE" "$LATEST_VSM_VER")
+    xray_badge=$(format_ver_badge "$CUR_XRAY_VER" "$SVC_XRAY_STATE" "$HAS_XRAY_UPDATE" "$LATEST_XRAY_VER")
+    sb_badge=$(format_ver_badge "$CUR_SB_VER" "$SVC_SB_STATE" "$HAS_SB_UPDATE" "$LATEST_SB_VER")
+    print_kv_pair '控制面 vsm' "$vsm_badge" 'Xray 内核' "$xray_badge"
+    print_kv_pair 'sing-box 内核' "$sb_badge"
+
+    # ── 3. VPS 状态 ──
+    ((compact == 0)) && hr_line '─' '2'
+    local bbr_disp ipv4_disp ipv6_disp
+    if [[ $VPS_BBR == bbr* ]]; then
+      bbr_disp=$(paint 32 "$VPS_BBR")
+    else
+      bbr_disp=$(paint 33 "$VPS_BBR")
+    fi
+    ipv4_disp=$( [[ $VPS_IPV4 == '无' ]] && paint 2 '无' || printf '%s' "$VPS_IPV4" )
+    ipv6_disp=$( [[ $VPS_IPV6 == '无' ]] && paint 2 '无' || printf '%s' "$VPS_IPV6" )
+    print_kv_pair '系统' "$VPS_OS" '内核' "$VPS_KERNEL"
+    print_kv_pair '处理器' "$VPS_CPU" '虚拟化' "$VPS_VIRT"
+    print_kv_pair 'BBR算法' "$bbr_disp" 'IPv4 地址' "$ipv4_disp"
+    print_kv_pair 'IPv6 地址' "$ipv6_disp"
+  else
+    menu_heading 'vps-sub-meter · 管理菜单'
+    if [[ -e $config_path ]]; then
+      vsm status
+    else
+      paint 33 '尚未初始化，请选择 1 开始部署。'
+      printf '\n'
+    fi
+  fi
+
+  if "$interactive" && ((TERM_COLS >= 88)); then
+    local col_w=$((w / 2))
+    local -a left_rows=(
+      "$(section_half_bar '订阅与流量' "$col_w")"
+      "$(menu_entry_str 2 '查看订阅与二维码')"
+      "$(menu_entry_str 3 '管理订阅凭据')"
+      "$(menu_entry_str 10 '流量账期与校准')"
+      "$(section_half_bar '系统维护' "$col_w")"
+      "$(menu_entry_str 4 '轮换节点密钥')"
+      "$(menu_entry_str 5 '更新内核 (Xray / sing-box)')"
+      "$(menu_entry_str 13 '查看运行日志')"
+      "$(menu_entry_str 9 '卸载 vps-sub-meter' 31)"
+      "$(menu_entry_str 0 '退出')"
+    )
+    local -a right_rows=(
+      "$(section_half_bar '部署与配置' "$col_w")"
+      "$(menu_entry_str 1 '初始化 / 重新配置')"
+      "$(menu_entry_str 6 '配置 / 切换域名 (HTTPS)')"
+      "$(menu_entry_str 7 '管理 Argo 隧道')"
+      "$(menu_entry_str 8 '应用配置')"
+      "$(menu_entry_str 11 '节点端口设置')"
+      "$(menu_entry_str 12 '证书管理')"
+      ""
+      ""
+      ""
+    )
+    ((compact == 0)) && printf '\n'
+    local idx
+    for ((idx = 0; idx < ${#left_rows[@]}; idx++)); do
+      printf '%s%s\n' "$(pad_right "${left_rows[idx]}" "$col_w")" "${right_rows[idx]}"
+    done
+  else
+    menu_section '订阅与流量'
+    menu_item 2 '查看订阅与二维码'
+    menu_item 3 '管理订阅凭据'
+    menu_item 10 '流量账期与校准'
+
+    menu_section '部署与配置'
+    menu_item 1 '初始化 / 重新配置'
+    menu_item 6 '配置 / 切换域名 (HTTPS)'
+    menu_item 7 '管理 Argo 隧道'
+    menu_item 8 '应用配置'
+    menu_item 11 '节点端口设置'
+    menu_item 12 '证书管理'
+
+    menu_section '系统维护'
+    menu_item 4 '轮换节点密钥'
+    menu_item 5 '更新内核 (Xray / sing-box)'
+    menu_item 13 '查看运行日志'
+    menu_item 9 '卸载 vps-sub-meter' 31
+    ((compact == 0)) && printf '\n'
+    menu_item 0 '退出'
+  fi
+  if "$interactive"; then
+    hr_line '─' '2'
+    printf '  %s\n' "$(paint 2 '网页管理面板 (在本机运行 SSH 转发后打开 http://127.0.0.1:8787/):')"
+    printf '  %s\n' "$(paint 36 "$DASH_PANEL_SSH_CMD")"
+  fi
+}
+
+# 返回码: 0=已选中编号($answer), 1=退出(0或EOF), 2=窗口变化/缓存更新需重绘, 3=手动刷新(r)
+read_main_choice() {
+  local rc cur_size cur_mtime cache_path
+  cache_path=$(version_cache_path)
+  while true; do
+    paint '1;33' '请输入编号（0–13，r 刷新）' >&2
+    printf ': ' >&2
+    while true; do
+      winch_resized=0
+      IFS= read -r -t 0.4 answer
+      rc=$?
+      if ((rc == 0)); then
+        answer=${answer#"${answer%%[![:space:]]*}"}
+        answer=${answer%"${answer##*[![:space:]]}"}
+        if [[ $answer == 0 ]]; then
+          return 1
+        elif [[ $answer == r || $answer == R ]]; then
+          return 3
+        elif [[ $answer =~ ^[1-9][0-9]?$ ]] && ((answer <= 13)); then
+          return 0
+        fi
+        printf '\n请输入 0–13 之间的编号（或输入 r 刷新）。\n' >&2
+        break
+      elif ((rc == 1)); then
+        return 1
+      else
+        if ((winch_resized)); then
+          return 2
+        fi
+        cur_size=$(stty size </dev/tty 2>/dev/null || true)
+        if [[ $cur_size =~ ^([0-9]+)[[:space:]]+([0-9]+)$ ]]; then
+          if [[ ${BASH_REMATCH[1]} != "$LAST_DRAW_LINES" || ${BASH_REMATCH[2]} != "$LAST_DRAW_COLS" ]]; then
+            return 2
+          fi
+        fi
+        cur_mtime=$(cache_file_mtime "$cache_path" 2>/dev/null || printf '')
+        if [[ -n $cur_mtime && $cur_mtime != "$CACHE_MTIME_SEEN" ]]; then
+          read_version_cache >/dev/null 2>&1 || true
+          evaluate_update_flags
+          return 2
+        fi
+      fi
+    done
+  done
+}
+
+# ── 原有子菜单与操作函数 ──
 
 ask_node_port() {
   local config=$1 node=$2 name port value
@@ -127,6 +1061,8 @@ ask_node_port() {
   done
   return 1
 }
+
+direct_nodes=(vless_reality_pqc vless_xhttp_pqc anytls_tcp hysteria2_hop tuic_bbr)
 
 initialize() {
   local current host domain ip interface quota reset_day node candidate email='' mode sni
@@ -388,21 +1324,122 @@ uninstall_vsm() {
 }
 
 update_cores() {
-  local rc=0
+  local rc=0 use_latest=0
   if [[ ! -f $script_dir/cores.sh ]]; then
     printf '找不到内核更新脚本: %s\n' "$script_dir/cores.sh" >&2
     pause_if_interactive
     return 1
   fi
-  confirm '确认更新 Xray 与 sing-box 内核到脚本指定版本' 1 || return 0
+  menu_heading '更新代理内核 (Xray / sing-box)'
+  printf '  Xray 当前: %s%s\n' "$CUR_XRAY_VER" "${LATEST_XRAY_VER:+  |  GitHub 最新: $LATEST_XRAY_VER}"
+  printf '  sing-box 当前: %s%s\n\n' "$CUR_SB_VER" "${LATEST_SB_VER:+  |  GitHub 最新: $LATEST_SB_VER}"
+  if ((HAS_XRAY_UPDATE || HAS_SB_UPDATE)) && [[ -n $LATEST_XRAY_VER || -n $LATEST_SB_VER ]]; then
+    menu_item 1 '更新到脚本指定稳定版本'
+    menu_item 2 '更新到 GitHub 最新 Release 版本'
+    menu_item 0 '返回主菜单'
+    choose 2 '选择更新目标' 1 || return 0
+    [[ $answer == 2 ]] && use_latest=1
+  else
+    confirm '确认更新 Xray 与 sing-box 内核到脚本指定版本' 1 || return 0
+  fi
   if [[ $root == / ]]; then
-    bash "$script_dir/cores.sh" update || rc=$?
+    if ((use_latest)); then
+      XRAY_VERSION="${LATEST_XRAY_VER:-}" SING_BOX_VERSION="${LATEST_SB_VER:-}" \
+        bash "$script_dir/cores.sh" update || rc=$?
+    else
+      bash "$script_dir/cores.sh" update || rc=$?
+    fi
   fi
   if ((rc == 0)) && [[ -e $config_path ]]; then
     vsm apply || rc=$?
   fi
+  if ((rc == 0)); then
+    invalidate_version_cache
+  fi
   pause_if_interactive
   return "$rc"
+}
+
+view_logs() {
+  local unit='' label='' mode=1
+  if [[ $root != / ]]; then
+    menu_heading '查看运行日志'
+    printf '沙箱模式下无法读取宿主机 systemd 日志。\n' >&2
+    pause_if_interactive
+    return 0
+  fi
+  if ! command -v journalctl >/dev/null 2>&1; then
+    menu_heading '查看运行日志'
+    printf '当前系统未检测到 journalctl，无法查看服务日志。\n' >&2
+    pause_if_interactive
+    return 1
+  fi
+
+  while true; do
+    menu_heading '查看运行日志'
+    menu_item 1 '订阅服务 (vps-sub-meter)'
+    menu_item 2 'Xray 内核 (vps-sub-meter-xray)'
+    menu_item 3 'sing-box 内核 (vps-sub-meter-singbox)'
+    menu_item 4 'Argo 隧道 (vps-sub-meter-argo)'
+    menu_item 5 '全部核心服务综合日志'
+    menu_item 0 '返回主菜单'
+    choose 5 '选择要查看日志的服务' 0 || return 0
+    case $answer in
+      1) unit='vps-sub-meter.service'; label='订阅服务' ;;
+      2) unit='vps-sub-meter-xray.service'; label='Xray 内核' ;;
+      3) unit='vps-sub-meter-singbox.service'; label='sing-box 内核' ;;
+      4) unit='vps-sub-meter-argo.service'; label='Argo 隧道' ;;
+      5) unit='ALL'; label='全部核心服务' ;;
+    esac
+
+    menu_heading "日志操作 · ${label}"
+    menu_item 1 '查看最近 50 行'
+    menu_item 2 '查看最近 200 行'
+    menu_item 3 '实时跟踪日志 (Ctrl+C 停止返回)'
+    menu_item 4 '仅查看警告与错误 (最近 100 条)'
+    menu_item 0 '返回上一级'
+    choose 4 '选择查看方式' 1 || continue
+    mode=$answer
+
+    local -a units=()
+    if [[ $unit == ALL ]]; then
+      units=(-u vps-sub-meter.service -u vps-sub-meter-xray.service -u vps-sub-meter-singbox.service -u vps-sub-meter-argo.service)
+    else
+      units=(-u "$unit")
+    fi
+
+    clear_screen
+    case $mode in
+      1)
+        journalctl "${units[@]}" -n 50 --no-pager || true
+        pause_if_interactive
+        ;;
+      2)
+        if "$interactive" && command -v less >/dev/null 2>&1; then
+          journalctl "${units[@]}" -n 200 --no-pager | less -R +G || true
+        else
+          journalctl "${units[@]}" -n 200 --no-pager || true
+          pause_if_interactive
+        fi
+        ;;
+      3)
+        printf '正在实时跟踪 %s 日志，按 Ctrl+C 停止并返回...\n\n' "$label" >&2
+        trap ':' INT
+        journalctl "${units[@]}" -n 30 -f || true
+        if "$interactive"; then
+          trap 'cleanup; exit 130' INT
+        else
+          trap - INT
+        fi
+        printf '\n' >&2
+        pause_if_interactive
+        ;;
+      4)
+        journalctl "${units[@]}" -p warning -n 100 --no-pager || true
+        pause_if_interactive
+        ;;
+    esac
+  done
 }
 
 manage_argo() {
@@ -752,40 +1789,35 @@ main() {
     exit 2
   fi
 
+  if "$interactive"; then
+    trap cleanup EXIT
+    trap 'cleanup; exit 130' INT TERM HUP
+    trap 'winch_resized=1' WINCH
+    enter_alt_screen
+  fi
+
+  local need_collect=1 force_ver=0 choice_rc=0
   while true; do
-    menu_heading 'vps-sub-meter · 管理菜单'
-    if [[ -e $config_path ]]; then
-      vsm status
-    else
-      paint 33 '尚未初始化，请选择 1 开始部署。'
-      printf '\n'
-    fi
-
-    menu_section '订阅与流量'
-    menu_item 2 '查看订阅与二维码'
-    menu_item 3 '管理订阅凭据'
-    menu_item 10 '流量账期与校准'
-
-    menu_section '部署与配置'
-    menu_item 1 '初始化 / 重新配置'
-    menu_item 6 '配置 / 切换域名 (HTTPS)'
-    menu_item 7 '管理 Argo 隧道'
-    menu_item 8 '应用配置'
-    menu_item 11 '节点端口设置'
-    menu_item 12 '证书管理'
-
-    menu_section '系统维护'
-    menu_item 4 '轮换节点密钥'
-    menu_item 5 '更新内核 (Xray / sing-box)'
-    menu_item 9 '卸载 vps-sub-meter' 31
-    printf '\n'
-    menu_item 0 '退出'
     if "$interactive"; then
-      printf '\n'
-      paint 2 '  提示：可通过 SSH 端口转发运行 sudo vsm panel 打开网页管理面板'
-      printf '\n'
+      if ((need_collect)); then
+        collect_dashboard_data "$force_ver"
+        need_collect=0
+        force_ver=0
+      fi
+      render_main_menu
+      read_main_choice
+      choice_rc=$?
+      case $choice_rc in
+        1) exit 0 ;;
+        2) continue ;;
+        3) need_collect=1; force_ver=1; continue ;;
+      esac
+      need_collect=1
+    else
+      render_main_menu
+      choose 13 '请输入编号（0–13）' || exit 0
     fi
-    choose 12 '请输入编号（0–12）' || exit 0
+
     case $answer in
       1) initialize ;;
       2) subscriptions ;;
@@ -799,6 +1831,7 @@ main() {
       10) manage_traffic ;;
       11) manage_ports ;;
       12) manage_certificate ;;
+      13) view_logs ;;
     esac
   done
 }

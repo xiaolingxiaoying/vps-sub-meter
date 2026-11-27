@@ -85,7 +85,15 @@ install_from_dir() {
   mv -fT /usr/local/lib/vps-sub-meter/.ly.sh.new /usr/local/lib/vps-sub-meter/ly.sh
   install -m 0755 "$src/vps-sub-meter" /usr/local/bin/.vps-sub-meter.new
   mv -f /usr/local/bin/.vps-sub-meter.new /usr/local/bin/vps-sub-meter
-  ln -sf /usr/local/bin/vps-sub-meter /usr/local/bin/vsm
+  cat >/usr/local/bin/.vsm.new <<'EOF'
+#!/usr/bin/env bash
+if [[ $# -eq 0 && -t 0 && -t 1 && -t 2 ]]; then
+  exec /usr/local/lib/vps-sub-meter/ly.sh
+fi
+exec /usr/local/bin/vps-sub-meter "$@"
+EOF
+  chmod 0755 /usr/local/bin/.vsm.new
+  mv -fT /usr/local/bin/.vsm.new /usr/local/bin/vsm
   ln -sfn /usr/local/lib/vps-sub-meter/ly.sh /usr/local/bin/ly
 
   for s in cores.sh cert.sh net.sh argo.sh migrate-sbctl.sh migrate_legacy.py upgrade.sh uninstall.sh; do
