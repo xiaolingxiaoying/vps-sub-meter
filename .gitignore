@@ -19,6 +19,8 @@ Thumbs.db
 .kilo/
 .zcode/
 .qoder/
+AGENTS.md
+CONTEXT.md
 
 # Local build artefacts, whatever target triple they were built for
 /sbctl-linux-*
