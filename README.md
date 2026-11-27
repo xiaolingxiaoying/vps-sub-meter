@@ -6,13 +6,13 @@
 
 ## 架构与 5 主力节点
 
-| 序号 | 节点名称 | 内核 | 默认端口 | 协议栈特性 |
-| --- | --- | --- | --- | --- |
-| 1 | `vless-reality-pqc` | Xray `26.11.9` | 优先 `443/tcp`（被占则随机） | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
-| 2 | `vless-xhttp-pqc` | Xray `26.11.9` | 随机 TCP | VLESS + XHTTP (`mode: auto`) + TLS 1.3 (`h2`) + VLESS Encryption (`ML-KEM-768`) |
-| 3 | `anytls-tcp` | sing-box `1.14+` | 随机 TCP | AnyTLS + TLS 1.3 + 8 段 `padding_scheme` |
-| 4 | `hysteria2-hop` | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃 |
-| 5 | `tuic-bbr` | sing-box `1.14+` | 随机 UDP | TUIC v5 + BBR + 0-RTT + Native UDP |
+| 序号 | 节点名称            | 内核             | 默认端口                               | 协议栈特性                                                                           |
+| ---- | ------------------- | ---------------- | -------------------------------------- | ------------------------------------------------------------------------------------ |
+| 1    | `vless-reality-pqc` | Xray `26.11.9`   | 优先 `443/tcp`（被占则随机）           | VLESS + `xtls-rprx-vision` + REALITY (`ML-DSA-65`) + VLESS Encryption (`ML-KEM-768`) |
+| 2    | `vless-xhttp-pqc`   | Xray `26.11.9`   | 随机 TCP                               | VLESS + XHTTP (`mode: auto`) + TLS 1.3 (`h2`) + VLESS Encryption (`ML-KEM-768`)      |
+| 3    | `anytls-tcp`        | sing-box `1.14+` | 随机 TCP                               | AnyTLS + TLS 1.3 + 8 段 `padding_scheme`                                             |
+| 4    | `hysteria2-hop`     | sing-box `1.14+` | 随机 UDP（默认跳跃范围 `30000-35000`） | Hysteria2 + Salamander 混淆 + `nftables` 防 QoS 端口跳跃                             |
+| 5    | `tuic-bbr`          | sing-box `1.14+` | 随机 UDP                               | TUIC v5 + BBR + 0-RTT + Native UDP                                                   |
 
 日常直连优先选 `vless-reality-pqc`。UDP 通畅且线路延迟较高或有丢包时，可以对比 `hysteria2-hop` 的下载吞吐。需要接入 HTTPS 反代或 CDN 时，优先考虑 `vless-xhttp-pqc`。`anytls-tcp` 可作 TCP 备用，常转发游戏或语音 UDP 时可对比 `tuic-bbr` 的延迟和抖动。
 
@@ -43,7 +43,9 @@ curl -fsSL https://github.com/xiaolingxiaoying/vps-sub-meter/releases/latest/dow
 ```bash
 # 先检查当前环境与迁移计划（只读，不做任何改动）
 curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/scripts/upgrade.sh | sudo bash -s -- --check
+```
 
+```bash
 # 执行平滑升级（自动优先使用已签名 Release；无预编译产物时自动从源码编译）
 curl -fsSL https://raw.githubusercontent.com/xiaolingxiaoying/vps-sub-meter/dev/scripts/upgrade.sh | sudo bash
 ```
