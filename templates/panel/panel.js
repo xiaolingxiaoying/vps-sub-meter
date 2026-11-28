@@ -410,8 +410,18 @@ function overview() {
       ["Xray 内核", model.services.xray, model.initialized && xrayNeeded],
       ["sing-box 内核", model.services.singbox, model.initialized && sbNeeded],
       ["Argo 连接器", model.services.argo, model.initialized && config.argo.enabled],
+      ["证书自动续期", model.services.cert_renew_timer, model.initialized && !isIp(config)],
     ].map(([name, state, required]) => element("div", { class: "service-item" },
       element("span", {}, name), serviceBadge(state, required))))) : null;
+  const certAlert = model.initialized && !isIp(config) && model.cert_renewal?.status === "failed"
+    ? element("div", { class: "callout callout-row error" },
+      element("span", {},
+        `证书自动续期失败（${time(model.cert_renewal.attempted_at, config.traffic.display_tz)}，连续失败 ${model.cert_renewal.consecutive_failures ?? 1} 次）：${model.cert_renewal.error || "未知错误"}`),
+      element("div", { class: "actions inline" },
+        button("立即续期", () => runJob("续期证书", { action: "certificate-renew" }),
+          { primary: true, disabled: !model.live }),
+        element("a", { href: "#certificate", class: "button-link" }, "证书管理")))
+    : null;
   const warning = model.config_error ? callout(model.config_error, true)
     : model.status_error ? callout(model.status_error, true)
     : !model.initialized ? callout("尚未初始化。请在「部署配置」中填写 VPS 地址并部署。")
@@ -420,7 +430,7 @@ function overview() {
       button("立即应用配置", () => runJob("应用当前配置", { action: "apply" }), { primary: true })) : null;
   return element("div", {}, heading("运行概览", "查看本机流量、服务运行、订阅批次与节点发布状态。",
     button("刷新", refresh, { primary: true })),
-  stack(warning, element("div", { class: "overview" }, monthly, deploymentSummary), servicesCard,
+  stack(certAlert, warning, element("div", { class: "overview" }, monthly, deploymentSummary), servicesCard,
     card("直连节点", table(["协议 / 节点类型", "配置端口", "传输", "内核", "订阅状态"], rows))));
 }
 
@@ -995,6 +1005,29 @@ function certificate() {
     status.textContent = result.message;
   };
   if (model.initialized) void load().catch((error) => { status.textContent = error.message; });
+  const autoRenewCard = model.initialized && !isIp(model.config)
+    ? (() => {
+      const timerActive = model.services?.cert_renew_timer === "active";
+      const rec = model.cert_renewal;
+      const renewSummary = rec
+        ? (rec.status === "failed"
+          ? `失败（${time(rec.attempted_at, model.config.traffic.display_tz)} · 连续 ${rec.consecutive_failures ?? 1} 次）：${rec.error || "未知错误"}`
+          : `正常（${time(rec.last_success_at || rec.attempted_at, model.config.traffic.display_tz)}${rec.detail ? ` · ${rec.detail}` : ""}）`)
+        : "暂无自动续期记录";
+      return card("自动续期",
+        rec?.status === "failed" ? callout(`最近一次续期失败：${rec.error || "未知错误"}`, true) : null,
+        facts([
+          ["定时器状态", model.services ? serviceBadge(model.services.cert_renew_timer, true) : "未知"],
+          ["最近续期", renewSummary],
+        ]),
+        actions(
+          button(timerActive ? "停用自动续期" : "启用自动续期",
+            () => runJob(timerActive ? "停用自动续期" : "启用自动续期",
+              { action: "certificate-auto-renew", enabled: !timerActive }),
+            { danger: timerActive, primary: !timerActive, disabled: !canChange }),
+        ));
+    })()
+    : null;
   const controls = isIp(model.config)
     ? row("IP 模式自签证书", "补齐自签证书，重新生成订阅并重载内核证书。",
       button("检查并补齐", () => confirmJob("补齐自签证书", "将应用配置并让内核重新加载证书。",
@@ -1006,7 +1039,7 @@ function certificate() {
       button("同步已有证书", () => runJob("同步证书", { action: "certificate-sync" }), { disabled: !canChange })));
   return element("div", {}, heading("证书管理", "查看证书状态，续期、同步或补齐当前部署的 TLS 证书。",
     button("刷新状态", load, { disabled: !model.initialized })),
-    stack(card("当前证书", status), card("证书操作", controls)));
+    stack(card("当前证书", status), autoRenewCard, card("证书操作", controls)));
 }
 
 async function uninstall() {

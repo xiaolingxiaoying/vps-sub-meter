@@ -22,6 +22,9 @@ pub fn status_json(
 ) -> Result<serde_json::Value, String> {
     let generation = store::current_generation(root).map_err(|e| e.to_string())?;
     let pending_changes = apply::has_pending_changes(root, cfg, generation.as_ref());
+    let cert_renewal = (!cfg.is_ip_mode())
+        .then(|| store::read_cert_renew_status_for_domain(root, cfg.tls_sni()))
+        .flatten();
     Ok(json!({
         "version": env!("CARGO_PKG_VERSION"),
         "address": cfg.primary_host(),
@@ -38,6 +41,7 @@ pub fn status_json(
         "generation": generation,
         "argo_enabled": cfg.argo.enabled,
         "pending_changes": pending_changes,
+        "cert_renewal": cert_renewal,
     }))
 }
 

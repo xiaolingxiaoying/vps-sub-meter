@@ -61,7 +61,7 @@ fi
 
 print_summary() {
   echo "即将卸载 vps-sub-meter（根目录: ${ROOT}）："
-  echo "  - 停止并移除 systemd 服务: vps-sub-meter, vps-sub-meter-xray, vps-sub-meter-singbox, vps-sub-meter-argo"
+  echo "  - 停止并移除 systemd 服务: vps-sub-meter, vps-sub-meter-xray, vps-sub-meter-singbox, vps-sub-meter-argo, vps-sub-meter-cert-renew.{timer,service}"
   echo "  - 清理网络规则与内核调优: nftables (vps_sub_meter_hy2), ufw vps-sub-meter 规则, 99-vps-sub-meter.conf"
   echo "  - 移除程序、软链接与脚本库: vps-sub-meter, vsm, ly, /usr/local/lib/vps-sub-meter"
   echo "  - 移除 certbot deploy hook 与 Argo token"
@@ -124,6 +124,8 @@ fi
 
 # 2. 停止并移除 systemd 服务单元
 UNITS=(
+  "vps-sub-meter-cert-renew.timer"
+  "vps-sub-meter-cert-renew.service"
   "vps-sub-meter.service"
   "vps-sub-meter-xray.service"
   "vps-sub-meter-singbox.service"
@@ -189,6 +191,7 @@ fi
 if [[ "$KEEP_CONFIG" -eq 1 ]]; then
   rm -f "${prefix}/var/lib/vps-sub-meter/current.json" \
         "${prefix}/var/lib/vps-sub-meter/serve-auth.json" \
+        "${prefix}/var/lib/vps-sub-meter/cert-renew-status.json" \
         "${prefix}/var/lib/vps-sub-meter/.operation.lock"
   rm -rf "${prefix}/var/lib/vps-sub-meter/generations" \
          "${prefix}/var/lib/vps-sub-meter/acme-webroot" \

@@ -520,4 +520,25 @@ fn panel_pending_changes_partial_traffic_set_and_argo_token_guard() {
     );
     assert!(subs["links"]["direct"].get("sing_box").is_none());
     assert!(subs["qr"]["direct"]["sing_box"].is_null());
+
+    // Panel /api/state exposes matching domain cert_renewal failures and ignores mismatched domains.
+    fs::write(
+        root.join("var/lib/vps-sub-meter/cert-renew-status.json"),
+        r#"{"domain":"other.example.com","status":"failed","source":"auto","provider":"acme","attempted_at":1795820000,"consecutive_failures":1,"error":"boom"}"#,
+    )
+    .unwrap();
+    assert!(panel.json("/api/state", None, 200)["cert_renewal"].is_null());
+
+    fs::write(
+        root.join("var/lib/vps-sub-meter/cert-renew-status.json"),
+        r#"{"domain":"sub.example.com","status":"failed","source":"auto","provider":"acme","attempted_at":1795820000,"consecutive_failures":2,"error":"tcp port 80 is already used"}"#,
+    )
+    .unwrap();
+    let failed_state = panel.json("/api/state", None, 200);
+    assert_eq!(failed_state["cert_renewal"]["status"], "failed");
+    assert_eq!(failed_state["cert_renewal"]["consecutive_failures"], 2);
+    assert_eq!(
+        failed_state["cert_renewal"]["error"],
+        "tcp port 80 is already used"
+    );
 }

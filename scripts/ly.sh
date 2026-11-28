@@ -65,6 +65,11 @@ DASH_INITIALIZED=0
 DASH_STATUS_JSON=''
 DASH_CONFIG_JSON=''
 DASH_CERT_SUMMARY='未初始化'
+DASH_CERT_AUTO_STATE='未知'
+DASH_CERT_RENEW_FAILED=0
+DASH_CERT_RENEW_ERR=''
+DASH_CERT_RENEW_TIME=''
+DASH_CERT_RENEW_COUNT=0
 DASH_REALITY_SNI='—'
 DASH_NODES_LINE1=''
 DASH_NODES_LINE2=''
@@ -653,7 +658,14 @@ collect_core_and_versions() {
 
 detect_cert_summary() {
   local cfg=$1 domain sni cert subject issuer end_line end_str end_ts now_ts days
-  local kind='' days_txt=''
+  local kind='' days_txt='' auto_suffix=''
+  local le_pem acme_pem=''
+  DASH_CERT_AUTO_STATE='未知'
+  DASH_CERT_RENEW_FAILED=0
+  DASH_CERT_RENEW_ERR=''
+  DASH_CERT_RENEW_TIME=''
+  DASH_CERT_RENEW_COUNT=0
+
   domain=$(jq -r '.domain | gsub("^\\s+|\\s+$"; "")' <<<"$cfg" 2>/dev/null || true)
   if is_ip_host "$domain"; then
     sni='www.bing.com'
@@ -670,10 +682,21 @@ detect_cert_summary() {
   end_line=$(openssl x509 -in "$cert" -noout -enddate 2>/dev/null || true)
   end_str=${end_line#notAfter=}
 
+  le_pem="${prefix}/etc/letsencrypt/live/${sni}/fullchain.pem"
+  if [[ -s "${prefix}/root/.acme.sh/${sni}_ecc/fullchain.cer" ]]; then
+    acme_pem="${prefix}/root/.acme.sh/${sni}_ecc/fullchain.cer"
+  elif [[ -s "${prefix}/root/.acme.sh/${sni}/fullchain.cer" ]]; then
+    acme_pem="${prefix}/root/.acme.sh/${sni}/fullchain.cer"
+  fi
+
   if is_ip_host "$domain" || [[ -n $subject && $subject == "$issuer" ]]; then
     kind='自签证书'
   elif [[ $issuer == *"Let's Encrypt"* ]]; then
-    if [[ -d "${prefix}/root/.acme.sh/${sni}_ecc" || -d "${prefix}/root/.acme.sh/${sni}" ]]; then
+    if [[ -s $le_pem ]] && cmp -s "$cert" "$le_pem" && [[ -z $acme_pem || ! $(cmp -s "$cert" "$acme_pem"; echo $?) -eq 0 ]]; then
+      kind="Certbot / Let's Encrypt"
+    elif [[ -n $acme_pem ]] && cmp -s "$cert" "$acme_pem"; then
+      kind="ACME / Let's Encrypt"
+    elif [[ -d "${prefix}/root/.acme.sh/${sni}_ecc" || -d "${prefix}/root/.acme.sh/${sni}" ]]; then
       kind="ACME / Let's Encrypt"
     elif [[ -d "${prefix}/etc/letsencrypt/live/${sni}" ]]; then
       kind="Certbot / Let's Encrypt"
@@ -710,7 +733,36 @@ detect_cert_summary() {
       days_txt=$(paint 31 '已过期')
     fi
   fi
-  DASH_CERT_SUMMARY="${kind} (${sni} · ${days_txt})"
+
+  if ! is_ip_host "$domain"; then
+    if [[ $root == / ]] && command -v systemctl >/dev/null 2>&1; then
+      DASH_CERT_AUTO_STATE=$(systemctl is-active vps-sub-meter-cert-renew.timer 2>/dev/null || printf 'inactive')
+      if [[ $DASH_CERT_AUTO_STATE == active ]]; then
+        auto_suffix=" · $(paint 32 '自动续期')"
+      fi
+    fi
+    if [[ -n $DASH_STATUS_JSON ]]; then
+      local renew_status
+      renew_status=$(jq -r '.cert_renewal.status // empty' <<<"$DASH_STATUS_JSON" 2>/dev/null || true)
+      if [[ $renew_status == failed ]]; then
+        local r_ts r_tz r_cnt r_err
+        DASH_CERT_RENEW_FAILED=1
+        r_ts=$(jq -r '.cert_renewal.attempted_at // 0' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf '0')
+        r_tz=$(jq -r '.traffic.display_tz // "UTC"' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf 'UTC')
+        r_cnt=$(jq -r '.cert_renewal.consecutive_failures // 1' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf '1')
+        r_err=$(jq -r '.cert_renewal.error // "未知错误"' <<<"$DASH_STATUS_JSON" 2>/dev/null || printf '未知错误')
+        if [[ $r_ts =~ ^[0-9]+$ ]] && ((r_ts > 0)); then
+          DASH_CERT_RENEW_TIME=$(TZ="$r_tz" date -d "@${r_ts}" '+%Y-%m-%d %H:%M' 2>/dev/null || printf '%s' "$r_ts")
+        else
+          DASH_CERT_RENEW_TIME='未知时间'
+        fi
+        DASH_CERT_RENEW_COUNT=$r_cnt
+        DASH_CERT_RENEW_ERR=$r_err
+        auto_suffix=" · $(paint '1;31' '续期失败')"
+      fi
+    fi
+  fi
+  DASH_CERT_SUMMARY="${kind} (${sni} · ${days_txt})${auto_suffix}"
 }
 
 format_node_chip() {
@@ -927,6 +979,12 @@ render_main_menu_body() {
         print_kv_pair '当前批次' "$batch_str" 'Argo 隧道' "$argo_str"
         if [[ $pending == true ]]; then
           printf '  %s\n' "$(paint '1;33' '配置待应用: 主配置与已发布批次不一致，请选择「8. 应用配置」生效')"
+        fi
+        if ((DASH_CERT_RENEW_FAILED)); then
+          local err_disp=$DASH_CERT_RENEW_ERR
+          ((${#err_disp} > 96)) && err_disp="${err_disp:0:93}..."
+          printf '  %s\n' "$(paint '1;31' "证书续期失败 (${DASH_CERT_RENEW_TIME} · 连续 ${DASH_CERT_RENEW_COUNT} 次): ${err_disp}")"
+          printf '  %s\n' "$(paint 31 '  请选择「12. 证书管理」查看详情或手动重试续期')"
         fi
       fi
     else
@@ -1427,15 +1485,17 @@ view_logs() {
     menu_item 2 'Xray 内核 (vps-sub-meter-xray)'
     menu_item 3 'sing-box 内核 (vps-sub-meter-singbox)'
     menu_item 4 'Argo 隧道 (vps-sub-meter-argo)'
-    menu_item 5 '全部核心服务综合日志'
+    menu_item 5 '证书自动续期 (vps-sub-meter-cert-renew)'
+    menu_item 6 '全部核心服务综合日志'
     menu_item 0 '返回主菜单'
-    choose 5 '选择要查看日志的服务' 0 || return 0
+    choose 6 '选择要查看日志的服务' 0 || return 0
     case $answer in
       1) unit='vps-sub-meter.service'; label='订阅服务' ;;
       2) unit='vps-sub-meter-xray.service'; label='Xray 内核' ;;
       3) unit='vps-sub-meter-singbox.service'; label='sing-box 内核' ;;
       4) unit='vps-sub-meter-argo.service'; label='Argo 隧道' ;;
-      5) unit='ALL'; label='全部核心服务' ;;
+      5) unit='vps-sub-meter-cert-renew.service'; label='证书自动续期' ;;
+      6) unit='ALL'; label='全部核心服务' ;;
     esac
 
     menu_heading "日志操作 · ${label}"
@@ -1449,7 +1509,7 @@ view_logs() {
 
     local -a units=()
     if [[ $unit == ALL ]]; then
-      units=(-u vps-sub-meter.service -u vps-sub-meter-xray.service -u vps-sub-meter-singbox.service -u vps-sub-meter-argo.service)
+      units=(-u vps-sub-meter.service -u vps-sub-meter-xray.service -u vps-sub-meter-singbox.service -u vps-sub-meter-argo.service -u vps-sub-meter-cert-renew.service)
     else
       units=(-u "$unit")
     fi
@@ -1709,7 +1769,14 @@ manage_certificate() {
     menu_item 1 '续期当前域名证书'
     menu_item 2 '同步已有 ACME 证书'
     menu_item 3 "申请或复用 Let's Encrypt 证书"
-    last=3
+    local auto_active=0 auto_label='启用自动续期 (systemd timer)'
+    if [[ $root == / ]] && command -v systemctl >/dev/null 2>&1 \
+      && systemctl is-active --quiet vps-sub-meter-cert-renew.timer 2>/dev/null; then
+      auto_active=1
+      auto_label='停用自动续期 (systemd timer)'
+    fi
+    menu_item 4 "$auto_label"
+    last=4
   else
     menu_item 1 '检查并补齐 IP 模式的自签证书'
   fi
@@ -1754,6 +1821,22 @@ manage_certificate() {
         pause_if_interactive
         return "$rc"
       fi
+      ;;
+    4)
+      if [[ $root != / ]]; then
+        printf '沙箱模式下不支持修改宿主机 systemd 定时器。\n' >&2
+        pause_if_interactive
+        return 0
+      fi
+      if ((auto_active)); then
+        confirm '确认停用证书自动续期定时器' 2 || return 0
+        bash "$script_dir/cert.sh" auto-disable || rc=$?
+      else
+        confirm '确认启用证书自动续期定时器' 1 || return 0
+        bash "$script_dir/cert.sh" auto-enable || rc=$?
+      fi
+      pause_if_interactive
+      return "$rc"
       ;;
   esac
 }

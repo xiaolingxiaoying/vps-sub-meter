@@ -10,8 +10,29 @@ use crate::config::VAR_DIR;
 
 pub const CURRENT_REL: &str = "var/lib/vps-sub-meter/current.json";
 pub const SERVE_AUTH_REL: &str = "var/lib/vps-sub-meter/serve-auth.json";
+pub const CERT_RENEW_STATUS_REL: &str = "var/lib/vps-sub-meter/cert-renew-status.json";
 pub const XRAY_CONFIG_REL: &str = "etc/vps-sub-meter/xray/config.json";
 pub const SINGBOX_CONFIG_REL: &str = "etc/vps-sub-meter/sing-box/config.json";
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertRenewStatus {
+    pub domain: String,
+    pub status: String,
+    #[serde(default)]
+    pub source: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub attempted_at: i64,
+    #[serde(default)]
+    pub last_success_at: Option<i64>,
+    #[serde(default)]
+    pub consecutive_failures: u32,
+    #[serde(default)]
+    pub detail: Option<String>,
+    #[serde(default)]
+    pub error: Option<String>,
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct GenerationMeta {
@@ -252,6 +273,15 @@ pub fn read_generation_file(
         Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+pub fn read_cert_renew_status(root: &Path) -> Option<CertRenewStatus> {
+    let bytes = read_no_follow(&root.join(CERT_RENEW_STATUS_REL)).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+pub fn read_cert_renew_status_for_domain(root: &Path, domain: &str) -> Option<CertRenewStatus> {
+    read_cert_renew_status(root).filter(|rec| rec.domain == domain)
 }
 
 pub fn read_serve_auth(root: &Path) -> io::Result<ServeAuth> {

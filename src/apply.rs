@@ -18,6 +18,10 @@ use crate::store::{
 const UNIT_VSM: &str = include_str!("../templates/systemd/vps-sub-meter.service");
 const UNIT_XRAY: &str = include_str!("../templates/systemd/vps-sub-meter-xray.service");
 const UNIT_SINGBOX: &str = include_str!("../templates/systemd/vps-sub-meter-singbox.service");
+const UNIT_CERT_RENEW_SERVICE: &str =
+    include_str!("../templates/systemd/vps-sub-meter-cert-renew.service");
+const UNIT_CERT_RENEW_TIMER: &str =
+    include_str!("../templates/systemd/vps-sub-meter-cert-renew.timer");
 
 #[derive(Debug, thiserror::Error)]
 pub enum ApplyError {
@@ -485,6 +489,16 @@ fn commit_server_and_services(
             "etc/systemd/system/vps-sub-meter-singbox.service",
             0o644,
         )?,
+        backup(
+            root,
+            "etc/systemd/system/vps-sub-meter-cert-renew.service",
+            0o644,
+        )?,
+        backup(
+            root,
+            "etc/systemd/system/vps-sub-meter-cert-renew.timer",
+            0o644,
+        )?,
     ];
     let xray_changed =
         backups[0].bytes.as_deref() != compiled.xray_server.as_deref().map(str::as_bytes);
@@ -559,6 +573,11 @@ fn commit_server_and_services(
             compiled.singbox_server.is_some(),
             sb_changed,
         )?;
+        if !config.is_ip_mode() {
+            systemctl(&["enable", "--now", "vps-sub-meter-cert-renew.timer"])?;
+        } else if unit_exists("vps-sub-meter-cert-renew.timer") {
+            let _ = systemctl(&["disable", "--now", "vps-sub-meter-cert-renew.timer"]);
+        }
 
         // Brief health verification
         std::thread::sleep(std::time::Duration::from_millis(800));
@@ -637,6 +656,16 @@ pub fn write_systemd_units(root: &Path, config: &Config) -> Result<(), ApplyErro
         sb_unit.as_bytes(),
         0o644,
     )?;
+    store::write_atomic(
+        &unit_dir.join("vps-sub-meter-cert-renew.service"),
+        UNIT_CERT_RENEW_SERVICE.as_bytes(),
+        0o644,
+    )?;
+    store::write_atomic(
+        &unit_dir.join("vps-sub-meter-cert-renew.timer"),
+        UNIT_CERT_RENEW_TIMER.as_bytes(),
+        0o644,
+    )?;
     Ok(())
 }
 
@@ -675,6 +704,11 @@ fn fix_live_permissions(gen_dir: &Path) {
     );
     store::chown_name(
         Path::new("/var/lib/vps-sub-meter/serve-auth.json"),
+        Some("root"),
+        Some("vps-sub-meter"),
+    );
+    store::chown_name(
+        Path::new("/var/lib/vps-sub-meter/cert-renew-status.json"),
         Some("root"),
         Some("vps-sub-meter"),
     );
@@ -874,6 +908,19 @@ mod tests {
         )
         .unwrap();
         assert!(sb_unit.contains("net.sh apply-hy2 eth0 30000-35000 34443"));
+
+        let renew_service = fs::read_to_string(
+            dir.path()
+                .join("etc/systemd/system/vps-sub-meter-cert-renew.service"),
+        )
+        .unwrap();
+        assert!(renew_service.contains("cert.sh auto-renew"));
+        let renew_timer = fs::read_to_string(
+            dir.path()
+                .join("etc/systemd/system/vps-sub-meter-cert-renew.timer"),
+        )
+        .unwrap();
+        assert!(renew_timer.contains("OnCalendar="));
     }
 
     #[test]

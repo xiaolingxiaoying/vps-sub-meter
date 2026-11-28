@@ -1,0 +1,8 @@
+[Unit]
+Description=vps-sub-meter Automatic TLS Certificate Renewal
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/lib/vps-sub-meter/cert.sh auto-renew

@@ -207,6 +207,25 @@ fn run(root: &Path, command: Commands) -> Result<(), String> {
                     );
                 }
             }
+            if !cfg.is_ip_mode()
+                && let Some(rec) = store::read_cert_renew_status_for_domain(root, cfg.tls_sni())
+                && rec.status == "failed"
+            {
+                let when = if rec.attempted_at > 0 {
+                    format!(
+                        "{} ({})",
+                        traffic::format_time_in_tz(rec.attempted_at, &cfg.traffic.display_tz),
+                        cfg.traffic.display_tz
+                    )
+                } else {
+                    "未知时间".into()
+                };
+                let reason = rec.error.as_deref().unwrap_or("未知错误");
+                println!(
+                    "证书续期告警: 最近续期失败（{when}，连续失败 {} 次）：{reason}；请运行 ly 选择「12. 证书管理」查看或重试",
+                    rec.consecutive_failures
+                );
+            }
             Ok(())
         }
         Commands::Sub(args) => admin::sub(root, args),

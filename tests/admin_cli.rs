@@ -684,12 +684,15 @@ fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
             "var/lib/vps-sub-meter/traffic-state.json",
             "var/lib/vps-sub-meter/current.json",
             "var/lib/vps-sub-meter/serve-auth.json",
+            "var/lib/vps-sub-meter/cert-renew-status.json",
             "var/lib/vps-sub-meter/generations/g1/clash.yaml",
             "var/lib/vps-sub-meter/certificates/sub.example.com/fullchain.pem",
             "etc/systemd/system/vps-sub-meter.service",
             "etc/systemd/system/vps-sub-meter-xray.service",
             "etc/systemd/system/vps-sub-meter-singbox.service",
             "etc/systemd/system/vps-sub-meter-argo.service",
+            "etc/systemd/system/vps-sub-meter-cert-renew.service",
+            "etc/systemd/system/vps-sub-meter-cert-renew.timer",
             "etc/sysctl.d/99-vps-sub-meter.conf",
             "etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook",
             "etc/letsencrypt/live/sub.example.com/fullchain.pem",
@@ -785,11 +788,14 @@ fn uninstall_script_cleans_sandbox_and_respects_keep_flags() {
         "usr/local/bin/ly",
         "usr/local/lib/vps-sub-meter",
         "etc/systemd/system/vps-sub-meter.service",
+        "etc/systemd/system/vps-sub-meter-cert-renew.service",
+        "etc/systemd/system/vps-sub-meter-cert-renew.timer",
         "etc/sysctl.d/99-vps-sub-meter.conf",
         "etc/letsencrypt/renewal-hooks/deploy/vps-sub-meter-deploy-hook",
         "etc/cloudflared/vps-sub-meter-argo.token",
         "var/lib/vps-sub-meter/generations",
         "var/lib/vps-sub-meter/current.json",
+        "var/lib/vps-sub-meter/cert-renew-status.json",
     ] {
         assert!(!sandbox.root().join(removed).exists(), "{removed}");
     }
@@ -966,4 +972,49 @@ fn bash_menu_requires_initialized_for_keys_rotate_and_apply() {
             "choice={choice:?} should fail before confirm: {stderr}"
         );
     }
+}
+
+#[test]
+fn status_reports_matching_cert_renewal_failure_and_ignores_mismatch_or_ip_mode() {
+    let sandbox = Sandbox::new();
+    let mut cfg = sandbox.prepare(&["--ports", "keep"])["config"].clone();
+    cfg["domain"] = json!("sub.example.com");
+    cfg["public_ip"] = json!("203.0.113.10");
+    cfg["nodes"]["vless_reality_pqc"]["enabled"] = json!(false);
+    cfg["nodes"]["vless_xhttp_pqc"]["enabled"] = json!(false);
+    sandbox.ok(&["config", "write"], Some(&cfg));
+    sandbox.ok(&["apply"], None);
+
+    // Non-matching domain is ignored
+    sandbox.write(
+        "var/lib/vps-sub-meter/cert-renew-status.json",
+        r#"{"domain":"other.example.com","status":"failed","source":"auto","provider":"acme","attempted_at":1795820000,"consecutive_failures":2,"error":"tcp port 80 is already used"}"#,
+    );
+    let mismatch_json = sandbox.json(&["status", "--json"]);
+    assert!(mismatch_json["cert_renewal"].is_null());
+    assert!(!sandbox.ok(&["status"], None).contains("证书续期告警:"));
+
+    // Matching domain failure appears in both JSON and text status
+    sandbox.write(
+        "var/lib/vps-sub-meter/cert-renew-status.json",
+        r#"{"domain":"sub.example.com","status":"failed","source":"auto","provider":"acme","attempted_at":1795820000,"consecutive_failures":3,"error":"tcp port 80 is already used"}"#,
+    );
+    let match_json = sandbox.json(&["status", "--json"]);
+    assert_eq!(match_json["cert_renewal"]["status"], "failed");
+    assert_eq!(match_json["cert_renewal"]["consecutive_failures"], 3);
+    assert_eq!(
+        match_json["cert_renewal"]["error"],
+        "tcp port 80 is already used"
+    );
+    let status_text = sandbox.ok(&["status"], None);
+    assert!(status_text.contains("证书续期告警:"));
+    assert!(status_text.contains("连续失败 3 次"));
+    assert!(status_text.contains("tcp port 80 is already used"));
+
+    // IP mode ignores domain renewal failures
+    cfg["domain"] = json!("");
+    sandbox.ok(&["config", "write", "--replace"], Some(&cfg));
+    let ip_json = sandbox.json(&["status", "--json"]);
+    assert!(ip_json["cert_renewal"].is_null());
+    assert!(!sandbox.ok(&["status"], None).contains("证书续期告警:"));
 }

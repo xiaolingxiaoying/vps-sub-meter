@@ -84,6 +84,9 @@ pub enum Action {
         email: String,
     },
     CertificateSelfSigned,
+    CertificateAutoRenew {
+        enabled: bool,
+    },
     UpgradeCheck,
     UpgradeRelease {
         force_templates: bool,
@@ -289,6 +292,19 @@ impl Action {
                 }
                 script(root, "cert.sh", &["reload", sni], None, &mut output)?;
             }
+            Self::CertificateAutoRenew { enabled } => {
+                require_live(root)?;
+                let config = load_config(root)?;
+                if config.is_ip_mode() {
+                    return Err("当前是 IP 模式，不支持域名证书自动续期".into());
+                }
+                let subcmd = if enabled {
+                    "auto-enable"
+                } else {
+                    "auto-disable"
+                };
+                script(root, "cert.sh", &[subcmd], None, &mut output)?;
+            }
             Self::UpgradeCheck => {
                 require_live(root)?;
                 script(root, "upgrade.sh", &["--check"], None, &mut output)?;
@@ -358,8 +374,12 @@ pub fn state(root: &Path) -> Result<Value, String> {
             "xray": service_state("vps-sub-meter-xray.service"),
             "singbox": service_state("vps-sub-meter-singbox.service"),
             "argo": service_state("vps-sub-meter-argo.service"),
+            "cert_renew_timer": service_state("vps-sub-meter-cert-renew.timer"),
         })
     });
+    let cert_renewal = (initialized && !config.is_ip_mode())
+        .then(|| store::read_cert_renew_status_for_domain(root, config.tls_sni()))
+        .flatten();
     let argo_preferred_ip_count = render::client::load_argo_preferred_ips(root, &config).len();
     Ok(json!({
         "config": config,
@@ -371,6 +391,7 @@ pub fn state(root: &Path) -> Result<Value, String> {
         "revision": revision,
         "generation": generation,
         "services": services,
+        "cert_renewal": cert_renewal,
         "argo_token_configured": argo_token_exists(root),
         "argo_preferred_ip_count": argo_preferred_ip_count,
         "live": is_live(root),
