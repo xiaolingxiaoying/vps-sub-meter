@@ -409,7 +409,7 @@ fn bash_menu_cancels_before_writes_and_reuses_previewed_ports() {
     let cancelled = run_menu("99\n13\n11\n8\n3\n36041\n0\n0\n");
     assert!(cancelled.status.success());
     let prompts = String::from_utf8_lossy(&cancelled.stderr);
-    assert!(prompts.contains("请输入 0–13 之间的编号"));
+    assert!(prompts.contains("请输入 0–14 之间的编号"));
     assert!(prompts.contains("请输入 0–7 之间的编号"));
     let screen = String::from_utf8_lossy(&cancelled.stdout);
     assert!(screen.contains("端口预览"));

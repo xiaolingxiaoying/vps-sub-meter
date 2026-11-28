@@ -1024,6 +1024,11 @@ render_main_menu_body() {
     fi
   fi
 
+  local vsm_upd_label='更新 vps-sub-meter'
+  if ((HAS_VSM_UPDATE)) && [[ -n $LATEST_VSM_VER ]]; then
+    vsm_upd_label="更新 vps-sub-meter $(paint '1;33' "(新版 v${LATEST_VSM_VER})")"
+  fi
+
   if "$interactive" && ((TERM_COLS >= 88)); then
     local col_w=$((w / 2))
     local -a left_rows=(
@@ -1034,6 +1039,7 @@ render_main_menu_body() {
       "$(section_half_bar '系统维护' "$col_w")"
       "$(menu_entry_str 4 '轮换节点密钥')"
       "$(menu_entry_str 5 '更新内核 (Xray / sing-box)')"
+      "$(menu_entry_str 14 "$vsm_upd_label")"
       "$(menu_entry_str 13 '查看运行日志')"
       "$(menu_entry_str 9 '卸载 vps-sub-meter' 31)"
       "$(menu_entry_str 0 '退出')"
@@ -1046,6 +1052,7 @@ render_main_menu_body() {
       "$(menu_entry_str 8 '应用配置')"
       "$(menu_entry_str 11 '节点端口设置')"
       "$(menu_entry_str 12 '证书管理')"
+      ""
       ""
       ""
       ""
@@ -1072,6 +1079,7 @@ render_main_menu_body() {
     menu_section '系统维护'
     menu_item 4 '轮换节点密钥'
     menu_item 5 '更新内核 (Xray / sing-box)'
+    menu_item 14 "$vsm_upd_label"
     menu_item 13 '查看运行日志'
     menu_item 9 '卸载 vps-sub-meter' 31
     ((compact == 0)) && printf '\n'
@@ -1103,7 +1111,7 @@ render_main_menu() {
 read_main_choice() {
   local rc settle prev_r prev_c
   while true; do
-    paint '1;33' '请输入编号（0–13，r 刷新）' >&2
+    paint '1;33' '请输入编号（0–14，r 刷新）' >&2
     printf ': ' >&2
     while true; do
       winch_resized=0
@@ -1116,10 +1124,10 @@ read_main_choice() {
           return 1
         elif [[ $answer == r || $answer == R ]]; then
           return 3
-        elif [[ $answer =~ ^[1-9][0-9]?$ ]] && ((answer <= 13)); then
+        elif [[ $answer =~ ^[1-9][0-9]?$ ]] && ((answer <= 14)); then
           return 0
         fi
-        printf '\n请输入 0–13 之间的编号（或输入 r 刷新）。\n' >&2
+        printf '\n请输入 0–14 之间的编号（或输入 r 刷新）。\n' >&2
         break
       elif ((rc == 1)); then
         return 1
@@ -1459,6 +1467,57 @@ update_cores() {
   fi
   if ((rc == 0)); then
     invalidate_version_cache
+  fi
+  pause_if_interactive
+  return "$rc"
+}
+
+upgrade_vsm() {
+  local rc=0
+  if [[ ! -f $script_dir/upgrade.sh ]]; then
+    printf '找不到程序升级脚本: %s\n' "$script_dir/upgrade.sh" >&2
+    pause_if_interactive
+    return 1
+  fi
+  menu_heading '更新 vps-sub-meter'
+  printf '  当前版本: %s%s\n\n' "${CUR_VSM_VER:-未知}" "${LATEST_VSM_VER:+  |  GitHub 最新: v$LATEST_VSM_VER}"
+  if [[ $root != / ]]; then
+    printf '沙箱模式下不支持执行宿主机程序升级。\n' >&2
+    pause_if_interactive
+    return 0
+  fi
+
+  menu_item 1 '检查升级兼容性（只读）'
+  menu_item 2 '升级到最新官方 Release'
+  menu_item 3 '升级到最新官方 Release（并覆盖部署模板）'
+  menu_item 0 '返回主菜单'
+  choose 3 '选择升级操作' 1 || return 0
+
+  case $answer in
+    1)
+      bash "$script_dir/upgrade.sh" --check || rc=$?
+      pause_if_interactive
+      return "$rc"
+      ;;
+    2)
+      confirm '确认从 GitHub 最新签名 Release 升级 vps-sub-meter' 1 || return 0
+      bash "$script_dir/upgrade.sh" --release-only || rc=$?
+      ;;
+    3)
+      confirm '确认升级 vps-sub-meter 并用新版覆盖现有部署模板' 2 || return 0
+      bash "$script_dir/upgrade.sh" --release-only --force-templates || rc=$?
+      ;;
+  esac
+
+  if ((rc == 0)); then
+    invalidate_version_cache
+    if "$interactive"; then
+      printf '\n' >&2
+      ask '升级完成，按回车重新加载新版菜单' '' || true
+      cleanup
+      exec "$prefix/usr/local/lib/vps-sub-meter/ly.sh"
+    fi
+    return 0
   fi
   pause_if_interactive
   return "$rc"
@@ -1944,7 +2003,7 @@ main() {
       need_collect=1
     else
       render_main_menu
-      choose 13 '请输入编号（0–13）' || exit 0
+      choose 14 '请输入编号（0–14）' || exit 0
     fi
 
     case $answer in
@@ -1961,6 +2020,7 @@ main() {
       11) manage_ports ;;
       12) manage_certificate ;;
       13) view_logs ;;
+      14) upgrade_vsm ;;
     esac
   done
 }
